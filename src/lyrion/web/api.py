@@ -1,0 +1,961 @@
+"""JSON-RPC API for Lyrion Music Server."""
+from __future__ import annotations
+
+from typing import Any, Callable, Optional
+
+try:
+    import orjson
+
+    def _json_loads(data: bytes | str) -> Any:
+        return orjson.loads(data)
+
+    def _json_dumps(obj: Any) -> bytes:
+        return orjson.dumps(obj)
+
+except ImportError:
+    import json
+
+    def _json_loads(data: bytes | str) -> Any:
+        if isinstance(data, bytes):
+            data = data.decode("utf-8")
+        return json.loads(data)
+
+    def _json_dumps(obj: Any) -> bytes:
+        return json.dumps(obj).encode("utf-8")
+
+
+class JSONRPCError(Exception):
+    """JSON-RPC error exception."""
+
+    def __init__(self, code: int, message: str, data: Any = None):
+        self.code = code
+        self.message = message
+        self.data = data
+        super().__init__(message)
+
+    def to_dict(self) -> dict:
+        return {
+            "code": self.code,
+            "message": self.message,
+            "data": self.data,
+        }
+
+
+class JSONRPCAPI:
+    """JSON-RPC 2.0 API handler.
+
+    Handles both single requests and batch requests. Methods are registered
+    via register() and are called with positional parameters from the params
+    array.
+    """
+
+    # Standard JSON-RPC error codes
+    PARSE_ERROR = -32700
+    INVALID_REQUEST = -32600
+    METHOD_NOT_FOUND = -32601
+    INVALID_PARAMS = -32602
+    INTERNAL_ERROR = -32603
+
+    def __init__(self) -> None:
+        self._methods: dict[str, Callable] = {}
+        self._register_default_methods()
+
+    # ------------------------------------------------------------------
+    # Registration
+    # ------------------------------------------------------------------
+
+    def _register_default_methods(self) -> None:
+        """Register the built-in method set."""
+        self.register("server.version", self._server_version)
+        self.register("server.status", self._server_status)
+        self.register("player.list", self._player_list)
+        self.register("player.count", self._player_count)
+        self.register("player.name", self._player_name)
+        self.register("player.power", self._player_power)
+        self.register("player.volume", self._player_volume)
+        self.register("player.mode", self._player_mode)
+        self.register("player.status", self._player_status)
+        self.register("playlist.tracks", self._playlist_tracks)
+        self.register("playlist.play", self._playlist_play)
+        self.register("playlist.stop", self._playlist_stop)
+        self.register("playlist.pause", self._playlist_pause)
+        self.register("playlist.next", self._playlist_next)
+        self.register("playlist.prev", self._playlist_prev)
+        self.register("slim.request", self._slim_request)
+        self.register("rescan", self._rescan)
+
+    def register(self, name: str, method: Callable) -> None:
+        """Register a method.
+
+        Args:
+            name: Fully-qualified method name (e.g. "player.power").
+            method: Async callable accepting *params.
+        """
+        self._methods[name] = method
+
+    def unregister(self, name: str) -> None:
+        """Remove a registered method."""
+        self._methods.pop(name, None)
+
+    # ------------------------------------------------------------------
+    # Request handling
+    # ------------------------------------------------------------------
+
+    async def handle_request(self, request_data: bytes | str) -> bytes:
+        """Parse and handle a JSON-RPC request.
+
+        Args:
+            request_data: Raw request body.
+
+        Returns:
+            JSON-RPC response as bytes.
+        """
+        try:
+            request = _json_loads(request_data)
+
+            # Batch request
+            if isinstance(request, list):
+                responses = [await self._handle_single(r) for r in request]
+                # Filter out null results that some transports prefer
+                responses = [r for r in responses if r is not None]
+                return _json_dumps(responses) if responses else b"[]"
+
+            response = await self._handle_single(request)
+            return _json_dumps(response)
+
+        except (ValueError, Exception) as e:
+            return _json_dumps({
+                "jsonrpc": "2.0",
+                "error": {
+                    "code": self.PARSE_ERROR,
+                    "message": f"Parse error: {e}",
+                },
+                "id": None,
+            })
+
+    async def _handle_single(self, request: dict) -> Optional[dict]:
+        """Handle one JSON-RPC request/notification.
+
+        Compatible with real LMS: accepts requests with or without the
+        "jsonrpc" version field ("2.0" or "1.0" both accepted) — SqueezeCtrl,
+        Squeezer and similar apps omit it. Responses always include "2.0".
+        """
+        jsonrpc = request.get("jsonrpc")
+        if jsonrpc not in (None, "2.0", "1.0"):
+            return {
+                "jsonrpc": "2.0",
+                "error": {
+                    "code": self.INVALID_REQUEST,
+                    "message": "Invalid JSON-RPC version",
+                },
+                "id": request.get("id"),
+            }
+
+        method_name = request.get("method", "")
+        params = request.get("params", [])
+        id = request.get("id")
+
+        # Notification (no id) — don't send response
+        if id is None and method_name in self._methods:
+            try:
+                await self._methods[method_name](*params)
+            except Exception:
+                pass
+            return None
+
+        if method_name not in self._methods:
+            return {
+                "jsonrpc": "2.0",
+                "error": {
+                    "code": self.METHOD_NOT_FOUND,
+                    "message": f"Method not found: {method_name}",
+                },
+                "id": id,
+            }
+
+        try:
+            result = await self._methods[method_name](*params)
+            return {"jsonrpc": "2.0", "result": result, "id": id}
+        except TypeError as e:
+            return {
+                "jsonrpc": "2.0",
+                "error": {
+                    "code": self.INVALID_PARAMS,
+                    "message": str(e),
+                },
+                "id": id,
+            }
+        except Exception as e:
+            return {
+                "jsonrpc": "2.0",
+                "error": {
+                    "code": self.INTERNAL_ERROR,
+                    "message": str(e),
+                },
+                "id": id,
+            }
+
+    # ------------------------------------------------------------------
+    # Built-in methods
+    # ------------------------------------------------------------------
+
+    async def _server_version(self) -> str:
+        from lyrion.version import __version__
+        return __version__
+
+    async def _server_status(self) -> dict:
+        from lyrion import __version__
+        try:
+            from lyrion.player import PlayerManager
+            pm = PlayerManager()
+            players = pm.get_connected_count()
+        except Exception:
+            players = 0
+        return {"version": __version__, "players": players}
+
+    async def _player_list(self) -> list[dict]:
+        try:
+            from lyrion.player import PlayerManager
+            pm = PlayerManager()
+            return [p.to_dict() for p in pm.get_all_players()]
+        except Exception:
+            return []
+
+    async def _player_count(self) -> int:
+        try:
+            from lyrion.player import PlayerManager
+            return PlayerManager().get_connected_count()
+        except Exception:
+            return 0
+
+    async def _player_name(self, mac: str) -> str:
+        try:
+            from lyrion.player import PlayerManager
+            player = PlayerManager().get_player(mac)
+            return player.name if player else ""
+        except Exception:
+            return ""
+
+    async def _player_power(self, mac: str, power: Optional[bool] = None) -> bool:
+        try:
+            from lyrion.player import PlayerManager
+            pm = PlayerManager()
+            if power is None:
+                player = pm.get_player(mac)
+                return player.power if player else False
+            pm.set_power(mac, power)
+            return power
+        except Exception:
+            return False
+
+    async def _player_volume(
+        self, mac: str, level: Optional[int] = None
+    ) -> int:
+        try:
+            from lyrion.player import PlayerManager
+            pm = PlayerManager()
+            if level is None:
+                player = pm.get_player(mac)
+                return player.volume if player else 0
+            await pm.set_volume(mac, level)
+            return level
+        except Exception:
+            return 0
+
+    async def _player_mode(self, mac: str) -> str:
+        try:
+            from lyrion.player import PlayerManager
+            player = PlayerManager().get_player(mac)
+            return player.mode if player else "stop"
+        except Exception:
+            return "stop"
+
+    async def _player_status(self, mac: str) -> dict:
+        """Full playback status for a player (used by the web UI)."""
+        try:
+            from lyrion.player import PlayerManager
+            player = PlayerManager().get_player(mac)
+            if player is None:
+                return {"mode": "stop", "playlist_cur_index": -1}
+            mode_map = {"play": "playing", "pause": "paused",
+                        "stop": "stopped", "loading": "loading"}
+            return {
+                "mode": mode_map.get(player.mode, player.mode),
+                "player_connected": bool(player.connected),
+                "power": bool(player.power),
+                "volume": player.volume,
+                "playlist_tracks": player.playlist_total,
+                "playlist_cur_index": player.playlist_position,
+                "current_track_id": player.current_track_id,
+                "current_title": getattr(player, "current_title", None),
+                "current_url": getattr(player, "current_url", None),
+            }
+        except Exception:
+            return {"mode": "stop", "playlist_cur_index": -1}
+
+    async def _playlist_tracks(self, mac: str) -> list[dict]:
+        """Return the player's playlist as JSON objects (used by the web UI)."""
+        try:
+            from lyrion.player import PlayerManager
+            player = PlayerManager().get_player(mac)
+            if player is None:
+                return []
+            tracks = player.playlist
+            out: list[dict] = []
+            # Track titles from the DB (one query for all local tracks)
+            track_ids = [e for e in tracks if not isinstance(e, str)]
+            titles: dict[int, str] = {}
+            if track_ids:
+                try:
+                    from sqlalchemy import select
+                    from lyrion.database.schema import Track
+                    from lyrion.database.sqlite_helper import db_session
+                    async with db_session() as session:
+                        result = await session.execute(
+                            select(Track.id, Track.title).where(Track.id.in_(track_ids))
+                        )
+                        titles = {tid: t for tid, t in result.all()}
+                except Exception:
+                    titles = {}
+            for i, entry in enumerate(tracks):
+                if isinstance(entry, str):
+                    out.append({
+                        "index": i,
+                        "url": entry,
+                        "title": player.current_title
+                        if i == player.playlist_position and player.current_title
+                        else "Radio Stream",
+                    })
+                else:
+                    out.append({
+                        "index": i,
+                        "track_id": entry,
+                        "title": titles.get(entry, f"Track {entry}"),
+                    })
+            return out
+        except Exception:
+            return []
+
+    async def _playlist_play(self, mac: str, index: int = 0) -> bool:
+        try:
+            from lyrion.player import PlayerManager
+            pm = PlayerManager()
+            # If the index points into a populated playlist, send a strm frame
+            player = pm.get_player(mac)
+            if player is not None and getattr(player, "playlist", []):
+                await self._play_playlist_item(pm, player, index)
+                return True
+            # Fallback: direct track play
+            return await pm.play_track(mac, index)
+        except Exception:
+            return False
+
+    async def _playlist_stop(self, mac: str) -> bool:
+        try:
+            from lyrion.player import PlayerManager
+            PlayerManager().send_command(mac, "stop")
+            return True
+        except Exception:
+            return False
+
+    async def _playlist_pause(self, mac: str, state: int = -1) -> bool:
+        try:
+            from lyrion.player import PlayerManager
+            if state == 1:
+                PlayerManager().send_command(mac, "pause")
+            elif state == 0:
+                PlayerManager().send_command(mac, "pause 1")
+            else:
+                PlayerManager().send_command(mac, "pause")
+            return True
+        except Exception:
+            return False
+
+    async def _playlist_next(self, mac: str) -> bool:
+        try:
+            from lyrion.player import PlayerManager
+            PlayerManager().send_command(mac, "playlist jump +1")
+            return True
+        except Exception:
+            return False
+
+    async def _playlist_prev(self, mac: str) -> bool:
+        try:
+            from lyrion.player import PlayerManager
+            PlayerManager().send_command(mac, "playlist jump -1")
+            return True
+        except Exception:
+            return False
+
+    async def _slim_request(self, player_id: str, command: list[str]) -> Any:
+        """LMS-compatible slim.request — returns structured JSON dicts.
+
+        SqueezeCtrl / Squeezer / SqueezeTray expect dict responses
+        (players_loop, playlist_loop, mixer volume, etc.), not text lines.
+        """
+        if not command:
+            return {}
+        cmd = command[0]
+        args = command[1:] if len(command) > 1 else []
+        pid = player_id if player_id and player_id != "-" else None
+
+        try:
+            from lyrion.player.manager import PlayerManager
+            pm = PlayerManager()
+        except Exception:
+            pm = None
+
+        # ── players ────────────────────────────────────────────────
+        if cmd == "players":
+            players = pm.get_all_players() if pm else []
+            start = int(args[0]) if args and args[0].isdigit() else 0
+            count = int(args[1]) if len(args) > 1 and args[1].isdigit() else 100
+            loop = []
+            for p in players[start:start + count]:
+                loop.append({
+                    "playerid": p.mac,
+                    "name": p.name or p.mac,
+                    "model": p.model or "squeezebox",
+                    "modelname": p.model or "Squeezebox",
+                    "ip": f"{p.ip}:{p.port}",
+                    "uuid": p.mac,
+                    "firmware": p.firmware or "1",
+                    "isplaying": 1 if p.mode == "play" else 0,
+                    "isplayer": 1 if p.is_player else 0,
+                    "canpoweroff": 1 if p.can_power_off else 0,
+                    "connected": 1 if p.connected else 0,
+                    "power": 1 if p.power else 0,
+                    "seq_no": 0,
+                })
+            return {"count": count, "players_loop": loop}
+
+        # ── serverstatus ───────────────────────────────────────────
+        if cmd == "serverstatus":
+            from lyrion import __version__
+            players = pm.get_all_players() if pm else []
+            return {
+                "version": __version__,
+                "uuid": "lyrion-server-0001",
+                "name": "Lyrion Music Server",
+                "httpport": 9000,
+                "player count": len(players),
+                "info total genres": 0,
+                "info total artists": 0,
+                "info total albums": 0,
+                "info total songs": 0,
+            }
+
+        # ── status (player) ────────────────────────────────────────
+        if cmd == "status":
+            return await self._json_player_status(pm, pid, args)
+
+        # ── Control commands (return {} — LMS convention) ──────────
+        if cmd in ("pause", "power", "play", "stop", "mixer", "sync",
+                   "unsync", "pref", "playerpref", "display", "button",
+                   "alarm", "signalstrength", "client", "mode", "name",
+                   "playlist"):
+            await self._json_control(pm, pid, cmd, args)
+            return {}
+
+        # ── favorites ──────────────────────────────────────────────
+        if cmd == "favorites" and args and args[0] == "items":
+            return await self._json_favorites(pm, pid, args)
+        if cmd == "favorites" and len(args) >= 3 and args[0] == "playlist" and args[1] == "play":
+            # favorites playlist play item_id:<n> → play_url on the player
+            item_id = None
+            for a in args:
+                if a.startswith("item_id:"):
+                    try:
+                        item_id = int(a[8:])
+                    except ValueError:
+                        pass
+            if item_id is not None and pid:
+                url = await self._favorite_url(item_id)
+                if url:
+                    from lyrion.player.manager import PlayerManager
+                    pm = pm or PlayerManager()
+                    player = pm.get_player(pid)
+                    if player is not None:
+                        player.playlist = [url]
+                        player.playlist_total = 1
+                        await self._play_playlist_item(pm, player, 0)
+            return {}
+
+        # ── Browse commands (library) ──────────────────────────────
+        if cmd in ("albums", "artists", "genres", "songs", "titles",
+                   "musicfolder", "playlists", "radios", "songinfo",
+                   "info", "contributors", "browse"):
+            return await self._json_browse(cmd, args)
+
+        # ── Fallback: text CLI passthrough ─────────────────────────
+        try:
+            from lyrion.control.cli import CLIHandler, CLIContext
+            async with CLIHandler() as cli:
+                ctx = CLIContext(player_id=player_id)
+                result = await cli.dispatch(ctx, (cmd, args))
+                return result if isinstance(result, list) else [str(result)]
+        except Exception as e:
+            return {"error": str(e)}
+
+    async def _rescan(self, mode: str = "normal") -> Any:
+        """Direct rescan — triggers MusicImporter in background."""
+        import asyncio as _asyncio
+        async def _do():
+            from lyrion.media.importer import MusicImporter, ImportConfig
+            importer = MusicImporter(ImportConfig())
+            stats = await importer.import_music()
+            return stats
+        _asyncio.create_task(_do())
+        return {"status": "rescan started", "mode": mode}
+
+    # ─────────────────────────────────────────────────────────────
+    # slim.request JSON helpers
+    # ─────────────────────────────────────────────────────────────
+
+    async def _json_player_status(self, pm, pid: str | None, args: list[str]) -> dict:
+        """Build a player status dict (LMS 'status' command)."""
+        from lyrion.player.manager import PlayerManager
+        pm = pm or PlayerManager()
+        if not pid:
+            players = pm.get_all_players()
+            pid = players[0].mac if players else None
+        player = pm.get_player(pid) if pid else None
+        if player is None:
+            return {"mode": "stop", "power": 0, "player_name": "", "playlist_tracks": 0}
+
+        # Track metadata from DB for playlist_loop (only int ids)
+        loop = []
+        playlist_ids = getattr(player, "playlist", []) or []
+        int_ids = [i for i in playlist_ids if isinstance(i, int)]
+        track_rows = await self._load_tracks(int_ids) if int_ids else {}
+
+        for i, tid in enumerate(playlist_ids):
+            if isinstance(tid, int):
+                info = track_rows.get(tid, {})
+                title = info.get("title", "Unknown")
+                artist = info.get("artist", "")
+                album = info.get("album", "")
+                duration = info.get("duration", 0) or 0
+                url = info.get("url", "")
+            else:
+                # Remote stream URL (radio) — title from the URL host
+                title = str(tid)
+                artist = ""
+                album = ""
+                duration = 0
+                url = str(tid)
+                try:
+                    from urllib.parse import urlparse
+                    host = urlparse(url).hostname or ""
+                    if host:
+                        title = host.replace("www.", "")
+                except Exception:
+                    pass
+            loop.append({
+                "id": tid,
+                "index": i,
+                "title": title,
+                "artist": artist,
+                "album": album,
+                "duration": duration,
+                "url": url,
+            })
+
+        cur = player.playlist_position or 0
+        if cur < len(playlist_ids) and isinstance(playlist_ids[cur], int):
+            cur_info = track_rows.get(playlist_ids[cur], {})
+        else:
+            cur_info = {}
+        if cur < len(playlist_ids) and not isinstance(playlist_ids[cur], int):
+            cur_info = {"title": str(playlist_ids[cur])}
+
+        return {
+            "mode": player.mode,
+            "power": 1 if player.power else 0,
+            "player_name": player.name or player.mac,
+            "mixer volume": player.volume or 50,
+            "playlist_tracks": len(playlist_ids),
+            "playlist_cur_index": cur,
+            "time": 0,
+            "duration": cur_info.get("duration", 0) or 0,
+            "artist": cur_info.get("artist", ""),
+            "title": cur_info.get("title", ""),
+            "album": cur_info.get("album", ""),
+            "playlist_loop": loop,
+        }
+
+    async def _load_tracks(self, track_ids: list[int]) -> dict:
+        """Load track metadata (title/artist/album/duration/url) for ids."""
+        result: dict = {}
+        if not track_ids:
+            return result
+        try:
+            import sqlite3
+            db = sqlite3.connect("/root/.lyrion/Lyrion/Prefs/lyrion.db")
+            db.row_factory = sqlite3.Row
+            placeholders = ",".join("?" * len(track_ids))
+            rows = db.execute(
+                f"SELECT id, title, url, duration FROM tracks WHERE id IN ({placeholders})",
+                track_ids,
+            ).fetchall()
+            # Artist/album via join tables
+            for row in rows:
+                tid = row["id"]
+                artist = ""
+                album = ""
+                try:
+                    a = db.execute(
+                        "SELECT c.name FROM contributors c JOIN tracks_contributors tc ON tc.contributor_id = c.id "
+                        "WHERE tc.track_id = ? AND tc.role = 'artist' LIMIT 1", (tid,)
+                    ).fetchone()
+                    if a: artist = a["name"]
+                except Exception:
+                    pass
+                try:
+                    al = db.execute(
+                        "SELECT a.name FROM albums a JOIN tracks_albums ta ON ta.album_id = a.id "
+                        "WHERE ta.track_id = ? LIMIT 1", (tid,)
+                    ).fetchone()
+                    if al: album = al["name"]
+                except Exception:
+                    pass
+                result[tid] = {
+                    "title": row["title"] or "",
+                    "url": row["url"] or "",
+                    "duration": row["duration"] or 0,
+                    "artist": artist,
+                    "album": album,
+                }
+            db.close()
+        except Exception:
+            pass
+        return result
+
+    async def _json_control(self, pm, pid: str | None, cmd: str, args: list[str]) -> None:
+        """Execute control commands (pause/power/play/stop/mixer/playlist)."""
+        from lyrion.player.manager import PlayerManager
+        pm = pm or PlayerManager()
+        if not pid:
+            players = pm.get_all_players()
+            pid = players[0].mac if players else None
+        if not pid:
+            return
+
+        def send(cmd_str: str) -> None:
+            try:
+                pm.send_command(pid, cmd_str)
+            except Exception:
+                pass
+
+        if cmd == "power":
+            val = args[0] if args else "1"
+            player = pm.get_player(pid)
+            if player is not None:
+                player.power = val in ("1", "on", "toggle", "")
+                pm.set_power(pid, player.power)
+            else:
+                send(f"power {val}")
+        elif cmd == "pause":
+            val = args[0] if args else "0"
+            player = pm.get_player(pid)
+            if player is not None:
+                if val == "1":
+                    player.mode = "pause"
+                    pm.set_mode(pid, "pause")
+                elif val == "0":
+                    # Resume: power on + (re)send strm for the current track
+                    player.power = True
+                    player.mode = "play"
+                    pm.set_mode(pid, "play")
+                    await self._play_playlist_item(pm, player, player.playlist_position or 0)
+            else:
+                send(f"pause {val}")
+        elif cmd == "play":
+            player = pm.get_player(pid)
+            if player is not None:
+                player.power = True
+                player.mode = "play"
+                pm.set_mode(pid, "play")
+                await self._play_playlist_item(pm, player, player.playlist_position or 0)
+            else:
+                send("play")
+        elif cmd == "stop":
+            player = pm.get_player(pid)
+            if player is not None:
+                player.mode = "stop"
+                pm.set_mode(pid, "stop")
+            else:
+                send("stop")
+        elif cmd == "mixer":
+            val = args[-1] if args else ""
+            if val.isdigit():
+                player = pm.get_player(pid)
+                if player is not None:
+                    player.volume = int(val)
+                send(f"mixer volume {val}")
+        elif cmd == "playlist":
+            sub = args[0] if args else ""
+            rest = args[1:] if len(args) > 1 else []
+            if sub == "add" and rest:
+                # Accept both a DB track id and a plain URL. SqueezeTray adds
+                # URLs (radio/favorites); the SPA adds track ids.
+                item = rest[0]
+                player = pm.get_player(pid)
+                if player is not None:
+                    if item.isdigit():
+                        player.playlist.append(int(item))
+                    else:
+                        player.playlist.append(item)
+                    player.playlist_total = len(player.playlist)
+            elif sub == "index" and rest:
+                idx = rest[0]
+                player = pm.get_player(pid)
+                if player is not None and idx.isdigit():
+                    player.playlist_position = int(idx)
+                    await self._play_playlist_item(pm, player, int(idx))
+            elif sub == "stop":
+                send("stop")
+            elif sub == "clear":
+                player = pm.get_player(pid)
+                if player is not None:
+                    player.playlist = []
+                    player.playlist_total = 0
+        else:
+            send(f"{cmd} {' '.join(args)}")
+
+    async def _play_playlist_item(self, pm, player, idx: int) -> None:
+        """Send a strm frame for playlist item idx (track id or stream URL)."""
+        try:
+            items = getattr(player, "playlist", []) or []
+            if idx < 0 or idx >= len(items):
+                return
+            item = items[idx]
+            handler = getattr(pm, "_protocol_handler", None)
+            if handler is None:
+                return
+            # Playing implies power-on (like real LMS)
+            if not player.power:
+                player.power = True
+            if isinstance(item, int):
+                await handler.send_strm_to_player(player.mac, item)
+            else:
+                await handler.send_remote_stream(player.mac, str(item))
+            player.mode = "play"
+            player.playlist_position = idx
+            if isinstance(item, int):
+                player.current_track_id = item
+            pm.set_mode(player.mac, "play")
+            logger = __import__("logging").getLogger("lyrion.web.api")
+            logger.info("Playing playlist item %d (%r) on %s", idx, item, player.mac)
+        except Exception as exc:
+            logger = __import__("logging").getLogger("lyrion.web.api")
+            logger.warning("_play_playlist_item failed: %s", exc)
+
+    async def _json_favorites(self, pm, pid: str | None, args: list[str]) -> dict:
+        """Return favorites from favorites.opml (folder hierarchy)."""
+        import xml.etree.ElementTree as ET
+        opml_path = "/var/lib/squeezeboxserver/prefs/favorites.opml"
+        try:
+            tree = ET.parse(opml_path)
+        except Exception:
+            return {"count": 0, "loop_loop": []}
+
+        root = tree.getroot()
+        body = root.find("body")
+        if body is None:
+            return {"count": 0, "loop_loop": []}
+
+        outlines = list(body.findall("outline"))
+        # item_id:<parent> filters children of a folder; parent id = index in
+        # the full flattened outline list.
+        parent_id = None
+        for a in args:
+            if a.startswith("item_id:"):
+                try:
+                    parent_id = int(a[8:])
+                except ValueError:
+                    parent_id = None
+
+        items = []
+        index = 0
+        for o in outlines:
+            attrs = o.attrib
+            name = attrs.get("text", attrs.get("title", "???"))
+            url = (attrs.get("URL") or "").strip()
+            children = list(o.findall("outline"))
+            if parent_id is None:
+                entry = {
+                    "id": str(index),
+                    "name": name,
+                    "url": url,
+                    "hasitems": 1 if children else (1 if not url else 0),
+                    "type": attrs.get("type", ""),
+                    "children": [],
+                }
+                items.append(entry)
+            elif index == parent_id and children:
+                for child in children:
+                    cattr = child.attrib
+                    cname = cattr.get("text", cattr.get("title", "???"))
+                    curl = (cattr.get("URL") or "").strip()
+                    gchildren = list(child.findall("outline"))
+                    items.append({
+                        "id": str(index),
+                        "name": cname,
+                        "url": curl,
+                        "hasitems": 1 if gchildren else 0,
+                        "type": cattr.get("type", ""),
+                        "children": [],
+                    })
+            index += 1
+
+        return {"count": len(items), "loop_loop": items}
+
+    async def _favorite_url(self, item_id: int) -> str:
+        """Return the stream URL for a favorite by flattened outline index."""
+        import xml.etree.ElementTree as ET
+        try:
+            tree = ET.parse("/var/lib/squeezeboxserver/prefs/favorites.opml")
+        except Exception:
+            return ""
+        body = tree.getroot().find("body")
+        if body is None:
+            return ""
+        outlines = list(body.findall("outline"))
+        if 0 <= item_id < len(outlines):
+            o = outlines[item_id]
+            return (o.attrib.get("URL") or "").strip()
+        return ""
+
+    async def _json_browse(self, cmd: str, args: list[str]) -> dict:
+        """Browse library tables (albums/artists/songs/genres) as JSON."""
+        start = int(args[0]) if args and args[0].isdigit() else 0
+        count = int(args[1]) if len(args) > 1 and args[1].isdigit() else 50
+        try:
+            import sqlite3
+            db = sqlite3.connect("/root/.lyrion/Lyrion/Prefs/lyrion.db")
+            db.row_factory = sqlite3.Row
+
+            if cmd == "artists":
+                rows = db.execute(
+                    "SELECT id, name FROM contributors WHERE role = 'artist' "
+                    "ORDER BY name LIMIT ? OFFSET ?", (count, start)).fetchall()
+                loop = [{"id": r["id"], "artist": r["name"] or ""} for r in rows]
+                total = db.execute(
+                    "SELECT COUNT(*) FROM contributors WHERE role = 'artist'").fetchone()[0]
+            elif cmd == "albums":
+                rows = db.execute(
+                    "SELECT id, name, year FROM albums ORDER BY name LIMIT ? OFFSET ?",
+                    (count, start)).fetchall()
+                loop = [{"id": r["id"], "album": r["name"] or "", "year": r["year"] or 0} for r in rows]
+                total = db.execute("SELECT COUNT(*) FROM albums").fetchone()[0]
+            elif cmd == "songs" or cmd == "titles":
+                rows = db.execute(
+                    "SELECT id, title, url, duration FROM tracks ORDER BY title LIMIT ? OFFSET ?",
+                    (count, start)).fetchall()
+                loop = [{"id": r["id"], "title": r["title"] or "", "url": r["url"] or "",
+                         "duration": r["duration"] or 0} for r in rows]
+                total = db.execute("SELECT COUNT(*) FROM tracks").fetchone()[0]
+            elif cmd == "genres":
+                rows = db.execute(
+                    "SELECT id, name FROM genres ORDER BY name LIMIT ? OFFSET ?",
+                    (count, start)).fetchall()
+                loop = [{"id": r["id"], "genre": r["name"] or ""} for r in rows]
+                total = db.execute("SELECT COUNT(*) FROM genres").fetchone()[0]
+            else:
+                db.close()
+                return {"count": 0, "loop_loop": []}
+            db.close()
+            return {"count": total, "loop_loop": loop}
+        except Exception:
+            return {"count": 0, "loop_loop": []}
+
+
+class WebAPIHandler:
+    """HTTP request handler that routes to JSON-RPC or the web UI.
+
+    Routes:
+      POST /jsonrpc.js  → JSONRPCAPI.handle_request()
+      GET  /api/v1/*    → REST passthrough (subclass for details)
+      GET  /            → Serve index.html from html/
+    """
+
+    def __init__(self, jsonrpc: Optional[JSONRPCAPI] = None) -> None:
+        self.jsonrpc = jsonrpc or JSONRPCAPI()
+        self._static_dir = None
+
+    def set_static_dir(self, path: str) -> None:
+        """Set the directory for static file serving."""
+        from pathlib import Path
+        self._static_dir = Path(path)
+
+    async def handle(self, method: str, path: str, body: bytes) -> tuple[int, dict, bytes]:
+        """Handle an incoming HTTP request.
+
+        Returns:
+            (status_code, headers_dict, body_bytes)
+        """
+        from pathlib import Path
+
+        if path == "/jsonrpc.js" or path == "/api/jsonrpc":
+            return await self._handle_jsonrpc(method, body)
+
+        if path.startswith("/api/v1/"):
+            return await self._handle_rest(method, path, body)
+
+        if path == "/" or path.startswith("/html/"):
+            return self._serve_static(path)
+
+        # Fallback: 404
+        return (
+            404,
+            {"Content-Type": "application/json"},
+            b'{"error": "Not found"}',
+        )
+
+    async def _handle_jsonrpc(self, method: str, body: bytes) -> tuple[int, dict, bytes]:
+        if method != "POST":
+            return 405, {"Content-Type": "application/json"}, b'{"error": "Method not allowed"}'
+        response = await self.jsonrpc.handle_request(body)
+        return 200, {"Content-Type": "application/json"}, response
+
+    async def _handle_rest(
+        self, method: str, path: str, body: bytes
+    ) -> tuple[int, dict, bytes]:
+        route = path[8:]  # strip "/api/v1/"
+        if route == "status":
+            result = await self.jsonrpc._server_status()
+            return 200, {"Content-Type": "application/json"}, _json_dumps(result)
+        if route == "players":
+            result = await self.jsonrpc._player_list()
+            return 200, {"Content-Type": "application/json"}, _json_dumps(result)
+        return 404, {"Content-Type": "application/json"}, b'{"error": "Not found"}'
+
+    def _serve_static(self, path: str) -> tuple[int, dict, bytes]:
+        if self._static_dir is None:
+            return 404, {}, b"Static dir not configured"
+
+        from pathlib import Path
+
+        if path == "/":
+            path = "/index.html"
+
+        file_path = self._static_dir / path.lstrip("/")
+        # Security: prevent directory traversal
+        if not str(file_path).startswith(str(self._static_dir.resolve())):
+            return 403, {}, b"Forbidden"
+
+        if not file_path.is_file():
+            return 404, {}, b"Not found"
+
+        import mimetypes
+        mime, _ = mimetypes.guess_type(str(file_path))
+        try:
+            content = file_path.read_bytes()
+            headers = {"Content-Type": mime or "application/octet-stream"}
+            # HTML without cache so UI updates are picked up immediately
+            if mime == "text/html":
+                headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+            return 200, headers, content
+        except Exception as e:
+            return 500, {}, str(e).encode()
