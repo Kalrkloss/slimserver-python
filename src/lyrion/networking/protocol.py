@@ -1098,6 +1098,48 @@ class SlimProtoClient:
         ])
         return struct.pack(">H", len(payload)) + payload
 
+    async def send_flush_to_player(self, mac: str) -> bool:
+        """Send a 'strm' flush command ('f') to a player.
+
+        The Perl LMS sends this before switching streams while the player
+        is playing (Squeezebox2.pm flush -> stream('f'), triggered by
+        StreamingController::_FlushGetNext). Squeezelite's 'f' handler
+        does decode_flush + output_flush + buf_flush(streambuf) — without
+        it the player keeps playing out its old buffers, so a radio
+        switch takes as long as the old buffer lasts (and the old stream
+        keeps being audible).
+        """
+        mac = mac.upper().replace(":", "")
+        writer = self._player_writers.get(mac)
+        if writer is None or writer.is_closing():
+            return False
+        payload = b"".join([
+            b"strm", b"f", b"0", b"?", b"0", b"0", b"0", b"l",
+            bytes(7),                       # threshold..slaves
+            struct.pack(">I", 0),           # replay_gain
+            struct.pack(">H", 0),           # server_port
+            struct.pack(">I", 0),           # server_ip
+        ])
+        frame = struct.pack(">H", len(payload)) + payload
+        try:
+            writer.write(frame)
+            await writer.drain()
+            logger.info("Sent strm 'f' (flush) to %s", mac)
+            return True
+        except (ConnectionError, OSError, RuntimeError):
+            return False
+
+    async def _flush_if_playing(self, mac: str) -> None:
+        """Flush the player's buffers before a stream switch, like the
+        Perl LMS does (stream('f') before the new strm when playing)."""
+        try:
+            from lyrion.player.manager import PlayerManager
+            player = PlayerManager().get_player(mac)
+            if player is not None and player.mode in ("play", "loading"):
+                await self.send_flush_to_player(mac)
+        except Exception:
+            pass
+
     async def send_strm_to_player(self, mac: str, track_id: int) -> bool:
         """Send a 'strm' (stream) frame to a player so it fetches the track
         over HTTP from this server's /stream.mp3 endpoint.
@@ -1145,6 +1187,9 @@ class SlimProtoClient:
             request=request, codec=codec, autostart=1,
             server_port=self.web_port,
         )
+        # Flush old stream buffers first (Perl LMS behaviour) so the
+        # switch is immediate instead of playing out the old buffer.
+        await self._flush_if_playing(mac)
         try:
             writer.write(frame)
             await writer.drain()
@@ -1175,6 +1220,10 @@ class SlimProtoClient:
         if writer is None or writer.is_closing():
             logger.warning("No active connection for player %s", mac)
             return False
+
+        # Flush old stream buffers first (Perl LMS behaviour) so the
+        # switch is immediate instead of playing out the old buffer.
+        await self._flush_if_playing(mac)
 
         from urllib.parse import urlparse
         import socket as _socket
