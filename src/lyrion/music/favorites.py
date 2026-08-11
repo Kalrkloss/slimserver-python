@@ -134,13 +134,16 @@ class FavoritesManager:
             await session.commit()
             return True
 
-    async def rename(self, fav_id: int, title: str) -> bool:
+    async def rename(self, fav_id: int, title: str, url: str | None = None) -> bool:
         title = (title or "").strip()
         if not title:
             return False
+        values: dict = {"title": title}
+        if url is not None:
+            values["url"] = url.strip()
         async with self._db_session() as session:
             result = await session.execute(
-                update(Favorite).where(Favorite.id == fav_id).values(title=title)
+                update(Favorite).where(Favorite.id == fav_id).values(**values)
             )
             await session.commit()
             return bool(result.rowcount)

@@ -1910,6 +1910,7 @@ async function refreshFavorites() {
     const cmd = parent ? ['favorites', 'items', String(parent)] : ['favorites', 'items'];
     const r = await api('slim.request', ['-', cmd]);
     items = parseFavItems(r);
+    appState.favItems = items;
     await loadFavFolders();
   } catch (e) {
     el.innerHTML = errEl(e.message);
@@ -1939,7 +1940,7 @@ async function refreshFavorites() {
             <option value="0">→ Root</option>
             ${favFolderOptions()}
           </select>
-          <button class="btn-secondary btn-sm" onclick="favRename(${f.fav_id})">✏️</button>
+          <button class="btn-secondary btn-sm" onclick="favEdit(${i})">✏️</button>
           <button class="btn-danger btn-sm" onclick="favDelete(${f.fav_id})">🗑</button>
         </td>
       </tr>`;
@@ -1985,11 +1986,18 @@ async function favDelete(id) {
   } catch (e) { showToast('Fehler: ' + e.message); }
 }
 
-async function favRename(id) {
-  const name = prompt('Neuer Name:');
-  if (!name) return;
+async function favEdit(index) {
+  const item = (appState.favItems || [])[index];
+  if (!item) return;
+  const newName = prompt('Name:', item.title || '');
+  if (newName === null) return;
+  const newUrl = prompt('Stream-URL:', item.url || '');
+  if (newUrl === null) return;
+  if (!newName && !newUrl) return;
   try {
-    await api('slim.request', ['-', ['favorites', 'rename', String(id), name]]);
+    await api('slim.request', ['-', ['favorites', 'rename', String(item.fav_id),
+                                    newName || item.title, newUrl || item.url]]);
+    showToast('Favorit aktualisiert');
     refreshFavorites();
   } catch (e) { showToast('Fehler: ' + e.message); }
 }

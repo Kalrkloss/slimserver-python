@@ -1516,10 +1516,11 @@ async def _fav_rename(
     args: list[str],
 ) -> list[str]:
     if len(args) < 2 or not str(args[0]).isdigit():
-        return ["favorites rename <id> <title> — missing id/title", ""]
+        return ["favorites rename <id> <title> [url] — missing id/title", ""]
     try:
         from lyrion.music.favorites import get_favorites_manager
-        ok = await get_favorites_manager().rename(int(str(args[0])), str(args[1]))
+        url = str(args[2]) if len(args) > 2 else None
+        ok = await get_favorites_manager().rename(int(str(args[0])), str(args[1]), url)
         return ["renamed"] if ok else ["cli error: favorite not found", ""]
     except Exception as e:  # noqa: BLE001
         return [f"cli error: {e}", ""]
