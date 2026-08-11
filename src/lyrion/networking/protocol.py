@@ -1405,7 +1405,14 @@ class SlimProtoClient:
                     for sep in (b"\x00", b"\xff", b"\x00\x00"):
                         idx = tail.find(sep)
                         if idx > 0:
-                            candidate = tail[:idx].decode("utf-8", errors="replace").strip()
+                            raw_name = tail[:idx]
+                            try:
+                                candidate = raw_name.decode("utf-8").strip()
+                            except UnicodeDecodeError:
+                                # SqueezePlay sends the name in latin-1
+                                # (e.g. "Küche" -> b'K\xfcche'); utf-8 with
+                                # errors="replace" would store "K�che".
+                                candidate = raw_name.decode("latin-1").strip()
                             if candidate and candidate.isprintable() and len(candidate) < 64:
                                 logger.info("STAT setd from %s: name=%r (payload %d bytes)", mac_str, candidate, len(payload))
                                 from lyrion.player.manager import PlayerManager
