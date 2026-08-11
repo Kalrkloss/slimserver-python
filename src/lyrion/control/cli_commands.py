@@ -244,9 +244,28 @@ async def cmd_play(
             return [f"play {track_id}", ""]
         # No track id — resume whatever is selected
         player = pm.get_player(ctx.player_id)
-        if player and player.current_track_id is not None:
-            ok = await pm.play_track(ctx.player_id, player.current_track_id)
-            return [f"play {player.current_track_id}", ""] if ok else ["cli error: playback failed"]
+        if player is not None:
+            # Paused -> resume in place (LMS play button behaviour)
+            if player.mode == "pause":
+                ok = await pm.pause_player(ctx.player_id, False)
+                return ["play", ""] if ok else ["cli error: playback failed"]
+            # Radio stream (current_track_id None, current_url set)
+            if player.current_track_id is None and getattr(player, "current_url", None):
+                ok = await pm.play_url(ctx.player_id, player.current_url,
+                                       getattr(player, "current_title", "") or "")
+                return [f"play {player.current_url[:60]}", ""] if ok \
+                    else ["cli error: playback failed"]
+            if player.current_track_id is not None:
+                ok = await pm.play_track(ctx.player_id, player.current_track_id)
+                return [f"play {player.current_track_id}", ""] if ok else ["cli error: playback failed"]
+            # Fallback: resume the current playlist entry
+            if player.playlist and 0 <= player.playlist_position < len(player.playlist):
+                entry = player.playlist[player.playlist_position]
+                if isinstance(entry, str):
+                    ok = await pm.play_url(ctx.player_id, entry, "")
+                else:
+                    ok = await pm.play_track(ctx.player_id, entry)
+                return ["play", ""] if ok else ["cli error: playback failed"]
         return ["play", ""]
     except ValueError:
         return ["cli error: track id must be a number", ""]

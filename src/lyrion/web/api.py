@@ -353,37 +353,40 @@ class JSONRPCAPI:
     async def _playlist_stop(self, mac: str) -> bool:
         try:
             from lyrion.player import PlayerManager
-            PlayerManager().send_command(mac, "stop")
-            return True
+            # Real SlimProto frame (strm 'q') — send_command with CLI text
+            # does nothing on Squeezelite. stop_player also sets mode=stop.
+            return await PlayerManager().stop_player(mac)
         except Exception:
             return False
 
     async def _playlist_pause(self, mac: str, state: int = -1) -> bool:
         try:
             from lyrion.player import PlayerManager
+            pm = PlayerManager()
             if state == 1:
-                PlayerManager().send_command(mac, "pause")
-            elif state == 0:
-                PlayerManager().send_command(mac, "pause 1")
-            else:
-                PlayerManager().send_command(mac, "pause")
-            return True
+                # pause on -> real strm 'p' frame
+                return await pm.pause_player(mac, True)
+            if state == 0:
+                # resume -> strm 'p' 0 (Squeezelite resumes in place)
+                return await pm.pause_player(mac, False)
+            # toggle
+            player = pm.get_player(mac)
+            currently_paused = player is not None and player.mode == "pause"
+            return await pm.pause_player(mac, not currently_paused)
         except Exception:
             return False
 
     async def _playlist_next(self, mac: str) -> bool:
         try:
             from lyrion.player import PlayerManager
-            PlayerManager().send_command(mac, "playlist jump +1")
-            return True
+            return await PlayerManager().playlist_next(mac)
         except Exception:
             return False
 
     async def _playlist_prev(self, mac: str) -> bool:
         try:
             from lyrion.player import PlayerManager
-            PlayerManager().send_command(mac, "playlist jump -1")
-            return True
+            return await PlayerManager().playlist_prev(mac)
         except Exception:
             return False
 

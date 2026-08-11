@@ -1667,12 +1667,15 @@ class SlimProtoClient:
                 player = pm.get_player(mac_str)
                 if player is not None:
                     if event == "STMd":
-                        # DECODE_COMPLETE — decoder has no more data, the
-                        # previous track finished playing. This is the LMS
-                        # end-of-track signal (Squeezelite sends it exactly
-                        # once; decode state then goes to DECODE_STOPPED).
+                        # DECODE_COMPLETE — decoder has no more data. This
+                        # fires BOTH at natural track end AND when the user
+                        # stopped the player (strm 'q' also runs the decoder
+                        # to completion). Only auto-advance on natural end:
+                        # if the server already set mode=stop (user stop /
+                        # power off), the STMd is the player acknowledging.
+                        if player.mode != "stop":
+                            asyncio.create_task(_advance_after_track(pm, mac_str))
                         player.mode = "stop"
-                        asyncio.create_task(_advance_after_track(pm, mac_str))
                     elif event == "STMs":
                         # TRACK_STARTED — a new track started playing
                         player.mode = "play"
