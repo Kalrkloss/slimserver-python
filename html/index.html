@@ -1793,6 +1793,22 @@ function favFolderOptions() {
 
 function parseFavItems(lines) {
   const items = [];
+  // LMS JSON format (loop_loop with id/name/url/hasitems) — SqueezeTray
+  // compatible. Directly map to the internal shape.
+  if (lines && Array.isArray(lines.loop_loop)) {
+    for (const it of lines.loop_loop) {
+      if (!it || !it.id) continue;
+      items.push({
+        fav_id: String(it.id),
+        title: it.name || it.title || '???',
+        url: it.url || '',
+        type: it.type === 'folder' ? 'folder' : 'stream',
+        hasitems: it.hasitems,
+      });
+    }
+    return items;
+  }
+  // Fallback: CLI text format ("favorite id:" / "title:" / ...)
   let cur = null;
   for (const line of (Array.isArray(lines) ? lines : [])) {
     if (typeof line !== 'string') continue;

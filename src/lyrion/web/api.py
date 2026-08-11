@@ -462,8 +462,37 @@ class JSONRPCAPI:
             await self._json_control(pm, pid, cmd, args)
             return {}
 
-        # ── favorites (DB-backed via CLI handler; text format the UI
-        #    parser expects: "favorite id:" / "title:" / "url:" lines) ──
+        # ── favorites ──────────────────────────────────────────────
+        # JSON-RPC clients (SqueezeTray/SqueezeCtrl/SPA) expect the LMS
+        # loop_loop format: {"count": N, "loop_loop": [{id, name, url,
+        # hasitems, ...}]}. items is DB-backed (FavoritesManager); the
+        # other subcommands go through the CLI handler.
+        if cmd == "favorites" and args and str(args[0]) == "items":
+            try:
+                from lyrion.music.favorites import get_favorites_manager
+                rest = args[1:]
+                parent = None
+                for a in rest:
+                    if str(a).startswith("item_id:"):
+                        try:
+                            parent = int(str(a)[8:])
+                        except ValueError:
+                            parent = None
+                items = await get_favorites_manager().list_items(parent)
+                loop = []
+                for it in items:
+                    loop.append({
+                        "id": str(it["id"]),
+                        "name": it["title"],
+                        "url": it["url"] or "",
+                        "hasitems": 1 if it["type"] == "folder" else 0,
+                        "type": it["type"],
+                        "parent_id": str(it["parent_id"]) if it["parent_id"] is not None else "",
+                        "position": it["position"],
+                    })
+                return {"count": len(loop), "loop_loop": loop}
+            except Exception as e:  # noqa: BLE001
+                return {"error": str(e)}
         if cmd == "favorites":
             try:
                 from lyrion.control.cli import CLIHandler, CLIContext

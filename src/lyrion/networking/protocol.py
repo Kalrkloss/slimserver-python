@@ -382,6 +382,12 @@ class SlimProtoClient:
         # when the player reports the source's response headers (RESP frame).
         self._resp_waiters: dict[str, asyncio.Future[int]] = {}
 
+        # Open TCP connections per player MAC. Squeezelite keeps TWO
+        # connections (control + data); closing one must NOT mark the
+        # player disconnected while the other is alive (that broke
+        # stop/play: "Cannot send command to disconnected player").
+        self._player_connections: dict[str, int] = {}
+
         # Server-side fields (populated after HELO)
         self._server_buffer_size: int = 0
         self._server_max_channels: int = 0
@@ -730,7 +736,13 @@ class SlimProtoClient:
 
                 # Register writer so play/stop commands can reach this player
                 # (key normalized: uppercase, no colons — same as PlayerManager)
-                self._player_writers[mac_str.replace(":", "").upper()] = writer
+                mac_key = mac_str.replace(":", "").upper()
+                self._player_writers[mac_key] = writer
+                # Track connection count per MAC (Squeezelite uses 2 TCP
+                # connections; only the last close unregisters).
+                self._player_connections[mac_key] = (
+                    self._player_connections.get(mac_key, 0) + 1
+                )
 
                 # Start keepalive: Squeezelite declares the connection dead after
                 # ~35s without any server message ("No messages from server -
@@ -892,7 +904,11 @@ class SlimProtoClient:
             mac_formatted = ":".join(f"{b:02X}" for b in hello.mac)
             # The binary HELO path must populate the same writer registry as
             # the Squeezelite/ASCII-HELO path. Playback commands use this map.
-            self._player_writers[mac_formatted.replace(":", "").upper()] = writer
+            mac_key = mac_formatted.replace(":", "").upper()
+            self._player_writers[mac_key] = writer
+            self._player_connections[mac_key] = (
+                self._player_connections.get(mac_key, 0) + 1
+            )
             model_name = hello.device_id.strip() or "squeezebox"
             player_ip = peer[0] if peer else "unknown"
             player_port = peer[1] if peer else 0
@@ -935,28 +951,38 @@ class SlimProtoClient:
         finally:
             if keepalive_task is not None:
                 keepalive_task.cancel()
-            # Deregister writer for this player
+            # Deregister writer + decrement connection count for this player.
+            # Squeezelite keeps TWO connections; only when the LAST one
+            # closes (and it was not a DSCO end-of-stream) the player is
+            # unregistered. Otherwise stop/play would break mid-stream
+            # ("Cannot send command to disconnected player").
             try:
                 if hello is not None:
                     mac_clean = ":".join(f"{b:02X}" for b in hello.mac)
                     key = mac_clean.replace(":", "").upper()
-                    if self._player_writers.get(key) is writer:
-                        self._player_writers.pop(key, None)
+                    count = self._player_connections.get(key, 1) - 1
+                    if count <= 0:
+                        self._player_connections.pop(key, None)
+                        if self._player_writers.get(key) is writer:
+                            self._player_writers.pop(key, None)
+                        from lyrion.player.manager import PlayerManager
+                        if keep_registered:
+                            # DSCO end-of-stream: the player reconnects
+                            # immediately. Mark offline but KEEP the state
+                            # (playlist/volume) so the reconnect restores it.
+                            p = PlayerManager().get_player(mac_clean)
+                            if p is not None:
+                                p.connected = False
+                        else:
+                            PlayerManager().unregister_player(mac_clean)
+                            logger.info("Player unregistered: %s", mac_clean)
+                    else:
+                        self._player_connections[key] = count
             except Exception:
                 pass
             writer.close()
             await writer.wait_closed()
             logger.info("Player disconnected: %s", peer)
-            # Unregister player from PlayerManager (unless DSCO: the player
-            # reconnects immediately and must keep playlist/state)
-            try:
-                from lyrion.player.manager import PlayerManager
-                if hello is not None and not keep_registered:
-                    mac_formatted = ":".join(f"{b:02X}" for b in hello.mac)
-                    PlayerManager().unregister_player(mac_formatted)
-                    logger.info("Player unregistered: %s", mac_formatted)
-            except Exception:
-                pass
 
     async def _read_single_frame_from_reader(
         self,
