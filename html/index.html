@@ -1992,17 +1992,46 @@ async function favDelete(id) {
 async function favEdit(index) {
   const item = (appState.favItems || [])[index];
   if (!item) return;
-  const newName = prompt('Name:', item.title || '');
-  if (newName === null) return;
-  const newUrl = prompt('Stream-URL:', item.url || '');
-  if (newUrl === null) return;
-  if (!newName && !newUrl) return;
-  try {
-    await api('slim.request', ['-', ['favorites', 'rename', String(item.fav_id),
-                                    newName || item.title, newUrl || item.url]]);
-    showToast('Favorit aktualisiert');
-    refreshFavorites();
-  } catch (e) { showToast('Fehler: ' + e.message); }
+  showFavEditDialog(item);
+}
+
+// Inline edit dialog (no browser prompt() — those are suppressed in some
+// WebViews/extensions, which made the edit look non-interactive).
+function showFavEditDialog(item) {
+  const old = document.getElementById('fav-edit-dialog');
+  if (old) old.remove();
+  const dlg = document.createElement('div');
+  dlg.id = 'fav-edit-dialog';
+  dlg.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.6);display:flex;align-items:center;justify-content:center;z-index:10000';
+  dlg.innerHTML = `
+    <div style="background:var(--bg,#1e1e24);border:1px solid var(--border,#333);border-radius:8px;padding:18px;width:min(520px,90vw);box-shadow:0 4px 24px rgba(0,0,0,.5)">
+      <h3 style="margin:0 0 12px">Stream bearbeiten</h3>
+      <label style="display:block;font-size:12px;color:var(--text-light,#999);margin-bottom:4px">Name</label>
+      <input id="fav-edit-name" type="text" style="width:100%;box-sizing:border-box;padding:6px;margin-bottom:10px;border:1px solid var(--border,#333);border-radius:3px;background:#26262e;color:var(--text,#eee)" value="${escHtml(item.title || '')}">
+      <label style="display:block;font-size:12px;color:var(--text-light,#999);margin-bottom:4px">Stream-URL</label>
+      <input id="fav-edit-url" type="text" style="width:100%;box-sizing:border-box;padding:6px;margin-bottom:14px;border:1px solid var(--border,#333);border-radius:3px;background:#26262e;color:var(--text,#eee);font-family:monospace;font-size:12px" value="${escHtml(item.url || '')}">
+      <div style="display:flex;gap:8px;justify-content:flex-end">
+        <button class="btn-secondary btn-sm" id="fav-edit-cancel">Abbrechen</button>
+        <button class="btn-secondary btn-sm" id="fav-edit-save">Speichern</button>
+      </div>
+    </div>`;
+  document.body.appendChild(dlg);
+  const nameEl = dlg.querySelector('#fav-edit-name');
+  const urlEl = dlg.querySelector('#fav-edit-url');
+  const close = () => dlg.remove();
+  dlg.querySelector('#fav-edit-cancel').onclick = close;
+  dlg.querySelector('#fav-edit-save').onclick = async () => {
+    const newName = nameEl.value.trim();
+    const newUrl = urlEl.value.trim();
+    close();
+    try {
+      await api('slim.request', ['-', ['favorites', 'rename', String(item.fav_id),
+                                      newName || item.title, newUrl || item.url]]);
+      showToast('Favorit aktualisiert');
+      refreshFavorites();
+    } catch (e) { showToast('Fehler: ' + e.message); }
+  };
+  nameEl.focus();
 }
 
 async function favMove(id, target) {
