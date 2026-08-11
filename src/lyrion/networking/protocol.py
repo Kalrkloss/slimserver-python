@@ -94,6 +94,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import struct
 from collections.abc import Coroutine
 from dataclasses import dataclass, field
@@ -376,6 +377,10 @@ class SlimProtoClient:
 
         # Server-side: player MAC -> StreamWriter (for sending frames to players)
         self._player_writers: dict[str, asyncio.StreamWriter] = {}
+
+        # Direct-stream RESP waiters: MAC -> Future resolved with icy-metaint
+        # when the player reports the source's response headers (RESP frame).
+        self._resp_waiters: dict[str, asyncio.Future[int]] = {}
 
         # Server-side fields (populated after HELO)
         self._server_buffer_size: int = 0
@@ -792,6 +797,11 @@ class SlimProtoClient:
                     op = opcode_raw.decode("ascii", errors="replace").lower()
                     if op == "stat":
                         self._handle_stat_frame(mac_str, payload)
+                    elif op == "resp":
+                        # Direct stream: player forwards the source's HTTP
+                        # response headers — extract icy-metaint and send
+                        # the 'cont' frame that starts the decoder.
+                        self._handle_resp_frame(mac_str, payload)
                     elif op == "setd":
                         # SETD frame — id 0 carries the player's assigned name
                         if payload:
@@ -1106,11 +1116,89 @@ class SlimProtoClient:
     async def send_remote_stream(self, mac: str, url: str, codec: str = "m") -> bool:
         """Send a strm frame for an EXTERNAL stream URL (radio/favorites).
 
-        LMS behaviour (Squeezebox.pm stream_s): the player ALWAYS fetches
-        from THIS server via "GET /stream.mp3?player=MAC" — the server then
-        proxies the remote radio stream. Even players with CanHTTPS=1 get
-        the proxy URL (for auth/transcoding/control reasons).
+        LMS behaviour (Squeezebox.pm stream_s, $isDirect branch): the player
+        streams DIRECTLY from the source. server_ip/server_port in the strm
+        frame point at the source, the request string is the source request
+        (Slim/Player/Protocols/HTTP.pm requestString), autostart is 3
+        (direct = proxy-autostart 1 + 2). After the player connects it
+        forwards the source's HTTP response headers as a RESP frame; the
+        server replies with a 'cont' frame carrying the Icecast metaint so
+        the player can de-interleave metadata itself. The stream keeps
+        playing when this server goes away — exactly like the real LMS.
+
+        Falls back to the server-side proxy (/stream.mp3?player=MAC) when
+        the URL cannot be resolved to a direct connection.
         """
+        mac = mac.upper().replace(":", "")
+        writer = self._player_writers.get(mac)
+        if writer is None or writer.is_closing():
+            logger.warning("No active connection for player %s", mac)
+            return False
+
+        from urllib.parse import urlparse
+        import socket as _socket
+
+        try:
+            parsed = urlparse(url)
+            if parsed.scheme not in ("http", "https") or not parsed.hostname:
+                raise ValueError(f"unsupported URL scheme: {url[:40]}")
+            host = parsed.hostname
+            port = parsed.port or (443 if parsed.scheme == "https" else 80)
+            path = parsed.path or "/"
+            if parsed.query:
+                path += "?" + parsed.query
+            # Squeezelite's slimproto server_ip field is 4 bytes — IPv4 only.
+            # Force AF_INET so getaddrinfo cannot return an IPv6 address
+            # (inet_aton would reject it).
+            infos = await asyncio.get_event_loop().getaddrinfo(
+                host, port, family=_socket.AF_INET, type=_socket.SOCK_STREAM
+            )
+            ip = str(infos[0][4][0])
+            server_ip = int.from_bytes(_socket.inet_aton(ip), "big")
+        except Exception as exc:
+            logger.warning("Direct stream setup failed for %s (%s) — using proxy",
+                           url[:60], exc)
+            return await self._send_proxy_stream(mac, url, codec)
+
+        # Request string exactly like the Perl-LMS HTTP.pm requestString:
+        #   GET <path> HTTP/1.0 + Accept + Cache-Control + User-Agent +
+        #   Icy-MetaData: 1 + Connection: close + Host
+        host_header = host if port in (80, 443) else f"{host}:{port}"
+        request = (
+            f"GET {path} HTTP/1.0\r\n"
+            f"Accept: */*\r\n"
+            f"Cache-Control: no-cache\r\n"
+            f"User-Agent: LyrionMusicServer/9.2.0\r\n"
+            f"Icy-MetaData: 1\r\n"
+            f"Connection: close\r\n"
+            f"Host: {host_header}\r\n"
+            f"\r\n"
+        ).encode("ascii")
+
+        # Direct stream: autostart 1+2=3 (player waits for 'cont' after
+        # RESP); SSL flag 0x20 for https (HTTPS.pm slimprotoFlags).
+        flags = 0x20 if parsed.scheme == "https" else 0
+        frame = self._build_stream_frame(
+            request=request, codec=codec, autostart=3,
+            server_port=port, server_ip=server_ip, flags=flags,
+        )
+        try:
+            writer.write(frame)
+            await writer.drain()
+            logger.info("Sent DIRECT strm to %s (remote: %s -> %s:%d)",
+                        mac, url[:60], ip, port)
+        except (ConnectionError, OSError, RuntimeError) as exc:
+            logger.warning("Failed to send direct strm to %s: %s", mac, exc)
+            return False
+
+        # Wait for the player's RESP (source headers) and send 'cont' with
+        # the metaint so the player can strip Icecast metadata itself.
+        asyncio.create_task(self._send_cont_after_resp(mac, url))
+        return True
+
+    async def _send_proxy_stream(self, mac: str, url: str, codec: str = "m") -> bool:
+        """Fallback: server-side proxy stream (player fetches /stream.mp3
+        from this server, which relays the remote URL)."""
         mac = mac.upper().replace(":", "")
         writer = self._player_writers.get(mac)
         if writer is None or writer.is_closing():
@@ -1122,8 +1210,6 @@ class SlimProtoClient:
             f"\r\n"
         ).encode("ascii")
 
-        # This is also a normal HTTP proxy stream.  The original LMS only
-        # uses autostart=3 for a direct/header-managed protocol handler.
         frame = self._build_stream_frame(
             request=request, codec=codec, autostart=1,
             server_port=self.web_port,
@@ -1136,6 +1222,44 @@ class SlimProtoClient:
             return True
         except (ConnectionError, OSError, RuntimeError) as exc:
             logger.warning("Failed to send remote strm to %s: %s", mac, exc)
+            return False
+
+    async def _send_cont_after_resp(self, mac: str, url: str) -> None:
+        """Wait for the player's RESP frame (source HTTP headers) for a
+        direct stream, then send the 'cont' frame that starts the decoder
+        and passes the Icecast metaint (Squeezebox2.pm sendContCommand).
+        """
+        mac_key = mac.upper().replace(":", "")
+        loop = asyncio.get_event_loop()
+        fut: asyncio.Future[int] = loop.create_future()
+        self._resp_waiters[mac_key] = fut
+        try:
+            try:
+                metaint = await asyncio.wait_for(fut, timeout=20)
+            except asyncio.TimeoutError:
+                logger.warning("No RESP from %s for direct stream %s — cont metaint=0",
+                               mac, url[:50])
+                metaint = 0
+            await self._send_cont(mac, metaint)
+        except Exception as exc:
+            logger.warning("cont after RESP failed for %s: %s", mac, exc)
+        finally:
+            self._resp_waiters.pop(mac_key, None)
+
+    async def _send_cont(self, mac: str, metaint: int) -> bool:
+        """Send a 'cont' frame (metaint, loop=0, no guids) to a player."""
+        mac = mac.upper().replace(":", "")
+        writer = self._player_writers.get(mac)
+        if writer is None or writer.is_closing():
+            return False
+        payload = struct.pack(">IIH", metaint, 0, 0)  # metaint, loop, count
+        frame = struct.pack(">H", 4 + len(payload)) + b"cont" + payload
+        try:
+            writer.write(frame)
+            await writer.drain()
+            logger.info("Sent cont metaint=%d to %s", metaint, mac)
+            return True
+        except (ConnectionError, OSError, RuntimeError):
             return False
 
     async def send_stop_to_player(self, mac: str) -> bool:
@@ -1215,6 +1339,28 @@ class SlimProtoClient:
             return True
         except (ConnectionError, OSError, RuntimeError):
             return False
+
+    def _handle_resp_frame(self, mac_str: str, payload: bytes) -> None:
+        """Handle a RESP frame: the player forwards the source's HTTP
+        response headers after connecting for a direct stream (Squeezelite
+        sendRESP). Extract icy-metaint and resolve the pending cont waiter
+        (or send 'cont' directly if the server restarted in between).
+        """
+        try:
+            text = payload.decode("latin1", errors="replace")
+            m = re.search(r"(?im)^icy-metaint:\s*(\d+)\s*$", text)
+            metaint = int(m.group(1)) if m else 0
+            mac_key = mac_str.upper().replace(":", "")
+            fut = self._resp_waiters.get(mac_key)
+            if fut is not None and not fut.done():
+                fut.set_result(metaint)
+            else:
+                # No waiter (e.g. server restarted between strm and RESP) —
+                # send cont directly so the decoder still starts.
+                asyncio.create_task(self._send_cont(mac_str, metaint))
+            logger.info("RESP from %s: metaint=%d", mac_str, metaint)
+        except Exception as exc:
+            logger.warning("RESP parse failed for %s: %s", mac_str, exc)
 
     def _handle_stat_frame(self, mac_str: str, payload: bytes) -> None:
         """Parse a STAT frame from a player (best effort, for logging/state).
