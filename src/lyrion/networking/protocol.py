@@ -1254,12 +1254,19 @@ class SlimProtoClient:
             self._resp_waiters.pop(mac_key, None)
 
     async def _send_cont(self, mac: str, metaint: int) -> bool:
-        """Send a 'cont' frame (metaint, loop=0, no guids) to a player."""
+        """Send a 'cont' frame to a player.
+
+        Exact Perl-LMS format (Squeezebox2.pm sendContCommand,
+        pack('NCnC*', metaint, loop, count, guids)) — Perl 'C' is unsigned
+        char = Python 'B', Perl 'n' is unsigned short BE = Python 'H'.
+        Squeezelite's cont_packet is opcode + metaint(u32 BE) + loop(u8);
+        count/guids are ignored. `>IBH` = N(4 BE) + B(1) + H(2 BE).
+        """
         mac = mac.upper().replace(":", "")
         writer = self._player_writers.get(mac)
         if writer is None or writer.is_closing():
             return False
-        payload = struct.pack(">IIH", metaint, 0, 0)  # metaint, loop, count
+        payload = struct.pack(">IBH", metaint, 0, 0)  # metaint, loop, count
         frame = struct.pack(">H", 4 + len(payload)) + b"cont" + payload
         try:
             writer.write(frame)
