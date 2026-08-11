@@ -887,7 +887,10 @@ async function refreshAll() {
 async function refreshServerInfo() {
   try {
     appState.version = await api('server.version');
-    document.getElementById('server-version').textContent = `Server: v${appState.version}`;
+    // UI build stamp: lets you verify the browser loaded the current UI
+    // (visible in the header). If you see an older stamp, hard-reload.
+    const UI_STAMP = 'UI 2026-08-11';
+    document.getElementById('server-version').textContent = `Server: v${appState.version} · ${UI_STAMP}`;
     const status = await api('server.status');
     document.getElementById('server-players').textContent = `Players: ${status.players ?? '?'}`;
   } catch(e) {
