@@ -349,6 +349,7 @@ class SlimProtoClient:
         capabilities: int = DEFAULT_CAPABILITIES,
         lang: str = "EN  ",
         uuid: str = "LYR00001",
+        web_port: int = 9000,
     ):
         self.device_id = device_id
         self.revision = revision
@@ -356,6 +357,10 @@ class SlimProtoClient:
         self.capabilities = capabilities
         self.lang = lang
         self.uuid = uuid
+        # HTTP port of THIS server's web/stream endpoint. The strm frame
+        # tells the player where to fetch /stream.mp3 — LMS sends its own
+        # httpport here (Squeezebox.pm stream_s: $server_port = $prefs->get('httpport')).
+        self.web_port = web_port
 
         self._reader: asyncio.StreamReader | None = None
         self._writer: asyncio.StreamWriter | None = None
@@ -621,6 +626,10 @@ class SlimProtoClient:
         # Track the parsed HELO for cleanup
         hello: HelloMessage | None = None
         keepalive_task: asyncio.Task | None = None
+        # Set when the player sent 'dsco' (end-of-stream): the player keeps
+        # its identity/playlist across the reconnect that follows (LMS
+        # behaviour). Only a real disconnect (bye/TCP-close) unregisters.
+        keep_registered = False
 
         try:
             # Read first byte to detect protocol
@@ -749,6 +758,20 @@ class SlimProtoClient:
                 except Exception as exc:
                     logger.warning("Squeezelite register failed: %s", exc)
 
+                # ── Sync volume like the real LMS (audg frame) ──
+                # Squeezelite zero-initialises its internal gain; until an
+                # audg frame arrives all audio is multiplied by 0 → the
+                # player decodes but outputs silence. The Perl LMS pushes
+                # the current volume to every newly connected player.
+                try:
+                    from lyrion.player.manager import PlayerManager
+                    pstate = PlayerManager().get_player(mac_str)
+                    if pstate is not None:
+                        await self.send_volume_to_player(mac_str, pstate.volume)
+                        logger.info("Sent audg volume=%d to %s on connect", pstate.volume, mac_str)
+                except Exception as exc:
+                    logger.warning("Volume sync failed for %s: %s", mac_str, exc)
+
                 # ── Read loop: binary slimproto frames from player ──
                 # Player → server framing (from LMS Slim/Networking/Slimproto.pm
                 # client_readable): 4-byte ASCII opcode + 4-byte BE length + payload.
@@ -784,6 +807,18 @@ class SlimProtoClient:
                                         logger.warning("SETD rename failed for %s: %s", mac_str, exc)
                     elif op in ("bye", "dsco", "quit"):
                         logger.info("Player %s sent '%s' — closing connection", mac_str, op)
+                        if op == "dsco":
+                            # DSCO = end-of-stream notification: Squeezelite
+                            # sends it whenever the current stream disconnects
+                            # (e.g. after EOF — for fast local files that is
+                            # right after the strm, because the whole file is
+                            # buffered instantly) and then IMMEDIATELY opens a
+                            # new connection with a fresh HELO. The real LMS
+                            # treats DSCO as end-of-stream and KEEPS the
+                            # player (playlist, volume, mode survive the
+                            # reconnect). Unregistering here would destroy the
+                            # playlist before the track even finished playing.
+                            keep_registered = True
                         break
                     elif op == "helo":
                         # Player re-sent HELO (reconnect after control drop) — reply again
@@ -830,6 +865,9 @@ class SlimProtoClient:
 
             # Register this player with the PlayerManager
             mac_formatted = ":".join(f"{b:02X}" for b in hello.mac)
+            # The binary HELO path must populate the same writer registry as
+            # the Squeezelite/ASCII-HELO path. Playback commands use this map.
+            self._player_writers[mac_formatted.replace(":", "").upper()] = writer
             model_name = hello.device_id.strip() or "squeezebox"
             player_ip = peer[0] if peer else "unknown"
             player_port = peer[1] if peer else 0
@@ -876,16 +914,19 @@ class SlimProtoClient:
             try:
                 if hello is not None:
                     mac_clean = ":".join(f"{b:02X}" for b in hello.mac)
-                    self._player_writers.pop(mac_clean.replace(":", "").upper(), None)
+                    key = mac_clean.replace(":", "").upper()
+                    if self._player_writers.get(key) is writer:
+                        self._player_writers.pop(key, None)
             except Exception:
                 pass
             writer.close()
             await writer.wait_closed()
             logger.info("Player disconnected: %s", peer)
-            # Unregister player from PlayerManager
+            # Unregister player from PlayerManager (unless DSCO: the player
+            # reconnects immediately and must keep playlist/state)
             try:
                 from lyrion.player.manager import PlayerManager
-                if hello is not None:
+                if hello is not None and not keep_registered:
                     mac_formatted = ":".join(f"{b:02X}" for b in hello.mac)
                     PlayerManager().unregister_player(mac_formatted)
                     logger.info("Player unregistered: %s", mac_formatted)
@@ -957,6 +998,55 @@ class SlimProtoClient:
             return "p"
         return "m"  # mp3 and everything else
 
+    @staticmethod
+    def _build_stream_frame(
+        *,
+        request: bytes,
+        codec: str = "m",
+        autostart: int = 1,
+        server_port: int = 9000,
+        server_ip: int = 0,
+        flags: int = 0,
+        threshold: int = 50,
+    ) -> bytes:
+        """Build the 24-byte LMS ``strm`` packet plus its HTTP request.
+
+        The important distinction is ``autostart``:
+
+        * 1: normal LMS proxy stream.  Squeezelite starts decoding after
+          receiving the HTTP headers; no ``cont`` frame is expected.
+        * 3: direct/header-managed stream.  The player waits for a later
+          ``cont`` frame after sending RESP to the server.
+
+        The Perl LMS uses ``?`` for unknown PCM fields and output threshold
+        1 for MP3.  Numeric zeroes here are not equivalent: they describe
+        an 8-bit/0Hz/0-channel stream to some clients.
+        """
+        if autostart not in (0, 1, 2, 3):
+            raise ValueError(f"invalid strm autostart: {autostart}")
+        payload = b"".join([
+            b"strm",
+            b"s",
+            str(autostart).encode("ascii"),  # LMS/squeezelite: '0'..'3'
+            codec.encode("ascii"),
+            b"?",                    # pcm_sample_size: unknown for MP3
+            b"?",                    # pcm_sample_rate: unknown for MP3
+            b"?",                    # pcm_channels: unknown for MP3
+            b"?",                    # pcm_endianness: unknown for MP3
+            bytes([max(0, min(255, threshold))]),
+            bytes([0]),               # SPDIF auto
+            bytes([0]),               # transition period
+            b"0",                    # transition type: none
+            bytes([flags & 0xFF]),
+            bytes([1 if codec == "m" else 0]),  # output threshold
+            bytes([0]),               # proxy slaves
+            struct.pack(">I", 0),
+            struct.pack(">H", server_port),
+            struct.pack(">I", server_ip),
+            request,
+        ])
+        return struct.pack(">H", len(payload)) + payload
+
     async def send_strm_to_player(self, mac: str, track_id: int) -> bool:
         """Send a 'strm' (stream) frame to a player so it fetches the track
         over HTTP from this server's /stream.mp3 endpoint.
@@ -989,53 +1079,25 @@ class SlimProtoClient:
         codec = self._codec_char(mime)
 
         # HTTP request string Squeezelite will send to our web server.
-        # LMS format (Slim/Player/Squeezebox.pm): NO track id in the URL —
-        # the /stream endpoint resolves the current track from the player's
-        # playlist via the player= param. This is what all players expect.
+        # LMS format (Slim/Player/Squeezebox.pm stream_s): the request is
+        # exactly "GET /stream.mp3?player=<MAC> HTTP/1.0\r\n\r\n" — no track
+        # id in the URL, no Host header. The /stream endpoint resolves the
+        # current track from the player's playlist via the player= param.
         request = (
             f"GET /stream.mp3?player={mac} HTTP/1.0\r\n"
-            f"Host: 192.168.1.90:9000\r\n"
-            f"Connection: close\r\n\r\n"
+            f"\r\n"
         ).encode("ascii")
 
-        # strm_packet layout — EXACTLY as LMS builds it (Slim/Player/Squeezebox.pm):
-        #   pack 'aaaaaaaCCCaCCCNnN' = command, autostart, format, pcm_sample_size,
-        #   pcm_sample_rate, pcm_channels, pcm_endianness, threshold, spdif,
-        #   transition_duration, transition_type, flags, output_threshold, slaves,
-        #   replay_gain(4 BE), server_port(2 BE), server_ip(4 BE)
-        # NOTE: all multi-purpose fields are NUMERIC bytes (0x01, 0x00), NOT
-        # ASCII chars. Squeezelite v1.9.x (LMS-compatible) reads them as numbers.
-        payload = b"".join([
-            b"strm",
-            b"s",                     # command: stream (0x73)
-            b"3",                     # autostart: '3' (0x33) — works for BOTH
-                                      #   - '0' (squeezelite: 3 → cont starts decoder)
-                                      #   and raw-value (3/51 > 1 → starts too)
-            codec.encode("ascii"),    # format code ('m'/'p'/'f'...)
-            bytes([0]),               # pcm_sample_size
-            bytes([0]),               # pcm_sample_rate
-            bytes([0]),               # pcm_channels
-            bytes([0]),               # pcm_endianness
-            bytes([50]),              # buffer threshold: 50 KB
-            bytes([0]),               # spdif auto
-            bytes([0]),               # transition_duration
-            b"0",                     # transition_type: '0' (ASCII → -'0' = 0)
-            bytes([0]),               # flags
-            bytes([0]),               # output_threshold
-            bytes([0]),               # slaves
-            struct.pack(">I", 0),        # replay_gain
-            struct.pack(">H", 9000),     # server_port (web port)
-            struct.pack(">I", 0),        # server_ip: 0 -> use slimproto peer ip
-            request,
-        ])
-        frame = struct.pack(">H", len(payload)) + payload
+        # Normal LMS proxy stream: autostart=1.  The player starts after
+        # HTTP headers; it must not wait for a cont frame.
+        frame = self._build_stream_frame(
+            request=request, codec=codec, autostart=1,
+            server_port=self.web_port,
+        )
         try:
             writer.write(frame)
             await writer.drain()
             logger.info("Sent strm to %s: track=%d codec=%s", mac, track_id, codec)
-            # NOTE: real LMS sends NO 'cont' frame after 'strm' (Squeezebox.pm
-            # stream_s: just readyToStream). A cont here can disturb the
-            # decoder start on squeezelite v1.9.x.
             return True
         except (ConnectionError, OSError, RuntimeError) as exc:
             logger.warning("Failed to send strm to %s: %s", mac, exc)
@@ -1057,32 +1119,15 @@ class SlimProtoClient:
 
         request = (
             f"GET /stream.mp3?player={mac} HTTP/1.0\r\n"
-            f"Host: 192.168.1.90:9000\r\n"
-            f"Connection: close\r\n\r\n"
+            f"\r\n"
         ).encode("ascii")
 
-        payload = b"".join([
-            b"strm",
-            b"s",                     # command: stream
-            b"3",                     # autostart: '3' (0x33) — decoder starts via -'0'
-            codec.encode("ascii"),    # format code
-            bytes([0]),               # pcm_sample_size
-            bytes([0]),               # pcm_sample_rate
-            bytes([0]),               # pcm_channels
-            bytes([0]),               # pcm_endianness
-            bytes([50]),              # buffer threshold: 50 KB
-            bytes([0]),               # spdif auto
-            bytes([0]),               # transition_duration
-            b"0",                     # transition_type: '0' (ASCII → -'0' = 0)
-            bytes([0]),               # flags
-            bytes([0]),               # output_threshold
-            bytes([0]),               # slaves
-            struct.pack(">I", 0),        # replay_gain
-            struct.pack(">H", 9000),     # server_port (this server's web port)
-            struct.pack(">I", 0),        # server_ip: 0 -> use slimproto peer ip
-            request,
-        ])
-        frame = struct.pack(">H", len(payload)) + payload
+        # This is also a normal HTTP proxy stream.  The original LMS only
+        # uses autostart=3 for a direct/header-managed protocol handler.
+        frame = self._build_stream_frame(
+            request=request, codec=codec, autostart=1,
+            server_port=self.web_port,
+        )
         try:
             writer.write(frame)
             await writer.drain()
@@ -1215,7 +1260,17 @@ class SlimProtoClient:
                 pm = PlayerManager()
                 player = pm.get_player(mac_str)
                 if player is not None:
-                    if event == "pause":
+                    if event == "STMd":
+                        # DECODE_COMPLETE — decoder has no more data, the
+                        # previous track finished playing. This is the LMS
+                        # end-of-track signal (Squeezelite sends it exactly
+                        # once; decode state then goes to DECODE_STOPPED).
+                        player.mode = "stop"
+                        asyncio.create_task(_advance_after_track(pm, mac_str))
+                    elif event == "STMs":
+                        # TRACK_STARTED — a new track started playing
+                        player.mode = "play"
+                    elif event == "pause":
                         player.mode = "pause"
                     elif event == "stop":
                         player.mode = "stop"
@@ -1228,6 +1283,31 @@ class SlimProtoClient:
                 pass
         except Exception as exc:
             logger.warning("Failed to parse STAT from %s: %s", mac_str, exc)
+
+    # ------------------------------------------------------------------
+    # End-of-track handling
+    # ------------------------------------------------------------------
+
+
+async def _advance_after_track(pm, mac_str: str) -> None:
+    """Advance the playlist when the player reports track end (STAT STMd).
+
+    LMS behaviour: after the last track the player stops; otherwise the
+    next playlist item gets a new strm frame. Do NOT wrap around (LMS
+    default has repeat off).
+    """
+    try:
+        player = pm.get_player(mac_str)
+        if player is None or not player.playlist:
+            return
+        if player.playlist_position < len(player.playlist) - 1:
+            logger.info("Track finished on %s — advancing playlist", mac_str)
+            await pm.playlist_next(mac_str)
+        else:
+            logger.info("Last track finished on %s — stopping", mac_str)
+            await pm.stop_player(mac_str)
+    except Exception as exc:
+        logger.warning("advance after track failed for %s: %s", mac_str, exc)
 
     # ------------------------------------------------------------------
     # Convenience helpers

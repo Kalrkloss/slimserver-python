@@ -530,12 +530,25 @@ class PlayerManager:
         if handler is None:
             logger.warning("play_track: no protocol handler wired")
             return False
+        # The HTTP proxy endpoint resolves a request without ?id= through the
+        # player's playlist, exactly like LMS. Populate state before sending:
+        # Squeezelite can connect immediately after receiving the strm frame.
+        if not player.playlist:
+            player.playlist = [track_id]
+            player.playlist_position = 0
+            player.playlist_total = 1
+        elif track_id in player.playlist:
+            player.playlist_position = player.playlist.index(track_id)
+        else:
+            player.playlist = [track_id]
+            player.playlist_position = 0
+            player.playlist_total = 1
+
         ok = await handler.send_strm_to_player(player.mac, track_id)
         if ok:
             player.power = True  # playing implies power-on
             player.mode = "play"
             player.current_track_id = track_id
-            player.playlist_position = 0
             player.last_activity = time.time()
         return ok
 
@@ -554,18 +567,25 @@ class PlayerManager:
         if handler is None:
             logger.warning("play_url: no protocol handler wired")
             return False
+        # Set the URL before sending strm: the player may open the HTTP
+        # connection before this coroutine gets another scheduling point.
+        old_playlist = player.playlist
+        old_position = player.playlist_position
+        player.playlist = [url]
+        player.playlist_position = 0
+        player.playlist_total = 1
         ok = await handler.send_remote_stream(player.mac, url, "m")
         if ok:
             player.power = True  # playing implies power-on
-            player.playlist = [url]
-            player.playlist_position = 0
-            player.playlist_total = 1
             player.current_title = title or url
             player.current_url = url
             player.current_track_id = None
             player.mode = "play"
             player.last_activity = time.time()
             logger.info("play_url %s: %s (%s)", player_id, title or url, url[:60])
+        else:
+            player.playlist = old_playlist
+            player.playlist_position = old_position
         return ok
 
     async def stop_player(self, player_id: str) -> bool:

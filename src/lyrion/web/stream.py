@@ -184,7 +184,6 @@ async def stream_track(scope: dict, receive, send) -> None:
     # Stream the file in chunks (async via to_thread — no aiofiles needed)
     import asyncio as _asyncio
 
-    fully_streamed = False
     try:
         remaining = length
         with open(path, "rb") as f:
@@ -197,26 +196,18 @@ async def stream_track(scope: dict, receive, send) -> None:
                 remaining -= len(chunk)
                 await send({"type": "http.response.body", "body": chunk,
                             "more_body": remaining > 0})
-        fully_streamed = remaining <= 0
     except (ConnectionError, BrokenPipeError, asyncio.CancelledError):
         # Player disconnected (stop/next) — this is normal.
         pass
     except Exception as exc:  # noqa: BLE001
         logger.warning("Stream error for track %d: %s", track_id, exc)
-
-    # Auto-next: when the file was streamed to the end and the request
-    # carried a player MAC, advance that player's playlist. Manual stop
-    # closes the connection early (fully_streamed stays False).
-    if fully_streamed:
-        player_mac = (query.get("player", [None]) or [None])[0]
-        if player_mac:
-            try:
-                from lyrion.player.manager import PlayerManager
-                _asyncio.create_task(PlayerManager().playlist_next(player_mac))
-                logger.debug("Track %d finished for %s — auto-next scheduled",
-                             track_id, player_mac)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("Auto-next failed: %s", exc)
+    # NOTE: no auto-next here. Advancing the playlist on HTTP-send
+    # completion is WRONG: the server can push the whole file into the
+    # player's buffer long before it finished playing, which restarts the
+    # track in a loop (observed: a new strm every ~1s). The real LMS
+    # advances when the PLAYER reports end-of-track (STAT "STMd" — decoder
+    # has no more data) — handled in networking/protocol.py
+    # `_handle_stat_frame`.
 
 
 async def _send_testtone(send) -> None:
@@ -282,6 +273,13 @@ async def _proxy_remote(send, remote_url: str) -> None:
     stream (httpx supports TLS) and re-serves it over plain http on
     /stream.mp3?remote=... The stream may run forever (radio), so no read
     timeout is applied.
+
+    Icecast/Shoutcast metadata: the upstream request sends Icy-MetaData: 1
+    (like the Perl LMS, Slim/Player/Protocols/HTTP.pm requestString) and the
+    metadata chunks are STRIPPED here before forwarding — Squeezelite does
+    NOT parse icy-metaint from the response header (verified in
+    stream.c: meta_interval is only set via a cont frame), so any metadata
+    left in the stream would be decoded as audio → "lost synchronization".
     """
     import httpx
 
@@ -292,9 +290,9 @@ async def _proxy_remote(send, remote_url: str) -> None:
                 "GET", remote_url,
                 headers={
                     "User-Agent": "LyrionMusicServer/9.2.0",
-                    # Ask for Icecast metadata — Squeezelite sends this to us
-                    # and NEEDS the icy-metaint interval in the response to
-                    # interleave metadata bytes correctly.
+                    # Ask for Icecast metadata — the Perl LMS does the same;
+                    # the metadata bytes are stripped below, only the audio
+                    # reaches the player.
                     "Icy-MetaData": "1",
                 },
             ) as resp:
@@ -308,21 +306,43 @@ async def _proxy_remote(send, remote_url: str) -> None:
                     (b"content-type", ctype.encode()),
                     (b"cache-control", b"no-cache"),
                 ]
-                # Forward Icecast metadata interval — Squeezelite sends
-                # "Icy-MetaData: 1" and NEEDS icy-metaint to interleave
-                # the metadata bytes correctly. Without it the decoder
-                # chokes on metadata as audio → silence.
                 metaint = resp.headers.get("icy-metaint")
-                if metaint:
-                    proxy_headers.append((b"icy-metaint", metaint.encode()))
                 await send({
                     "type": "http.response.start",
                     "status": 200,
                     "headers": proxy_headers,
                 })
-                async for chunk in resp.aiter_bytes(CHUNK_SIZE):
-                    await send({"type": "http.response.body", "body": chunk,
-                                "more_body": True})
+                if metaint:
+                    # Strip Icecast metadata chunks (1 length byte + N*16
+                    # bytes after every metaint audio bytes).
+                    logger.info("Stream %s: stripping icy metadata (metaint=%s)",
+                                remote_url[:60], metaint)
+                    audio_left = int(metaint)
+                    meta_left = 0
+                    async for chunk in resp.aiter_bytes(CHUNK_SIZE):
+                        buf = chunk
+                        while buf:
+                            if meta_left:
+                                take = min(len(buf), meta_left)
+                                meta_left -= take
+                                buf = buf[take:]
+                            elif audio_left == 0:
+                                n = buf[0]
+                                buf = buf[1:]
+                                meta_left = n * 16
+                                if meta_left == 0:
+                                    audio_left = int(metaint)
+                            else:
+                                take = min(len(buf), audio_left)
+                                await send({"type": "http.response.body",
+                                            "body": buf[:take],
+                                            "more_body": True})
+                                buf = buf[take:]
+                                audio_left -= take
+                else:
+                    async for chunk in resp.aiter_bytes(CHUNK_SIZE):
+                        await send({"type": "http.response.body", "body": chunk,
+                                    "more_body": True})
                 await send({"type": "http.response.body", "body": b"",
                             "more_body": False})
     except (ConnectionError, BrokenPipeError, asyncio.CancelledError):

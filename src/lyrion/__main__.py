@@ -156,7 +156,7 @@ async def _run_server(
     slimproto_port = int(cfg.get("slimproto_port", 3483))
     try:
         from lyrion.networking.protocol import SlimProtoClient
-        slimproto = SlimProtoClient()
+        slimproto = SlimProtoClient(web_port=http_port)
         asyncio.create_task(slimproto.serve(host="0.0.0.0", port=slimproto_port))
         log.info("Slimproto server listening on port %d", slimproto_port)
 

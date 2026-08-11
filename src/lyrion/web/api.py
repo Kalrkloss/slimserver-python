@@ -408,8 +408,8 @@ class JSONRPCAPI:
         # ── players ────────────────────────────────────────────────
         if cmd == "players":
             players = pm.get_all_players() if pm else []
-            start = int(args[0]) if args and args[0].isdigit() else 0
-            count = int(args[1]) if len(args) > 1 and args[1].isdigit() else 100
+            start = int(args[0]) if args and str(args[0]).isdigit() else 0
+            count = int(args[1]) if len(args) > 1 and str(args[1]).isdigit() else 100
             loop = []
             for p in players[start:start + count]:
                 loop.append({
@@ -432,12 +432,17 @@ class JSONRPCAPI:
         # ── serverstatus ───────────────────────────────────────────
         if cmd == "serverstatus":
             from lyrion import __version__
+            from lyrion.config import get_config
             players = pm.get_all_players() if pm else []
+            try:
+                http_port = int(get_config().get("serverport", 9000))
+            except Exception:
+                http_port = 9000
             return {
                 "version": __version__,
                 "uuid": "lyrion-server-0001",
                 "name": "Lyrion Music Server",
-                "httpport": 9000,
+                "httpport": http_port,
                 "player count": len(players),
                 "info total genres": 0,
                 "info total artists": 0,
@@ -648,7 +653,7 @@ class JSONRPCAPI:
                 pass
 
         if cmd == "power":
-            val = args[0] if args else "1"
+            val = str(args[0]) if args else "1"
             player = pm.get_player(pid)
             if player is not None:
                 player.power = val in ("1", "on", "toggle", "")
@@ -656,12 +661,12 @@ class JSONRPCAPI:
             else:
                 send(f"power {val}")
         elif cmd == "pause":
-            val = args[0] if args else "0"
+            val = str(args[0]) if args else "0"
             player = pm.get_player(pid)
             if player is not None:
                 if val == "1":
-                    player.mode = "pause"
-                    pm.set_mode(pid, "pause")
+                    # Real frame to the player (strm 'p'), not just state
+                    await pm.pause_player(pid, True)
                 elif val == "0":
                     # Resume: power on + (re)send strm for the current track
                     player.power = True
@@ -684,15 +689,22 @@ class JSONRPCAPI:
             if player is not None:
                 player.mode = "stop"
                 pm.set_mode(pid, "stop")
+                # Real frame to the player (strm 'q') — state alone does
+                # not stop Squeezelite.
+                await pm.stop_player(pid)
             else:
                 send("stop")
         elif cmd == "mixer":
-            val = args[-1] if args else ""
+            val = str(args[-1]) if args else ""
             if val.isdigit():
                 player = pm.get_player(pid)
                 if player is not None:
                     player.volume = int(val)
-                send(f"mixer volume {val}")
+                    # audg frame — text CLI does not exist on the
+                    # SlimProto channel.
+                    await pm.set_volume(pid, int(val))
+                else:
+                    send(f"mixer volume {val}")
         elif cmd == "playlist":
             sub = args[0] if args else ""
             rest = args[1:] if len(args) > 1 else []
@@ -702,7 +714,7 @@ class JSONRPCAPI:
                 item = rest[0]
                 player = pm.get_player(pid)
                 if player is not None:
-                    if item.isdigit():
+                    if str(item).isdigit():
                         player.playlist.append(int(item))
                     else:
                         player.playlist.append(item)
@@ -710,11 +722,15 @@ class JSONRPCAPI:
             elif sub == "index" and rest:
                 idx = rest[0]
                 player = pm.get_player(pid)
-                if player is not None and idx.isdigit():
+                if player is not None and str(idx).isdigit():
                     player.playlist_position = int(idx)
                     await self._play_playlist_item(pm, player, int(idx))
             elif sub == "stop":
-                send("stop")
+                player = pm.get_player(pid)
+                if player is not None:
+                    await pm.stop_player(pid)
+                else:
+                    send("stop")
             elif sub == "clear":
                 player = pm.get_player(pid)
                 if player is not None:
@@ -829,8 +845,8 @@ class JSONRPCAPI:
 
     async def _json_browse(self, cmd: str, args: list[str]) -> dict:
         """Browse library tables (albums/artists/songs/genres) as JSON."""
-        start = int(args[0]) if args and args[0].isdigit() else 0
-        count = int(args[1]) if len(args) > 1 and args[1].isdigit() else 50
+        start = int(args[0]) if args and str(args[0]).isdigit() else 0
+        count = int(args[1]) if len(args) > 1 and str(args[1]).isdigit() else 50
         try:
             import sqlite3
             db = sqlite3.connect("/root/.lyrion/Lyrion/Prefs/lyrion.db")
