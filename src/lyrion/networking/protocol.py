@@ -1199,6 +1199,43 @@ class SlimProtoClient:
             logger.warning("Failed to send strm to %s: %s", mac, exc)
             return False
 
+    @staticmethod
+    def _pick_playlist_url(body: bytes) -> list[str]:
+        """Playable URL lines from an M3U/PLS body (http/https), skipping
+        TuneIn/Radiotime ad 'bump' stub URLs — in playlist order."""
+        ad_hints = ("bump", "preview", "pre_", "advert",
+                    "promo", "teaser", "sample")
+        return [
+            ln.strip()
+            for ln in body.decode("utf-8", errors="replace").splitlines()
+            if ln.strip().startswith(("http://", "https://"))
+            and not any(h in ln.lower() for h in ad_hints)
+        ]
+
+    async def _first_reachable(self, candidates: list[str]) -> str | None:
+        """First playlist candidate that answers HEAD < 400, trying an
+        https→http fallback per candidate. Stream ports (8000/8060/…)
+        are often plain HTTP even when the playlist advertises https —
+        e.g. 1Mix: TuneIn lists https://fr2.1mix.co.uk:8060/320h, the
+        working stream is http://fr2.1mix.co.uk:8060/320."""
+        import httpx
+        headers = {"User-Agent": "LyrionMusicServer/9.2.0"}
+        timeout = httpx.Timeout(connect=3.0, read=3.0, write=3.0, pool=3.0)
+        async with httpx.AsyncClient(timeout=timeout,
+                                     follow_redirects=True) as client:
+            for cand in candidates:
+                variants = [cand]
+                if cand.startswith("https://"):
+                    variants.append("http://" + cand[len("https://"):])
+                for v in variants:
+                    try:
+                        r = await client.head(v, headers=headers)
+                        if r.status_code < 400:
+                            return str(r.url)
+                    except Exception:
+                        continue
+        return None
+
     # Cache for resolved stream URLs (redirects / playlist expansion).
     # Short TTL so a station's current stream URL can change.
     _url_resolve_cache: dict[str, tuple[float, str]] = {}
@@ -1233,10 +1270,11 @@ class SlimProtoClient:
                 is_playlist = ("playlist" in ctype or "mpegurl" in ctype
                                or final.lower().endswith((".pls", ".m3u", ".m3u8")))
                 if is_playlist:
-                    # Read the playlist body (bounded) and pick the first
-                    # playable URL line (http/https), skipping #EXT* lines.
-                    # TuneIn/Radiotime playlists lead with an ad "bump"
-                    # URL — skip URLs that look like ad/preview stubs.
+                    # Read the playlist body (bounded), then pick the first
+                    # REACHABLE URL (HEAD test, https→http fallback) — the
+                    # playlist often lists dead/mis-schemed URLs first
+                    # (1Mix: TuneIn lists https://…:8000, working stream
+                    # is http://…:8060/…).
                     try:
                         resp = await client.get(url, headers=headers)
                         body = b""
@@ -1244,19 +1282,10 @@ class SlimProtoClient:
                             body += chunk
                             if len(body) > 128 * 1024:
                                 break
-                        ad_hints = ("bump", "preview", "pre_", "advert",
-                                    "promo", "teaser", "sample")
-                        candidates = [
-                            ln.strip()
-                            for ln in body.decode("utf-8", errors="replace").splitlines()
-                            if ln.strip().startswith(("http://", "https://"))
-                        ]
+                        candidates = self._pick_playlist_url(body)
                         if candidates:
-                            result = next(
-                                (u for u in candidates
-                                 if not any(h in u.lower() for h in ad_hints)),
-                                candidates[0],
-                            )
+                            reachable = await self._first_reachable(candidates)
+                            result = reachable or candidates[0]
                     except Exception as exc:
                         logger.warning("Playlist resolve failed for %s: %s",
                                        url[:60], exc)
@@ -1435,6 +1464,15 @@ class SlimProtoClient:
                 logger.warning("No RESP from %s for direct stream %s — cont metaint=0",
                                mac, url[:50])
                 metaint = 0
+                # The source never answered (dead/unreachable station) —
+                # don't leave the UI showing "playing" with no audio.
+                try:
+                    from lyrion.player.manager import PlayerManager
+                    player = PlayerManager().get_player(mac)
+                    if player is not None:
+                        player.mode = "stop"
+                except Exception:
+                    pass
             await self._send_cont(mac, metaint)
         except Exception as exc:
             logger.warning("cont after RESP failed for %s: %s", mac, exc)

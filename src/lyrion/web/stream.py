@@ -266,6 +266,41 @@ async def _send_simple(send, status: int, body: str, content_type: str,
     await send({"type": "http.response.body", "body": body.encode()})
 
 
+async def _strip_icy_meta(chunks, metaint: int, send) -> None:
+    """Forward only audio bytes from an Icecast/Shoutcast stream, stripping
+    the metadata chunks (1 length byte + N*16 bytes after every `metaint`
+    audio bytes).
+
+    `audio_left` is reset after EVERY metadata block — also for real title
+    metadata (length byte > 0). Resetting only for empty blocks (n==0) makes
+    the parser read the first audio byte after a block as the next length
+    byte → the stream drifts → `mad_frame_decode error: lost
+    synchronization / bad main_data_begin pointer` → silence on stations
+    with real title metadata (1Mix, SWR3) while empty-block stations
+    (Hirschmilch) keep playing.
+    """
+    audio_left = int(metaint)
+    meta_left = 0
+    async for chunk in chunks:
+        buf = chunk
+        while buf:
+            if meta_left:
+                take = min(len(buf), meta_left)
+                meta_left -= take
+                buf = buf[take:]
+            elif audio_left == 0:
+                n = buf[0]
+                buf = buf[1:]
+                meta_left = n * 16
+                audio_left = int(metaint)
+            else:
+                take = min(len(buf), audio_left)
+                await send({"type": "http.response.body", "body": buf[:take],
+                            "more_body": True})
+                buf = buf[take:]
+                audio_left -= take
+
+
 async def _proxy_remote(send, remote_url: str) -> None:
     """Relay an external stream URL (radio favorite) to the player.
 
@@ -317,36 +352,9 @@ async def _proxy_remote(send, remote_url: str) -> None:
                     # bytes after every metaint audio bytes).
                     logger.info("Stream %s: stripping icy metadata (metaint=%s)",
                                 remote_url[:60], metaint)
-                    audio_left = int(metaint)
-                    meta_left = 0
-                    async for chunk in resp.aiter_bytes(CHUNK_SIZE):
-                        buf = chunk
-                        while buf:
-                            if meta_left:
-                                take = min(len(buf), meta_left)
-                                meta_left -= take
-                                buf = buf[take:]
-                            elif audio_left == 0:
-                                # After every metaint audio bytes comes one
-                                # length byte (N = metadata size in 16-byte
-                                # units). Reset audio_left ALWAYS — also for
-                                # n>0 (real title metadata): otherwise the
-                                # first audio byte after the metadata block
-                                # is misread as the next length byte and the
-                                # stream drifts (decoder: lost sync / bad
-                                # main_data_begin pointer → silence on
-                                # stations with real title metadata).
-                                n = buf[0]
-                                buf = buf[1:]
-                                meta_left = n * 16
-                                audio_left = int(metaint)
-                            else:
-                                take = min(len(buf), audio_left)
-                                await send({"type": "http.response.body",
-                                            "body": buf[:take],
-                                            "more_body": True})
-                                buf = buf[take:]
-                                audio_left -= take
+                    await _strip_icy_meta(
+                        resp.aiter_bytes(CHUNK_SIZE), int(metaint), send
+                    )
                 else:
                     async for chunk in resp.aiter_bytes(CHUNK_SIZE):
                         await send({"type": "http.response.body", "body": chunk,
