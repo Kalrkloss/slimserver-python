@@ -612,17 +612,56 @@ class PlayerManager:
             player.last_activity = time.time()
         return ok
 
+    @staticmethod
+    def _current_is_stream(player) -> bool:
+        """True if the player is (or was last) playing a live stream URL
+        rather than a local track — live streams cannot be paused in
+        place (LMS stops them on pause and restarts on resume)."""
+        if player.current_track_id is None:
+            return True
+        pl = getattr(player, "playlist", [])
+        pos = getattr(player, "playlist_position", 0)
+        return bool(pl and 0 <= pos < len(pl) and isinstance(pl[pos], str))
+
     async def pause_player(self, player_id: str, pause: bool) -> bool:
-        """Pause (or resume) playback on a player (sends strm 'p')."""
+        """Pause (or resume) playback on a player.
+
+        Squeezelite (this build, 2.0.0-1584) does NOT honour the strm 'p'
+        pause frame (interval 0) — the output keeps playing. So pause =
+        STOP (strm 'q'); resume restarts the current item (stream URL or
+        track). This matches the LMS behaviour for live streams
+        ('Stopping remote stream upon full buffer when paused') and is
+        the only reliable pause for this player firmware.
+        """
         player = self.get_player(player_id)
         if player is None:
             return False
         handler = self._protocol_handler
         if handler is None:
             return False
-        ok = await handler.send_pause_to_player(player.mac, 0 if not pause else 1)
+        if pause:
+            ok = await handler.send_stop_to_player(player.mac)
+            if ok:
+                player.mode = "pause"
+                player.last_activity = time.time()
+            return ok
+        # resume — restart the current item
+        is_stream = self._current_is_stream(player)
+        if is_stream:
+            url = getattr(player, "current_url", None) or ""
+            if not url:
+                pl = getattr(player, "playlist", [])
+                pos = getattr(player, "playlist_position", 0)
+                if pl and 0 <= pos < len(pl) and isinstance(pl[pos], str):
+                    url = pl[pos]
+            title = getattr(player, "current_title", "") or ""
+            ok = await self.play_url(player_id, url, title)
+        elif player.current_track_id is not None:
+            ok = await self.play_track(player_id, player.current_track_id)
+        else:
+            ok = False
         if ok:
-            player.mode = "pause" if pause else "play"
+            player.mode = "play"
             player.last_activity = time.time()
         return ok
 

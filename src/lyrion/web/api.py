@@ -1,6 +1,7 @@
 """JSON-RPC API for Lyrion Music Server."""
 from __future__ import annotations
 
+import logging
 from typing import Any, Callable, Optional
 
 try:
@@ -356,7 +357,8 @@ class JSONRPCAPI:
             # Real SlimProto frame (strm 'q') — send_command with CLI text
             # does nothing on Squeezelite. stop_player also sets mode=stop.
             return await PlayerManager().stop_player(mac)
-        except Exception:
+        except Exception as e:  # noqa: BLE001
+            logging.getLogger("lyrion.web.api").warning("_playlist_stop failed: %s", e)
             return False
 
     async def _playlist_pause(self, mac: str, state: int = -1) -> bool:
@@ -373,21 +375,24 @@ class JSONRPCAPI:
             player = pm.get_player(mac)
             currently_paused = player is not None and player.mode == "pause"
             return await pm.pause_player(mac, not currently_paused)
-        except Exception:
+        except Exception as e:  # noqa: BLE001
+            logging.getLogger("lyrion.web.api").warning("_playlist_pause failed: %s", e)
             return False
 
     async def _playlist_next(self, mac: str) -> bool:
         try:
             from lyrion.player import PlayerManager
             return await PlayerManager().playlist_next(mac)
-        except Exception:
+        except Exception as e:  # noqa: BLE001
+            logging.getLogger("lyrion.web.api").warning("_playlist_next failed: %s", e)
             return False
 
     async def _playlist_prev(self, mac: str) -> bool:
         try:
             from lyrion.player import PlayerManager
             return await PlayerManager().playlist_prev(mac)
-        except Exception:
+        except Exception as e:  # noqa: BLE001
+            logging.getLogger("lyrion.web.api").warning("_playlist_prev failed: %s", e)
             return False
 
     async def _slim_request(self, player_id: str, command: list[str]) -> Any:
@@ -772,6 +777,16 @@ class JSONRPCAPI:
                 if player is not None and str(idx).isdigit():
                     player.playlist_position = int(idx)
                     await self._play_playlist_item(pm, player, int(idx))
+            elif sub == "play":
+                # LMS-compatible 'playlist play [<index>]' (CLI/JSON path)
+                player = pm.get_player(pid)
+                if player is not None:
+                    if rest and str(rest[0]).isdigit():
+                        idx = int(rest[0])
+                    else:
+                        idx = player.playlist_position or 0
+                    player.playlist_position = idx
+                    await self._play_playlist_item(pm, player, idx)
             elif sub == "stop":
                 player = pm.get_player(pid)
                 if player is not None:

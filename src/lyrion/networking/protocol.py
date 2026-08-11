@@ -1354,6 +1354,11 @@ class SlimProtoClient:
                 pos = player.playlist_position or 0
                 if 0 <= pos < len(player.playlist) and isinstance(player.playlist[pos], str):
                     player.playlist[pos] = url
+            # Keep state consistent regardless of the calling path
+            # (play_url vs _play_playlist_item): this is a live stream.
+            if player is not None:
+                player.current_url = url
+                player.current_track_id = None
         except Exception:
             pass
 
@@ -1541,8 +1546,15 @@ class SlimProtoClient:
         except (ConnectionError, OSError, RuntimeError):
             return False
 
-    async def send_pause_to_player(self, mac: str, pause_ms: int) -> bool:
-        """Send a 'strm' pause command ('p') to a player (0 = resume)."""
+    async def send_pause_to_player(self, mac: str, pause_ms: int = 0) -> bool:
+        """Send a 'strm' pause command ('p') to a player.
+
+        LMS semantics (Squeezebox.pm pause -> stream('p') without
+        interval): replay_gain = 0 means the output is held paused
+        INDEFINITELY (Squeezelite OUTPUT_STOPPED). A value > 0 would
+        auto-resume after that many milliseconds. Resume is a separate
+        command ('u'), see send_unpause_to_player.
+        """
         mac = mac.upper().replace(":", "")
         writer = self._player_writers.get(mac)
         if writer is None or writer.is_closing():
@@ -1559,6 +1571,32 @@ class SlimProtoClient:
             writer.write(frame)
             await writer.drain()
             logger.info("Sent strm 'p' (pause=%d) to %s", pause_ms, mac)
+            return True
+        except (ConnectionError, OSError, RuntimeError):
+            return False
+
+    async def send_unpause_to_player(self, mac: str) -> bool:
+        """Send a 'strm' unpause command ('u') — LMS resume.
+
+        Squeezebox2.pm resume -> stream('u'); Squeezelite process_strm
+        'u' with replay_gain 0 unpauses immediately.
+        """
+        mac = mac.upper().replace(":", "")
+        writer = self._player_writers.get(mac)
+        if writer is None or writer.is_closing():
+            return False
+        payload = b"".join([
+            b"strm", b"u", b"0", b"?", b"0", b"0", b"0", b"l",
+            bytes(7),
+            struct.pack(">I", 0),  # replay_gain = unpause jiffies (0 = now)
+            struct.pack(">H", 0),
+            struct.pack(">I", 0),
+        ])
+        frame = struct.pack(">H", len(payload)) + payload
+        try:
+            writer.write(frame)
+            await writer.drain()
+            logger.info("Sent strm 'u' (unpause) to %s", mac)
             return True
         except (ConnectionError, OSError, RuntimeError):
             return False
@@ -1670,12 +1708,17 @@ class SlimProtoClient:
                         # DECODE_COMPLETE — decoder has no more data. This
                         # fires BOTH at natural track end AND when the user
                         # stopped the player (strm 'q' also runs the decoder
-                        # to completion). Only auto-advance on natural end:
-                        # if the server already set mode=stop (user stop /
-                        # power off), the STMd is the player acknowledging.
-                        if player.mode != "stop":
+                        # to completion) AND when pausing a live stream
+                        # (pause = stop for streams). Only auto-advance on
+                        # natural end: if the server already set mode=stop
+                        # or mode=pause, the STMd is the player
+                        # acknowledging the stop.
+                        if player.mode not in ("stop", "pause"):
                             asyncio.create_task(_advance_after_track(pm, mac_str))
-                        player.mode = "stop"
+                        # Keep "pause" if the player was paused (pause of a
+                        # live stream = stop, STMd acknowledges it).
+                        if player.mode != "pause":
+                            player.mode = "stop"
                     elif event == "STMs":
                         # TRACK_STARTED — a new track started playing
                         player.mode = "play"
