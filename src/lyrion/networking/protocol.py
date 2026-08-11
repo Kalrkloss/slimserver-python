@@ -807,7 +807,14 @@ class SlimProtoClient:
                         if payload:
                             setd_id = payload[0]
                             if setd_id == 0 and len(payload) > 1:
-                                new_name = payload[1:].split(b"\x00")[0].decode("utf-8", errors="replace").strip()
+                                raw = payload[1:].split(b"\x00")[0]
+                                try:
+                                    new_name = raw.decode("utf-8").strip()
+                                except UnicodeDecodeError:
+                                    # SqueezePlay sends the name in latin-1
+                                    # (e.g. "Küche" -> b'K\xfcche'); utf-8
+                                    # would mangle it to "K�che".
+                                    new_name = raw.decode("latin-1").strip()
                                 if new_name:
                                     logger.info("Player %s sends name via SETD: %r", mac_str, new_name)
                                     try:

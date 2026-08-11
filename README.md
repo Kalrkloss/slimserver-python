@@ -25,7 +25,7 @@ protocol surface of the original (Perl) Lyrion Music Server.
 | Library scanner | ✅ SQLite DB (`~/.lyrion/Lyrion/Prefs/lyrion.db`), 50k+ tracks, genres, artists, albums |
 | Player control | ✅ power/volume (audg frame), play/pause/stop/next/prev (strm frames), playlist management, favorites |
 | **Audio playback (MP3)** | ✅ **End-to-end verified on Squeezelite v2.0.0** (strm → HTTP `/stream.mp3` → decode → output; capture peak 0.5 FS) |
-| **Radio / favorites** | ✅ **Server-side proxy** (`GET /stream.mp3?player=MAC`), HTTP + HTTPS sources, **Icecast metadata stripped server-side** |
+| **Radio / favorites** | ✅ **Direct streaming** like the real LMS: strm frame points at the source, player connects directly, server sends `cont` with metaint (RESP round-trip); proxy fallback |
 | Auto-next / end-of-track | ✅ Playlist advance on player STAT `STMd` (decoder complete); last track → stop |
 | Test tone | ✅ `/stream.mp3?testtone=1` (440 Hz, 5 s WAV) |
 
@@ -93,13 +93,18 @@ python3 -m lyrion --localfile test-ports.conf --loglevel debug
   (`autostart - '0' >= 2`) and wait forever for a `cont` frame that LMS
   never sends. `transition_type='0'` (ASCII), PCM fields `'?'`, threshold/
   output_threshold numeric.
-- Like the original LMS, players always fetch streams through the server
-  (`GET /stream.mp3?player=MAC HTTP/1.0`, no Host header); the server
-  proxies external radio URLs (HTTP + HTTPS). **Icecast/Shoutcast
-  metadata is stripped server-side** — Squeezelite does not parse
-  `icy-metaint` from response headers (only via a `cont` frame), so any
-  metadata left in the stream is decoded as audio (`lost
-  synchronization`). The upstream request sends `Icy-MetaData: 1`.
+- Like the original LMS, library tracks are fetched through the server
+  (`GET /stream.mp3?player=MAC HTTP/1.0`, no Host header). **Radio
+  streams are streamed DIRECTLY from the source** (stream_s `$isDirect`
+  branch): the strm frame carries the source IP/port + the source request
+  string (HTTP.pm requestString, `Icy-MetaData: 1`), `autostart=3`
+  (direct), SSL flag `0x20` for https. After the player connects it
+  forwards the source's response headers as a RESP frame; the server
+  replies with a `cont` frame (`metaint, loop, guids`) so the player
+  strips Icecast metadata itself. The stream keeps playing if the server
+  goes away. Proxy fallback only when the source cannot be resolved
+  (the proxy then strips Icecast metadata server-side — Squeezelite does
+  not parse `icy-metaint` from headers).
 - **audg on connect is mandatory**: Squeezelite zero-initialises its
   internal gain; without an `audg` frame every sample is multiplied by 0
   → decoder runs, output runs, but nothing is audible. The server sends
