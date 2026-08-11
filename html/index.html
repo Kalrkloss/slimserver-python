@@ -1995,8 +1995,8 @@ async function favEdit(index) {
   showFavEditDialog(item);
 }
 
-// Inline edit dialog (no browser prompt() — those are suppressed in some
-// WebViews/extensions, which made the edit look non-interactive).
+// Inline edit dialog — modal dialogs are suppressed in some
+// WebViews/extensions, which made the edit look non-interactive.
 function showFavEditDialog(item) {
   const old = document.getElementById('fav-edit-dialog');
   if (old) old.remove();
