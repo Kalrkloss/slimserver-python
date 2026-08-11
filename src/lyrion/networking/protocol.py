@@ -1199,6 +1199,78 @@ class SlimProtoClient:
             logger.warning("Failed to send strm to %s: %s", mac, exc)
             return False
 
+    # Cache for resolved stream URLs (redirects / playlist expansion).
+    # Short TTL so a station's current stream URL can change.
+    _url_resolve_cache: dict[str, tuple[float, str]] = {}
+    _URL_RESOLVE_TTL = 600.0  # 10 min
+
+    async def _resolve_stream_url(self, url: str) -> str:
+        """Resolve a radio URL the way the Perl LMS does before sending a
+        direct stream: follow HTTP redirects and expand M3U/PLS playlists
+        to the first playable audio URL. Squeezelite can do neither —
+        without this, redirect URLs (SWR3) or playlist URLs (1Mix/TuneIn)
+        produce silence on direct streams.
+        """
+        import time as _time
+
+        now = _time.time()
+        cached = self._url_resolve_cache.get(url)
+        if cached and now - cached[0] < self._URL_RESOLVE_TTL:
+            return cached[1]
+
+        import httpx
+
+        result = url
+        try:
+            headers = {"User-Agent": "LyrionMusicServer/9.2.0"}
+            timeout = httpx.Timeout(connect=8.0, read=8.0, write=8.0, pool=8.0)
+            async with httpx.AsyncClient(timeout=timeout,
+                                         follow_redirects=True) as client:
+                # HEAD first: follows redirects, cheap, no audio body.
+                resp = await client.head(url, headers=headers)
+                final = str(resp.url)
+                ctype = resp.headers.get("content-type", "").lower()
+                is_playlist = ("playlist" in ctype or "mpegurl" in ctype
+                               or final.lower().endswith((".pls", ".m3u", ".m3u8")))
+                if is_playlist:
+                    # Read the playlist body (bounded) and pick the first
+                    # playable URL line (http/https), skipping #EXT* lines.
+                    # TuneIn/Radiotime playlists lead with an ad "bump"
+                    # URL — skip URLs that look like ad/preview stubs.
+                    try:
+                        resp = await client.get(url, headers=headers)
+                        body = b""
+                        async for chunk in resp.aiter_bytes():
+                            body += chunk
+                            if len(body) > 128 * 1024:
+                                break
+                        ad_hints = ("bump", "preview", "pre_", "advert",
+                                    "promo", "teaser", "sample")
+                        candidates = [
+                            ln.strip()
+                            for ln in body.decode("utf-8", errors="replace").splitlines()
+                            if ln.strip().startswith(("http://", "https://"))
+                        ]
+                        if candidates:
+                            result = next(
+                                (u for u in candidates
+                                 if not any(h in u.lower() for h in ad_hints)),
+                                candidates[0],
+                            )
+                    except Exception as exc:
+                        logger.warning("Playlist resolve failed for %s: %s",
+                                       url[:60], exc)
+                elif final != url and resp.status_code < 400:
+                    result = final
+        except Exception as exc:
+            logger.warning("Stream URL resolve failed for %s (%s) — using as-is",
+                           url[:60], exc)
+
+        if result != url:
+            logger.info("Resolved stream URL: %s -> %s", url[:60], result[:90])
+        self._url_resolve_cache[url] = (now, result)
+        return result
+
     async def send_remote_stream(self, mac: str, url: str, codec: str = "m") -> bool:
         """Send a strm frame for an EXTERNAL stream URL (radio/favorites).
 
@@ -1224,6 +1296,24 @@ class SlimProtoClient:
         # Flush old stream buffers first (Perl LMS behaviour) so the
         # switch is immediate instead of playing out the old buffer.
         await self._flush_if_playing(mac)
+
+        # Resolve redirects / M3U/PLS playlists server-side (Squeezelite
+        # can do neither) — like the Perl LMS does before direct streams.
+        url = await self._resolve_stream_url(url)
+
+        # Keep the player playlist in sync: the proxy endpoint resolves
+        # the track from player.playlist, so it must hold the RESOLVED
+        # URL — otherwise it would re-fetch the raw M3U/redirect URL and
+        # stream playlist text as audio (silence).
+        try:
+            from lyrion.player.manager import PlayerManager
+            player = PlayerManager().get_player(mac)
+            if player is not None and player.playlist:
+                pos = player.playlist_position or 0
+                if 0 <= pos < len(player.playlist) and isinstance(player.playlist[pos], str):
+                    player.playlist[pos] = url
+        except Exception:
+            pass
 
         from urllib.parse import urlparse
         import socket as _socket

@@ -327,11 +327,19 @@ async def _proxy_remote(send, remote_url: str) -> None:
                                 meta_left -= take
                                 buf = buf[take:]
                             elif audio_left == 0:
+                                # After every metaint audio bytes comes one
+                                # length byte (N = metadata size in 16-byte
+                                # units). Reset audio_left ALWAYS — also for
+                                # n>0 (real title metadata): otherwise the
+                                # first audio byte after the metadata block
+                                # is misread as the next length byte and the
+                                # stream drifts (decoder: lost sync / bad
+                                # main_data_begin pointer → silence on
+                                # stations with real title metadata).
                                 n = buf[0]
                                 buf = buf[1:]
                                 meta_left = n * 16
-                                if meta_left == 0:
-                                    audio_left = int(metaint)
+                                audio_left = int(metaint)
                             else:
                                 take = min(len(buf), audio_left)
                                 await send({"type": "http.response.body",
