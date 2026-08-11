@@ -1217,23 +1217,36 @@ class SlimProtoClient:
         https→http fallback per candidate. Stream ports (8000/8060/…)
         are often plain HTTP even when the playlist advertises https —
         e.g. 1Mix: TuneIn lists https://fr2.1mix.co.uk:8060/320h, the
-        working stream is http://fr2.1mix.co.uk:8060/320."""
+        working stream is http://fr2.1mix.co.uk:8060/320.
+
+        All HEADs run in parallel (asyncio.gather) — with a dead station
+        a sequential scan would block the play request for the sum of
+        all timeouts (60 s+); parallel it is just one timeout.
+        """
         import httpx
         headers = {"User-Agent": "LyrionMusicServer/9.2.0"}
-        timeout = httpx.Timeout(connect=3.0, read=3.0, write=3.0, pool=3.0)
+        timeout = httpx.Timeout(connect=2.0, read=2.0, write=2.0, pool=2.0)
         async with httpx.AsyncClient(timeout=timeout,
                                      follow_redirects=True) as client:
+            variants: list[str] = []
             for cand in candidates:
-                variants = [cand]
+                variants.append(cand)
                 if cand.startswith("https://"):
                     variants.append("http://" + cand[len("https://"):])
-                for v in variants:
-                    try:
-                        r = await client.head(v, headers=headers)
-                        if r.status_code < 400:
-                            return str(r.url)
-                    except Exception:
-                        continue
+
+            async def test(v: str) -> str | None:
+                try:
+                    r = await client.head(v, headers=headers)
+                    if r.status_code < 400:
+                        return str(r.url)
+                except Exception:
+                    pass
+                return None
+
+            results = await asyncio.gather(*(test(v) for v in variants))
+            for r in results:
+                if r:
+                    return r
         return None
 
     # Cache for resolved stream URLs (redirects / playlist expansion).
