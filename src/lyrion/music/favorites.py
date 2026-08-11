@@ -17,7 +17,7 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any, Optional
 
-from sqlalchemy import delete, select, update
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.orm import selectinload
 
 from lyrion.database.schema import Favorite
@@ -55,13 +55,19 @@ class FavoritesManager:
     # ── queries ────────────────────────────────────────────────────────
 
     async def list_items(self, parent_id: Optional[int] = None) -> list[dict[str, Any]]:
-        """Return favorites under parent_id (None = root), ordered by position."""
+        """Return favorites under parent_id (None = root), folders first
+        (alphabetical), then streams (alphabetical)."""
         await ensure_opml_imported()
         async with self._db_session() as session:
             stmt = (
                 select(Favorite)
                 .where(Favorite.parent_id == parent_id)
-                .order_by(Favorite.position, Favorite.title)
+                # Folders (url IS NULL) sort before streams; both groups
+                # alphabetically (case-insensitive).
+                .order_by(
+                    Favorite.url.is_not(None),
+                    func.lower(Favorite.title),
+                )
             )
             result = await session.execute(stmt)
             return [self._fav_to_dict(f) for f in result.scalars().all()]
