@@ -1498,9 +1498,10 @@ async function loadBrowseData() {
         break;
       }
       case 'radio': {
-        const r = await req(['radio', start, perPage]);
-        data = parse(Array.isArray(r) ? r : []);
-        total = data.length >= perPage ? start + perPage + 1 : start + data.length;
+        // No browse table for radio — the panel (add stream + search) is
+        // all there is; saved stations live under Favorites.
+        data = [];
+        total = 0;
         break;
       }
     }
@@ -1529,7 +1530,6 @@ function renderBrowseTable() {
     paginationEl.innerHTML = '';
     return;
   }
-
   // Radio panel: add stream + search (radio-browser directory)
   let panelHtml = '';
   if (type === 'radio') {
@@ -1547,7 +1547,6 @@ function renderBrowseTable() {
           <button id="radio-search-btn" class="btn-secondary" onclick="searchRadioStations()">Search</button>
         </div>
         <div id="radio-results" style="margin-bottom:12px"></div>
-        <h3 style="margin-top:12px">Saved stations</h3>
       </div>`;
   }
 
