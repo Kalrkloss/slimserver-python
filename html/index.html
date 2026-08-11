@@ -2133,12 +2133,14 @@ async function renderServerSettings() {
   const el = document.getElementById('settings-content');
   if (!el) return;
 
-  let version = '—', players = 0, status = 'Unknown';
+  let version = '—', players = 0, status = 'Unknown', musicdir = '';
   try {
     version = await api('server.version');
     const st = await api('server.status');
     players = st.players ?? 0;
     status = 'Running';
+    const prefs = await api('slim.request', ['-', ['serverpref', 'musicdir']]);
+    musicdir = (prefs && prefs.musicdir) || '';
   } catch(e) { status = 'Error: ' + e.message; }
 
   el.innerHTML = `
@@ -2159,9 +2161,14 @@ async function renderServerSettings() {
         <div class="settings-card-header">Library</div>
         <div class="settings-card-body">
           <div class="info-grid">
-            <span class="label">Music Library:</span><span>— rescan required</span>
+            <span class="label">Music Library:</span>
+            <input id="musicdir-input" type="text" value="${escHtml(musicdir)}"
+              placeholder="/mnt/media2/Musik"
+              style="font-family:monospace;font-size:12px;padding:5px;border:1px solid var(--border);border-radius:3px;width:100%;box-sizing:border-box">
           </div>
+          <p style="font-size:11px;color:var(--text-light);margin:6px 0 0">Path to the music folder. Save, then rescan to rebuild the library.</p>
           <div style="margin-top:12px;display:flex;gap:8px">
+            <button class="btn-secondary" onclick="saveLibraryPath()">💾 Save Path</button>
             <button class="btn-secondary" onclick="rescanLibrary()">🔄 Rescan Library</button>
           </div>
         </div>
@@ -2284,9 +2291,27 @@ function selectPlayer(mac) {
   navigate();
 }
 
+async function saveLibraryPath() {
+  const input = document.getElementById('musicdir-input');
+  if (!input) return;
+  const p = input.value.trim();
+  if (!p) { showToast('Path is empty'); return; }
+  try {
+    await api('slim.request', ['-', ['serverpref', 'musicdir', p]]);
+    showToast('Music library path saved: ' + p);
+  } catch (e) {
+    showToast('Failed: ' + e.message);
+  }
+}
+
 async function rescanLibrary() {
   showToast('Library rescan initiated…');
-  // LMS Python port may not have rescan, show feedback
+  try {
+    await api('rescan');
+    showToast('Library rescan running in background');
+  } catch (e) {
+    showToast('Rescan failed: ' + e.message);
+  }
 }
 
 // ─────────────────────────────────────────────

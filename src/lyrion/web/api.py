@@ -462,28 +462,33 @@ class JSONRPCAPI:
             await self._json_control(pm, pid, cmd, args)
             return {}
 
-        # ── favorites ──────────────────────────────────────────────
-        if cmd == "favorites" and args and args[0] == "items":
-            return await self._json_favorites(pm, pid, args)
-        if cmd == "favorites" and len(args) >= 3 and args[0] == "playlist" and args[1] == "play":
-            # favorites playlist play item_id:<n> → play_url on the player
-            item_id = None
-            for a in args:
-                if a.startswith("item_id:"):
-                    try:
-                        item_id = int(a[8:])
-                    except ValueError:
-                        pass
-            if item_id is not None and pid:
-                url = await self._favorite_url(item_id)
-                if url:
-                    from lyrion.player.manager import PlayerManager
-                    pm = pm or PlayerManager()
-                    player = pm.get_player(pid)
-                    if player is not None:
-                        player.playlist = [url]
-                        player.playlist_total = 1
-                        await self._play_playlist_item(pm, player, 0)
+        # ── favorites (DB-backed via CLI handler; text format the UI
+        #    parser expects: "favorite id:" / "title:" / "url:" lines) ──
+        if cmd == "favorites":
+            try:
+                from lyrion.control.cli import CLIHandler, CLIContext
+                async with CLIHandler() as cli:
+                    ctx = CLIContext(player_id=pid or "-")
+                    result = await cli.dispatch(ctx, (cmd, args))
+                    return result if isinstance(result, list) else [str(result)]
+            except Exception as e:  # noqa: BLE001
+                return {"error": str(e)}
+
+        # ── serverpref: get/set server preferences (e.g. library paths) ──
+        #   ["serverpref", "musicdir"]            → {"musicdir": "/mnt/..."}
+        #   ["serverpref", "musicdir", "/pfad"]   → set + return
+        if cmd == "serverpref":
+            try:
+                from lyrion.config import PreferenceStore
+                prefs = PreferenceStore.instance()
+                if len(args) >= 2:
+                    value = " ".join(str(a) for a in args[1:])
+                    await prefs.set(args[0], value)
+                    return {str(args[0]): value}
+                if args:
+                    return {str(args[0]): prefs.get(str(args[0])) or ""}
+            except Exception as e:  # noqa: BLE001
+                return {"error": str(e)}
             return {}
 
         # ── Browse commands (library) ──────────────────────────────
@@ -505,9 +510,12 @@ class JSONRPCAPI:
     async def _rescan(self, mode: str = "normal") -> Any:
         """Direct rescan — triggers MusicImporter in background."""
         import asyncio as _asyncio
+        from pathlib import Path as _Path
         async def _do():
+            from lyrion.config import get_config
             from lyrion.media.importer import MusicImporter, ImportConfig
-            importer = MusicImporter(ImportConfig())
+            musicdir = get_config().get("musicdir", "/mnt/media2/Musik") or "/mnt/media2/Musik"
+            importer = MusicImporter(ImportConfig(source_path=_Path(musicdir)))
             stats = await importer.import_music()
             return stats
         _asyncio.create_task(_do())
@@ -766,82 +774,6 @@ class JSONRPCAPI:
         except Exception as exc:
             logger = __import__("logging").getLogger("lyrion.web.api")
             logger.warning("_play_playlist_item failed: %s", exc)
-
-    async def _json_favorites(self, pm, pid: str | None, args: list[str]) -> dict:
-        """Return favorites from favorites.opml (folder hierarchy)."""
-        import xml.etree.ElementTree as ET
-        opml_path = "/var/lib/squeezeboxserver/prefs/favorites.opml"
-        try:
-            tree = ET.parse(opml_path)
-        except Exception:
-            return {"count": 0, "loop_loop": []}
-
-        root = tree.getroot()
-        body = root.find("body")
-        if body is None:
-            return {"count": 0, "loop_loop": []}
-
-        outlines = list(body.findall("outline"))
-        # item_id:<parent> filters children of a folder; parent id = index in
-        # the full flattened outline list.
-        parent_id = None
-        for a in args:
-            if a.startswith("item_id:"):
-                try:
-                    parent_id = int(a[8:])
-                except ValueError:
-                    parent_id = None
-
-        items = []
-        index = 0
-        for o in outlines:
-            attrs = o.attrib
-            name = attrs.get("text", attrs.get("title", "???"))
-            url = (attrs.get("URL") or "").strip()
-            children = list(o.findall("outline"))
-            if parent_id is None:
-                entry = {
-                    "id": str(index),
-                    "name": name,
-                    "url": url,
-                    "hasitems": 1 if children else (1 if not url else 0),
-                    "type": attrs.get("type", ""),
-                    "children": [],
-                }
-                items.append(entry)
-            elif index == parent_id and children:
-                for child in children:
-                    cattr = child.attrib
-                    cname = cattr.get("text", cattr.get("title", "???"))
-                    curl = (cattr.get("URL") or "").strip()
-                    gchildren = list(child.findall("outline"))
-                    items.append({
-                        "id": str(index),
-                        "name": cname,
-                        "url": curl,
-                        "hasitems": 1 if gchildren else 0,
-                        "type": cattr.get("type", ""),
-                        "children": [],
-                    })
-            index += 1
-
-        return {"count": len(items), "loop_loop": items}
-
-    async def _favorite_url(self, item_id: int) -> str:
-        """Return the stream URL for a favorite by flattened outline index."""
-        import xml.etree.ElementTree as ET
-        try:
-            tree = ET.parse("/var/lib/squeezeboxserver/prefs/favorites.opml")
-        except Exception:
-            return ""
-        body = tree.getroot().find("body")
-        if body is None:
-            return ""
-        outlines = list(body.findall("outline"))
-        if 0 <= item_id < len(outlines):
-            o = outlines[item_id]
-            return (o.attrib.get("URL") or "").strip()
-        return ""
 
     async def _json_browse(self, cmd: str, args: list[str]) -> dict:
         """Browse library tables (albums/artists/songs/genres) as JSON."""

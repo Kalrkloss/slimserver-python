@@ -4,10 +4,17 @@ Favorites manager — radio streams and folders, mirroring LMS "Favorites".
 Structure mirrors the original LMS favorites (OPML outlines): a favorite is
 either a folder (url is None) or a stream (url set). Folders nest to any
 depth; items are ordered by position within their parent.
+
+The DB table is the source of truth. On first use, an existing
+favorites.opml (written by the Perl LMS) is imported once so existing
+favorites survive the migration.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
+import xml.etree.ElementTree as ET
+from pathlib import Path
 from typing import Any, Optional
 
 from sqlalchemy import delete, select, update
@@ -16,6 +23,10 @@ from sqlalchemy.orm import selectinload
 from lyrion.database.schema import Favorite
 
 logger = logging.getLogger("lyrion.music.favorites")
+
+_OPML_PATH = Path("/var/lib/squeezeboxserver/prefs/favorites.opml")
+_opml_lock = asyncio.Lock()
+_opml_import_done = False
 
 
 class FavoritesManager:
@@ -45,6 +56,7 @@ class FavoritesManager:
 
     async def list_items(self, parent_id: Optional[int] = None) -> list[dict[str, Any]]:
         """Return favorites under parent_id (None = root), ordered by position."""
+        await ensure_opml_imported()
         async with self._db_session() as session:
             stmt = (
                 select(Favorite)
@@ -171,3 +183,61 @@ def get_favorites_manager() -> FavoritesManager:
     if _manager is None:
         _manager = FavoritesManager()
     return _manager
+
+
+async def ensure_opml_imported() -> None:
+    """Merge favorites.opml into the DB once per process.
+
+    Adds OPML favorites (written by the Perl LMS) that are not yet in the
+    DB (matched by URL for streams, by title+parent for folders), so
+    existing DB favorites are kept and the user's OPML favorites survive
+    the migration.
+    """
+    global _opml_import_done
+    if _opml_import_done:
+        return
+    async with _opml_lock:
+        if _opml_import_done:
+            return
+        _opml_import_done = True  # set before the work: add() re-enters
+        try:
+            if not _OPML_PATH.exists():
+                return
+            mgr = FavoritesManager()
+            async with mgr._db_session() as session:
+                rows = (await session.execute(
+                    select(Favorite.url, Favorite.title, Favorite.parent_id)
+                )).all()
+            known_urls = {r[0] for r in rows if r[0]}
+            known_folders = {(r[1], r[2]) for r in rows if not r[0]}
+            added = 0
+
+            async def _merge(outline: ET.Element, parent_id: Optional[int]) -> None:
+                nonlocal added
+                attrs = outline.attrib
+                name = attrs.get("text") or attrs.get("title") or "???"
+                url = (attrs.get("URL") or "").strip() or None
+                if url:
+                    if url in known_urls:
+                        return
+                    known_urls.add(url)
+                else:
+                    key = (name, parent_id)
+                    if key in known_folders:
+                        return
+                    known_folders.add(key)
+                new_id = await mgr.add(name, url, parent_id)
+                added += 1
+                for child in outline.findall("outline"):
+                    await _merge(child, new_id)
+
+            tree = ET.parse(_OPML_PATH)
+            body = tree.getroot().find("body")
+            if body is None:
+                return
+            for outline in body.findall("outline"):
+                await _merge(outline, None)
+            if added:
+                logger.info("Merged %d favorite(s) from %s into DB", added, _OPML_PATH)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("OPML favorites import failed: %s", exc)
