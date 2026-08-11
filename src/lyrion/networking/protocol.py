@@ -683,12 +683,20 @@ class SlimProtoClient:
                 # Taverne SqueezePlay, put their player name there).
                 model = "squeezelite"
                 display_name = ""
+                can_https = False
                 for part in cap_text.split(","):
                     part = part.strip()
                     if part.startswith("Model="):
                         model = part[6:]
                     elif part.startswith("ModelName="):
                         display_name = part[10:]
+                    elif part == "CanHTTPS=1":
+                        # Player can do TLS itself (SqueezeLite/ESP32 builds
+                        # with OpenSSL, SqueezePlay). https radio streams may
+                        # then be streamed DIRECTLY with the SSL flag; without
+                        # this cap they are proxied by the server (Perl LMS:
+                        # HTTP.pm canDirectStream + HTTPS.pm slimprotoFlags).
+                        can_https = True
 
                 logger.info(
                     "HELO from %s: model=%s display=%s mac=%s len=%d caps=%s",
@@ -757,7 +765,7 @@ class SlimProtoClient:
                     PlayerManager().register_player(
                         mac=mac_str, name=reg_name, ip=peer_ip,
                         port=peer[1] if peer else 0, model=model, firmware="2.0.0",
-                        name_source=src,
+                        name_source=src, can_https=can_https,
                     )
                     logger.info("Squeezelite player registered: %s (%s) model=%s src=%s", reg_name, mac_str, model, src)
                 except Exception as exc:
@@ -1144,6 +1152,21 @@ class SlimProtoClient:
 
         from urllib.parse import urlparse
         import socket as _socket
+
+        # Player without CanHTTPS=1 cannot do TLS itself → https streams
+        # must be proxied by the server (Perl LMS: canDirectStream returns
+        # 0 unless CanHTTPS; HTTPS.pm slimprotoFlags only sets the SSL flag
+        # for direct streams). http streams always go direct.
+        try:
+            from lyrion.player.manager import PlayerManager
+            pstate = PlayerManager().get_player(mac)
+        except Exception:
+            pstate = None
+        parsed_tmp = urlparse(url)
+        if parsed_tmp.scheme == "https" and not getattr(pstate, "can_https", False):
+            logger.info("Player %s cannot do TLS (no CanHTTPS cap) — proxying %s",
+                        mac, url[:60])
+            return await self._send_proxy_stream(mac, url, codec)
 
         try:
             parsed = urlparse(url)

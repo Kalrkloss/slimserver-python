@@ -52,6 +52,7 @@ class PlayerManager:
         model: str = "squeezebox",
         firmware: str = "unknown",
         name_source: str = "device",
+        can_https: bool = False,
     ) -> PlayerState:
         """Register a new player or update an existing one.
 
@@ -90,6 +91,7 @@ class PlayerManager:
                 player.name_source = name_source
             player.model = model or player.model
             player.firmware = firmware
+            player.can_https = can_https
             player.connected = True
             player.update_activity()
             logger.info("Player reconnected: %s (%s) src=%s", player.name, mac, player.name_source)
@@ -103,6 +105,7 @@ class PlayerManager:
                 model=model,
                 firmware=firmware,
                 connected=True,
+                can_https=can_https,
             )
             self.players[mac] = player
             logger.info("Player registered: %s (%s) [%s:%d] src=%s", name, mac, ip, port, name_source)

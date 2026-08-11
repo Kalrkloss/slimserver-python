@@ -55,6 +55,10 @@ class PlayerState:
     display_width: int = 320
     display_height: int = 32
     display_lines: int = 4
+    # Whether the player can do TLS itself (HELO cap "CanHTTPS=1").
+    # False → https radio streams must be proxied by the server
+    # (like the Perl LMS: canDirectStream honours CanHTTPS).
+    can_https: bool = False
 
     def update_activity(self) -> None:
         """Mark the last activity timestamp to now."""
