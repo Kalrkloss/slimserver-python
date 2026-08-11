@@ -187,6 +187,13 @@ class PlayerManager:
         """
         if not name:
             return False
+        if "\ufffd" in name:
+            # Player sent a corrupted name (U+FFFD replacement char, e.g.
+            # SqueezePlay that received the mangled name from an earlier
+            # utf-8-errors=replace decode). Never let it clobber the
+            # confirmed name from players.db.
+            logger.warning("Rejecting player name containing U+FFFD: %r", name)
+            return False
         player = self.players.get(mac)
         confirmed = False
         if player:
