@@ -472,12 +472,19 @@ class JSONRPCAPI:
                 from lyrion.music.favorites import get_favorites_manager
                 rest = args[1:]
                 parent = None
+                # item_id:<n> (SqueezeTray folder children) — highest priority
                 for a in rest:
                     if str(a).startswith("item_id:"):
                         try:
                             parent = int(str(a)[8:])
                         except ValueError:
                             parent = None
+                        break
+                if parent is None and len(rest) == 1 and str(rest[0]).isdigit():
+                    # Web UI: ['favorites','items','<parent_id>'] — a bare
+                    # number is the folder id (SqueezeTray sends multiple
+                    # args: start/count/want_url — never a bare parent).
+                    parent = int(str(rest[0]))
                 items = await get_favorites_manager().list_items(parent)
                 loop = []
                 for it in items:
