@@ -487,6 +487,40 @@ class JSONRPCAPI:
             return await self._json_player_status(pm, pid, args)
 
         # ── Control commands (return {} — LMS convention) ──────────
+        # ── CLI query commands: <cmd> ? → {"_<cmd>": value} ──────
+        # LMS JSON-RPC convention (ioBroker.squeezeboxrpc, Squeezer,
+        # SqueezeClient): single-value queries are answered with the
+        # command name prefixed by '_' as the result key.
+        if args and len(args) == 1 and str(args[0]) == "?":
+            player = pm.get_player(pid) if pid else None
+            if player is not None:
+                val: Any = ""
+                if cmd == "mode":
+                    val = player.mode
+                elif cmd == "name":
+                    val = player.name or ""
+                elif cmd == "power":
+                    val = 1 if player.power else 0
+                elif cmd == "current_title":
+                    val = getattr(player, "current_title", "") or ""
+                elif cmd in ("current_url", "url"):
+                    val = getattr(player, "current_url", "") or ""
+                elif cmd == "playlist":
+                    val = len(getattr(player, "playlist", []) or [])
+                elif cmd in ("artist", "album"):
+                    tid = getattr(player, "current_track_id", None)
+                    if tid is not None:
+                        info = await self._load_tracks([tid])
+                        val = (info.get(tid, {}) or {}).get(cmd, "") or ""
+                return {f"_{cmd}": val}
+            return {f"_{cmd}": ""}
+
+        # mixer volume ? → {"_volume": N}
+        if cmd == "mixer" and args and len(args) == 2 \
+                and str(args[0]) == "volume" and str(args[1]) == "?":
+            player = pm.get_player(pid) if pid else None
+            return {"_volume": player.volume if player else 0}
+
         if cmd in ("pause", "power", "play", "stop", "mixer", "sync",
                    "unsync", "pref", "playerpref", "display", "button",
                    "alarm", "signalstrength", "client", "mode", "name",
