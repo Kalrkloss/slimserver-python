@@ -1,7 +1,9 @@
 """JSON-RPC API for Lyrion Music Server."""
 from __future__ import annotations
 
+import json
 import logging
+import time
 from typing import Any, Callable, Optional
 
 try:
@@ -59,6 +61,9 @@ class JSONRPCAPI:
 
     def __init__(self) -> None:
         self._methods: dict[str, Callable] = {}
+        # Short-TTL cache for status/serverstatus/players polls
+        # (misbehaving clients can flood the server otherwise).
+        self._status_cache: dict[tuple, tuple[float, Any]] = {}
         self._register_default_methods()
 
     # ------------------------------------------------------------------
@@ -407,6 +412,20 @@ class JSONRPCAPI:
         args = command[1:] if len(command) > 1 else []
         pid = player_id if player_id and player_id != "-" else None
 
+        # Status/serverstatus polls from remote apps (a misbehaving
+        # SqueezeTray can issue hundreds of identical requests per
+        # second) — cache the response for 1s to keep the server
+        # responsive for everyone else.
+        cacheable = cmd in ("status", "serverstatus", "players")
+        cache_key: tuple | None = None
+        if cacheable:
+            cache_key = (str(pid), str(cmd), json.dumps(args, sort_keys=True))
+            cached = self._status_cache.get(cache_key)
+            now = time.time()
+            if cached and now - cached[0] < 1.0:
+                return cached[1]
+            self._cache_hit = False
+
         try:
             from lyrion.player.manager import PlayerManager
             pm = PlayerManager()
@@ -441,7 +460,10 @@ class JSONRPCAPI:
             # the position within the paginated slice.
             for i, entry in enumerate(loop):
                 entry["playerindex"] = start + i
-            return {"count": len(players), "players_loop": loop}
+            result = {"count": len(players), "players_loop": loop}
+            if cacheable:
+                self._status_cache[cache_key] = (time.time(), result)
+            return result
 
         # ── serverstatus ───────────────────────────────────────────
         if cmd == "serverstatus":
@@ -487,11 +509,16 @@ class JSONRPCAPI:
                 }
                 for i, p in enumerate(players)
             ]
+            if cacheable:
+                self._status_cache[cache_key] = (time.time(), result)
             return result
 
         # ── status (player) ────────────────────────────────────────
         if cmd == "status":
-            return await self._json_player_status(pm, pid, args)
+            result = await self._json_player_status(pm, pid, args)
+            if cacheable:
+                self._status_cache[cache_key] = (time.time(), result)
+            return result
 
         # ── Control commands (return {} — LMS convention) ──────────
         # ── CLI query commands: <cmd> ? → {"_<cmd>": value} ──────
