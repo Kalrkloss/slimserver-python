@@ -1,0 +1,781 @@
+/**
+ * LMS-Material
+ *
+ * Copyright (c) 2018-2026 Craig Drummond <craig.p.drummond@gmail.com>
+ * MIT license.
+ */
+'use strict';
+
+var TB_SETTINGS        = {id:0, hdr: true };
+var TB_UI_SETTINGS     = {id:1, svg:  "ui-settings" };
+var TB_PLAYER_SETTINGS = {id:2, svg:  "player-settings" };
+var TB_SERVER_SETTINGS = {id:3, svg:  "server-settings" };
+var TB_APP_SETTINGS    = {id:4, svg:  "app-settings" };
+var TB_INFO            = {id:5, icon: "info_outline" };
+var TB_MANAGE_PLAYERS  = {id:6, svg:  "player-manager" };
+var TB_START_PLAYER    = {id:7, icon: "surround_sound" }
+var TB_APP_QUIT        = {id:8, svg:  "close" }
+
+const TB_CUSTOM_SETTINGS_ACTIONS = {id:20};
+
+Vue.component('lms-navdrawer', {
+    template: `
+<v-navigation-drawer v-model="show" app temporary :width="maxWidth" style="display:flex;flex-direction:column">
+ <div class="nd-top"></div>
+ <div class="nd-header">
+  <v-menu v-if="enableMenuButton" bottom left v-model="showMenu" style="position:absolute; right:40px; z-index:5">
+   <v-btn icon slot="activator" :title="i18n('Menu')"><v-icon>more_vert</v-icon></v-btn>
+   <v-list>
+    <v-subheader v-if="multipleStandardPlayers">{{i18n("All players")}}</v-subheader>
+    <v-list-tile v-if="multipleStandardPlayers" role="menuitem" @click="sleepAll()" class="menu-group-item">
+     <v-list-tile-avatar><v-icon>hotel</v-icon></v-list-tile-avatar>
+     <v-list-tile-content><v-list-tile-title>{{i18n('Sleep')}}</v-list-tile-title></v-list-tile-content>
+    </v-list-tile>
+    <v-list-tile v-if="multipleStandardPlayers" role="menuitem" @click="powerAll(0)" class="menu-group-item">
+     <v-list-tile-avatar><v-icon class="dimmed">power_settings_new</v-icon></v-list-tile-avatar>
+     <v-list-tile-content><v-list-tile-title>{{i18n('Switch off')}}</v-list-tile-title></v-list-tile-content>
+    </v-list-tile>
+    <v-list-tile v-if="multipleStandardPlayers" role="menuitem" @click="powerAll(1)" class="menu-group-item">
+     <v-list-tile-avatar><v-icon>power_settings_new</v-icon></v-list-tile-avatar>
+     <v-list-tile-content><v-list-tile-title>{{i18n('Switch on')}}</v-list-tile-title></v-list-tile-content>
+    </v-list-tile>
+    <v-divider v-if="multipleStandardPlayers"></v-divider>
+    <v-list-tile v-if="numPlayers>1" role="menuitem" @click="configurePlayerList">
+     <v-list-tile-avatar><img class="svg-img" :src="'list-configure' | svgIcon(darkUi)"></img></v-list-tile-avatar>
+     <v-list-tile-content><v-list-tile-title>{{i18n('Configure player list')}}</v-list-tile-title></v-list-tile-content>
+    </v-list-tile>
+    <v-list-tile v-if="numPlayers!=numEnabledPlayers" role="menuitem" @click="toggleShowAllPlayers">
+     <v-list-tile-avatar><v-icon>{{showAllPlayers ? 'check_box' : 'check_box_outline_blank'}}</v-icon></v-list-tile-avatar>
+     <v-list-tile-content><v-list-tile-title>{{i18n('Show all players')}}</v-list-tile-title></v-list-tile-content>
+    </v-list-tile>
+    <v-divider v-if="LMS_P_USERS || showCustomSystemActions"></v-divider>
+    <v-list-tile role="menuitem" @click="switchUser" v-if="LMS_P_USERS">
+     <v-list-tile-avatar><img class="svg-img" :src="'user-switch' | svgIcon(darkUi)"></img>
+     </v-list-tile-avatar>
+     <v-list-tile-content><v-list-tile-title>{{i18n('Switch user')}}</v-list-tile-title></v-list-tile-content>
+    </v-list-tile>
+    <template v-if="showCustomSystemActions" v-for="(action, index) in customSystemActions">
+     <v-list-tile role="menuitem" @click="doCustomAction(action)" v-if="undefined==action.players || action.players.indexOf(player.id)>=0">
+      <v-list-tile-avatar><v-icon v-if="action.icon">{{action.icon}}</v-icon><img v-else-if="action.svg" class="svg-img" :src="action.svg | svgIcon(darkUi)"></img></v-list-tile-avatar>
+      <v-list-tile-content><v-list-tile-title>{{action.title}}</v-list-tile-title></v-list-tile-content>
+     </v-list-tile>
+    </template>
+   </v-list>
+  </v-menu>
+  <v-list-tile @click.prevent="close">
+   <v-list-tile-avatar v-if="(undefined==queryParams.dragleft || queryParams.dragleft<=48) && ('l'!=queryParams.tbarBtnsPos)" :title="i18n('Close')"><v-btn icon flat @click="show=false"><v-icon v-bind:class="{'apple-back':IS_APPLE}">{{BACK_ARROW}}<v-icon></v-btn></v-list-tile-avatar>
+   <div v-if="LMS_P_USERS" class="nd-user">
+    <div class="nd-avatar">
+     <img v-if="undefined!=userAvatar.img" class="user-img" :src="userAvatar.img"></img>
+     <img v-else-if="undefined!=userAvatar.svg" class="svg-img" :src="userAvatar.svg | svgIcon(darkUi)"></img>
+     <v-icon v-else>{{userAvatar.icon}}</v-icon>
+    </div>
+    <div class="ellipsis">{{userName}}</div>
+   </div>
+   <div v-else class="lyrion-logo" v-longpress:nomove="clickLogo"><img :src="'lyrion-logo' | svgIcon(darkUi)"></img></div>
+   <v-list-tile-action>
+    <v-btn icon @click="menuAction(TB_INFO.id)" style="position:absolute;right:16px" :title="updatesAvailable ? trans.updatesAvailable : restartRequired ? trans.restartRequired : TB_INFO.title">
+     <img v-if="updatesAvailable" class="svg-img" :src="'update' | infoIcon(darkUi, true)"></img>
+     <img v-else-if="restartRequired" class="svg-img" :src="'restart' | infoIcon(darkUi, true)">
+     <v-icon v-else>{{TB_INFO.icon}}</v-icon>
+    </v-btn>
+   </v-list-tile-action>
+  </v-list-tile>
+ </div>
+ <div class="nd-main" id="nd-list">
+  <v-list class="nd-list py-0">
+   <v-list-tile v-if="!connected" @click="bus.$emit('showError', undefined, trans.connectionLost)">
+    <v-list-tile-avatar><v-icon class="red">error</v-icon></v-list-tile-avatar>
+    <v-list-tile-content><v-list-tile-title>{{trans.connectionLost}}</v-list-tile-title></v-list-tile-content>
+   </v-list-tile>
+   <template v-for="(item, index) in visiblePlayers" v-if="connected">
+    <v-subheader v-if="index==0 && !item.isgroup && visiblePlayers[visiblePlayers.length-1].isgroup">{{trans.standardPlayers}}</v-subheader>
+    <v-subheader v-else-if="index>0 && item.isgroup && !visiblePlayers[index-1].isgroup">{{trans.groupPlayers}}</v-subheader>
+    <v-list-tile @click="setPlayer(item.id)" v-bind:class="{'nd-active-player':player && item.id === player.id}" :id="'nd-player-'+index">
+     <v-list-tile-avatar v-longpress:nomove="syncPlayer" :id="index+'-icon'">
+      <v-icon v-if="item.isplaying" class="playing-badge">play_arrow</v-icon>
+      <v-icon v-if="item.icon.icon">{{item.icon.icon}}</v-icon><img v-else class="svg-img" :src="item.icon.svg | svgIcon(darkUi)"></img>
+     </v-list-tile-avatar>
+     <v-list-tile-content>
+      <v-list-tile-title>{{item.name}}</v-list-tile-title>
+     </v-list-tile-content>
+      <v-list-tile-action v-if="index<10 && keyboardControl" class="menu-shortcut menu-shortcut-player" v-bind:class="{'menu-shortcut-player-apple':IS_APPLE}">{{index|playerShortcut}}</v-list-tile-action>
+      <v-list-tile-action>
+       <v-btn v-if="item.canpoweroff" icon style="float:right" v-longpress:nomove="togglePower" :id="index+'-power-btn'" :title="(item.id==player.id && playerStatus.ison) || item.ison ? i18n('Switch off %1', item.name) : i18n('Switch on %1', item.name)"><v-icon v-bind:class="{'dimmed': (item.id==player.id ? !playerStatus.ison : !item.ison)}">power_settings_new</v-icon></v-btn>
+      </v-list-tile-action>
+    </v-list-tile>
+    <v-list-tile v-if="connected && player && item.id === player.id && (playerStatus.sleepTime || playerStatus.alarmStr)" class="hide-for-mini status">
+     <div v-if="playerStatus.sleepTime" class="link-item" @click="show=false; bus.$emit('dlg.open', 'sleep', player)"><v-icon class="player-status-icon">hotel</v-icon> {{playerStatus.sleepTime | displayTime}}</div>
+     <div v-if="playerStatus.alarmStr" class="link-item" @click="show=false; bus.$emit('dlg.open', 'playersettings', undefined, 'alarms')"><v-icon class="player-status-icon">alarm</v-icon> {{playerStatus.alarmStr}}</div>
+    </v-list-tile>
+   </template>
+
+   <v-divider v-if="playersDivider" class="hide-for-mini"></v-divider>
+
+   <v-list-tile v-if="showManagePlayers" v-longpress:nomove="managePlayers" class="hide-for-mini noselect">
+    <v-list-tile-avatar><img class="svg-img" :src="TB_MANAGE_PLAYERS.svg | svgIcon(darkUi)"></img></v-list-tile-avatar>
+    <v-list-tile-content><v-list-tile-title>{{TB_MANAGE_PLAYERS.title}}</v-list-tile-title></v-list-tile-content>
+    <v-list-tile-action v-if="TB_MANAGE_PLAYERS.shortcut && keyboardControl" class="menu-shortcut player-menu-shortcut">{{TB_MANAGE_PLAYERS.shortcut}}</v-list-tile-action>
+   </v-list-tile>
+
+   <v-list-tile :href="appLaunchPlayer" v-if="undefined!=appLaunchPlayer && connected && !haveLocalPlayer" @click="show=false">
+    <v-list-tile-avatar><v-icon>{{TB_START_PLAYER.icon}}</v-icon></v-list-tile-avatar>
+    <v-list-tile-title>{{TB_START_PLAYER.title}}</v-list-tile-title>
+   </v-list-tile>
+
+   <template v-if="showCustomActions" v-for="(action, index) in customPlayerActions">
+    <v-list-tile @click="doCustomAction(action)" v-if="undefined==action.players || action.players.indexOf(player.id)>=0">
+     <v-list-tile-avatar><v-icon v-if="action.icon">{{action.icon}}</v-icon><img v-else-if="action.svg" class="svg-img" :src="action.svg | svgIcon(darkUi)"></img></v-list-tile-avatar>
+     <v-list-tile-content><v-list-tile-title>{{action.title}}</v-list-tile-title></v-list-tile-content>
+    </v-list-tile>
+   </template>
+
+  </v-list>
+  <v-spacer></v-spacer>
+ </div>
+
+ <div style="height:1px; width:100%; border-top:1px solid var(--list-item-border-color)!important;"></div>
+ <div v-if="showShortcuts">
+  <v-subheader>{{trans.shortcuts}}</v-subheader>
+  <ul class="nd-shortcuts" v-bind:class="{'nd-shortcuts-wide':maxWidth>320}">
+   <li v-for="(item, index) in shortcuts">
+    <v-btn icon class="toolbar-button" @click="show=false; bus.$emit('browse-shortcut', item.id)" v-if="!homeButton || item.id!=HOME_SHORTCUT" :title="item.title">
+     <v-icon v-if="undefined!=item.icon">{{item.icon}}</v-icon>
+     <img v-else class="svg-img" :src="item.svg | svgIcon(darkUi)"></img>
+    </v-btn>
+   </li>
+  </ul>
+ </div>
+ <div v-if="settingsIcons">
+  <v-subheader>{{TB_SETTINGS.title}}</v-subheader>
+  <ul class="nd-shortcuts" v-bind:class="{'nd-shortcuts-wide':maxWidth>320}">
+   <template v-for="(item, index) in menuItems">
+    <li :title="item.title" v-if="item!=DIVIDER && !item.hdr && (TB_PLAYER_SETTINGS.id==item.id ? (player && connected) : (TB_SERVER_SETTINGS.id!=item.id || (unlockAll && connected)))">
+     <v-btn v-if="TB_APP_SETTINGS.id==item.id" :href="queryParams.appSettings" @click="show=false" icon class="toolbar-button">
+      <img class="svg-img" :src="TB_APP_SETTINGS.svg | svgIcon(darkUi)"></img>
+     </v-btn>
+     <v-btn v-else-if="TB_CUSTOM_SETTINGS_ACTIONS.id!=item.id" icon class="toolbar-button" @click="menuAction(item.id)">
+      <v-icon v-if="undefined!=item.icon">{{item.icon}}</v-icon>
+      <img v-else class="svg-img" :src="item.svg | svgIcon(darkUi)"></img>
+     </v-btn>
+    </li>
+    <template v-if="TB_CUSTOM_SETTINGS_ACTIONS.id==item.id && undefined!=customSettingsActions && customSettingsActions.length>0" v-for="(action, actIndex) in customSettingsActions">
+     <li><v-btn icon class="toolbar-button" @click="doCustomAction(action)" :title="action.title" v-if="action.icon || action.svg">
+      <v-icon v-if="action.icon">{{action.icon}}</v-icon><img v-else class="svg-img" :src="action.svg | svgIcon(darkUi)"></img>
+     </v-btn></li>
+    </template>
+   </template>
+  </ul>
+  <v-divider v-if="queryParams.appQuit" style="margin-top:8px"></v-divider>
+   <v-list-tile :href="queryParams.appQuit" @click="$emit('quit')" v-if="queryParams.appQuit">
+   <v-list-tile-avatar><img class="svg-img" :src="TB_APP_QUIT.svg | svgIcon(darkUi)"></img></v-list-tile-avatar>
+   <v-list-tile-title>{{TB_APP_QUIT.title}}</v-list-tile-title>
+  </v-list-tile>
+ </div>
+ <v-list class="nd-list py-0" v-else>
+  <template v-for="(item, index) in menuItems">
+   <v-divider v-if="item===DIVIDER"></v-divider>
+   <v-subheader v-else-if="item.hdr">{{item.title}}</v-subheader>
+   <v-list-tile @click="menuAction(item.id)" v-else-if="(TB_UI_SETTINGS.id==item.id) || (TB_PLAYER_SETTINGS.id==item.id && player && connected) || (TB_SERVER_SETTINGS.id==item.id && unlockAll && connected)">
+    <v-list-tile-avatar><img v-if="item.svg" class="svg-img" :src="item.svg | svgIcon(darkUi)"><v-icon v-else>{{item.icon}}</v-icon></v-list-tile-avatar>
+    <v-list-tile-content>
+     <v-list-tile-title>{{item.stitle ? item.stitle : item.title}}</v-list-tile-title>
+    </v-list-tile-content>
+    <v-list-tile-action v-if="item.shortcut && keyboardControl" class="menu-shortcut">{{item.shortcut}}</v-list-tile-action>
+   </v-list-tile>
+   <v-list-tile v-else-if="TB_APP_SETTINGS.id==item.id" :href="queryParams.appSettings" @click="show=false">
+    <v-list-tile-avatar><img class="svg-img" :src="TB_APP_SETTINGS.svg | svgIcon(darkUi)"></img></v-list-tile-avatar>
+    <v-list-tile-content><v-list-tile-title>{{TB_APP_SETTINGS.stitle}}</v-list-tile-title></v-list-tile-content>
+   </v-list-tile>
+   <template v-else-if="TB_CUSTOM_SETTINGS_ACTIONS.id==item.id && undefined!=customSettingsActions && customSettingsActions.length>0" v-for="(action, actIndex) in customSettingsActions">
+    <v-list-tile @click="doCustomAction(action)">
+     <v-list-tile-avatar><v-icon v-if="action.icon">{{action.icon}}</v-icon><img v-else-if="action.svg" class="svg-img" :src="action.svg | svgIcon(darkUi)"></img></v-list-tile-avatar>
+     <v-list-tile-content><v-list-tile-title>{{action.title}}</v-list-tile-title></v-list-tile-content>
+    </v-list-tile>
+   </template>
+  </template>
+  <v-divider v-if="queryParams.appQuit"></v-divider>
+  <v-list-tile :href="queryParams.appQuit" @click="$emit('quit')" v-if="queryParams.appQuit">
+   <v-list-tile-avatar><img class="svg-img" :src="TB_APP_QUIT.svg | svgIcon(darkUi)"></img></v-list-tile-avatar>
+   <v-list-tile-title>{{TB_APP_QUIT.title}}</v-list-tile-title>
+  </v-list-tile>
+ </v-list>
+ <div class="nd-bottom"></div>
+</v-navigation-drawer>
+`,
+    props: [],
+    data() {
+        return {
+            show: false,
+            showMenu: false,
+            trans:{groupPlayers:undefined, standardPlayers:undefined, connectionLost:undefined, updatesAvailable:undefined, restartRequired:undefined,
+                   shortcuts:undefined, generalUser: undefined, unknownUser:undefined },
+            menuItems: [],
+            shortcuts: [],
+            users: [],
+            customSystemActions:undefined,
+            customSettingsActions:undefined,
+            customPlayerActions:undefined,
+            playerStatus: { ison: 1, isplaying: false, volume: 0, synced: false, sleepTime: undefined, count:0, alarm: undefined, alarmStr: undefined },
+            appLaunchPlayer: queryParams.appLaunchPlayer,
+            maxWidth: 300,
+            height: 50,
+            connected: true,
+            windowControlsOnLeft: false,
+            showAllPlayers: false
+        }
+    },
+    created() {
+        try {
+            let tbRect = window.navigator.windowControlsOverlay.getTitlebarAreaRect();
+            this.windowControlsOnLeft = tbRect.left>32;
+        } catch (e) { }
+        bus.$on('langChanged', function() {
+            this.initItems();
+        }.bind(this));
+        bus.$on('homeScreenItems', function(view) {
+            this.updateShortcuts(view);
+        }.bind(this));
+        this.initItems();
+        this.showAllPlayers = getLocalStorageBool('nd-showAllPlayers', this.showAllPlayers);
+        bus.$on('navDrawer', function() {
+            this.show = true;
+            addBrowserHistoryItem();
+            if (this.$store.state.player) {
+                for (let i=0, loop=this.visiblePlayers, len=loop.length; i<len; ++i) {
+                    if (loop[i].id==this.$store.state.player.id) {
+                        let list = document.getElementById('nd-list', 0);
+                        if (i<2) {
+                            setElemScrollTop(list, 0);
+                        } else {
+                            let listHeight = list.clientHeight;
+                            let entrySize = 48;
+                            let elementTop = list.offsetTop;
+                            let divTop = document.getElementById('nd-player-'+i).offsetTop;
+                            let elementRelativeTop = divTop - elementTop;
+
+                            if ((elementRelativeTop + (2*entrySize)) > listHeight) {
+                                setElemScrollTop(list, elementRelativeTop-entrySize);
+                            }
+                        }
+                        break;
+                    }
+                }
+            }
+        }.bind(this));
+        this.maxWidth = window.innerWidth>500 ? 400 : 300;
+        bus.$on('windowWidthChanged', function() {
+            this.maxWidth = window.innerWidth>500 ? 400 : 300;
+        }.bind(this));
+        this.height = Math.floor(window.innerHeight/20)*20;
+        bus.$on('windowHeightChanged', function() {
+            this.height = Math.floor(window.innerHeight/20)*20;
+        }.bind(this));
+        bus.$on('customActions', function() {
+            if (undefined==this.customSettingsActions) {
+                this.updateCustomActions();
+            }
+        }.bind(this));
+        bus.$on('lockChanged', function() {
+            this.updateCustomActions();
+        }.bind(this));
+        bus.$on('closeMenu', function() {
+            this.close();
+        }.bind(this));
+        bus.$on('networkStatus', function(connected) {
+            this.connected=connected;
+        }.bind(this));
+        bus.$on('playerStatus', function(playerStatus) {
+            if (playerStatus.ison!=this.playerStatus.ison) {
+                this.playerStatus.ison = playerStatus.ison;
+            }
+            if (playerStatus.isplaying!=this.playerStatus.isplaying) {
+                this.playerStatus.isplaying = playerStatus.isplaying;
+            }
+            this.controlSleepTimer(playerStatus.will_sleep_in);
+            if (playerStatus.synced!=this.playerStatus.synced) {
+                this.playerStatus.synced = playerStatus.synced;
+            }
+            this.playerId = ""+this.$store.state.player.id;
+            if (this.playerStatus.alarm!=playerStatus.alarm) {
+                if (undefined==playerStatus.alarm) {
+                    this.playerStatus.alarmStr = undefined;
+                } else {
+                    let alarmDate = new Date(playerStatus.alarm*1000);
+                    this.playerStatus.alarmStr = dateStr(alarmDate, this.$store.state.lang)+" "+timeStr(alarmDate, this.$store.state.lang);
+                }
+                this.playerStatus.alarm=playerStatus.alarm;
+            }
+        }.bind(this));
+
+        this.updateCustomActions();
+
+        if (!IS_MOBILE && !LMS_KIOSK_MODE) {
+            bindKey(LMS_UI_SETTINGS_KEYBOARD, 'mod');
+            bindKey(LMS_PLAYER_SETTINGS_KEYBOARD, 'mod');
+            bindKey(LMS_SERVER_SETTINGS_KEYBOARD, 'mod');
+            bindKey(LMS_INFORMATION_KEYBOARD, 'mod');
+            bindKey(LMS_MANAGEPLAYERS_KEYBOARD, 'mod');
+            for (var i=0; i<=9; ++i) {
+                bindKey(''+i, 'alt');
+            }
+            bus.$on('keyboard', function(key, modifier) {
+                if (this.$store.state.openDialogs.length>1 || (1==this.$store.state.openDialogs.length && this.$store.state.openDialogs[0]!='info-dialog')) {
+                    return;
+                }
+                if ('mod'==modifier) {
+                    if (this.$store.state.visibleMenus.size==0 || (this.$store.state.visibleMenus.size==1 && this.$store.state.visibleMenus.has('navdrawer'))) {
+                        if (LMS_UI_SETTINGS_KEYBOARD==key || LMS_PLAYER_SETTINGS_KEYBOARD==key || LMS_SERVER_SETTINGS_KEYBOARD==key || LMS_INFORMATION_KEYBOARD==key ||
+                            (LMS_MANAGEPLAYERS_KEYBOARD==key && this.$store.state.players.length>1)) {
+                            this.menuAction(LMS_UI_SETTINGS_KEYBOARD==key ? TB_UI_SETTINGS.id : LMS_PLAYER_SETTINGS_KEYBOARD==key ? TB_PLAYER_SETTINGS.id :
+                                            LMS_SERVER_SETTINGS_KEYBOARD==key ? TB_SERVER_SETTINGS.id :
+                                            LMS_INFORMATION_KEYBOARD==key ? TB_INFO.id : TB_MANAGE_PLAYERS.id);
+                        }
+                    }
+                } else if ('alt'==modifier && 1==key.length && !isNaN(key)) {
+                    var player = parseInt(key);
+                    if (player==0) {
+                        player=10;
+                    } else {
+                        player=player-1;
+                    }
+                    if (player<this.$store.state.players.length) {
+                        var id = this.$store.state.players[player].id;
+                        if (id!=this.$store.state.player.id) {
+                            this.setPlayer(id);
+                        }
+                    }
+                }
+            }.bind(this));
+        }
+    },
+    methods: {
+        initItems() {
+            TB_SETTINGS.title=i18n('Settings');
+            TB_UI_SETTINGS.title=i18n('Interface settings');
+            TB_UI_SETTINGS.stitle=i18n('Interface');
+            TB_UI_SETTINGS.shortcut=shortcutStr(LMS_UI_SETTINGS_KEYBOARD);
+            TB_PLAYER_SETTINGS.title=i18n('Player settings');
+            TB_PLAYER_SETTINGS.stitle=i18n('Player');
+            TB_PLAYER_SETTINGS.shortcut=shortcutStr(LMS_PLAYER_SETTINGS_KEYBOARD);
+            TB_SERVER_SETTINGS.title=i18n('Server settings');
+            TB_SERVER_SETTINGS.stitle=i18n('Server');
+            TB_SERVER_SETTINGS.shortcut=shortcutStr(LMS_SERVER_SETTINGS_KEYBOARD);
+            TB_INFO.title=i18n('Information');
+            TB_INFO.shortcut=shortcutStr(LMS_INFORMATION_KEYBOARD);
+            TB_MANAGE_PLAYERS.title=i18n('Manage players');
+            TB_MANAGE_PLAYERS.shortcut=shortcutStr(LMS_MANAGEPLAYERS_KEYBOARD);
+            TB_APP_SETTINGS.title=i18n('Application settings');
+            TB_APP_SETTINGS.stitle=i18n('Application');
+            TB_START_PLAYER.title=i18n('Start player');
+            TB_APP_QUIT.title=i18n('Quit');
+            this.trans = { groupPlayers:i18n("Group Players"), standardPlayers:i18n("Standard Players"), connectionLost:i18n('Server connection lost!'),
+                           updatesAvailable:i18n('Updates available'), restartRequired:i18n('Restart required'), shortcuts:i18n('Shortcuts'),
+                           generalUser:"LYRION", unknownUser:i18n("Unknown") };
+            if (LMS_KIOSK_MODE) {
+                this.menuItems = [];
+                this.menuLength = this.menuItems.length;
+            } else {
+                if (queryParams.party) {
+                    this.menuItems = queryParams.appSettings ? [TB_SETTINGS, TB_APP_SETTINGS, TB_UI_SETTINGS] : [TB_SETTINGS, TB_UI_SETTINGS];
+                    this.menuLength = this.menuItems.length;
+                } else {
+                    this.menuItems = queryParams.appSettings
+                        ? [TB_SETTINGS, TB_APP_SETTINGS, TB_UI_SETTINGS, TB_PLAYER_SETTINGS, TB_SERVER_SETTINGS, TB_CUSTOM_SETTINGS_ACTIONS]
+                        : [TB_SETTINGS, TB_UI_SETTINGS, TB_PLAYER_SETTINGS, TB_SERVER_SETTINGS, TB_CUSTOM_SETTINGS_ACTIONS]
+                    this.menuLength = this.menuItems.length - 1;
+                }
+            }
+        },
+        updateCustomActions() {
+            this.customSettingsActions = getCustomActions("settings", this.$store.state.unlockAll);
+            this.customPlayerActions = getCustomActions("players", this.$store.state.unlockAll);
+            this.customSystemActions = getCustomActions(undefined, this.$store.state.unlockAll);
+        },
+        updateShortcuts(view) {
+            this.shortcuts = [];
+            if (undefined!=view && undefined!=view.top) {
+                for (let i=0, items=view.top, len=items.length; i<len; ++i) {
+                    let item = items[i];
+                    if ((undefined==item.menu || item.menu.length<1 || item.menu[0]!=PLAY_ACTION) && item.stdItem!=STD_ITEM_RANDOM_MIX && !view.hidden.has(item.id) && item.id!=START_RANDOM_MIX_ID && (item.id!=TOP_RADIO_ID || !lmsOptions.combineAppsAndRadio)) {
+                        this.shortcuts.push({id:item.id, icon:item.icon, svg:item.svg, title:item.title});
+                    }
+                }
+                if (!this.$store.state.browseSearch) {
+                    this.shortcuts.unshift({id:SEARCH_SHORTCUT, svg:ACTIONS[SEARCH_LIB_ACTION].svg, title:ACTIONS[SEARCH_LIB_ACTION].title});
+                }
+                if (this.shortcuts.length>0) {
+                    this.shortcuts.unshift({id:HOME_SHORTCUT, icon:'home', title:i18n('Home')});
+                }
+            }
+        },
+        setPlayer(id) {
+            if (id == this.$store.state.player.id) {
+                bus.$emit('refreshStatus');
+            } else {
+                this.$store.commit('setPlayer', id);
+            }
+            this.show = false;
+        },
+        close() {
+            if (this.showMenu) {
+                this.showMenu = false;
+            } else {
+                this.show=false;
+            }
+        },
+        sleepAll(event) {
+            storeClickOrTouchPos(event);
+            bus.$emit('dlg.open', 'sleep');
+            this.show=false;
+        },
+        powerAll(state) {
+            this.$store.state.players.forEach(p => {
+                if (p.enabled) {
+                    lmsCommand(p.id, ['power', state]).then(({d}) => { 
+                        bus.$emit('updatePlayer', p.id);
+                    })
+                }
+            });
+        },
+        managePlayers(longPress, el, event) {
+            if (event) {
+                event.preventDefault();
+                event.stopPropagation();
+            }
+            if (longPress) {
+                // Leave menu open for 1/4 of a second so that it captures the
+                // click/touch end event. If we close immediately then the element
+                // that long-press was bound to no longer exists so it can't stop
+                // the event => sometimes na entry in the sync-dialog gets this
+                // and toggles its setting.
+                setTimeout(function () {
+                    this.show = false;
+                    bus.$emit('dlg.open', 'sync', this.$store.state.player);
+                }.bind(this), 250);
+            } else {
+                this.menuAction(TB_MANAGE_PLAYERS.id);
+            }
+        },
+        menuAction(id) {
+            if (TB_UI_SETTINGS.id==id) {
+                bus.$emit('dlg.open', 'uisettings');
+            } else if (TB_PLAYER_SETTINGS.id==id) {
+                if (this.connected) {
+                    bus.$emit('dlg.open', 'playersettings');
+                }
+            } else if (TB_SERVER_SETTINGS.id==id) {
+                if (this.$store.state.unlockAll && this.connected) {
+                    lmsCommand("", ["material-skin", "server"]).then(({data}) => {
+                        if (data && data.result) {
+                            openServerSettings(data.result.libraryname, 0);
+                        }
+                    }).catch(err => {
+                    });
+                }
+            } else if (TB_INFO.id==id) {
+                bus.$emit('dlg.open', 'info');
+            } else if (TB_MANAGE_PLAYERS.id==id) {
+                if (this.connected) {
+                    bus.$emit('dlg.open', 'manage');
+                }
+            } else {
+                bus.$emit('toolbarAction', id);
+            }
+            this.show = false;
+        },
+        togglePlayerPower(player, longPress) {
+            if (queryParams.party) {
+                return;
+            }
+            if (longPress) {
+                this.show = false;
+                bus.$emit('dlg.open', 'sleep', player);
+            } else {
+                let ison = this.$store.state.player.id == player.id ? this.playerStatus.ison : player.ison;
+                if (!player.isgroup) {
+                    if (1==queryParams.nativePlayerPower) {
+                        try {
+                            if (1==NativeReceiver.controlLocalPlayerPower(player.id, player.ip, ison ? 0 : 1)) {
+                                setTimeout(function () {
+                                    bus.$emit('refreshServerStatus');
+                                    setTimeout(function () { bus.$emit('refreshServerStatus');}.bind(this), 1000);
+                                }.bind(this), 500);
+                                return;
+                            }
+                        } catch (e) {
+                        }
+                    } else if (queryParams.nativePlayerPower>0) {
+                        emitNative("MATERIAL-PLAYERPOWER\nID " + player.id+"\nIP "+player.ip+"\nSTATE "+(ison ? 0 : 1), queryParams.nativePlayerPower);
+                    }
+                }
+                lmsCommand(player.id, ["power", ison ? "0" : "1"]).then(({data}) => {
+                    bus.$emit('refreshStatus', player.id);
+                    // Status seems to take while to update, so check again 1/2 second later...
+                    setTimeout(function () {
+                        bus.$emit('refreshStatus', player.id);
+                        // And after a further second?
+                        setTimeout(function () { bus.$emit('refreshStatus', player.id); }.bind(this), 1000);
+                    }.bind(this), 500);
+                });
+            }
+        },
+        syncPlayer(longPress, el, event) {
+            storeClickOrTouchPos(event);
+            event.preventDefault();
+            event.stopPropagation();
+            let idx = parseInt(el.id.split("-")[0]);
+            if (idx>=0 && idx<=this.visiblePlayers.length) {
+                if (longPress) {
+                    this.show = false;
+                    bus.$emit('dlg.open', 'sync', this.visiblePlayers[idx]);
+                } else {
+                    this.setPlayer(this.visiblePlayers[idx].id);
+                }
+            }
+        },
+        togglePower(longPress, el, event) {
+            storeClickOrTouchPos(event);
+            event.preventDefault();
+            event.stopPropagation();
+            if (queryParams.party) {
+                return;
+            }
+            let idx = parseInt(el.id.split("-")[0]);
+            if (idx>=0 && idx<=this.visiblePlayers.length) {
+                this.togglePlayerPower(this.visiblePlayers[idx], longPress);
+            }
+        },
+        clickLogo(longPress, el, event) {
+            if (event) {
+                event.preventDefault();
+                event.stopPropagation();
+            }
+            if (this.showMenu) {
+                this.showMenu = false;
+            } else {
+                this.show=false;
+                if (longPress) {
+                    window.open("https://lyrion.org", "_blank").focus();
+                }
+            }
+        },
+        doCustomAction(action) {
+            this.show = false;
+            performCustomAction(action, this.$store.state.player);
+        },
+        cancelSleepTimer() {
+            this.playerStatus.sleepTime = undefined;
+            if (undefined!==this.playerStatus.sleepTimer) {
+                clearInterval(this.playerStatus.sleepTimer);
+                this.playerStatus.sleepTimer = undefined;
+            }
+        },
+        controlSleepTimer(timeLeft) {
+            if (undefined!=timeLeft && timeLeft>1) {
+                timeLeft = Math.floor(timeLeft);
+                if (this.playerStatus.sleepTimeLeft!=timeLeft) {
+                    this.cancelSleepTimer();
+                    this.playerStatus.sleepTime = timeLeft;
+                    this.playerStatus.sleepTimeLeft = this.playerStatus.sleepTime;
+                    this.playerStatus.sleepStart = new Date();
+
+                    this.playerStatus.sleepTimer = setInterval(function () {
+                        var current = new Date();
+                        var diff = (current.getTime()-this.playerStatus.sleepStart.getTime())/1000.0;
+                        this.playerStatus.sleepTime = this.playerStatus.sleepTimeLeft - diff;
+                        if (this.playerStatus.sleepTime<=0) {
+                            this.playerStatus.sleepTime = undefined;
+                            this.cancelSleepTimer();
+                        }
+                    }.bind(this), 1000);
+                }
+            } else {
+                this.cancelSleepTimer();
+            }
+        },
+        startStatusTimer() {
+            // Have player menu open, so poll LMS server for updates in case another player starts or stops playback
+            if (undefined==this.statusTimer) {
+                this.statusTimer = setInterval(function () {
+                    if (this.$store.state.players && this.$store.state.players.length>1) {
+                        bus.$emit('refreshServerStatus');
+                    }
+                }.bind(this), 2500);
+            }
+        },
+        cancelStatusTimer() {
+            if (undefined!==this.statusTimer) {
+                clearInterval(this.statusTimer);
+                this.statusTimer = undefined;
+            }
+        },
+        toggleShowAllPlayers() {
+            this.showAllPlayers=!this.showAllPlayers;
+            setLocalStorageVal("nd-showAllPlayers", this.showAllPlayers);
+        },
+        configurePlayerList(event) {
+            this.show=false;
+            storeClickOrTouchPos(event, this.menu);
+            bus.$emit('dlg.open', 'playerlist');
+        },
+        switchUser() {
+            lmsCommand("", ["users", "list"]).then(({data}) => {
+                if (data && data.result && data.result.users_loop) {
+                    let users = [{id:-1, title:this.trans.generalUser, svg:'lyrion-icon'}];
+                    for (let i=0, list=data.result.users_loop, len=list.length; i<len; ++i) {
+                        users.push({id:parseInt(list[i].id), title:list[i].name, icon:'person', img:list[i].avatar});
+                    }
+                    choose(i18n("Select user profile"), users).then(choice => {
+                        if (undefined!=choice && choice.id!=this.$store.state.user.id) {
+                            this.$store.commit('setUser', {id:choice.id, name:choice.title});
+                        }
+                    });
+                }
+            }).catch(err => {
+            });
+        }
+    },
+    computed: {
+        darkUi () {
+            return this.$store.state.darkUi
+        },
+        player () {
+            return this.$store.state.player
+        },
+        players () {
+            return this.$store.state.players
+        },
+        visiblePlayers () {
+            return this.showAllPlayers ? this.players : this.enabledPlayers
+        },
+        enabledPlayers () {
+            if (!this.$store.state.players) {
+                return this.$store.state.players;
+            }
+            return this.$store.state.players.filter((item) => {
+                return item.enabled;
+            });
+        },
+        otherPlayers () {
+            return this.$store.state.otherPlayers
+        },
+        multipleStandardPlayers () {
+            let playerList = this.visiblePlayers
+            return playerList && playerList.length>1 && !playerList[1].isgroup
+        },
+        numPlayers() {
+            return this.$store.state.players ? this.$store.state.players.length : 0
+        },
+        numEnabledPlayers() {
+            return this.enabledPlayers ? this.enabledPlayers.length : 0
+        },
+        enableMenuButton() {
+            return this.numPlayers>1 || LMS_P_USERS || this.showCustomSystemActions
+        },
+        noPlayer () {
+            return !this.$store.state.players || this.$store.state.players.length<1
+        },
+        updatesAvailable() {
+            return this.$store.state.unlockAll && this.$store.state.updatesAvailable.size>0
+        },
+        restartRequired() {
+            return this.$store.state.unlockAll && this.$store.state.restartRequired
+        },
+        keyboardControl() {
+            return this.$store.state.keyboardControl && !IS_MOBILE
+        },
+        unlockAll() {
+            return this.$store.state.unlockAll
+        },
+        showManagePlayers() {
+            return this.connected && ((this.players && this.players.length>1) || this.otherPlayers.length>0) && !queryParams.party
+        },
+        showCustomActions() {
+            return !this.noPlayer && this.customPlayerActions && this.customPlayerActions.length>0
+        },
+        showCustomSystemActions() {
+            return this.customSystemActions && this.customSystemActions.length>0
+        },
+        playersDivider() {
+            return this.showManagePlayers || (undefined!=this.appLaunchPlayer && !this.haveLocalPlayer) || this.showCustomActions
+        },
+        haveLocalPlayer() {
+            return this.$store.state.haveLocalPlayer
+        },
+        showShortcuts() {
+            return this.$store.state.ndShortcuts>0 && this.shortcuts.length>0
+        },
+        ndShortcuts() {
+            return this.$store.state.ndShortcuts
+        },
+        settingsIcons() {
+            const itemHeight = 46;
+            const titleHeight = 36;
+            let playerList = this.visiblePlayers
+            let haveGroup = playerList && playerList.length>0 && playerList[playerList.length-1].isgroup;
+            let settingsHeight = ((this.menuLength  + (queryParams.appQuit ? 1 : 0) + (this.customSettingsActions ? this.customSettingsActions.length : 0)) * itemHeight) + titleHeight;
+            let numPlayers = (playerList ? playerList.length : 0);
+            let playerheight = ((numPlayers + (this.showManagePlayers ? 1 : 0) + (this.customPlayerActions ? this.customPlayerActions.length : 0)) * itemHeight) + (haveGroup ? titleHeight*2 : 0) /*titles*/;
+            let shortcutHeight = this.showShortcuts ? 100 : 0;
+            let minPlayerHeight = Math.max(4*48, playerheight);
+            return (this.height-(queryParams.topPad+queryParams.botPad+settingsHeight+shortcutHeight+ itemHeight/*top bar*/))<minPlayerHeight;
+        },
+        homeButton() {
+            return this.$store.state.homeButton
+        },
+        userName() {
+            return this.$store.state.user.id==-1 ? this.trans.generalUser : undefined==this.$store.state.user.name ? this.trans.unknownUser : this.$store.state.user.name
+        },
+        userAvatar() {
+            return this.$store.state.user.id==-1
+                       ? {svg:'lyrion-icon'}
+                       : this.$store.state.user.avatar
+                          ? {img:this.$store.state.user.avatar}
+                          : {icon:'person'}
+        }
+    },
+    filters: {
+        svgIcon: function (name, dark, updateIcon) {
+            return "/material/svg/"+name+"?c="+(updateIcon ? LMS_UPDATE_SVG : dark ? LMS_DARK_SVG : LMS_LIGHT_SVG)+"&r="+LMS_MATERIAL_REVISION;
+        },
+        infoIcon: function (name, dark) {
+            return "/material/svg/info-"+name+"?c="+(dark ? LMS_DARK_SVG : LMS_LIGHT_SVG)+"&c2="+LMS_UPDATE_SVG+"&r="+LMS_MATERIAL_REVISION;
+        },
+        playerShortcut: function(index) {
+            return IS_APPLE ? ("⌥+"+(9==index ? 0 : index+1)) : i18n("Alt+%1", 9==index ? 0 : index+1);
+        }
+    },
+    watch: {
+        'show': function(newVal) {
+            bus.$emit('navdrawer', newVal);
+            this.$store.commit('menuVisible', {name:'navdrawer', shown:newVal});
+            if (newVal) {
+                bus.$emit('refreshServerStatus');
+                this.startStatusTimer();
+            } else {
+                this.cancelStatusTimer();
+            }
+        },
+        'showMenu': function(val) {
+            this.$store.commit('menuVisible', {name:'navdrawer-title', shown:val});
+            if (val) {
+                lmsCommand("", ["users", "list"]).then(({data}) => {
+                    this.users = [];
+                    if (data && data.result && data.result.users_loop && data.result.users_loop.length>0) {
+                        for (let i=0, list=data.result.users_loop, len=list.length; i<len; ++i) {
+                            this.users.push({id:parseInt(list[i].id), name:list[i].name, avatar:list[i].avatar, icon:'person'});
+                        }
+                        this.users.sort(nameSort);
+                        this.users.unshift({id:-1, name:this.trans.generalUser, svg:'lyrion-icon'});
+                    }
+                }).catch(err => {
+                });
+            }
+        }
+    },
+    beforeDestroy() {
+        this.cancelSleepTimer();
+        this.cancelStatusTimer();
+    }
+})

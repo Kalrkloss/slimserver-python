@@ -1,0 +1,1051 @@
+:root {
+ --bold-weight:500;
+ --std-font-size:15px;
+ --pq-current-color:#1976d2;
+ --text-color:#edece7;
+ --background-color:#212121;
+ --std-popup-background-color:#303030;
+ --highlight-rgb:25,118,210;
+ --primary-color:#1976d2;
+ --accent-color:#82b1ff;
+ --active-color:var(--accent-color);
+}
+
+body,
+body pre {
+ font-size:var(--std-font-size)!important;
+ background:var(--background-color);
+ color:var(--text-color);
+}
+
+#log-header {
+ background:var(--std-popup-background-color);
+ color:var(--text-color);
+}
+
+@supports not selector(::-webkit-scrollbar) {
+ :root {
+   scrollbar-color:var(--scrollbar-thumb-color) var(--scrollbar-track-color);
+ }
+}
+
+#sdi_logo, #topGraphicMenu1, #topGraphicMenu2, #statusMessage a, .playericon, .largeAttribute {
+ display:none;
+}
+
+.pagebar > a, .pagebar > a > img, .pagebar > b, .browsedbLeftControls > a {
+ vertical-align:middle;
+}
+.pagebar > a > img {
+ width:24px!important;
+ height:24px!important;
+}
+
+#statusarea {
+ display:none;
+}
+
+#choose_setting {
+ margin-left:-4px;
+ margin-bottom:8px;
+ margin-top:8px;
+ font-size:18px !important;
+ font-weight:500 !important;
+ border-radius: 0px;
+ width:100%!important;
+ border-bottom:2px solid var(--active-color)!important;
+}
+
+#choose_setting optgroup {
+ font-weight: 400;
+}
+
+#statusMessage {
+ color:transparent!important;
+ width:100%!important;
+}
+
+#prefsSubmit {
+ color:transparent!important;
+ background-color:transparent!important;
+ border-top:1px solid var(--list-item-border-color);
+ padding-left:16px;
+}
+
+div#topGraphicMenu3 {
+ height:22px;
+ background:transparent!important;
+}
+
+div#topGraphicBox, tbody, td.even, td.odd, div.odd, div.even {
+ background:transparent!important;
+}
+
+.browsedbListItem {
+ border-bottom:1px solid var(--list-item-border-color);
+}
+
+hr {
+ border:0.5px solid var(--list-item-border-color);
+ margin-right:8px;
+}
+
+.browsedbLeftControls > a {
+ padding-top:8px;
+}
+
+html {
+ width:100%;
+ height:100%;
+}
+
+body {
+ margin-top:0px;
+ max-width:1600px;
+ margin-left:auto;
+ margin-right:auto;
+}
+
+@media (max-width: 1599px) {
+ body {
+  margin-right:2px;
+ }
+}
+
+td input { /* Fix entry/combo alignment in additional browse modes */
+ margin-bottom:-1px;
+ padding-bottom:0px;
+}
+
+#updatePlugins td,
+#activePlugins td,
+#inactivePlugins td,
+#otherPlugins0 td,
+#otherPlugins1 td,
+#otherPlugins2 td,
+#otherPlugins3 td,
+#otherPlugins4 td,
+#otherPlugins5 td,
+#otherPlugins6 td,
+#otherPlugins7 td,
+#otherPlugins8 td,
+#otherPlugins9 td {
+ border-bottom: 1px solid var(--list-item-border-color);
+}
+
+#updatePlugins table,
+#activePlugins table,
+#inactivePlugins table,
+#otherPlugins0 table,
+#otherPlugins1 table,
+#otherPlugins2 table,
+#otherPlugins3 table,
+#otherPlugins4 table,
+#otherPlugins5 table,
+#otherPlugins6 table,
+#otherPlugins7 table,
+#otherPlugins8 table,
+#otherPlugins9 table {
+ border-spacing:0px 2px!important;
+}
+
+/* Advanced search - has been removed, but these used elsewhere?*/
+.border tbody tr td input[type=text] {
+ padding-bottom:1px;
+}
+.border tbody tr td.content {
+ vertical-align: text-bottom !important;
+}
+
+div.prefDesc, div.prefDesc a, p {
+ font-size:14px!important;
+}
+
+table {
+ padding-right:14px;
+}
+
+div#homeMenu {
+ margin-left:16px;
+ margin-right:16px;
+}
+.lms-settings-player div#homeMenu, .lms-settings-server div#homeMenu {
+ margin-left:0px;
+}
+div#homeMenu > div#settingsRegion {
+ margin-left:0px;
+ margin-right:0px;
+}
+table.topside {
+ width:calc(100% - 16px);
+}
+
+div#innerSettingsBlock {
+ margin-left:0px!important;
+ margin-right:0px!important;
+ width:calc(100% - 32px)!important;
+ height:calc((var(--vh, 1vh)*100) - (var(--all-pad) + 300px))!important;
+ padding:20px 16px 120px 16px;
+}
+
+@media (max-width: 1600px) {
+ div#innerSettingsBlock {
+  width:calc(100vw - 32px)!important;
+ }
+}
+
+div#topGraphicMenu3 #statusMessage {
+ font-size:0px!important;
+}
+
+*, body, table, input, select, textarea, p, l {
+ font-size:var(--std-font-size) !important;
+ font-family:Roboto,sans-serif !important;
+ text-rendering: optimizeLegibility;
+ line-height: 1.25;
+ -webkit-font-smoothing: antialiased;
+ -moz-osx-font-smoothing: grayscale;
+}
+
+table td {
+ padding-bottom:8px;
+}
+
+.homeMenuSection div, .settingSection .groupHead, .settingSection .prefHead, .prefHead {
+ background-color: transparent;
+ min-height: 15px;
+ height: auto !important;
+ padding: 8px 6px 4px 0px;
+ font-weight: 500;
+ text-transform: none;
+}
+
+.settingSection .collapsableSection {
+ font-weight:var(--bold-weight)!important;
+ background-color:var(--pq-current-color)!important;
+ border-radius: 8px;
+ cursor: pointer;
+}
+
+.msk-hidden-section, .msk-hidden-section ul, .msk-hidden-section ul li {
+ visibility:hidden;
+ height:0px;
+}
+
+select, input {
+ min-height:24px;
+ cursor: pointer;
+}
+
+input[type="text"], input[type="button"], button, input[type="submit"], input[type=checkbox], input[type=radio], select {
+ -webkit-appearance: none;
+ appearance: none;
+}
+
+input[type=radio] {
+ margin-top:-4px;
+ margin-right:4px;
+}
+
+select::-ms-expand {
+ display: none;
+}
+
+select:not([multiple]) {
+ border: none;
+ text-overflow:ellipsis;
+ overflow:hidden;
+ white-space:nowrap;
+ max-width:100%;
+ border-radius: 0px;
+ min-height:26px;
+ margin-bottom:1px;
+ background-position: 100% center;
+ background-repeat: no-repeat;
+ padding-right:25px;
+}
+
+select:not([multiple]):focus {
+ outline: none;
+}
+
+select[multiple] {
+ border: 1px solid var(--text-color);
+}
+
+select[multiple]:focus {
+ border: 1px solid var(--active-color);
+}
+
+input[type="text"], input[type="password"], input[type="stdedit"], input.stdedit {
+ border: none;
+ border-bottom: 1px solid var(--text-color);
+ min-width:80px;
+ max-width:calc(100% - 32px);
+ border-radius: 0px;
+}
+
+input[type="text"]:focus, input[type="password"]:focus, input[type="stdedit"]:focus, input.stdedit:focus, input[type=checkbox]:focus, input[type=radio]:focus {
+ outline: none!important;
+ border-bottom: 1px solid var(--active-color);
+}
+
+input[type="submit"], input[type="button"] {
+ border: none;
+ border-radius: 3px;
+ padding:5px 8px 5px 8px;
+ outline: none;
+ color: var(--text-color) !important;
+ background-color: transparent;
+}
+
+input[type=checkbox], input[type=radio] {
+ vertical-align: middle;
+ text-align:center;
+ border:none;
+ background-color: transparent;
+ width:24px;
+ height:30px;
+ min-width:24px;
+ min-height:30px;
+ max-width:24px;
+ max-height:30px;
+ padding-top:3px;
+}
+
+input[type=checkbox] {
+ padding-top:1px;
+}
+
+input[type=checkbox]:before {
+ content:"check_box_outline_blank";
+}
+
+input[type=checkbox]:checked:before {
+ content:"check_box";
+}
+
+[type="checkbox"]:focus, [type="radio"]:focus {
+ border-bottom: none !important;
+}
+
+input[type=radio]:before {
+ content:"radio_button_unchecked";
+}
+
+input[type=radio]:checked:before {
+ content:"radio_button_checked";
+}
+
+[type="checkbox"]:before, [type="radio"]:before {
+ border: 1px solid transparent;
+}
+
+#activePlugins input[type=checkbox],
+#inactivePlugins input[type=checkbox],
+#otherPlugins0 input[type=checkbox],
+#otherPlugins1 input[type=checkbox],
+#otherPlugins2 input[type=checkbox],
+#otherPlugins3 input[type=checkbox],
+#otherPlugins4 input[type=checkbox],
+#otherPlugins5 input[type=checkbox],
+#unsafePlugin input[type=checkbox] {
+ margin-top:-2px;
+}
+
+.msk-dir-btn:before, input[type=checkbox]:before, input[type=radio]:before, .msk-expander-btn:before, .msk-help-btn:before {
+ vertical-align: middle!important;
+ font-family: "Material Icons"!important;
+ font-size:24px!important;
+ line-height:24px!important;
+ text-decoration:none!important;
+}
+
+.msk-dir-btn:before {
+ content:"folder";
+ line-height:32px!important;
+}
+
+.msk-expander-btn:before {
+ content:"expand_more";
+ line-height:32px!important;
+}
+
+.msk-collapsed .msk-expander-btn:before {
+ content:"chevron_right";
+ line-height:32px!important;
+}
+
+.msk-dir-btn, .msk-expander-btn {
+ width:32px;
+ height:32px;
+ border-radius:50%;
+ display:inline-block;
+ text-align:center;
+}
+
+.msk-expander-btn {
+ float:left;
+ pointer-events:none;
+}
+
+.msk-help-btn {
+ width:22px;
+ height:22px;
+ border-radius:50%;
+ display:inline-block;
+ text-align:center;
+ opacity:0.5;
+ padding-top:4px;
+ padding-left:0px;
+ margin-bottom:-4px;
+ cursor:pointer;
+}
+
+.msk-help-btn:hover {
+ opacity:1;
+}
+
+.msk-help-btn:before {
+ content:"help_outline";
+ font-size:18px!important;
+ line-height:22px!important;
+}
+.msk-slider {
+ margin-bottom:-8px;
+ margin-right:8px;
+ -webkit-appearance: none;
+ width:150px;
+ height: 2px !important;
+ min-height: 2px !important;
+ line-height: 1!important;
+ border-radius: 5px;
+ background: var(--range-trough-color);
+ outline: none;
+ -webkit-transition: .2s;
+ transition: opacity .2s;
+}
+
+@media (min-width: 350px) {
+ .msk-slider {
+  width:180px;
+ }
+}
+@media (min-width: 370px) {
+ .msk-slider {
+  width:200px;
+ }
+}
+
+.msk-slider::-moz-range-thumb {
+ width: 16px;
+ height: 16px;
+ border-radius: 50%;
+ background: var(--primary-color);
+ border: 1px solid var(--primary-color);
+ cursor: pointer;
+}
+.msk-slider::-webkit-slider-thumb {
+ -webkit-appearance: none;
+ width: 16px;
+ height: 16px;
+ border-radius: 50%;
+ background: var(--primary-color);
+ border: 1px solid var(--primary-color);
+ cursor: pointer;
+}
+.msk-slider::-ms-thumb {
+ width: 16px;
+ height: 16px;
+ border-radius: 50%;
+ background: var(--primary-color);
+ border: 1px solid var(--primary-color);
+ cursor: pointer;
+}
+
+.msk-slider::-moz-range-progress {
+ background-color: var(--primary-color);
+ height:2px!important;
+}
+.msk-slider::-moz-range-track {
+ background: var(--range-trough-color);
+ height:2px!important;
+}
+.msk-slider::-ms-fill-lower {
+ background-color: var(--primary-color);
+ height:2px!important;
+}
+.msk-slider::-ms-fill-upper {
+ background: var(--range-trough-color);
+ height:2px!important;
+}
+.msk-slider-input {
+ width:48px!important;
+ max-width:48px!important;
+ min-width:48px!important;
+}
+
+#saveSettings {
+ border: 2px solid var(--active-color) !important;
+ margin-top:18px;
+}
+
+#saveSettings:active {
+ opacity:0.8;
+}
+
+html, body {
+ overflow: unset!important;
+}
+
+html, body, .stdedit, select, input[type="text"], div#topGraphicMenu3, .prefDesc, .groupDesc, .groupHead, .homeMenuSection div, td, 
+.settingSection, .settingSection .groupHead, .settingSection .prefHead:not(.collapsableSection), li {
+ background-color:var(--background-color) !important;
+}
+
+html, body, .homeMenuSection div, .settingSection div, #playingStatus, #currentPlaylistLabel, #statusarea, .stdedit, .exlisting, p, ol, ul, dl, dd, td, .exboldlisting, th, h5, .prefDesc, .groupDesc, .groupHead, .homeMenuSection div, .settingSection, .settingSection .groupHead, .settingSection .prefHead, li, select, b, pre, code {
+ color: var(--text-color) !important;
+}
+
+pre, code {
+ font-family: monospace, monospace !important;
+}
+
+.browsedbLeftControls > a:before {
+ color: var(--text-color) !important;
+}
+
+p input, p label {
+ color: var(--text-color) !important;
+}
+
+div.even {
+ background-color:var(--background-color) !important;
+}
+
+a, div.prefs a, div.prefDesc a {
+ color: var(--active-color) !important;
+}
+
+a:focus, div.prefs a:focus, div.prefDesc a:focus {
+ border-bottom: 1px solid var(--active-color) !important;
+}
+
+input[type="text"], input[type="password"], input[type="stdedit"] {
+ background:var(--background-color) !important;
+ color:var(--text-color);
+ border-bottom: 1px solid var(--text-color);
+ min-height:28px;
+}
+
+input[type="text"]:focus, input[type="password"]:focus, input[type="stdedit"]:focus, .stdedit:focus, select:focus {
+ border-bottom: 1px solid var(--active-color);
+}
+
+textarea {
+ border: 1px solid var(--border-color);
+ max-width:calc(100% - 40px);
+}
+
+textarea:focus {
+ border: 1px solid var(--active-color);
+}
+
+textarea:focus-visible {
+ outline:var(--active-color) !important;
+}
+
+/* text enty auto-complete */
+input:-webkit-autofill,
+input:-webkit-autofill:hover,
+input:-webkit-autofill:focus,
+textarea:-webkit-autofill,
+textarea:-webkit-autofill:hover,
+textarea:-webkit-autofill:focus,
+select:-webkit-autofill,
+select:-webkit-autofill:hover,
+select:-webkit-autofill:focus {
+ -webkit-text-fill-color: var(--text-color);
+ -webkit-box-shadow: 0 0 0px 1000px var(--background-color) inset;
+ transition: background-color 5000s ease-in-out 0s;
+}
+
+input[type=checkbox]:before, input[type=radio]:before {
+ color:var(--text-color);
+}
+
+input[type=checkbox]:checked:before, input[type=radio]:checked:before {
+ color:var(--active-color);
+}
+
+[type="checkbox"]:focus:before, [type="radio"]:focus:before {
+ border: 1px solid var(--active-color);
+ border-radius:3px;
+}
+
+/* Progress bars (e.g. scan) */
+img[src*="bar_small_empty.gif"] {
+ border:1px solid var(--active-color);
+ border-radius:50%;
+ width:10px !important;
+ height:10px !important;
+ margin-right:2px;
+}
+
+img[src*="bar_small_empty.gif"]:first-child,
+img[src*="bar_small_full.gif"]:first-child {
+ margin-left:6px;
+}
+
+img[src*="bar_small_full.gif"] {
+ background-color:var(--active-color);
+ border:1px solid var(--active-color);
+ border-radius:50%;
+ width:10px !important;
+ height:10px !important;
+ margin-right:2px;
+}
+
+div#Info0, div#Info1, div#Info2, div#Info3, div#Info4, div#Info5, div#Info6, div#Info7, div#Info8, div#Info9, div#Info10, div#Info11, div#Info12, div#Info13, div#Info14 {
+ margin-left:6px;
+ opacity:0.7;
+ font-size:14px!important;
+}
+
+.progressItem {
+ margin-bottom:-8px;
+}
+
+.msk-cs-touch-img {
+ padding-right:4px;
+}
+
+/* SugarCube headers */
+#homeMenu table.topside thead th {
+ border-radius:0px;
+ text-align:initial;
+}
+
+/* Inguz */
+.songInfoText .stdclick {
+ width:initial!important;
+}
+
+.hiddenDesc {
+ display:block!important;
+}
+
+hr.main-sep {
+ opacity:0.4!important;
+ border:0.25px solid var(--text-color)!important;
+}
+
+hr.sub-sep {
+ opacity:0.2!important;
+ border:0.25px solid var(--text-color)!important;
+ margin-bottom:32px;
+}
+
+/* Material Design 2 changes */
+input[type="submit"], input[type="button"], button {
+ border-radius: 100px;
+ font-weight:var(--bold-weight)!important;
+ color:var(--active-color)!important;
+ padding:6px 14px 5px 14px;
+}
+
+input[type="submit"]:hover, input[type="button"]:hover, input[type="submit"]:focus, input[type="button"]:focus, button:hover, button:focus {
+ background-color: var(--pq-current-color);
+}
+
+button {
+ background-color: var(--background-color);
+}
+
+.msk-dir-btn:hover, .msk-dir-btn:focus, #viewToggle:hover, #viewToggle:focus {
+ background-color: var(--border-color);
+}
+
+input[type="submit"]:active, input[type="button"]:active, button:active {
+ opacity: 0.8;
+}
+
+input[type="submit"], input[type="button"], button {
+ border:1px solid var(--active-color);
+}
+
+input[name="pref_rescan"] {
+ margin-top:16px;
+}
+
+@media (min-width:450px) {
+ input[name="pref_rescan"] {
+  margin-left:16px;
+ }
+}
+
+.settingSection .settingGroup {
+ margin-bottom:48px!important;
+}
+
+.msk-is-non-touch .settingSection .settingGroup {
+ margin-bottom:24px!important;
+}
+
+.msk-is-non-touch .hiddenDesc {
+ visibility: hidden;
+ width:0px!important;
+ height:0px!important;
+}
+
+.msk-is-non-touch .settingSection .prefHead:not(.collapsableSection) {
+ padding: 0px 6px 0px 0px;
+}
+
+table td input[type=checkbox] {
+ margin-top:-2px;
+}
+
+@media (min-width:1000px) {
+ .settingGroup {
+  position: relative;
+  padding-left: 278px;
+  margin-bottom: 15px;
+ }
+
+ .settingGroup .prefHead {
+  position: absolute;
+  width: 250px;
+  left: 0;
+  margin-top:11px;
+  text-align:right;
+ }
+
+ .settingGroup .prefs {
+  margin-top:-2px;
+ }
+ .settingGroup .prefs:has(input[type=range]) {
+  margin-top:-5px;
+ }
+
+ .msk-help-btn {
+  position: absolute;
+  left: 252px;
+  margin-top:6px;
+ }
+ .lms-settings-section-PLUGIN_EXTENDED_BROWSEMODES .settingGroup {
+  padding-left: 208px;
+ }
+ .lms-settings-section-PLUGIN_EXTENDED_BROWSEMODES .settingGroup .prefHead {
+  width: 180px;
+ }
+ .lms-settings-section-PLUGIN_EXTENDED_BROWSEMODES .msk-help-btn {
+  left: 182px;
+ }
+}
+
+@media (min-width: 1200px) {
+ .settingGroup {
+  padding-left: 298px;
+ }
+ .settingGroup .prefHead {
+  width: 270px;
+ }
+ .msk-help-btn {
+  left: 272px;
+ }
+}
+@media (min-width: 1500px) {
+ .settingGroup {
+  padding-left: 328px;
+ }
+ .settingGroup .prefHead {
+  width: 300px;
+ }
+ .msk-help-btn {
+  left: 302px;
+ }
+}
+@media (min-width: 1700px) {
+ .settingGroup {
+  padding-left: 348px;
+ }
+ .settingGroup .prefHead {
+  width: 320px;
+ }
+ .msk-help-btn {
+  left: 322px;
+ }
+}
+@media (min-width: 2000px) {
+ .settingGroup {
+  padding-left: 378px;
+ }
+ .settingGroup .prefHead {
+  width: 350px;
+ }
+ .msk-help-btn {
+  left: 352px;
+ }
+}
+
+#mediadirs0, #mediadirs1, #mediadirs2, #mediadirs3, #mediadirs4, #mediadirs5, #mediadirs6, #mediadirs7, #mediadirs8, #mediadirs9 {
+ max-width: calc(100vw - 232px)!important;
+}
+
+.prefs .selectFolder {
+ max-width:calc(100% - 64px)!important;
+}
+
+/* Shrink path selection fields in 'Basic Settings' */
+@media (max-width: 570px) {
+ td.even, td.odd {
+  max-width:calc(100% - 180px);
+ }
+}
+
+#ignoreInAudioScan0, #ignoreInAudioScan1, #ignoreInAudioScan2, #ignoreInAudioScan3, #ignoreInAudioScan4,
+#ignoreInAudioScan5, #ignoreInAudioScan6, #ignoreInAudioScan7, #ignoreInAudioScan0, #ignoreInAudioScan9 {
+ margin-top:3px!important;
+}
+
+.pluginItem div:first-of-type div:first-of-type > img:first-of-type {
+ background-color:var(--border-color);
+ border-radius:8px;
+}
+
+#pluginListPanel.pluginListList .pluginItem div:first-of-type div:first-of-type > img:first-of-type {
+ border-radius:4px;
+}
+
+.pluginList ul.thumbWrap li.thumbWrap {
+ border:solid 1px var(--border-color);
+}
+
+#pluginButtonBar {
+ padding-top:20px;
+ padding-bottom:4px;
+ padding-left:4px;
+ height:80px;
+}
+
+#pluginButtonBar > span {
+ display:inline-block;
+ padding-top:8px;
+}
+
+#pluginButtonBar > span:first-of-type {
+ margin-left:12px;
+}
+
+#pluginButtonBar > span:last-of-type {
+ float:right;
+ margin-right:13px;
+}
+
+.pluginListList {
+ max-width: calc(100vw - 46px)!important;
+ overflow-x:hidden; /* At some zoom levels get scrollbars??? */
+}
+
+#viewToggle {
+ height:24px!important;
+ width:24px!important;
+ position:relative!important;
+ top:4px!important;
+ left:12px!important;
+ border:none!important;
+ border-radius:50%!important;
+ padding:4px;
+}
+
+.lms-settings-section-SETUP_PLUGINS_9 div#innerSettingsBlock {
+ height:calc((var(--vh, 1vh)*100) - (var(--all-pad) + 247px))!important;
+}
+
+.lms-settings-section-SETUP_PLUGINS_9 div#homeMenu > div#settingsRegion {
+ margin-top:-20px;
+}
+
+.lms-settings-section-SETUP_PLUGINS_9 div#innerSettingsBlock {
+ padding: 0px 16px 4px 16px
+}
+
+@media (min-width:1150px) {
+ .lms-settings-section-PLUGIN_EXTENDED_BROWSEMODES td:nth-of-type(3) > div > span {
+  min-width:250px!important;
+ }
+}
+@media (max-width:700px) {
+ #pluginButtonBar > span {
+  display:block;
+  margin-left:12px;
+  width:100%;
+ }
+ #pluginButtonBar > span:last-of-type {
+  float:unset;
+  margin-right:0px!important;
+ }
+ .lms-settings-section-SETUP_PLUGINS_9 div#homeMenu > div#settingsRegion {
+  margin-top:14px;
+ }
+ .lms-settings-section-SETUP_PLUGINS_9 div#innerSettingsBlock {
+  height:calc((var(--vh, 1vh)*100) - (var(--all-pad) + 281px))!important;
+ }
+ #viewToggle {
+  position:fixed!important;
+  top:52px!important;
+  left:16px!important;
+ }
+ .lms-91p #pluginButtonBar > span:first-of-type {
+  margin-left:48px;
+ }
+}
+
+.custom-select-option {
+ min-height:32px!important;
+ cursor: pointer;
+}
+
+.custom-select-option,
+.custom-select-optgroup::before {
+ color:var(--text-color);
+ background-color:var(--popup-background-color);
+}
+
+.custom-select-optgroup::before {
+ font-weight:bold;
+ color:var(--text-color)!important;
+}
+
+.custom-select-option.has-focus {
+ background-color:var(--list-hover-color)!important;
+}
+
+.custom-select-opener {
+ color:var(--text-color);
+ background-color:transparent!important;
+ border-bottom:1px solid var(--text-color);
+ padding-left:0px!important;
+ margin-top:-3px!important;
+ min-width:80px!important;
+ min-height:32px!important;
+ padding:8px 32px 4px 0px!important;
+}
+
+#setup_chooser .custom-select-opener {
+ font-weight:bold!important;
+ color:var(--active-color);
+}
+
+.custom-select-container {
+ display:inline-block;
+ min-width:250px;
+ padding-bottom:4px;
+}
+
+.cs-xsmall {
+ min-width:80px;
+}
+.cs-small {
+ min-width:100px;
+}
+.cs-medium {
+ min-width:200px;
+}
+
+.lms-settings-section-PLUGIN_EXTENDED_BROWSEMODES table .custom-select-container, /* additional browse modes */
+.lms-settings-section-DEBUGGING_SETTINGS p > .custom-select-container { /* logging page */
+ min-width:100px;
+}
+
+#setup_chooser .custom-select-container {
+ width:calc(100% - 16px)!important;
+}
+
+.custom-select-opener:focus {
+ border-bottom:1px solid var(--active-color);
+}
+
+.custom-select-container.is-open .custom-select-panel {
+ top:30px!important;
+ overflow-y:visible!important;
+}
+.container {
+ overflow-y:visible!important;
+}
+
+#setup_chooser .custom-select-container.is-open .custom-select-panel {
+ max-height:calc((var(--vh, 1vh)*100) - (var(--all-pad) + 180px))!important;
+ top:32px!important;
+}
+
+.custom-select-panel {
+ background-color:var(--popup-background-color)!important;
+ transition:none!important;
+}
+
+.custom-select-container.is-open .custom-select-panel {
+ box-shadow:var(--menu-dlg-shadow);
+}
+
+.custom-select-option.is-selected::before {
+ content: ""!important;
+ padding-right: unset!important;
+}
+
+.custom-select-option.is-selected {
+ color:var(--active-color);
+}
+
+:focus-visible {
+ outline: transparent auto 0px;
+}
+
+.lms-settings-player .custom-select-optgroup div[data-value="ALARM"],
+.lms-settings-player .custom-select-optgroup div[data-value="PLUGIN_DSTM"] {
+ height:0px!important;
+ min-height:0px!important;
+ visibility:hidden!important;
+ padding:0px!important;
+}
+
+.browsedbControls {
+ padding-top:0px;
+}
+
+.Toggle { /* SqueezeDSP */
+ margin-top:-22px;
+}
+
+.custom-select-container:has(select:disabled),
+select:disabled,
+input:disabled,
+button:disabled {
+ opacity:0.7;
+}
+
+select option, select optgroup {
+ color:var(--text-color)!important;
+ background:var(--popup-background-color)!important;
+}
+
+select option:checked {
+ background:var(--primary-color)!important;
+}
+
+::selection {
+ background-color:var(--pq-current-color)!important;
+ color: var(--text-color)!important;
+ text-shadow: none!important;
+}
+
+input, .custom-select-opener {
+ -webkit-touch-callout:none!important;
+ -webkit-user-select:none!important;
+ -khtml-user-select:none!important;
+ -moz-user-select:none!important;
+ -ms-user-select:none!important;
+ user-select:none!important;
+ -webkit-tap-highlight-color: transparent;
+}

@@ -1,0 +1,45 @@
+.image-grid-item-img, .np-grid-item img, .np-grid-sect .pq-current, .lms-image-grid .list-active, .lms-image-grid .highlight, .np-grid-sect .list-active,
+#browse-list .browse-html img, .np-info-text img, .np-info-text-desktop img, .np-info-text-full img, .np-info-text-full-desktop img, .inline-image,
+.image-grid-item .mi, .msk-is-non-touch .image-grid-item:not(.defcursor):hover {
+ border-radius:9px!important;
+}
+
+.lms-list .mi-1, .lms-list .mi-2, .lms-list .mi-3 {
+ border-radius:3px!important;
+}
+
+.image-grid-item .mi-1, .image-grid-item .mi-2, .image-grid-item .mi-3 {
+ border-radius:7px!important;
+}
+
+.lms-list img:not(.image-grid-item-img):not(.svg-list-img):not(.multi-disc):not(.mi-0):not(.mi-1):not(.mi-2):not(.mi-3):not(.circular), .pmgr-cover img, .np-info .lms-list img, .sub-cover, .menu-image, .mi .v-avatar,
+.sub-cover .mi {
+ border-radius:4px!important;
+}
+
+.circular {
+ border-radius: 50%!important;
+}
+
+.sub-cover .mi-1, .sub-cover .mi-2, .sub-cover .mi-3 {
+ border-radius:3px!important;
+}
+
+.lms-list3 img, .np-bar-image .np-cover {
+ border-radius:5px!important;
+}
+
+.np-image, .np-image .np-cover, .np-no-meta-img, .np-image-landscape, .np-image-landscape .np-cover {
+ border-radius:max(6px, min(14px, 7%)) !important;
+}
+
+/* For old browsers that dont support min() */
+@supports not (width: min(10px, 5vw)) {
+ .np-image, .np-image .np-cover, .np-no-meta-img, .np-image-landscape, .np-image-landscape .np-cover {
+  border-radius:14px!important;
+ }
+}
+
+.np-info .lms-list-item {
+ border-radius: 4px;
+}

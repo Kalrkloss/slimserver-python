@@ -18,7 +18,62 @@ from .cometd import LONG_POLL_TIMEOUT, CometdManager
 logger = logging.getLogger(__name__)
 
 
-async def _handle_cometd(cometd: CometdManager, receive, send) -> None:
+async def _handle_streaming_connect(
+    cometd: CometdManager,
+    cid: str,
+    msg: dict,
+    replies: list[dict],
+    send,
+) -> None:
+    """Streaming /meta/connect: reply immediately (acks + any queued
+    events), then hold the response open and push events as chunks.
+
+    SqueezeClient expects the connect + subscribe acks within 5 seconds
+    and then reads the body as a stream of JSON arrays.
+    """
+    import json as _json
+
+    connect_ack = {
+        "channel": "/meta/connect",
+        "successful": True,
+        "clientId": cid,
+        "id": msg.get("id", ""),
+        "advice": {"reconnect": "retry", "interval": 0, "timeout": 25},
+    }
+    first = list(replies) + [connect_ack]
+    events = await cometd.wait_for_events(cid, timeout=0)
+    first.extend(events)
+
+    await send({
+        "type": "http.response.start",
+        "status": 200,
+        "headers": [(b"Content-Type", b"application/json"),
+                    (b"Cache-Control", b"no-cache")],
+    })
+    await send({"type": "http.response.body",
+                "body": _json.dumps(first).encode("utf-8"), "more_body": True})
+
+    # Keep the stream open: push event batches as they arrive. Close
+    # after a quiet period so dead connections are reclaimed (clients
+    # reconnect automatically).
+    try:
+        while True:
+            events = await cometd.wait_for_events(cid, timeout=30)
+            if not events:
+                break
+            await send({"type": "http.response.body",
+                        "body": _json.dumps(events).encode("utf-8"),
+                        "more_body": True})
+    except Exception:
+        pass
+    try:
+        await send({"type": "http.response.body", "body": b"",
+                    "more_body": False})
+    except Exception:
+        pass
+
+
+async def _handle_cometd(cometd: CometdManager, path: str, receive, send) -> None:
     """Handle a POST /cometd batch (Jive controller protocol).
 
     Replies to handshake/subscribe/request immediately; /meta/connect
@@ -38,7 +93,9 @@ async def _handle_cometd(cometd: CometdManager, receive, send) -> None:
         messages = _json.loads(body.decode("utf-8", errors="replace"))
         if not isinstance(messages, list):
             messages = [messages]
-    except Exception:
+        logger.info("Cometd POST %s: %.220s", path, body.decode("utf-8", errors="replace")[:220])
+    except Exception as exc:
+        logger.info("Cometd body not JSON (%s): %.160s", exc, body.decode("utf-8", errors="replace"))
         messages = []
 
     replies: list[dict] = []
@@ -51,9 +108,15 @@ async def _handle_cometd(cometd: CometdManager, receive, send) -> None:
                     and m.get("channel") == "/meta/connect"]
 
     if connect_msgs:
-        # /meta/connect messages long-poll for events.
+        # /meta/connect: streaming clients (SqueezeClient, Material) need
+        # the reply IMMEDIATELY (5s timeout) and then a held-open stream
+        # that pushes events as chunks.
         for msg in connect_msgs:
             cid = msg.get("clientId", "")
+            if msg.get("connectionType") == "streaming":
+                await _handle_streaming_connect(cometd, cid, msg, replies, send)
+                return
+            # long-polling: hold until events arrive or timeout
             events = await cometd.wait_for_events(cid)
             replies.append({
                 "channel": "/meta/connect",
@@ -116,10 +179,11 @@ def create_app(
             await stream_track(scope, receive, send)
             return
 
-        # Cometd (Jive controllers: SqueezeControl, iPeng, Orange Squeeze).
-        # Needs long-polling: the response is sent after events arrive.
-        if path == "/cometd" and method == "POST":
-            await _handle_cometd(cometd, receive, send)
+        # Cometd (Jive controllers + Material Skin). libcometd sends the
+        # action as a path suffix (/cometd/handshake, /cometd/connect,
+        # /cometd/subscribe) — accept the base path and any suffix.
+        if (path == "/cometd" or path.startswith("/cometd/")) and method == "POST":
+            await _handle_cometd(cometd, path, receive, send)
             return
 
         # Read request body

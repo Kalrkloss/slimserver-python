@@ -1,0 +1,203 @@
+/**
+ * LMS-Material
+ *
+ * Copyright (c) 2018-2026 Craig Drummond <craig.p.drummond@gmail.com>
+ * MIT license.
+ */
+'use strict';
+
+Vue.component('lms-sync-dialog', {
+    template: `
+<v-dialog v-model="show" v-if="show" persistent width="600" class="lms-dialog">
+ <v-card v-if="player" v-clickoutside="outsideClick">
+  <v-card-text class="sync-dialog">
+   <v-container grid-list-md style="padding: 4px">
+    <v-layout wrap>
+     <v-flex xs12 class="dlgtitle">{{i18n("Select which players you would like to synchronize with '%1'", player.name)}}</v-flex>
+     <v-flex xs12>
+      <v-list class="sleep-list dialog-main-list">
+       <template v-for="(p, index) in players">
+        <v-list-tile @click="togglePlayer(index)" @mousedown="togglePlayerDown(index)" @touchstart="togglePlayerDown(index)">
+         <v-list-tile-avatar :tile="true" class="lms-avatar"><v-icon>{{p.synced ? 'check_box' : 'check_box_outline_blank'}}</v-icon></v-list-tile-avatar>
+         <v-list-tile-title class="sleep-item">{{p.name}}</v-list-tile-title>
+        </v-list-tile>
+        <v-divider></v-divider>
+       </template>
+      </v-list>
+     </v-flex>
+    </v-layout>
+   </v-container>
+  </v-card-text>
+  <v-card-actions v-if="queryParams.altBtnLayout">
+   <p style="margin-left:10px" class="dimmed">{{i18np("1 Player", "%1 Players", numPlayerSync)}}</p>
+   <v-spacer></v-spacer>
+   <v-btn flat @click.native="sync()">{{i18n('Sync')}}</v-btn>
+   <v-btn flat @click.native="close()">{{i18n('Cancel')}}</v-btn>
+  </v-card-actions>
+  <v-card-actions v-else>
+   <p style="margin-left:10px" class="dimmed">{{i18np("1 Player", "%1 Players", numPlayerSync)}}</p>
+   <v-spacer></v-spacer>
+   <v-btn flat @click.native="close()">{{i18n('Cancel')}}</v-btn>
+   <v-btn flat @click.native="sync()">{{i18n('Sync')}}</v-btn>
+  </v-card-actions>
+ </v-card>
+</v-dialog>
+`,
+    props: [],
+    data() {
+        return {
+            show: false,
+            player: undefined,
+            players: [],
+            numPlayerSync:0
+        }
+    },
+    computed: {
+        selectAllIcon () {
+            if (this.numPlayerSync==this.players.length) {
+                return "check_box";
+            }
+            if (this.numPlayerSync>0) {
+                return "indeterminate_check_box";
+            }
+            return "check_box_outline_blank";
+        }
+    },
+    mounted() {
+        bus.$on('sync.open', function(player) {
+            if ((player.isgroup && !player.isplaying) || queryParams.party) {
+                return;
+            }
+            this.player = player;
+            this.numPlayerSync = 0;
+            this.lastIndex = undefined;
+            lmsCommand(this.player.id, ["sync", "?"]).then(({data}) => {
+                if (data && data.result && undefined!=data.result._sync) {
+                    let sync = data.result._sync.split(",");
+                    this.origSync = sync.length>0 && sync[0]!="-" ? new Set(sync) : new Set();
+                    this.players=[];
+                    this.$store.state.players.forEach(p => {
+                        if (p.id!==this.player.id) {
+                            let synced = this.origSync.has(p.id);
+                            let play = {id:p.id, name:p.name, synced:synced};
+                            if (!p.isgroup) {
+                                this.players.push(play);
+                                if (synced) {
+                                    this.numPlayerSync++;
+                                }
+                            }
+                        }
+                    });
+                    if (this.players.length>0) {
+                        this.show = true;
+                    }
+                }
+            });
+        }.bind(this));
+        bus.$on('noPlayers', function() {
+            this.show=false;
+        }.bind(this));
+        bus.$on('closeDialog', function(dlg) {
+            if (dlg == 'sync') {
+                this.show=false;
+            }
+        }.bind(this));
+    },
+    methods: {
+        outsideClick() {
+            setTimeout(function () { this.close(); }.bind(this), 50);
+        },
+        close() {
+            this.show=false;
+        },
+        sync() {
+            var newSync = new Set();
+            for (let i=0, len=this.players.length; i<len; ++i) {
+                if (this.players[i].synced) {
+                    newSync.add(this.players[i].id);
+                }
+            }
+
+            // Build list of commands to execute...
+            var commands = [];
+            // ...first remove any previously synced players that will no longer be synced
+            this.origSync.forEach(p => {
+                if (!newSync.has(p)) {
+                    commands.push({player:p, command:["sync", "-"]});
+                }
+            });
+            // ...now add any new players
+            newSync.forEach(p => {
+                if (!this.origSync.has(p)) {
+                    commands.push({player:this.player.id, command:["sync", p]});
+                }
+            });
+            if (0==commands.length) {
+                // No changes!
+                this.show=false;
+            } else {
+                this.doCommands(commands);
+            }
+        },
+        doCommands(commands) {
+            if (!this.show) {
+                return;
+            }
+            if (0==commands.length) {
+                this.show=false;
+                bus.$emit('refreshStatus', this.player.id);
+                bus.$emit('syncChanged');
+            } else {
+                let command = commands.shift();
+                logJsonMessage("SYNC", command);
+                lmsCommand(command.player, command.command).then(({data}) => {
+                    this.doCommands(commands);
+                });
+            }
+        },
+        togglePlayerDown(index) {
+            this.lastIndex = index;
+        },
+        togglePlayer(index) {
+            if (this.lastIndex!=index) {
+                this.lastIndex = undefined;
+                return;
+            }
+            this.lastIndex = undefined;
+            if (index<0 || index>this.players.length) {
+                return;
+            }
+            let player = this.players[index];
+            player.synced=!player.synced;
+            this.numPlayerSync+=(player.synced ? 1 : -1);
+        },
+        toggleAllDown() {
+            this.lastIndex=-1;
+        },
+        toggleAll() {
+            if (this.lastIndex!=-1) {
+                this.lastIndex = undefined;
+                return;
+            }
+            this.lastIndex = undefined;
+            let sel = this.numPlayerSync!=this.players.length;
+            for (let i=0, len=this.players.length; i<len; ++i) {
+                this.players[i].synced = sel;
+            }
+            this.numPlayerSync = sel ? this.players.length : 0;
+        },
+        i18n(str, arg) {
+            if (this.show) {
+                return i18n(str, arg);
+            } else {
+                return str;
+            }
+        }
+    },
+    watch: {
+        'show': function(val) {
+            this.$store.commit('dialogOpen', {name:'sync', shown:val});
+        }
+    }
+})
+

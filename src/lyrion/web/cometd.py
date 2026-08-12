@@ -101,7 +101,9 @@ class CometdManager:
             elif channel in ("/meta/subscribe", "/slim/subscribe"):
                 client = self.get(cid)
                 data = msg.get("data", {})
-                subscription = data.get("subscription", "")
+                # Material sends data.response, Jive/SqueezeClient send
+                # data.subscription — accept both.
+                subscription = data.get("subscription") or data.get("response") or ""
                 if client is not None and subscription:
                     client.subscriptions[subscription] = data
                     logger.info("Cometd %s subscribed %s", cid, subscription)
@@ -163,12 +165,20 @@ class CometdManager:
         return events
 
     async def _dispatch(self, request: list) -> dict:
-        """Dispatch a slim.request payload ([player, [cmd, ...]]) and
-        return the result dict (or an error)."""
+        """Dispatch a slim.request payload and return the result dict.
+
+        Accepts both [player, [cmd,...]] (Jive/SqueezeClient/Material)
+        and [[cmd,...]] (no player — Material subscriptions).
+        """
         try:
-            if not isinstance(request, list) or len(request) < 2:
+            if not isinstance(request, list) or not request:
                 return {}
-            player_id, command = request[0], request[1]
+            if len(request) == 1 and isinstance(request[0], list):
+                player_id, command = "", request[0]
+            elif len(request) >= 2 and isinstance(request[1], list):
+                player_id, command = request[0], request[1]
+            else:
+                return {}
             body = json.dumps({
                 "id": 1,
                 "method": "slim.request",

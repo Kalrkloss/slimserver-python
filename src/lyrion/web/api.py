@@ -929,7 +929,7 @@ class WebAPIHandler:
         if path.startswith("/api/v1/"):
             return await self._handle_rest(method, path, body)
 
-        if path == "/" or path.startswith("/html/"):
+        if path == "/" or path.startswith("/html/") or path.startswith("/material"):
             return self._serve_static(path)
 
         # Fallback: 404
@@ -965,6 +965,9 @@ class WebAPIHandler:
 
         if path == "/":
             path = "/index.html"
+        elif path == "/material" or path == "/material/":
+            # Material Skin (Jive controller UI) SPA entry
+            path = "/material/index.html"
 
         file_path = self._static_dir / path.lstrip("/")
         # Security: prevent directory traversal

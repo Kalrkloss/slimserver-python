@@ -1,0 +1,218 @@
+<!--
+ * LMS-Material
+ *
+ * Copyright (c) 2018-2026 Craig Drummond <craig.p.drummond@gmail.com>
+ * MIT license.
+-->
+
+<!DOCTYPE html>
+<html>
+ <head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, minimal-ui, interactive-widget=resizes-content">
+  <link href="html/font/font.css?r=202512" rel="stylesheet">
+  <!--CSS start-->
+  <link href="html/lib/vuetify.min.css?r=1.5.24trim20241031" rel="stylesheet">
+  <link href="html/lib/vue-virtual-scroller.css?r=1.0.10mod" rel="stylesheet">
+  <!--CSS end-->
+    <link href="html/css/themes/dark.css?r=6.4.6" rel="stylesheet" id="themecss" onerror="setTheme('dark')">
+  <link href="html/css/colors/blue.css?r=6.4.6" rel="stylesheet" id="colorcss">
+  <link href="html/css/style.css?r=6.4.6" rel="stylesheet">
+  <link href="html/css/mobile.css?r=6.4.6" rel="stylesheet" id="layoutcss">
+  <link href="html/css/covers/round.css?r=6.4.6" rel="stylesheet" id="covercss">
+  <link href="html/css/variant/standard.css?r=6.4.6" rel="stylesheet" id="variantcss">
+  <title>Material Skin</title>
+  <meta name="apple-mobile-web-app-title" content="Material Skin">
+  <meta name="application-name" content="Material Skin">
+  <meta name="theme-color" content="#212121">
+  <link href="/material/customcss/mobile" rel="stylesheet" id="customcss">
+  <link href="/material/material.webmanifest?themeColor=212121" rel="manifest">
+  <link href="html/images/icon.png" rel="icon shortcut" type="image/png" sizes="512x512">
+  <link href="html/images/icon-80.png" rel="icon shortcut" type="image/png" sizes="80x80">
+  <link href="html/images/icon-192.png" rel="icon shortcut" type="image/png" sizes="192x192">
+  <link href="html/images/icon-1024.png" rel="icon shortcut" type="image/png" sizes="1024x1024">
+  <link href="html/images/icon.png" rel="apple-touch-icon" type="image/png" sizes="512x512">
+  <link href="html/images/icon-80.png" rel="apple-touch-icon" type="image/png" sizes="80x80">
+  <link href="html/images/icon-192.png" rel="apple-touch-icon" type="image/png" sizes="192x192">
+  <link href="html/images/icon-1024.png" rel="apple-touch-icon" type="image/png" sizes="1024x1024">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black">
+  </head>
+  <body class="IS_NOT_ANDROID">
+
+  <div id="app" v-cloak>
+   <v-app class="lms-app" :dark="darkUi" v-touch:start="touchStart" v-touch:end="touchEnd" v-bind:class="{'no-navbar':!desktopLayout && MBAR_REP_NAV==mobileBar, 'np-full':nowPlayingFull, 'tinted':tinted, 'notracks':queueEmpty, 'lms-lyrion'
+   :lyrionColors}">
+    <div id="stringLenCheckElem" style="display:hidden; position:fixed; top:0px;"></div>
+    <v-snackbar style="z-index:3000" v-model="snackbar.show" :multi-line="true" :timeout="snackbar.timeout ? snackbar.timeout : 2500" :color="snackbar.color" top>{{ snackbar.msg }}</v-snackbar>
+    <lms-currentcover></lms-currentcover>
+    <lms-server></lms-server>
+    <lms-toolbar></lms-toolbar>
+    <lms-splitter :margin="(desktopLayout && showQueue) ? 20 : 0" class="hide-for-mini" v-bind:class="{'hide-splitter':nowPlayingExpanded}">
+     <div slot="left-pane"><lms-browse v-show="desktopLayout || page=='browse'"></lms-browse></div>
+     <div slot="right-pane"><lms-queue v-show="(desktopLayout && showQueue) || page=='queue'"></lms-queue></div>
+    </lms-splitter>
+    <lms-now-playing></lms-now-playing>
+    <lms-navdrawer></lms-navdrawer>
+    <lms-bottomnav v-if="!desktopLayout && MBAR_REP_NAV!=mobileBar"></lms-bottomnav>
+    <lms-ui-settings v-if="dialogs.uisettings"></lms-ui-settings>
+    <lms-player-settings v-if="dialogs.playersettings"></lms-player-settings>
+    <lms-player-settings-plugin v-if="dialogs.playersettingsplugin"></lms-player-settings-plugin>
+    <lms-information-dialog v-if="dialogs.info"></lms-information-dialog>
+    <lms-sync-dialog v-if="dialogs.sync"></lms-sync-dialog>
+    <lms-groupplayers-dialog v-if="dialogs.group"></lms-groupplayers-dialog>
+    <lms-volume v-if="dialogs.volume"></lms-volume>
+    <lms-groupvolume v-if="dialogs.groupvolume"></lms-groupvolume>
+    <lms-manage-players v-if="dialogs.manage"></lms-manage-players>
+    <lms-playerlist-dialog v-if="dialogs.playerlist"></lms-playerlist-dialog>
+    <lms-randommix v-if="dialogs.rndmix"></lms-randommix>
+    <lms-favorite v-if="dialogs.favorite"></lms-favorite>
+    <lms-rating-dialog v-if="dialogs.rating"></lms-rating-dialog>
+    <lms-sleep-dialog v-if="dialogs.sleep"></lms-sleep-dialog>
+    <lms-search-dialog v-if="dialogs.search"></lms-search-dialog>
+    <lms-info-dialog v-if="dialogs.iteminfo"></lms-info-dialog>
+    <lms-iframe-dialog v-if="dialogs.iframe"></lms-iframe-dialog>
+    <lms-dstm-dialog v-if="dialogs.dstm"></lms-dstm-dialog>
+    <lms-savequeue v-if="dialogs.savequeue"></lms-savequeue>
+    <lms-icon-dialog v-if="dialogs.icon"></lms-icon-dialog>
+    <lms-prompt-dialog v-if="dialogs.prompt"></lms-prompt-dialog>
+    <lms-choice-dialog v-if="dialogs.choice"></lms-choice-dialog>
+    <lms-addtoplaylist-dialog v-if="dialogs.addtoplaylist"></lms-addtoplaylist-dialog>
+    <lms-file-dialog v-if="dialogs.file"></lms-file-dialog>
+    <lms-advancedsearch-dialog v-if="dialogs.advancedsearch"></lms-advancedsearch-dialog>
+    <lms-downloadstatus v-if="dialogs.downloadstatus"></lms-downloadstatus>
+    <lms-gallery v-if="dialogs.gallery"></lms-gallery>
+    <lms-npshare-dialog v-if="dialogs.npshare"></lms-npshare-dialog>
+    <lms-screensaver></lms-screensaver>
+    <lms-volumeoverlay></lms-volumeoverlay>
+    <lms-mediasession></lms-mediasession>
+   </v-app>
+  </div>
+  <script>
+const LMS_MATERIAL_REVISION="6.4.6";
+const LMS_VERSION=9.2;
+const LMS_WINDOW_TITLE="Material Skin";
+const LMS_SETTINGS_HIDE="0";
+const LMS_STATS_ENABLED=1;
+const LMS_KIOSK_MODE=0;
+const HIDE_FOR_KIOSK=new Set([0]);
+const LMS_SKIN_LANGUAGES=new Set([]);
+const LMS_MAX_PLAYLIST_EDIT_SIZE=1000;
+const LMS_MOBILE_SCROLL=0;
+const LMS_P_RL=0;
+const LMS_P_CD=0;
+const LMS_P_RP=undefined;
+const LMS_P_CS=0;
+const LMS_P_YT=0;
+const LMS_P_MAI=0;
+const LMS_P_DSTM=0;
+const LMS_P_BMIX=0;
+const LMS_P_LMIX=0;
+const LMS_P_RMIX=0;
+const LMS_P_USERS=0;
+const LMS_DEF_ARTIST_PICS=1;
+const LMS_DEF_SRV_EMBLEM=1;
+const LMS_DEF_NO_GENRE_FILTER=0;
+const LMS_DEF_NO_ROLE_FILTER=0;
+const LMS_NEW_MUSIC_LIMIT=100;
+const LMS_DEF_GROUP_DISCS=0;
+const LMS_DEF_VA_STRING="Various Artists";
+const LMS_LANG="en";
+const LMS_DEF_SUPPORT_RELEASE_TYPES=true;
+const LMS_DEF_GROUP_BY_RELEASE_TYPE=1;
+const LMS_DEF_12HR=false;
+const LMS_DARK_LOGIC=1;
+const LMS_OS_NAME="linux";
+const LMS_3RDPARTY_HOME_EXTRA=0;
+</script>
+
+  <!--JS start-->
+  <script src="html/lib/axios.min.js?r=1.6.7"></script>
+  <script src="html/lib/libcometd.min.js?r=4.0.3mod2"></script>
+  <script src="html/lib/idb-keyval-iife.min.js?r=3.1.0p50"></script>
+  <script src="html/lib/vue.min.js?r=2.7.15"></script>
+  <script src="html/lib/vuetify.min.js?r=1.5.24trim20241031"></script>
+  <script src="html/lib/vuex.min.js?r=3.6.2"></script>
+  <script src="html/lib/intersection-observer.min.js?r=0.5.0"></script>
+  <script src="html/lib/vue-virtual-scroller.min.js?r=1.0.10mod"></script>
+  <script src="html/lib/vue-lazyload.js?r=1.3.3"></script>
+  <script src="html/lib/vue-touch-events.min.js?r=2.2.1pre1502"></script>
+  <script src="html/lib/mousetrap.min.js?r=a4098"></script>
+  <script src="html/lib/fast-average-color.min.js?r=9.3.0"></script>
+  <script src="html/lib/vibrant.min.js?r=1.0"></script>
+  <script src="html/lib/mobile-drag-drop.min.js?r=2.3.0-rc.2"></script>
+    <script src="html/js/clickoutside.js?r=6.4.6"></script>
+  <script src="html/js/longpress.js?r=6.4.6"></script>
+  <script src="html/js/mobile-scroll.js?r=6.4.6"></script>
+  <script src="html/js/actions.js?r=6.4.6"></script>
+  <script src="html/js/constants.js?r=6.4.6"></script>
+  <script src="html/js/customactions.js?r=6.4.6"></script>
+  <script src="html/js/emblems.js?r=6.4.6"></script>
+  <script src="html/js/track-sources.js?r=6.4.6"></script>
+  <script src="html/js/currentcover.js?r=6.4.6"></script>
+  <script src="html/js/utils.js?r=6.4.6"></script>
+  <script src="html/js/lmsoptions.js?r=6.4.6"></script>
+  <script src="html/js/windowcontrols.js?r=6.4.6"></script>
+  <script src="html/js/toolbar.js?r=6.4.6"></script>
+  <script src="html/js/navdrawer.js?r=6.4.6"></script>
+  <script src="html/js/bottomnav.js?r=6.4.6"></script>
+  <script src="html/js/icon-mapping.js?r=6.4.6"></script>
+  <script src="html/js/itemlinks.js?r=6.4.6"></script>
+  <script src="html/js/resizer.js?r=6.4.6"></script>
+  <script src="html/js/splitter.js?r=6.4.6"></script>
+  <script src="html/js/browse-page.js?r=6.4.6"></script>
+  <script src="html/js/nowplaying-page.js?r=6.4.6"></script>
+  <script src="html/js/progressbar.js?r=6.4.6"></script>
+  <script src="html/js/queue-page.js?r=6.4.6"></script>
+  <script src="html/js/screensaver.js?r=6.4.6"></script>
+  <script src="html/js/server.js?r=6.4.6"></script>
+  <script src="html/js/search-field.js?r=6.4.6"></script>
+  <script src="html/js/search-list.js?r=6.4.6"></script>
+  <script src="html/js/switch.js?r=6.4.6"></script>
+  <script src="html/js/text-field.js?r=6.4.6"></script>
+  <script src="html/js/volume-control.js?r=6.4.6"></script>
+  <script src="html/js/volume-overlay.js?r=6.4.6"></script>
+  <script src="html/js/mediasession.js?r=6.4.6"></script>
+  <script src="html/js/i18n.js?r=6.4.6"></script>
+  <script src="html/js/store.js?r=6.4.6"></script>
+  <script src="html/js/main.js?r=6.4.6"></script>
+
+  <!--JS end-->
+  
+  <script src="material/custom.js"></script>
+  <script type="text/javascript">
+   // DEFFERED start
+   function addJsToDocument(path, js, rev) {
+     for (let i=0, len=js.length; i<len; ++i) {
+       var element = document.createElement("script");
+       element.src = path+js[i]+".js?r="+rev;
+       document.body.appendChild(element);
+     }
+   }
+   function addCssToDocument(path, css, rev) {
+     for (let i=0, len=css.length; i<len; ++i) {
+       var element = document.createElement("link");
+       element.href = path+css[i]+".css?r="+rev;
+       element.rel = "stylesheet";
+       document.body.appendChild(element);
+     }
+   }
+   function loadOtherFiles() {
+     addJsToDocument("html/js/", ["browse-resp", "browse-functions", "nowplaying-functions", "prompt-dialog", "choice-dialog", "standarditems", "sync-dialog", "groupplayers-dialog", "ui-settings", "player-settings", "player-settings-plugin", "volume", "information", "randommix-dialog", "rating-dialog", "manage-players", "playerlist-dialog", "favorite-dialog", "sleep-dialog", "info-dialog", "iframe-dialog", "icon-dialog", "dstm-dialog", "savequeue-dialog", "addtoplaylist-dialog", "file-dialog", "groupvolume-dialog", "advancedsearch-dialog", "npshare-dialog", "download", "gallery", "utils-deferred"],
+                     "6.4.6", )
+     addCssToDocument("html/lib/photoswipe/", ["photoswipe.min", "default-skin/default-skin.min"], "4.1.2");
+     addJsToDocument("html/lib/photoswipe/", ["photoswipe.min", "photoswipe-ui-default.min"], "4.1.2");
+   }
+   // DEFFERED end
+   if (window.addEventListener) {
+     window.addEventListener("load", loadOtherFiles, false);
+   } else if (window.attachEvent) {
+     window.attachEvent("onload", loadOtherFiles);
+   } else {
+     window.onload = loadOtherFiles;
+   }
+  </script>
+ </body>
+</html>
+

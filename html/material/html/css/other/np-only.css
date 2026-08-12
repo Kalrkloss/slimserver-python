@@ -1,0 +1,40 @@
+.lms-toolbar {
+ display:none!important;
+}
+
+:root {
+ --main-toolbar-height:0px!important;
+ --bottom-toolbar-height:0px!important;
+ --np-controls-height:0px!important;
+ --desktop-np-wide-pad:0px!important;
+ --np-landscape-item-height:calc(var(--100vh) - (var(--main-toolbar-height) + var(--bottom-pad) + var(--np-controls-height) + 40px));
+}
+
+.no-control-adjust {
+ margin-top:16px;
+}
+
+.np-controls-wide {
+ bottom:32px;
+}
+
+.v-btn {
+ display:none!important;
+}
+
+body {
+ pointer-events:none!important;
+}
+
+.np-close, .np-menu {
+ visibility:hidden;
+}
+
+.np-bgnd-cover {
+ box-shadow:inset 100vw 120vh var(--background-shadow-color);
+}
+
+.np-playback {
+ height:0px!important;
+ visibility:hidden;
+}

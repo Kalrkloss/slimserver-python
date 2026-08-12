@@ -1,0 +1,87 @@
+axios
+    Version: 1.6.7
+    URL: https://github.com/axios/axios
+    License: MIT
+
+cometd
+    Version: 4.0.3 (modfified)
+    URL: https://github.com/cometd/cometd-javascript
+    License: Apache License Version 2.0
+    Notes: Renamed to libcometd.js. Changess made to work with LMS. Original is
+           libcometd.orig.js
+
+custom-select
+    Version: 1.1.16
+    URL: https://github.com/custom-select/custom-select
+    License: MIT
+
+fast-average-color
+    Version: 9.3.0
+    URL: https://github.com/fast-average-color/fast-average-color
+    License: MIT
+
+idb-keyval:
+    Version: 3.1.0 with pull req 50
+    URL: https://github.com/jakearchibald/idb-keyval
+    License: Apache License Version 2.0
+
+intersection-observer
+    Version: 0.5.0
+    URL: https://github.com/w3c/IntersectionObserver
+    License: W3C Software and Document License
+
+mobile-drag-drop
+    Version: 2.3.0-rc.2
+    URL: https://github.com/timruffles/mobile-drag-drop
+    License: MIT
+
+moustrap:
+    Version: a4098
+    URL: https://craig.is/killing/mice
+    License: Apache License, Version 2.0
+
+PhotoSwipe:
+    Version: 4.1.2
+    URL: https://github.com/dimsemenov/PhotoSwipe
+    License: MIT
+
+Vibrant:
+    Version: 1.0
+    URL: https://github.com/jariz/vibrant.js
+    License: MIT
+
+vue
+    Version: 2.7.15
+    URL: https://github.com/vuejs/vue
+    License: MIT
+
+vue-lazyload
+    Version: 1.3.3
+    URL: https://github.com/hilongjw/vue-lazyload
+    License: MIT
+
+vue-touch-events:
+    Version: 2.2.1pre (15/02/2020)
+    URL: https://github.com/jerrybendy/vue-touch-events
+    License: MIT
+    Notes: Set disableClick:true
+
+vue-virtual-scroller:
+    Version: 1.0.10mod
+    URL: https://github.com/Akryum/vue-virtual-scroller
+    License: MIT
+    NOTES: Modified min.js to result issue 416. Modified from char 12053, changed
+    "if(o)" to "if(o&&y.start!=this.$_lastUpdateScrollPosition)"
+
+vuetify
+    Version: 1.5.24trim202410
+    URL: https://github.com/vuetifyjs/vuetify
+    License: MIT
+    NOTES: Custom build with unused components removed. See tools/vuetify for
+           details.
+
+vuex    
+    Version: 3.3.0
+    URL: https://github.com/vuejs/vuex
+    License: MIT
+

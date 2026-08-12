@@ -1,0 +1,80 @@
+/**
+ * LMS-Material
+ *
+ * Copyright (c) 2018-2026 Craig Drummond <craig.p.drummond@gmail.com>
+ * MIT license.
+ */
+
+:root, .tinted {
+ --dialog-toolbar-color:var(--primary-color);
+ --bottom-toolbar-color:var(--primary-color);
+ --top-toolbar-color:var(--primary-color);
+ --bottom-toolbar-border-color:var(--primary-color);
+ --top-toolbar-border-color:var(--primary-color);
+ --dialog-toolbar-border-color:var(--primary-color);
+ --dialog-toolbar-text-color:var(--light-text-color);
+ --top-toolbar-text-color:var(--light-text-color);
+ --bottom-toolbar-text-color:var(--light-text-color);
+ --active-nav-btn-color:var(--light-text-color);
+ --toolbar-volume-color:var(--light-text-color);
+ --bottom-position-slider-color:var(--light-text-color);
+}
+
+.theme--dark {
+ --active-nav-btn-color:var(--light-text-color)!important;
+}
+
+.np-full:is(.theme--light) .active-nav > div > span,
+.np-full:is(.theme--light) .active-nav > div > i {
+ color:var(--dark-text-color)!important;
+}
+
+.np-full:is(.theme--light) .active-nav > div > .pill-ct {
+ background-color:var(--dark-text-color)!important;
+}
+
+.lms-toolbar .v-input--slider .v-slider__track {
+ background:rgba(255, 255, 255, 0.3333)!important;
+}
+
+.lms-toolbar .v-btn__content i.active-btn, .player-status-icon {
+ color:var(--light-text-color) !important;
+}
+
+.np-full .player-status-icon:is(.theme--light) {
+ color:var(--dark-text-color) !important;
+}
+
+@media (hover: hover) and (pointer: fine) {
+ .menu-btn:hover {
+  background-color:rgba(184, 184, 184, 0.5);
+ }
+ .lms-toolbar .link-item:hover {
+  color:var(--light-text-color) !important;
+  opacity:0.75;
+ }
+.np-full .player-status-icon:is(.theme--light):hover {
+  color:var(--dark-text-color) !important;
+ }
+ .active-nav:hover, .inactive-nav:hover {
+  opacity:0.8!important;
+  background-color:transparent;
+ }
+}
+
+.theme--light:is(.np-full) {
+ --top-toolbar-text-color:var(--dark-text-color);
+ --bottom-toolbar-text-color:var(--dark-text-color);
+}
+
+.theme--light:is(.np-full) .lms-toolbar .v-input--slider .v-slider__track {
+ background:rgba(0, 0, 0, 0.26)!important;
+}
+.np-full .lms-toolbar .v-slider .primary {
+ background-color:var(--primary-color) !important;
+ border-color:var(--primary-color) !important;
+}
+
+#app:not(.np-full) .v-dialog .v-card__title .v-icon {
+ color:var(--light-text-color) !important;
+}

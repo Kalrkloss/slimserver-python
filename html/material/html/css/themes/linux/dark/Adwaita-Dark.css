@@ -1,0 +1,31 @@
+/**
+ * LMS-Material
+ *
+ * Copyright (c) 2018-2026 Craig Drummond <craig.p.drummond@gmail.com>
+ * MIT license.
+ */
+
+:root {
+ --active-color:var(--accent-color);
+ --std-scrollbar-thumb-color:#5f5f5f;
+ --std-scrollbar-thumb-hover-color:#7f7f7f;
+ --std-background-color:#2c2c2c;
+ --background-shadow-color:rgba(45, 45, 45, 0.9);
+ --subtoolbar-shadow-color:rgba(45, 45, 45, 0.75);
+ --text-shadow-color:#000;
+ --active-nav-btn-color:var(--accent-color);
+ --toolbar-volume-color:var(--primary-color);
+ --bottom-position-slider-color:var(--primary-color);
+ --browse-header-color:rgba(64, 64, 64, 0.35);
+ --nav-hover-color:rgba(96, 96, 96, 0.2)!important;
+ --std-popup-background-color:#3f3f3f;
+ --popup-border-color:var(--sub-toolbar-border-color);
+}
+
+.np-info-cover {
+ background-color:#000;
+}
+
+.lms-toolbar .v-btn__content i.active-btn {
+ color:var(--active-color) !important;
+}

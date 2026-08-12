@@ -1,0 +1,26 @@
+/**
+ * LMS-Material
+ *
+ * Copyright (c) 2018-2026 Craig Drummond <craig.p.drummond@gmail.com>
+ * MIT license.
+ */
+
+:root {
+ --highlight-rgb:88,158,129;
+ --primary-color:#589e81;
+ --accent-color:#6cac92;
+}
+
+.lms-lyrion.theme--dark {
+ --highlight-rgb:227,253,196;
+ --primary-color:#e3fdc4;
+ --accent-color:#e3fdc4;
+ --active-color:#e3fdc4!important;
+ --toolbar-volume-color:#e3fdc4!important;
+ --inverted-text-color:#333;
+ --active-nav-btn-color:#e3fdc4;
+}
+
+.lms-lyrion.theme--dark .m3-switch--active:after {
+ background-color:#333!important;
+}
