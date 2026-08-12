@@ -55,14 +55,19 @@ async def _handle_streaming_connect(
     await send({"type": "http.response.body",
                 "body": _json.dumps(first).encode("utf-8"), "more_body": True})
 
-    # The response is CLOSED shortly after the first chunk: ASGI/uvicorn
-    # cannot process further POSTs on a connection while a response is
-    # held open (Orange Squeeze pipelines requests over one socket —
-    # its Jackson parser reads the successive HTTP responses from the
-    # same input stream). Events pushed after the close are delivered
-    # as the reply to the next request (or the next connect poll).
+    # Keep the stream open and push event batches as they arrive. The
+    # uvicorn path (port 9000) serves clients that connect directly to
+    # :9000 (Squeezer manual address) — closing after 0.6 s broke their
+    # connection. Orange Squeeze (pipelined POSTs over one socket) is
+    # served by the native server on 9080.
     try:
-        await asyncio.sleep(0.6)
+        while True:
+            events = await cometd.wait_for_events(cid, timeout=None)
+            if not events:
+                continue
+            await send({"type": "http.response.body",
+                        "body": _json.dumps(events).encode("utf-8"),
+                        "more_body": True})
     except Exception:
         pass
     try:

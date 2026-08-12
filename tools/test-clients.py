@@ -64,7 +64,12 @@ def cometd_post(host: str, port: int, messages: list, read_bytes: int = 20000,
         pass
     s.close()
     head, _, raw = data.partition(b"\r\n\r\n")
-    return head, dechunk(raw)
+    # Only dechunk when the response actually IS chunked — the native
+    # Cometd server answers finite responses (handshake, acks) with
+    # Content-Length, which dechunk() would destroy.
+    if b"chunked" in head.lower():
+        return head, dechunk(raw)
+    return head, raw
 
 
 def dechunk(data: bytes) -> bytes:

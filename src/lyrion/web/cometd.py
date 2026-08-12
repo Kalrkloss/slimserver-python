@@ -143,6 +143,10 @@ class CometdManager:
                     request = data.get("request") or []
                     if not request and "serverstatus" in subscription:
                         request = ["", ["serverstatus", "0", "100", "subscribe:60"]]
+                    elif not request and "menustatus" in subscription:
+                        # Squeezer subscribes to /<cid>/slim/menustatus/*
+                        # without a request — deliver the home menu array
+                        request = ["", ["menustatus"]]
                     result = await self._dispatch(request)
                     self.push(cid, {
                         "channel": subscription,
@@ -213,6 +217,16 @@ class CometdManager:
         events = client.events
         client.events = []
         return events
+
+    async def peek_events(self, client_id: str) -> list[dict]:
+        """Return queued events WITHOUT clearing them. Jive clients
+        expect request results in the POST reply, while SqueezeClient
+        receives them via the open stream — so the native server sends
+        them in the reply AND leaves them queued for the push_task."""
+        client = self.get(client_id)
+        if client is None:
+            return []
+        return list(client.events)
 
     async def _dispatch(self, request: list) -> dict:
         """Dispatch a slim.request payload and return the result dict.

@@ -228,12 +228,25 @@ async def _handle_connection(manager, reader: asyncio.StreamReader,
                         push_task.cancel()
                     break
                 else:
-                    # no connect: reply with the ACKS ONLY. SqueezeClient
-                    # reads publish responses via body.string() and only
-                    # checks messages[0].successful — the actual result
-                    # events must arrive via the OPEN STREAM (push_task),
-                    # otherwise they are lost.
-                    payload = json.dumps(replies).encode("utf-8")
+                    # no connect: reply with acks AND any queued events.
+                    # Jive clients (SqueezeCtrl) expect request results
+                    # in the POST reply; SqueezeClient reads publish
+                    # responses via body.string() (checks only
+                    # messages[0].successful) and receives the events
+                    # via the OPEN STREAM — so peek (don't clear) the
+                    # queue so the push_task delivers them too.
+                    events = []
+                    for m in messages:
+                        if not isinstance(m, dict):
+                            continue
+                        cid2 = m.get("clientId", "")
+                        if not cid2:
+                            resp = (m.get("data") or {}).get("response", "")
+                            if resp.startswith("/"):
+                                cid2 = resp.split("/")[1]
+                        if cid2:
+                            events.extend(await manager.peek_events(cid2))
+                    payload = json.dumps(replies + events).encode("utf-8")
                     writer.write(b"HTTP/1.1 200 OK\r\n"
                                  b"Content-Type: application/json\r\n"
                                  + f"Content-Length: {len(payload)}\r\n\r\n".encode()

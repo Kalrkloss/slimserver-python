@@ -541,17 +541,12 @@ class JSONRPCAPI:
                 "title": "Home",
             }
 
-        # ── menustatus (OpenSqueeze home menu) ─────────────────────
+        # ── menustatus (Squeezer format: [?, items, directive, player]) ──
+        # Squeezer's parseMenuStatus: data[0] unused, data[1] = item
+        # array, data[2] = menu directive — items are only added when
+        # the directive is "add" (MenuStatusMessage.ADD)!
         if cmd == "menustatus":
-            items = self._home_menu()
-            return {
-                "item_loop": items,
-                "count": len(items),
-                # SqueezeClient's JiveHomeItemListResponse requires offset
-                "offset": 0,
-                "base": {"id": "", "name": "Home"},
-                "title": "Home",
-            }
+            return [None, self._home_menu(), "add", pid or ""]
 
         # ── Control commands (return {} — LMS convention) ──────────
         # ── CLI query commands: <cmd> ? → {"_<cmd>": value} ──────
@@ -684,12 +679,23 @@ class JSONRPCAPI:
                    "info", "contributors", "browse"):
             return await self._json_browse(cmd, args)
 
+        # ── displaystatus (Squeezer subscribes with a request) ──────
+        # Squeezer's parseDisplayStatus does getDataAsMap() — an
+        # 'unknown command' list response crashes it. Empty map is fine.
+        if cmd == "displaystatus":
+            return {}
+
         # ── Fallback: text CLI passthrough ─────────────────────────
         try:
             from lyrion.control.cli import CLIHandler, CLIContext
             async with CLIHandler() as cli:
                 ctx = CLIContext(player_id=player_id)
                 result = await cli.dispatch(ctx, (cmd, args))
+                # Unknown commands must NOT be answered with the text
+                # list — apps (Squeezer) cast the response data and
+                # crash on Object[].
+                if isinstance(result, list) and result and str(result[0]).startswith("unknown command"):
+                    return {}
                 return result if isinstance(result, list) else [str(result)]
         except Exception as e:
             return {"error": str(e)}
@@ -799,13 +805,10 @@ class JSONRPCAPI:
 
         menu_block = None
         if "menu:menu" in (args or []):
-            items = self._home_menu()
-            menu_block = {
-                "item_loop": items,
-                "count": len(items),
-                "base": {"id": "", "name": "Home"},
-                "title": "Home",
-            }
+            # Squeezer's parseMenuStatus expects 'menu' to be the item
+            # ARRAY directly ((Object[]) record.get("menu")) — not an
+            # object with item_loop.
+            menu_block = self._home_menu()
         return {
             "mode": player.mode,
             "power": 1 if player.power else 0,
@@ -831,7 +834,7 @@ class JSONRPCAPI:
     def _home_menu(self) -> list[dict]:
         """The root browse menu (Home) shared by menu/menustatus/status."""
 
-        def _home_item(browse_id: str, name: str, typ: str) -> dict:
+        def _home_item(browse_id: str, name: str, typ: str, weight: int = 0) -> dict:
             return {
                 "id": f"browse://{browse_id}",
                 "name": name,
@@ -839,17 +842,19 @@ class JSONRPCAPI:
                 "node": browse_id,  # SqueezeClient HomeMenuItemResponse
                 "type": typ,
                 "hasitems": 1,
+                "weight": weight,
+                # Squeezer reads 'icon' (or 'icon-id') — 'image' is ignored
+                "icon": f"html/images/{browse_id}.png",
                 "browse": {"id": browse_id, "name": name, "type": typ},
-                "image": f"html/images/{browse_id}.png",
             }
 
         return [
-            _home_item("artists", "Artists", "artist"),
-            _home_item("albums", "Albums", "album"),
-            _home_item("songs", "Songs", "song"),
-            _home_item("genres", "Genres", "genre"),
-            _home_item("favorites", "Favorites", "link"),
-            _home_item("radios", "Radio", "link"),
+            _home_item("artists", "Artists", "artist", 0),
+            _home_item("albums", "Albums", "album", 1),
+            _home_item("songs", "Songs", "song", 2),
+            _home_item("genres", "Genres", "genre", 3),
+            _home_item("favorites", "Favorites", "link", 4),
+            _home_item("radios", "Radio", "link", 5),
         ]
 
     async def _load_tracks(self, track_ids: list[int]) -> dict:
