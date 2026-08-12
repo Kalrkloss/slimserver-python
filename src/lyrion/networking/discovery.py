@@ -276,20 +276,95 @@ class DiscoveryService:
         addr: tuple[str, int],
     ) -> None:
         """Handle an incoming player beacon or discovery query."""
-        # ── SlimProto discovery request (SqueezeControl, Orange Squeeze,
-        # SqueezePlay, iPeng): 8 bytes = deviceid(1) + revision(1) + mac(6).
-        # Respond like the Perl LMS (Slim/Networking/Discovery.pm
-        # gotDiscoveryRequest): 'D' + 17-byte hostname (NUL padded). ──
-        if len(data) == 8 and data[0] in (2, 3, 4):
-            await self._reply_discovery(addr, device_id=data[0])
+        # ── SlimProto discovery request (Squeezebox hardware, classic):
+        # starts with 'd', then deviceid(1) + revision(1) + 8 bytes +
+        # mac(6) — respond 'D' + 17-byte hostname (LMS Discovery.pm). ──
+        if data[0:1] == b"d" or (len(data) == 8 and data[0] in (2, 3, 4)):
+            await self._reply_discovery(addr)
+            return
+        # ── TLV discovery (Jive/SqueezeCtrl/SqueezePlay): 'e' + TLV
+        # blocks (NAME/IPAD/JSON/VERS/UUID) → answer with 'E' + TLVs. ──
+        if data[0:1] == b"e" and len(data) > 1:
+            await self._reply_tlv(addr, data)
             return
         # ── Short discovery probes from remote apps ──
-        if data in (b"D", b"d") or (len(data) > 0 and data[0:1] == b"e" and len(data) <= 20):
+        if data in (b"D", b"d"):
             await self._reply_discovery(addr)
             return
 
         # ── Player beacons / other traffic: existing handling ──
         await self._handle_player_beacon(data, addr)
+
+    async def _reply_tlv(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+    ) -> None:
+        """Answer a Jive 'e' TLV discovery request with an 'E' response
+        (Slim/Networking/Discovery.pm gotTLVRequest)."""
+        sock = self._beacon_socket
+        if sock is None:
+            return
+        import socket as _socket
+        from lyrion import __version__
+
+        # Local IP reachable by the client (the socket is bound to
+        # 0.0.0.0, so getsockname is useless here).
+        local_ip = "0.0.0.0"
+        try:
+            probe = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
+            probe.settimeout(1)
+            probe.connect(("192.168.1.1", 1))
+            local_ip = probe.getsockname()[0]
+            probe.close()
+        except Exception:
+            pass
+        if local_ip == "0.0.0.0":
+            try:
+                probe = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
+                probe.connect(("8.8.8.8", 80))
+                local_ip = probe.getsockname()[0]
+                probe.close()
+            except Exception:
+                pass
+        try:
+            from lyrion.config import get_config
+            http_port = int(get_config().get("serverport", 9000))
+        except Exception:
+            http_port = 9000
+
+        hostname = _socket.gethostname()[:16]
+        values = {
+            b"NAME": hostname.encode("iso-8859-1", errors="replace"),
+            b"IPAD": local_ip.encode(),
+            b"JSON": str(http_port).encode(),
+            b"VERS": __version__.encode("ascii", errors="replace"),
+            b"UUID": b"lyrion-server-0001",
+        }
+        # parse TLV blocks: T(4) L(1) V(L)
+        body = data[1:]
+        response = bytearray(b"E")
+        pos = 0
+        while pos + 5 <= len(body):
+            t = body[pos:pos + 4]
+            l = body[pos + 4]
+            v = body[pos + 5:pos + 5 + l] if l else b""
+            if t in values:
+                r = values[t]
+                response += t + bytes([len(r)]) + r
+            pos += 5 + l
+        # Always include the core fields even if not requested (the
+        # Jive client needs the server address to connect).
+        if b"IPAD" not in response:
+            response += b"IPAD" + bytes([len(local_ip)]) + local_ip.encode()
+        if b"JSON" not in response:
+            response += b"JSON" + bytes([len(str(http_port))]) + str(http_port).encode()
+        try:
+            await asyncio.to_thread(sock.sendto, bytes(response), addr)
+            logger.info("TLV discovery response sent to %s (%d bytes)",
+                        addr[0], len(response))
+        except Exception as exc:
+            logger.debug("TLV discovery response failed: %s", exc)
 
     async def _reply_discovery(
         self,

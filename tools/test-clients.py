@@ -272,6 +272,42 @@ def test_squeezer(host: str, port: int) -> None:
     _rpc(host, port, pid, ["stop"])
 
 
+# ----------------------------------------------------------------------
+# 4. SlimProto discovery (classic 'd' + Jive TLV 'e')
+# ----------------------------------------------------------------------
+
+def test_discovery(host: str, port: int) -> None:
+    print("\n== Discovery (SlimProto d + Jive TLV e) ==")
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.settimeout(3)
+
+    # classic: deviceid(1) + revision(1) + mac(6) → 'D' + hostname
+    s.sendto(struct.pack(">BB", 2, 16) + bytes.fromhex("000420123456"),
+             (host, 3483))
+    try:
+        d, _ = s.recvfrom(4096)
+        check("klassisch 'd' -> 'D'-Antwort",
+              d[0:1] == b"D" and len(d) == 18, repr(d[:10]))
+    except socket.timeout:
+        check("klassisch 'd' -> 'D'-Antwort", False, "timeout")
+
+    # Jive TLV: 'e' + NAME/IPAD/JSON/VERS/UUID → 'E' + Werte
+    def tlv(t, v):
+        return t + bytes([len(v)]) + v
+
+    e_pkt = (b"e" + tlv(b"NAME", b"jive") + tlv(b"IPAD", b"")
+             + tlv(b"JSON", b"") + tlv(b"VERS", b"") + tlv(b"UUID", b""))
+    s.sendto(e_pkt, (host, 3483))
+    try:
+        d, _ = s.recvfrom(4096)
+        check("Jive 'e'-TLV -> 'E' mit IPAD/JSON/VERS",
+              d.startswith(b"E") and b"IPAD" in d and b"JSON" in d
+              and b"VERS" in d, repr(d[:40]))
+    except socket.timeout:
+        check("Jive 'e'-TLV -> 'E' mit IPAD/JSON/VERS", False, "timeout")
+    s.close()
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--host", default="127.0.0.1")
@@ -281,6 +317,7 @@ def main() -> int:
     test_squeezeclient(args.host, args.port)
     test_jive(args.host, args.port)
     test_squeezer(args.host, args.port)
+    test_discovery(args.host, args.port)
 
     print()
     if failures:
