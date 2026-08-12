@@ -418,24 +418,26 @@ class JSONRPCAPI:
             players = pm.get_all_players() if pm else []
             start = int(args[0]) if args and str(args[0]).isdigit() else 0
             count = int(args[1]) if len(args) > 1 and str(args[1]).isdigit() else 100
-            loop = []
-            for p in players[start:start + count]:
-                loop.append({
+            loop = [
+                {
+                    "playerindex": i,
                     "playerid": p.mac,
-                    "name": p.name or p.mac,
-                    "model": p.model or "squeezebox",
-                    "modelname": p.model or "Squeezebox",
-                    "ip": f"{p.ip}:{p.port}",
+                    "name": getattr(p, "name", "") or p.mac,
+                    "model": getattr(p, "model", "squeezebox") or "squeezebox",
+                    "modelname": getattr(p, "model", "squeezebox") or "Squeezebox",
+                    "ip": f"{p.ip}:{p.port}" if getattr(p, "port", 0) else p.ip,
                     "uuid": p.mac,
-                    "firmware": p.firmware or "1",
+                    "firmware": getattr(p, "firmware", "2.0.0") or "1",
                     "isplaying": 1 if p.mode == "play" else 0,
-                    "isplayer": 1 if p.is_player else 0,
-                    "canpoweroff": 1 if p.can_power_off else 0,
+                    "isplayer": 1 if getattr(p, "is_player", True) else 0,
+                    "canpoweroff": 1 if getattr(p, "can_power_off", True) else 0,
                     "connected": 1 if p.connected else 0,
                     "power": 1 if p.power else 0,
                     "seq_no": 0,
-                })
-            return {"count": count, "players_loop": loop}
+                }
+                for i, p in enumerate(players[start:start + count])
+            ]
+            return {"count": len(players), "players_loop": loop}
 
         # ── serverstatus ───────────────────────────────────────────
         if cmd == "serverstatus":
@@ -459,27 +461,28 @@ class JSONRPCAPI:
             }
             # Jive controllers subscribe with
             # ['serverstatus', 0, 50, 'subscribe:60'] and expect the
-            # player list in players_loop (like the real LMS).
-            if args:
-                result["count"] = len(players)
-                result["players_loop"] = [
-                    {
-                        "playerid": p.mac,
-                        "name": p.name,
-                        "model": getattr(p, "model", "squeezebox"),
-                        "modelname": getattr(p, "model", "squeezebox"),
-                        "ip": f"{p.ip}:{p.port}" if p.port else p.ip,
-                        "uuid": p.mac,
-                        "firmware": getattr(p, "firmware", "2.0.0"),
-                        "isplaying": 1 if p.mode == "play" else 0,
-                        "isplayer": 1,
-                        "canpoweroff": 1,
-                        "connected": 1 if p.connected else 0,
-                        "power": 1 if p.power else 0,
-                        "seq_no": 0,
-                    }
-                    for p in players
-                ]
+            # player list in players_loop (like the real LMS). Also
+            # return it without args (Squeezer queries plain serverstatus).
+            result["count"] = len(players)
+            result["players_loop"] = [
+                {
+                    "playerindex": i,
+                    "playerid": p.mac,
+                    "name": p.name,
+                    "model": getattr(p, "model", "squeezebox"),
+                    "modelname": getattr(p, "model", "squeezebox"),
+                    "ip": f"{p.ip}:{p.port}" if p.port else p.ip,
+                    "uuid": p.mac,
+                    "firmware": getattr(p, "firmware", "2.0.0"),
+                    "isplaying": 1 if p.mode == "play" else 0,
+                    "isplayer": 1,
+                    "canpoweroff": 1,
+                    "connected": 1 if p.connected else 0,
+                    "power": 1 if p.power else 0,
+                    "seq_no": 0,
+                }
+                for i, p in enumerate(players)
+            ]
             return result
 
         # ── status (player) ────────────────────────────────────────
