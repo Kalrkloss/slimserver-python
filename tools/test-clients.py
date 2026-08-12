@@ -218,6 +218,16 @@ def test_squeezer(host: str, port: int) -> None:
           isinstance(r.get("players_loop"), list) and len(r.get("players_loop", [])) > 0,
           f"count={r.get('count')}")
 
+    # Favorites: loop_loop with the LMS item fields (Squeezer/ioBroker)
+    r = _rpc(host, port, "", ["favorites", "items", "0", "888", "want_url:1", "item_id:"])
+    loop = r.get("loop_loop") or []
+    check("favorites -> loop_loop", len(loop) > 0, f"{len(loop)} Favoriten")
+    if loop:
+        it = loop[0]
+        check("favorites Felder (isItem/isFolder/image)",
+              "isItem" in it and "isFolder" in it and "image" in it
+              and "hasitems" in it and "url" in it, str(sorted(it.keys())))
+
     pid = _first_player(host, port)
     if not pid:
         check("verbundener Player", False)

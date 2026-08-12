@@ -561,11 +561,15 @@ class JSONRPCAPI:
                 items = await get_favorites_manager().list_items(parent)
                 loop = []
                 for it in items:
+                    is_folder = it["type"] == "folder"
                     loop.append({
                         "id": str(it["id"]),
                         "name": it["title"],
                         "url": it["url"] or "",
-                        "hasitems": 1 if it["type"] == "folder" else 0,
+                        "hasitems": 1 if is_folder else 0,
+                        "isItem": 0 if is_folder else 1,
+                        "isFolder": 1 if is_folder else 0,
+                        "image": "",
                         "type": it["type"],
                         "parent_id": str(it["parent_id"]) if it["parent_id"] is not None else "",
                         "position": it["position"],
@@ -689,7 +693,18 @@ class JSONRPCAPI:
         else:
             cur_info = {}
         if cur < len(playlist_ids) and not isinstance(playlist_ids[cur], int):
-            cur_info = {"title": str(playlist_ids[cur])}
+            # Radio stream: title = station name (current_title if set,
+            # else host) — never the full URL.
+            url_str = str(playlist_ids[cur])
+            try:
+                from urllib.parse import urlparse
+                host = urlparse(url_str).hostname or url_str
+                title = host.replace("www.", "")
+            except Exception:
+                title = url_str
+            cur_info = {"title": title, "url": url_str}
+        if getattr(player, "current_title", ""):
+            cur_info["title"] = player.current_title
 
         elapsed = getattr(player, "elapsed", 0) or 0
         if player.mode != "play":
@@ -731,7 +746,10 @@ class JSONRPCAPI:
             return result
         try:
             import sqlite3
-            db = sqlite3.connect("/root/.lyrion/Lyrion/Prefs/lyrion.db")
+            # Read-only connection: status polls from many clients must
+            # never block on (or lock) the writer (aiosqlite session).
+            db = sqlite3.connect(
+                "file:/root/.lyrion/Lyrion/Prefs/lyrion.db?mode=ro", uri=True)
             db.row_factory = sqlite3.Row
             placeholders = ",".join("?" * len(track_ids))
             rows = db.execute(
@@ -918,7 +936,8 @@ class JSONRPCAPI:
         count = int(args[1]) if len(args) > 1 and str(args[1]).isdigit() else 50
         try:
             import sqlite3
-            db = sqlite3.connect("/root/.lyrion/Lyrion/Prefs/lyrion.db")
+            db = sqlite3.connect(
+                "file:/root/.lyrion/Lyrion/Prefs/lyrion.db?mode=ro", uri=True)
             db.row_factory = sqlite3.Row
 
             if cmd == "artists":
