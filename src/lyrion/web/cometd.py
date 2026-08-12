@@ -102,13 +102,19 @@ class CometdManager:
                 client = self.get(cid)
                 data = msg.get("data", {})
                 # Material sends data.response, Jive/SqueezeClient send
-                # data.subscription — accept both.
-                subscription = data.get("subscription") or data.get("response") or ""
+                # data.subscription, SqueezeCtrl sends 'subscription' as
+                # a TOP-LEVEL field of /meta/subscribe — accept all.
+                subscription = (data.get("subscription") or data.get("response")
+                                or msg.get("subscription") or "")
                 if client is not None and subscription:
                     client.subscriptions[subscription] = data
                     logger.info("Cometd %s subscribed %s", cid, subscription)
                     # Push the initial result of the subscription request.
+                    # SqueezeCtrl subscribes to /slim/serverstatus WITHOUT
+                    # a request — deliver the player list anyway.
                     request = data.get("request") or []
+                    if not request and "serverstatus" in subscription:
+                        request = ["", ["serverstatus", "0", "100", "subscribe:60"]]
                     result = await self._dispatch(request)
                     self.push(cid, {
                         "channel": subscription,

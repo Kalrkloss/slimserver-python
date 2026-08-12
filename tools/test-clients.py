@@ -171,6 +171,17 @@ def test_jive(host: str, port: int) -> None:
     check("serverstatus-Event mit players_loop",
           b"/slim/serverstatus" in body and b"players_loop" in body)
 
+    # SqueezeCtrl-style: /meta/subscribe with TOP-LEVEL subscription,
+    # no request — serverstatus must still deliver players_loop
+    head, body = cometd_post(host, port, [
+        {"channel": "/meta/connect", "clientId": cid, "id": "5",
+         "connectionType": "long-polling", "advice": {"timeout": 0}},
+        {"channel": "/meta/subscribe", "clientId": cid, "id": "6",
+         "subscription": f"/{cid}/slim/serverstatus"},
+    ], read_bytes=10000)
+    check("SqueezeCtrl top-level subscribe -> serverstatus-Event",
+          f"/{cid}/slim/serverstatus".encode() in body and b"players_loop" in body)
+
     # Jive request round-trip
     head, body = cometd_post(host, port, [{
         "channel": "/slim/request", "clientId": cid, "id": "4",

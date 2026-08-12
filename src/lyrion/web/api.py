@@ -559,6 +559,10 @@ class JSONRPCAPI:
                    "unsync", "pref", "playerpref", "display", "button",
                    "alarm", "signalstrength", "client", "mode", "name",
                    "playlist"):
+            # Invalidate the status cache: a poll right after a control
+            # command must see the NEW state, not the stale cached one
+            # (Squeezer otherwise shows 'playing' until the TTL expires).
+            self._status_cache.clear()
             await self._json_control(pm, pid, cmd, args)
             return {}
 
