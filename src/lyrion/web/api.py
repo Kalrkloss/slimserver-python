@@ -480,6 +480,8 @@ class JSONRPCAPI:
                 "name": "Lyrion Music Server",
                 "httpport": http_port,
                 "player count": len(players),
+                # SqueezeClient's ServerStatusResponse requires mediadirs
+                "mediadirs": [],
                 "info total genres": 0,
                 "info total artists": 0,
                 "info total albums": 0,
@@ -533,6 +535,8 @@ class JSONRPCAPI:
             return {
                 "item_loop": loop,
                 "count": len(items),
+                # SqueezeClient's JiveHomeItemListResponse requires offset
+                "offset": start,
                 "base": {"id": "", "name": "Home"},
                 "title": "Home",
             }
@@ -543,6 +547,8 @@ class JSONRPCAPI:
             return {
                 "item_loop": items,
                 "count": len(items),
+                # SqueezeClient's JiveHomeItemListResponse requires offset
+                "offset": 0,
                 "base": {"id": "", "name": "Home"},
                 "title": "Home",
             }
@@ -804,6 +810,11 @@ class JSONRPCAPI:
             "mode": player.mode,
             "power": 1 if player.power else 0,
             "player_name": player.name or player.mac,
+            # SqueezeClient's PlayerStatusResponse requires these
+            "player_connected": 1,
+            "count": len(playlist_ids),
+            "playlist shuffle": getattr(player, "shuffle", None) or "0",
+            "playlist repeat": getattr(player, "repeat", None) or "0",
             "mixer volume": player.volume or 50,
             "playlist_tracks": len(playlist_ids),
             "playlist_cur_index": cur,
@@ -825,6 +836,7 @@ class JSONRPCAPI:
                 "id": f"browse://{browse_id}",
                 "name": name,
                 "text": name,  # OpenSqueeze shows getText()
+                "node": browse_id,  # SqueezeClient HomeMenuItemResponse
                 "type": typ,
                 "hasitems": 1,
                 "browse": {"id": browse_id, "name": name, "type": typ},

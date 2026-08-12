@@ -212,29 +212,28 @@ async def _handle_connection(manager, reader: asyncio.StreamReader,
                                          "id": nc.get("id", "")}]).encode())
                                     await writer.drain()
                                 else:
-                                    # requests answered via push_task
-                                    pass
+                                    # Non-connect POSTs (slim/request
+                                    # publishes): reply with the ACKS
+                                    # inline (the OkHttp caller waits for
+                                    # a Content-Length response); the
+                                    # result events flow via push_task.
+                                    nack = json.dumps(nreplies).encode("utf-8")
+                                    writer.write(
+                                        b"HTTP/1.1 200 OK\r\n"
+                                        b"Content-Type: application/json\r\n"
+                                        + f"Content-Length: {len(nack)}\r\n\r\n".encode()
+                                        + nack)
+                                    await writer.drain()
                     finally:
                         push_task.cancel()
                     break
                 else:
-                    # no connect: reply + any queued events, then close
-                    events = []
-                    for m in messages:
-                        if not isinstance(m, dict):
-                            continue
-                        cid2 = m.get("clientId", "")
-                        if not cid2:
-                            # Orange Squeeze's slim/subscribe has no
-                            # clientId — derive it from the response
-                            # channel (/<clientId>/...).
-                            resp = (m.get("data") or {}).get("response", "")
-                            if resp.startswith("/"):
-                                cid2 = resp.split("/")[1]
-                        if cid2:
-                            ev = await manager.wait_for_events(cid2, timeout=0)
-                            events.extend(ev)
-                    payload = json.dumps(replies + events).encode("utf-8")
+                    # no connect: reply with the ACKS ONLY. SqueezeClient
+                    # reads publish responses via body.string() and only
+                    # checks messages[0].successful — the actual result
+                    # events must arrive via the OPEN STREAM (push_task),
+                    # otherwise they are lost.
+                    payload = json.dumps(replies).encode("utf-8")
                     writer.write(b"HTTP/1.1 200 OK\r\n"
                                  b"Content-Type: application/json\r\n"
                                  + f"Content-Length: {len(payload)}\r\n\r\n".encode()

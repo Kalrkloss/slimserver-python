@@ -147,8 +147,16 @@ class CometdManager:
                     self.push(cid, {
                         "channel": subscription,
                         "data": result,
+                        # SqueezeClient's Message class requires id: Int
+                        # — a missing id breaks the whole array parse.
+                        "id": msg.get("id", ""),
                     })
                 reply.update({"successful": client is not None, "error": None})
+                # libcometd (SqueezeClient) requires the subscription
+                # field in the ack — otherwise 'Subscription response
+                # missing'.
+                if subscription:
+                    reply["subscription"] = subscription
 
             elif channel in ("/meta/unsubscribe", "/slim/unsubscribe"):
                 client = self.get(cid)
