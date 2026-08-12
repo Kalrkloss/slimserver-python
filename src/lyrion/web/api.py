@@ -541,12 +541,22 @@ class JSONRPCAPI:
                     val = getattr(player, "current_url", "") or ""
                 elif cmd == "playlist":
                     val = len(getattr(player, "playlist", []) or [])
+                elif cmd == "version":
+                    # Orange Squeeze probes the server with 'version ?'
+                    # and requires {"_version": "..."} to connect at all.
+                    from lyrion import __version__
+                    val = __version__
                 elif cmd in ("artist", "album"):
                     tid = getattr(player, "current_track_id", None)
                     if tid is not None:
                         info = await self._load_tracks([tid])
                         val = (info.get(tid, {}) or {}).get(cmd, "") or ""
                 return {f"_{cmd}": val}
+            # Player-independent queries (Orange Squeeze sends
+            # ["", ["version", "?"]] to probe the server).
+            if cmd == "version":
+                from lyrion import __version__
+                return {"_version": __version__}
             return {f"_{cmd}": ""}
 
         # mixer volume ? → {"_volume": N}

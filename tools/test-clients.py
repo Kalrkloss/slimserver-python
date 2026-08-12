@@ -260,6 +260,9 @@ def test_squeezer(host: str, port: int) -> None:
 
     r = _rpc(host, port, pid, ["mode", "?"])
     check("mode ? -> _mode", r == {"_mode": r.get("_mode")} and "_mode" in r, str(r))
+    r = _rpc(host, port, "", ["version", "?"])
+    check("version ? (ohne Player) -> _version",
+          "_version" in r and bool(r["_version"]), str(r))
     r = _rpc(host, port, pid, ["current_title", "?"])
     check("current_title ? -> _current_title", "_current_title" in r, str(r))
     r = _rpc(host, port, pid, ["artist", "?"])
