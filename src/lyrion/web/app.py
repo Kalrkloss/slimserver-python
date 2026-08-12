@@ -13,8 +13,78 @@ from typing import Callable, Optional
 import uvicorn
 
 from .api import JSONRPCAPI, WebAPIHandler
+from .cometd import LONG_POLL_TIMEOUT, CometdManager
 
 logger = logging.getLogger(__name__)
+
+
+async def _handle_cometd(cometd: CometdManager, receive, send) -> None:
+    """Handle a POST /cometd batch (Jive controller protocol).
+
+    Replies to handshake/subscribe/request immediately; /meta/connect
+    long-polls (held open until events arrive or the timeout expires).
+    """
+    import json as _json
+
+    body = b""
+    more_body = True
+    while more_body:
+        event = await receive()
+        if event.get("type") == "http.request":
+            body += event.get("body", b"")
+            more_body = event.get("more_body", False)
+
+    try:
+        messages = _json.loads(body.decode("utf-8", errors="replace"))
+        if not isinstance(messages, list):
+            messages = [messages]
+    except Exception:
+        messages = []
+
+    replies: list[dict] = []
+    try:
+        replies = await cometd.handle_messages(messages)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Cometd handle_messages failed: %s", exc)
+
+    connect_msgs = [m for m in messages if isinstance(m, dict)
+                    and m.get("channel") == "/meta/connect"]
+
+    if connect_msgs:
+        # /meta/connect messages long-poll for events.
+        for msg in connect_msgs:
+            cid = msg.get("clientId", "")
+            events = await cometd.wait_for_events(cid)
+            replies.append({
+                "channel": "/meta/connect",
+                "successful": True,
+                "clientId": cid,
+                "id": msg.get("id", ""),
+                "advice": {"reconnect": "retry", "interval": 0,
+                           "timeout": LONG_POLL_TIMEOUT},
+            })
+            replies.extend(events)
+    else:
+        # No connect in this batch: deliver events pushed by
+        # subscribe/request immediately (Jive expects the response in
+        # the same reply batch when the request was sent standalone).
+        for msg in messages:
+            if not isinstance(msg, dict):
+                continue
+            cid = msg.get("clientId", "")
+            if not cid:
+                continue
+            events = await cometd.wait_for_events(cid, timeout=0)
+            replies.extend(events)
+
+    response = _json.dumps(replies).encode("utf-8")
+    await send({
+        "type": "http.response.start",
+        "status": 200,
+        "headers": [(b"Content-Type", b"application/json"),
+                    (b"Cache-Control", b"no-cache")],
+    })
+    await send({"type": "http.response.body", "body": response})
 
 
 def create_app(
@@ -30,6 +100,7 @@ def create_app(
     """
     jsonrpc_api = jsonrpc or JSONRPCAPI()
     api_handler = WebAPIHandler(jsonrpc_api)
+    cometd = CometdManager(jsonrpc_api)
 
     if static_dir:
         api_handler.set_static_dir(static_dir)
@@ -43,6 +114,12 @@ def create_app(
         if path.startswith("/stream") and method == "GET":
             from .stream import stream_track
             await stream_track(scope, receive, send)
+            return
+
+        # Cometd (Jive controllers: SqueezeControl, iPeng, Orange Squeeze).
+        # Needs long-polling: the response is sent after events arrive.
+        if path == "/cometd" and method == "POST":
+            await _handle_cometd(cometd, receive, send)
             return
 
         # Read request body

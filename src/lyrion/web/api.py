@@ -446,7 +446,7 @@ class JSONRPCAPI:
                 http_port = int(get_config().get("serverport", 9000))
             except Exception:
                 http_port = 9000
-            return {
+            result = {
                 "version": __version__,
                 "uuid": "lyrion-server-0001",
                 "name": "Lyrion Music Server",
@@ -457,6 +457,30 @@ class JSONRPCAPI:
                 "info total albums": 0,
                 "info total songs": 0,
             }
+            # Jive controllers subscribe with
+            # ['serverstatus', 0, 50, 'subscribe:60'] and expect the
+            # player list in players_loop (like the real LMS).
+            if args:
+                result["count"] = len(players)
+                result["players_loop"] = [
+                    {
+                        "playerid": p.mac,
+                        "name": p.name,
+                        "model": getattr(p, "model", "squeezebox"),
+                        "modelname": getattr(p, "model", "squeezebox"),
+                        "ip": f"{p.ip}:{p.port}" if p.port else p.ip,
+                        "uuid": p.mac,
+                        "firmware": getattr(p, "firmware", "2.0.0"),
+                        "isplaying": 1 if p.mode == "play" else 0,
+                        "isplayer": 1,
+                        "canpoweroff": 1,
+                        "connected": 1 if p.connected else 0,
+                        "power": 1 if p.power else 0,
+                        "seq_no": 0,
+                    }
+                    for p in players
+                ]
+            return result
 
         # ── status (player) ────────────────────────────────────────
         if cmd == "status":

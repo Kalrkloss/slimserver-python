@@ -276,23 +276,50 @@ class DiscoveryService:
         addr: tuple[str, int],
     ) -> None:
         """Handle an incoming player beacon or discovery query."""
-        # ── Discovery query from remote apps (SqueezeCtrl, Squeezer, etc.) ──
+        # ── SlimProto discovery request (SqueezeControl, Orange Squeeze,
+        # SqueezePlay, iPeng): 8 bytes = deviceid(1) + revision(1) + mac(6).
+        # Respond like the Perl LMS (Slim/Networking/Discovery.pm
+        # gotDiscoveryRequest): 'D' + 17-byte hostname (NUL padded). ──
+        if len(data) == 8 and data[0] in (2, 3, 4):
+            await self._reply_discovery(addr, device_id=data[0])
+            return
+        # ── Short discovery probes from remote apps ──
         if data in (b"D", b"d") or (len(data) > 0 and data[0:1] == b"e" and len(data) <= 20):
-            try:
-                sock = self._beacon_socket
-                if sock:
-                    import json as _json
-                    response = _json.dumps({
-                        "ip": f"{addr[0]}:9000",
-                        "name": "Lyrion Music Server",
-                        "uuid": "lyrion-server-0001",
-                    }).encode()
-                    await asyncio.to_thread(sock.sendto, response, addr)
-                    logger.debug("Responded to discovery query from %s:%d", addr[0], addr[1])
-            except Exception as exc:
-                logger.debug("Discovery response error: %s", exc)
+            await self._reply_discovery(addr)
             return
 
+        # ── Player beacons / other traffic: existing handling ──
+        await self._handle_player_beacon(data, addr)
+
+    async def _reply_discovery(
+        self,
+        addr: tuple[str, int],
+        device_id: int | None = None,
+    ) -> None:
+        """Answer a SlimProto discovery request with the LMS-compatible
+        'D' + hostname packet (18 bytes) — NOT JSON (apps expect the
+        original protocol)."""
+        sock = self._beacon_socket
+        if sock is None:
+            return
+        import socket as _socket
+        hostname = _socket.gethostname()[:16].encode(
+            "iso-8859-1", errors="replace")
+        hostname = hostname.ljust(17, b"\x00")
+        response = b"D" + hostname
+        try:
+            await asyncio.to_thread(sock.sendto, response, addr)
+            logger.info("Discovery response sent to %s (deviceid=%s)",
+                        addr[0], device_id if device_id is not None else "?")
+        except Exception as exc:
+            logger.debug("Discovery response failed: %s", exc)
+
+    async def _handle_player_beacon(
+        self,
+        data: bytes,
+        addr: tuple[str, int],
+    ) -> None:
+        """Handle a player UDP beacon (announce/heartbeat)."""
         player = parse_player_beacon(data)
         if player is None:
             logger.debug("Unrecognized beacon from %s: %r", addr, data)

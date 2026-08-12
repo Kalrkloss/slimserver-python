@@ -900,6 +900,20 @@ class SlimProtoClient:
             writer.write(pack_frame(0, ack_payload))
             await writer.drain()
 
+            # Jive controllers (SqueezeControl, iPeng, SqueezePlay) expect
+            # the same greeting as players: 'vers' + SETD name query —
+            # mirror the text-HELO path below.
+            try:
+                from lyrion import __version__
+                vers_payload = __version__.encode("ascii", errors="replace")
+                writer.write(struct.pack(">H", len(vers_payload) + 4) + b"vers" + vers_payload)
+                setd_frame = struct.pack(">H", 5) + b"setd" + bytes([0])
+                writer.write(setd_frame)
+                await writer.drain()
+                logger.info("Sent vers + SETD to %s (binary HELO)", hello.device_id)
+            except Exception as exc:
+                logger.warning("vers/SETD send failed for %s: %s", hello.device_id, exc)
+
             # Register this player with the PlayerManager
             mac_formatted = ":".join(f"{b:02X}" for b in hello.mac)
             # The binary HELO path must populate the same writer registry as
