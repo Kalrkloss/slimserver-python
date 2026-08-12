@@ -772,6 +772,9 @@ class JSONRPCAPI:
                 "album": album,
                 "duration": duration,
                 "url": url,
+                # Orange Squeeze does firstItem.get("trackType").asText()
+                # — a missing field is a NULL NPE crash.
+                "trackType": "local" if isinstance(tid, int) else "remote",
             })
 
         cur = player.playlist_position or 0
