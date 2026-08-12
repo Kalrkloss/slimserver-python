@@ -53,9 +53,33 @@ class CometdManager:
     # Client lifecycle
     # ------------------------------------------------------------------
 
-    def handshake(self) -> CometdClient:
-        client = CometdClient(client_id=f"lyrion-{next(self._counter)}")
-        self._clients[client.client_id] = client
+    def handshake(self, ext: dict | None = None) -> CometdClient:
+        """Create a client. The id is derived from the client UUID when
+        available (stable across reconnects — Orange Squeeze caches the
+        id from its first handshake), otherwise a counter."""
+        uuid = ""
+        if isinstance(ext, dict):
+            uuid = str(ext.get("uuid", "") or "")
+        if uuid:
+            client_id = "1" + uuid.replace("-", "")[:15]
+        else:
+            client_id = f"lyrion-{next(self._counter)}"
+        client = CometdClient(client_id=client_id)
+        self._clients[client_id] = client
+        return client
+
+    def get_or_create(self, client_id: str) -> CometdClient:
+        """Return the client, creating it on the fly if unknown.
+
+        Orange Squeeze caches its clientId from the first handshake and
+        reuses it for subscriptions after a reconnect/restart — without
+        this the server would answer 'successful: false' and the app
+        could not connect.
+        """
+        client = self._clients.get(client_id)
+        if client is None:
+            client = CometdClient(client_id=client_id)
+            self._clients[client_id] = client
         return client
 
     def get(self, client_id: str) -> CometdClient | None:
@@ -88,7 +112,7 @@ class CometdManager:
             reply: dict = {"channel": channel, "id": msg.get("id", "")}
 
             if channel == "/meta/handshake":
-                client = self.handshake()
+                client = self.handshake(msg.get("ext") if isinstance(msg.get("ext"), dict) else None)
                 reply.update({
                     "successful": True,
                     "version": "1.0",
@@ -99,13 +123,17 @@ class CometdManager:
                 logger.info("Cometd handshake -> client %s", client.client_id)
 
             elif channel in ("/meta/subscribe", "/slim/subscribe"):
-                client = self.get(cid)
                 data = msg.get("data", {})
                 # Material sends data.response, Jive/SqueezeClient send
                 # data.subscription, SqueezeCtrl sends 'subscription' as
                 # a TOP-LEVEL field of /meta/subscribe — accept all.
                 subscription = (data.get("subscription") or data.get("response")
                                 or msg.get("subscription") or "")
+                # Orange Squeeze's /slim/subscribe carries NO clientId —
+                # derive it from the subscription path (/<clientId>/...).
+                if not cid and subscription.startswith("/"):
+                    cid = subscription.split("/")[1]
+                client = self.get_or_create(cid)
                 if client is not None and subscription:
                     client.subscriptions[subscription] = data
                     logger.info("Cometd %s subscribed %s", cid, subscription)
@@ -131,9 +159,13 @@ class CometdManager:
                 reply.update({"successful": client is not None})
 
             elif channel == "/slim/request":
-                client = self.get(cid)
                 data = msg.get("data", {})
-                response_channel = data.get("response", f"/{cid}/slim/request")
+                response_channel = data.get("response", "")
+                # Orange Squeeze's slim/request carries NO clientId —
+                # derive it from the response channel (/<clientId>/...).
+                if not cid and response_channel.startswith("/"):
+                    cid = response_channel.split("/")[1]
+                client = self.get_or_create(cid)
                 request = data.get("request") or []
                 result = await self._dispatch(request)
                 if client is not None:
@@ -153,16 +185,20 @@ class CometdManager:
         return replies
 
     async def wait_for_events(
-        self, client_id: str, timeout: float = LONG_POLL_TIMEOUT
+        self, client_id: str, timeout: float | None = LONG_POLL_TIMEOUT
     ) -> list[dict]:
-        """Block until the client has queued events or the poll timeout
-        expires. Returns the events (and clears the queue)."""
+        """Block until the client has queued events (or the timeout
+        expires; None = wait forever). Returns the events (and clears
+        the queue)."""
         client = self.get(client_id)
         if client is None:
             return []
         if not client.events:
             try:
-                await asyncio.wait_for(client.notify.wait(), timeout=timeout)
+                if timeout is None:
+                    await client.notify.wait()
+                else:
+                    await asyncio.wait_for(client.notify.wait(), timeout=timeout)
             except asyncio.TimeoutError:
                 pass
         client.notify.clear()

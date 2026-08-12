@@ -520,6 +520,33 @@ class JSONRPCAPI:
                 self._status_cache[cache_key] = (time.time(), result)
             return result
 
+        # ── menu (home menu for Jive/Material/OpenSqueeze apps) ────
+        # LMS 'menu <start> <count> [direct:1]' returns the root browse
+        # items in item_loop. Apps hang on 'Loading Menus…' without it.
+        if cmd == "menu":
+            items = self._home_menu()
+            start = int(args[0]) if args and str(args[0]).isdigit() else 0
+            count = int(args[1]) if len(args) > 1 and str(args[1]).isdigit() else 512
+            loop = items[start:start + count]
+            for i, it in enumerate(loop):
+                it["index"] = start + i
+            return {
+                "item_loop": loop,
+                "count": len(items),
+                "base": {"id": "", "name": "Home"},
+                "title": "Home",
+            }
+
+        # ── menustatus (OpenSqueeze home menu) ─────────────────────
+        if cmd == "menustatus":
+            items = self._home_menu()
+            return {
+                "item_loop": items,
+                "count": len(items),
+                "base": {"id": "", "name": "Home"},
+                "title": "Home",
+            }
+
         # ── Control commands (return {} — LMS convention) ──────────
         # ── CLI query commands: <cmd> ? → {"_<cmd>": value} ──────
         # LMS JSON-RPC convention (ioBroker.squeezeboxrpc, Squeezer,
@@ -764,6 +791,15 @@ class JSONRPCAPI:
                 "url": cur_url,
             }
 
+        menu_block = None
+        if "menu:menu" in (args or []):
+            items = self._home_menu()
+            menu_block = {
+                "item_loop": items,
+                "count": len(items),
+                "base": {"id": "", "name": "Home"},
+                "title": "Home",
+            }
         return {
             "mode": player.mode,
             "power": 1 if player.power else 0,
@@ -778,7 +814,31 @@ class JSONRPCAPI:
             "title": cur_info.get("title", ""),
             "album": cur_info.get("album", ""),
             "playlist_loop": loop,
-        } | ({"remoteMeta": remote_meta} if remote_meta else {})
+        } | ({"remoteMeta": remote_meta} if remote_meta else {}) \
+          | ({"menu": menu_block} if menu_block else {})
+
+    def _home_menu(self) -> list[dict]:
+        """The root browse menu (Home) shared by menu/menustatus/status."""
+
+        def _home_item(browse_id: str, name: str, typ: str) -> dict:
+            return {
+                "id": f"browse://{browse_id}",
+                "name": name,
+                "text": name,  # OpenSqueeze shows getText()
+                "type": typ,
+                "hasitems": 1,
+                "browse": {"id": browse_id, "name": name, "type": typ},
+                "image": f"html/images/{browse_id}.png",
+            }
+
+        return [
+            _home_item("artists", "Artists", "artist"),
+            _home_item("albums", "Albums", "album"),
+            _home_item("songs", "Songs", "song"),
+            _home_item("genres", "Genres", "genre"),
+            _home_item("favorites", "Favorites", "link"),
+            _home_item("radios", "Radio", "link"),
+        ]
 
     async def _load_tracks(self, track_ids: list[int]) -> dict:
         """Load track metadata (title/artist/album/duration/url) for ids."""

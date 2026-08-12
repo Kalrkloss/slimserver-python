@@ -201,6 +201,13 @@ async def _run_server(
         try:
             import uvicorn
             from lyrion.web.app import create_config
+            from lyrion.web.api import JSONRPCAPI
+            from lyrion.web.cometd import CometdManager
+
+            # Shared JSON-RPC + Cometd manager (uvicorn AND the native
+            # streaming server must see the same clients/subscriptions).
+            jsonrpc_api = JSONRPCAPI()
+            cometd_mgr = CometdManager(jsonrpc_api)
 
             base_dir = Path(__file__).parent.parent.parent
             static_dir = str(base_dir / "html")
@@ -208,6 +215,8 @@ async def _run_server(
                 host="0.0.0.0",
                 port=http_port,
                 static_dir=static_dir,
+                jsonrpc=jsonrpc_api,
+                cometd=cometd_mgr,
             )
             _uvicorn_server = uvicorn.Server(config=config_uvicorn)
             log.info("Web server starting on http://0.0.0.0:%d", http_port)
@@ -217,6 +226,17 @@ async def _run_server(
             # uvicorn's signal handlers conflict with ours (systemd restart
             # would hang in "deactivating").
             uvicorn_task = asyncio.create_task(_uvicorn_server.serve())
+
+            # Native Cometd streaming server (SqueezePlay/Orange Squeeze
+            # pipeline POSTs over one socket with an open response —
+            # uvicorn cannot serve that). Advertised via TLV discovery.
+            try:
+                from lyrion.networking.cometd_stream import start_cometd_server
+                cometd_stream_port = int(cfg.get("cometd_stream_port", 9080))
+                asyncio.create_task(start_cometd_server(
+                    cometd_mgr, "0.0.0.0", cometd_stream_port, http_port))
+            except Exception as exc:
+                log.warning("Could not start native Cometd server: %s", exc)
 
             # Wait for shutdown signal or uvicorn stopping itself.
             # Active SIGTERM/SIGINT handler is bootstrap.request_shutdown,

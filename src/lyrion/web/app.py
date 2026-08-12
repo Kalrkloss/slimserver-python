@@ -6,8 +6,10 @@ with the project's async/await model.
 """
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
-from pathlib import Path
+import time
 from typing import Callable, Optional
 
 import uvicorn
@@ -53,17 +55,14 @@ async def _handle_streaming_connect(
     await send({"type": "http.response.body",
                 "body": _json.dumps(first).encode("utf-8"), "more_body": True})
 
-    # Keep the stream open: push event batches as they arrive. Close
-    # after a quiet period so dead connections are reclaimed (clients
-    # reconnect automatically).
+    # The response is CLOSED shortly after the first chunk: ASGI/uvicorn
+    # cannot process further POSTs on a connection while a response is
+    # held open (Orange Squeeze pipelines requests over one socket —
+    # its Jackson parser reads the successive HTTP responses from the
+    # same input stream). Events pushed after the close are delivered
+    # as the reply to the next request (or the next connect poll).
     try:
-        while True:
-            events = await cometd.wait_for_events(cid, timeout=30)
-            if not events:
-                break
-            await send({"type": "http.response.body",
-                        "body": _json.dumps(events).encode("utf-8"),
-                        "more_body": True})
+        await asyncio.sleep(0.6)
     except Exception:
         pass
     try:
@@ -93,7 +92,7 @@ async def _handle_cometd(cometd: CometdManager, path: str, receive, send) -> Non
         messages = _json.loads(body.decode("utf-8", errors="replace"))
         if not isinstance(messages, list):
             messages = [messages]
-        logger.info("Cometd POST %s: %.220s", path, body.decode("utf-8", errors="replace")[:220])
+        logger.info("Cometd POST %s: %.1200s", path, body.decode("utf-8", errors="replace")[:1200])
     except Exception as exc:
         logger.info("Cometd body not JSON (%s): %.160s", exc, body.decode("utf-8", errors="replace"))
         messages = []
@@ -155,6 +154,7 @@ def create_app(
     port: int = 9000,
     static_dir: Optional[str] = None,
     jsonrpc: Optional[JSONRPCAPI] = None,
+    cometd: Optional[CometdManager] = None,
 ) -> Callable:
     """Create and return the ASGI application callable.
 
@@ -163,7 +163,7 @@ def create_app(
     """
     jsonrpc_api = jsonrpc or JSONRPCAPI()
     api_handler = WebAPIHandler(jsonrpc_api)
-    cometd = CometdManager(jsonrpc_api)
+    cometd = cometd or CometdManager(jsonrpc_api)
 
     if static_dir:
         api_handler.set_static_dir(static_dir)
@@ -225,6 +225,7 @@ def create_config(
     port: int = 9000,
     static_dir: Optional[str] = None,
     jsonrpc: Optional[JSONRPCAPI] = None,
+    cometd: Optional[CometdManager] = None,
     log_level: str = "info",
 ) -> uvicorn.Config:
     """Create a uvicorn.Config ready for uvicorn.Server.
@@ -234,12 +235,15 @@ def create_config(
         port: Bind port.
         static_dir: Path to serve static files from (html/, etc.).
         jsonrpc: Pre-configured JSONRPCAPI instance.
+        cometd: Pre-configured CometdManager (shared with the native
+            streaming server).
         log_level: Logging level for uvicorn.
 
     Returns:
         uvicorn.Config object ready for uvicorn.Server.
     """
-    app = create_app(host=host, port=port, static_dir=static_dir, jsonrpc=jsonrpc)
+    app = create_app(host=host, port=port, static_dir=static_dir,
+                     jsonrpc=jsonrpc, cometd=cometd)
     return uvicorn.Config(
         app=app,
         host=host,

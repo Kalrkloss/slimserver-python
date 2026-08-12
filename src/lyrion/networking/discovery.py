@@ -329,9 +329,12 @@ class DiscoveryService:
                 pass
         try:
             from lyrion.config import get_config
-            http_port = int(get_config().get("serverport", 9000))
+            # Advertise the native Cometd streaming port (9080) so Jive
+            # apps (Orange Squeeze, SqueezePlay) connect to the server
+            # that can serve the Bayeux streaming protocol.
+            http_port = int(get_config().get("cometd_stream_port") or 9080)
         except Exception:
-            http_port = 9000
+            http_port = 9080
 
         hostname = _socket.gethostname()[:16]
         values = {
