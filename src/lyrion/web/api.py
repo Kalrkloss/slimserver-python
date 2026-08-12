@@ -437,6 +437,10 @@ class JSONRPCAPI:
                 }
                 for i, p in enumerate(players[start:start + count])
             ]
+            # playerindex must be the GLOBAL index (LMS semantics), not
+            # the position within the paginated slice.
+            for i, entry in enumerate(loop):
+                entry["playerindex"] = start + i
             return {"count": len(players), "players_loop": loop}
 
         # ── serverstatus ───────────────────────────────────────────
