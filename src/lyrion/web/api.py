@@ -685,6 +685,13 @@ class JSONRPCAPI:
         if cmd == "displaystatus":
             return {}
 
+        # ── playerstatus (SqueezeCtrl/Orange Squeeze subscribe) ─────
+        # The apps subscribe to /<cid>/slim/playerstatus/<player> and
+        # expect the player status as event data — without it they show
+        # no player status and no stream info.
+        if cmd == "playerstatus":
+            return await self._json_player_status(pm, pid, args)
+
         # ── Fallback: text CLI passthrough ─────────────────────────
         try:
             from lyrion.control.cli import CLIHandler, CLIContext
@@ -828,6 +835,8 @@ class JSONRPCAPI:
             "title": cur_info.get("title", ""),
             "album": cur_info.get("album", ""),
             "playlist_loop": loop,
+            # SqueezeCtrl/Squeezer read the current track from item_loop
+            "item_loop": loop,
         } | ({"remoteMeta": remote_meta} if remote_meta else {}) \
           | ({"menu": menu_block} if menu_block else {})
 
@@ -840,11 +849,17 @@ class JSONRPCAPI:
                 "name": name,
                 "text": name,  # OpenSqueeze shows getText()
                 "node": browse_id,  # SqueezeClient HomeMenuItemResponse
+                "parent": "home",  # Jive home root
                 "type": typ,
                 "hasitems": 1,
                 "weight": weight,
                 # Squeezer reads 'icon' (or 'icon-id') — 'image' is ignored
                 "icon": f"html/images/{browse_id}.png",
+                # Jive navigation: go/do action triggers browse
+                "actions": {
+                    "go": {"cmd": ["browse", browse_id]},
+                    "do": {"cmd": ["browse", browse_id]},
+                },
                 "browse": {"id": browse_id, "name": name, "type": typ},
             }
 
