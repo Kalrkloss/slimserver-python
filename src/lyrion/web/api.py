@@ -691,6 +691,23 @@ class JSONRPCAPI:
         if cur < len(playlist_ids) and not isinstance(playlist_ids[cur], int):
             cur_info = {"title": str(playlist_ids[cur])}
 
+        elapsed = getattr(player, "elapsed", 0) or 0
+        if player.mode != "play":
+            elapsed = 0
+
+        # remoteMeta: SqueezeClient / ioBroker expect the live-stream
+        # metadata block for remote streams (radio).
+        remote_meta = {}
+        cur_url = getattr(player, "current_url", None)
+        if cur_url and not isinstance(playlist_ids[cur] if cur < len(playlist_ids) else None, int):
+            remote_meta = {
+                "title": cur_info.get("title", ""),
+                "artist": cur_info.get("artist", ""),
+                "album": cur_info.get("album", ""),
+                "duration": cur_info.get("duration", 0) or 0,
+                "url": cur_url,
+            }
+
         return {
             "mode": player.mode,
             "power": 1 if player.power else 0,
@@ -698,13 +715,14 @@ class JSONRPCAPI:
             "mixer volume": player.volume or 50,
             "playlist_tracks": len(playlist_ids),
             "playlist_cur_index": cur,
-            "time": 0,
+            "time": elapsed,
+            "rate": 1 if player.mode == "play" else 0,
             "duration": cur_info.get("duration", 0) or 0,
             "artist": cur_info.get("artist", ""),
             "title": cur_info.get("title", ""),
             "album": cur_info.get("album", ""),
             "playlist_loop": loop,
-        }
+        } | ({"remoteMeta": remote_meta} if remote_meta else {})
 
     async def _load_tracks(self, track_ids: list[int]) -> dict:
         """Load track metadata (title/artist/album/duration/url) for ids."""

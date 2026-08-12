@@ -1683,9 +1683,14 @@ class SlimProtoClient:
                 event = payload[0:4].decode("ascii", errors="replace").strip("\x00")
             else:
                 event = "?"
-            jiffies = int.from_bytes(payload[24:28], "big") if len(payload) >= 28 else 0
-            elapsed = int.from_bytes(payload[36:40], "big") if len(payload) >= 40 else 0
-            logger.debug("STAT from %s: event=%s jiffies=%d elapsed=%ds", mac_str, event, jiffies, elapsed)
+            # Squeezelite/SqueezePlayer pack the statstruct_t WITHOUT
+            # C padding (53 bytes). Verified against live frames:
+            # output_buffer_size(4) at 29:33 == 0x0035d540 (3.5MB), so
+            # jiffies is at 25:29 and elapsed_seconds at 37:41.
+            jiffies = int.from_bytes(payload[25:29], "big") if len(payload) >= 29 else 0
+            elapsed = int.from_bytes(payload[37:41], "big") if len(payload) >= 41 else 0
+            logger.debug("STAT from %s: event=%s jiffies=%d elapsed=%ds hex=%s",
+                         mac_str, event, jiffies, elapsed, payload[:60].hex())
 
             # event "setd" carries the player-assigned name (squeezelite/IPAD style)
             if event == "setd":
@@ -1718,6 +1723,10 @@ class SlimProtoClient:
                 pm = PlayerManager()
                 player = pm.get_player(mac_str)
                 if player is not None:
+                    # Track playback position (STAT elapsed_seconds, sent
+                    # with every STMt) — used for status 'time'.
+                    if elapsed and elapsed < 3600 * 24:  # sanity: < 24h
+                        player.elapsed = elapsed
                     if event == "STMd":
                         # DECODE_COMPLETE — decoder has no more data. This
                         # fires BOTH at natural track end AND when the user

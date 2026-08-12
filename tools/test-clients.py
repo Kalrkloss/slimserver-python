@@ -228,6 +228,14 @@ def test_squeezer(host: str, port: int) -> None:
     check("status -> mode/title/artist/album/playlist_loop",
           "mode" in r and "title" in r and "artist" in r
           and "album" in r and "playlist_loop" in r, str(list(r.keys()))[:80])
+    check("status -> time int + rate 0/1",
+          isinstance(r.get("time"), int) and r.get("rate") in (0, 1),
+          f"time={r.get('time')} rate={r.get('rate')}")
+    if r.get("mode") == "play":
+        check("spielender Player: time > 0 (STAT elapsed)",
+              (r.get("time") or 0) > 0, f"time={r.get('time')}")
+    if r.get("title", "").startswith("http"):
+        check("Radio-Stream: remoteMeta vorhanden", "remoteMeta" in r)
 
     r = _rpc(host, port, pid, ["mode", "?"])
     check("mode ? -> _mode", r == {"_mode": r.get("_mode")} and "_mode" in r, str(r))
