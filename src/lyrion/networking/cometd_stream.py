@@ -61,6 +61,11 @@ async def _push_events(manager, cid: str, writer: asyncio.StreamWriter) -> None:
     """Push event batches into the open chunked stream as they arrive."""
     try:
         while True:
+            # A vanished client (meta/disconnect) makes wait_for_events
+            # return [] immediately — without the existence check this
+            # loop would spin at 100% CPU and freeze the whole server.
+            if manager.get(cid) is None:
+                break
             events = await manager.wait_for_events(cid, timeout=None)
             if events:
                 data = json.dumps(events).encode("utf-8")

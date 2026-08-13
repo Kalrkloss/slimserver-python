@@ -62,6 +62,11 @@ async def _handle_streaming_connect(
     # served by the native server on 9080.
     try:
         while True:
+            # A vanished client (meta/disconnect) makes wait_for_events
+            # return [] immediately — without the existence check the
+            # loop would spin at 100% CPU and freeze the whole server.
+            if cometd.get(cid) is None:
+                break
             events = await cometd.wait_for_events(cid, timeout=None)
             if not events:
                 continue
