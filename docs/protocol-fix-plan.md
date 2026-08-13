@@ -351,7 +351,7 @@ Verifikation Phase 3: Suite `all checks passed`, Ad-hoc-Skript
 gruppiert; albums genre:Rock → 652; songinfo vollständig; favorites id
 `0.0` + item_id:0.0 → 5 Kinder; Cometd disconnect/ping; menu nextWindow).
 
-Phase-4-Status (Commit `?`):
+Phase-4-Status (Commit `0acf491`):
 
 | Plan-ID | Gap | Status |
 |---------|-----|--------|
