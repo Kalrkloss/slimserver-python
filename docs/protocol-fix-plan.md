@@ -307,3 +307,14 @@ Controller-Navigation tot.
 Jede Phase ist einzeln commitbar; nach jeder Phase:
 `tools/test-clients.py` (9000 + 9080) + Ad-hoc-Verifikation + Commit/Push.
 
+## Status
+
+| Plan-ID | Gap | Status |
+|---------|-----|--------|
+| P1-1 | 3.2 | ✅ erledigt in `6e5fe21` (CLI zeilenorientiert + cli_server auf CLIHandler) |
+| P1-2 | 3.1 | ✅ erledigt in `6e5fe21` (percent-decoding + Player-ID-Erkennung) |
+| P1-3 | 6.1, 8.2(Teil) | ✅ erledigt in `6e5fe21` (`browse`-Kommando, _json_browse-SQL-Fixes) |
+| P5-1 | 1.1 | ✅ erledigt in `6e5fe21` (audg im binären HELO, Socket-verifiziert) |
+| — | 3.2(Zusatz), 10.3(Teil) | ✅ erledigt in `6e5fe21`: cli_server.py war ein Stub (fast alle Kommandos → „ok"); delegiert jetzt an die Registry. MAC-Normalisierung in allen Player-Lookups. `mixer volume` direkt. |
+| P2-1…P2-7, P3-1…P3-5, P4-1…P4-4, P5-2…P5-4, P6-1…P6-3 | restliche Gaps | ⏳ offen |
+
