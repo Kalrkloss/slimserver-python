@@ -856,7 +856,7 @@ class JSONRPCAPI:
         async def _do():
             from lyrion.config import get_config
             from lyrion.media.importer import MusicImporter, ImportConfig
-            musicdir = get_config().get("musicdir", "/mnt/media2/Musik") or "/mnt/media2/Musik"
+            musicdir = get_config().get("musicdir", "/mnt/media/Musik") or "/mnt/media/Musik"
             importer = MusicImporter(ImportConfig(source_path=_Path(musicdir)))
             stats = await importer.import_music()
             return stats

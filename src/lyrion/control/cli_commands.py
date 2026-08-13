@@ -1455,7 +1455,10 @@ async def cmd_rescan(
 
         async def _do() -> None:
             try:
-                imp = MusicImporter(ImportConfig())
+                from pathlib import Path as _Path
+                from lyrion.config import get_config
+                musicdir = get_config().get("musicdir", "/mnt/media/Musik") or "/mnt/media/Musik"
+                imp = MusicImporter(ImportConfig(source_path=_Path(musicdir)))
                 await imp.import_music()
             except Exception as exc:  # noqa: BLE001
                 import logging

@@ -317,6 +317,60 @@ class MediaScanner:
         """
         return await self._process_file(file_path)
 
+    def _extract_tags(self, file_path: Path) -> tuple:
+        """mutagen tag extraction — sync, runs in a worker thread.
+
+        Format-agnostic tag lookup: ID3 frame IDs, Vorbis/APE-style
+        keys, MP4 atom names. Returns the ten metadata values.
+        """
+        title = artist = album = genre = ""
+        year = track = duration = bitrate = sample_rate = channels = 0
+        try:
+            audio_file = MutagenFile(file_path)
+            if audio_file is None:
+                logger.warning("No audio metadata for %s", file_path)
+                return (title, artist, album, genre, year, track,
+                        duration, bitrate, sample_rate, channels)
+            try:
+                tags = getattr(audio_file, "tags", None)
+                info = getattr(audio_file, "info", None)
+                title = _tag_value(tags, "TIT2", "title", "\xa9nam", "Title", "WM/Title")
+                artist = _tag_value(
+                    tags, "TPE1", "artist", "\xa9ART", "Author",
+                    "Album Artist", "WM/AlbumArtist",
+                )
+                album = _tag_value(tags, "TALB", "album", "\xa9alb",
+                                   "WM/AlbumTitle", "Album")
+                genre = _tag_value(tags, "TCON", "genre", "\xa9gen",
+                                   "WM/Genre", "Genre")
+                year_str = _tag_value(tags, "TDRC", "TYER", "date", "\xa9day",
+                                      "WM/Year", "Year")
+                if year_str:
+                    m = re.search(r"\d{4}", year_str)
+                    if m:
+                        year = int(m.group(0))
+                track_str = _tag_value(tags, "TRCK", "tracknumber", "trck",
+                                       "Track", "WM/TrackNumber")
+                if track_str:
+                    m = re.search(r"\d+", track_str)
+                    if m:
+                        track = int(m.group(0))
+                if info is not None:
+                    duration = int(getattr(info, "length", 0) * 1000) or 0
+                    bitrate = int(getattr(info, "bitrate", 0) or 0)
+                    sample_rate = int(getattr(info, "sample_rate", 0) or 0)
+                    channels = int(getattr(info, "channels", 0) or 0)
+            finally:
+                # Close file handles for types that support it
+                try:
+                    audio_file.close()
+                except Exception:
+                    pass
+        except Exception as e:
+            logger.warning("Failed to extract metadata from %s: %s", file_path, e)
+        return (title, artist, album, genre, year, track,
+                duration, bitrate, sample_rate, channels)
+
     async def _process_file(self, file_path: Path) -> ScanResult | None:
         """Process a single music file."""
         # Get file stats
@@ -336,74 +390,12 @@ class MediaScanner:
         import mimetypes
         mime_type, _ = mimetypes.guess_type(str(file_path))
 
-        # Extract metadata using mutagen
-        title = ""
-        artist = ""
-        album = ""
-        genre = ""
-        year = 0
-        track = 0
-        duration = 0
-        bitrate = 0
-        sample_rate = 0
-        channels = 0
-
-        if self.config.extract_metadata:
-            try:
-                audio_file = MutagenFile(file_path)
-                if audio_file is None:
-                    logger.warning("No audio metadata for %s", file_path)
-                else:
-                    try:
-                        tags = getattr(audio_file, "tags", None)
-                        info = getattr(audio_file, "info", None)
-                        # Format-agnostic tag lookup: try ID3 frame IDs, then
-                        # Vorbis/APE-style keys, then MP4 atom names.
-                        title = _tag_value(
-                            tags, "TIT2", "title", "\xa9nam", "Title", "WM/Title"
-                        )
-                        artist = _tag_value(
-                            tags, "TPE1", "artist", "\xa9ART", "Author",
-                            "Album Artist", "WM/AlbumArtist",
-                        )
-                        album = _tag_value(
-                            tags, "TALB", "album", "\xa9alb",
-                            "WM/AlbumTitle", "Album",
-                        )
-                        genre = _tag_value(
-                            tags, "TCON", "genre", "\xa9gen",
-                            "WM/Genre", "Genre",
-                        )
-                        year_str = _tag_value(
-                            tags, "TDRC", "TYER", "date", "\xa9day",
-                            "WM/Year", "Year",
-                        )
-                        if year_str:
-                            year_match = re.search(r"\d{4}", year_str)
-                            if year_match:
-                                year = int(year_match.group(0))
-                        track_str = _tag_value(
-                            tags, "TRCK", "tracknumber", "trck",
-                            "Track", "WM/TrackNumber",
-                        )
-                        if track_str:
-                            track_match = re.search(r"\d+", track_str)
-                            if track_match:
-                                track = int(track_match.group(0))
-                        if info is not None:
-                            duration = int(getattr(info, "length", 0) * 1000) or 0
-                            bitrate = int(getattr(info, "bitrate", 0) or 0)
-                            sample_rate = int(getattr(info, "sample_rate", 0) or 0)
-                            channels = int(getattr(info, "channels", 0) or 0)
-                    finally:
-                        # Close file handles for types that support it
-                        try:
-                            audio_file.close()
-                        except Exception:
-                            pass
-
-            except Exception as e:
-                logger.warning("Failed to extract metadata from %s: %s", file_path, e)
+        # Extract metadata using mutagen. The mutagen C bindings release
+        # the GIL while parsing, so run the extraction in a worker thread
+        # — the 8 concurrent scan workers then parallelize for real.
+        (title, artist, album, genre, year, track,
+         duration, bitrate, sample_rate, channels) = (
+            await asyncio.to_thread(self._extract_tags, file_path))
 
         # Look for cover artwork
         artwork_path = None

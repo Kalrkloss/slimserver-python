@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 class ImportConfig:
     """Configuration for music import."""
 
-    source_path: Path = Path("/mnt/media2/Musik")
+    source_path: Path = Path("/mnt/media/Musik")
     batch_size: int = 100
     overwrite_existing: bool = False
 
@@ -118,27 +118,36 @@ class MusicImporter:
         for batch_start in range(0, len(files), self.config.batch_size):
             batch = files[batch_start:batch_start + self.config.batch_size]
 
-            # Phase 1: metadata extraction (no DB)
+            # Phase 1: metadata extraction (parallel, no DB). The mutagen
+            # C calls release the GIL in worker threads, so 8 concurrent
+            # workers give a large speedup on big libraries.
             extracted: list[tuple[Path, Any]] = []
-            for file_path in batch:
-                self.stats.scanned_files += 1
-                try:
-                    info = await scanner.scan_single_file(file_path)
-                    if info is not None:
-                        extracted.append((file_path, info))
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning("Extract failed for %s: %s", file_path, exc)
-                    self.stats.error_files += 1
+            sem = asyncio.Semaphore(8)
 
-            # Phase 2: short-lived session, inserts only
-            async with db_session() as session:
-                for file_path, info in extracted:
+            async def _extract(file_path: Path) -> tuple[Path, Any] | None:
+                async with sem:
                     try:
-                        await self._import_track(session, file_path, info)
-                        self.stats.imported_files += 1
+                        info = await scanner.scan_single_file(file_path)
+                        return (file_path, info) if info is not None else None
                     except Exception as exc:  # noqa: BLE001
-                        logger.warning("Import failed for %s: %s", file_path, exc)
+                        logger.warning("Extract failed for %s: %s", file_path, exc)
                         self.stats.error_files += 1
+                        return None
+
+            for task in asyncio.as_completed(
+                    [asyncio.create_task(_extract(p)) for p in batch]):
+                self.stats.scanned_files += 1
+                r = await task
+                if r:
+                    extracted.append(r)
+
+            # Phase 2: short-lived session, inserts only. Batch lookups
+            # (existing tracks/albums/contributors + join membership) run
+            # once per batch, not once per track — the per-track queries
+            # were the bottleneck (aiosqlite thread round-trips).
+            async with db_session() as session:
+                await self._import_batch(session, extracted)
+                self.stats.imported_files += len(extracted)
                 await session.commit()
             self._emit_progress()
             logger.info("Imported %d/%d files", batch_start + len(batch), len(files))
@@ -175,19 +184,96 @@ class MusicImporter:
 
     # -- single track -------------------------------------------------------
 
-    async def _import_track(self, session, file_path: Path, info: Any) -> None:
-        """Upsert one track + its album/contributors."""
-        from lyrion.database.schema import Album, Contributor, Track
+    async def _import_batch(self, session, extracted: list[tuple[Path, Any]]) -> None:
+        """Import one batch with batch-level lookups (once per batch,
+        not per track)."""
+        from sqlalchemy import select
+        from lyrion.database.schema import (
+            Album, Contributor, Track, albums_contributors,
+            tracks_albums, tracks_contributors,
+        )
+
+        # Existing tracks for the batch URLs.
+        urls = [_file_url(p) for p, _ in extracted]
+        track_by_url: dict[str, Track] = {t.url: t for t in (
+            await session.execute(
+                select(Track).where(Track.url.in_(urls)))).scalars()}
+
+        # Track upserts first — one flush per batch (not per track) gives
+        # every new track its id for the membership sets below.
+        for file_path, info in extracted:
+            try:
+                await self._import_track(session, file_path, info, track_by_url)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Import failed for %s: %s", file_path, exc)
+                self.stats.error_files += 1
+        await session.flush()
+
+        # Batch-level membership sets (existing join rows for these ids).
+        track_ids = [t.id for t in track_by_url.values()]
+        ta_set: set[tuple] = set()
+        tc_set: set[tuple] = set()
+        ac_set: set[tuple] = set()
+        if track_ids:
+            for r in (await session.execute(
+                    select(tracks_albums.c.track, tracks_albums.c.album)
+                    .where(tracks_albums.c.track.in_(track_ids)))).all():
+                ta_set.add((r[0], r[1]))
+            for r in (await session.execute(
+                    select(tracks_contributors.c.track,
+                           tracks_contributors.c.contributor)
+                    .where(tracks_contributors.c.track.in_(track_ids)))).all():
+                tc_set.add((r[0], r[1]))
+        album_ids = [a.id for a in
+                     (await session.execute(select(Album))).scalars()]
+        if album_ids:
+            for r in (await session.execute(
+                    select(albums_contributors.c.album,
+                           albums_contributors.c.contributor)
+                    .where(albums_contributors.c.album.in_(album_ids)))).all():
+                ac_set.add((r[0], r[1]))
+
+        # Existing albums/contributors for the batch keys.
+        album_keys = set()
+        artist_names: set[str] = set()
+        for _, info in extracted:
+            album_name = getattr(info, "album", None) or "Unknown Album"
+            year = getattr(info, "year", 0) or 0
+            album_keys.add((_sort_string(album_name), year or None))
+            artist = getattr(info, "artist", None) or "Unknown Artist"
+            if artist and artist != "Unknown Artist":
+                artist_names.add(artist.strip().lower())
+        album_by_key: dict[tuple, Album] = {
+            (a.titlesort, a.year): a for a in (
+                await session.execute(
+                    select(Album).where(
+                        Album.titlesort.in_([k[0] for k in album_keys])))).scalars()
+            if (a.titlesort, a.year) in album_keys}
+        contrib_by_name: dict[str, Contributor] = {
+            c.namespell: c for c in (
+                await session.execute(
+                    select(Contributor).where(
+                        Contributor.namespell.in_(list(artist_names))))).scalars()}
+
+        # Album/contributor links for the batch tracks.
+        for file_path, info in extracted:
+            try:
+                await self._import_links(session, file_path, info,
+                                         track_by_url, album_by_key,
+                                         contrib_by_name, ta_set, tc_set, ac_set)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Import failed for %s: %s", file_path, exc)
+                self.stats.error_files += 1
+
+    async def _import_track(
+        self, session, file_path: Path, info: Any,
+        track_by_url: dict[str, Track],
+    ) -> None:
+        """Upsert one track (no joins — those run in _import_links)."""
+        from lyrion.database.schema import Track
 
         url = _file_url(file_path)
         title = (info.title or file_path.stem) if hasattr(info, "title") else file_path.stem
-        artist = (info.artist or "Unknown Artist") if hasattr(info, "artist") else "Unknown Artist"
-        album_name = info.album or "Unknown Album" if hasattr(info, "album") else "Unknown Album"
-        genre = info.genre or "" if hasattr(info, "genre") else ""
-        year = info.year or 0 if hasattr(info, "year") else 0
-        # duration is in milliseconds in the new ScanResult
-        duration_ms = getattr(info, "duration", 0) or 0
-        duration = duration_ms / 1000.0
         mtime = getattr(info, "last_modified", None)
         modtime = int(mtime.timestamp()) if mtime is not None else 0
         filesize = getattr(info, "filesize", 0) or 0
@@ -199,12 +285,13 @@ class MusicImporter:
         disc = getattr(info, "disc_number", None) or getattr(info, "disc", None) or None
         comment = getattr(info, "comment", None)
         compilation = bool(getattr(info, "compilation", False))
+        # duration is in milliseconds in the new ScanResult
+        duration_ms = getattr(info, "duration", 0) or 0
+        duration = duration_ms / 1000.0
+        genre = getattr(info, "genre", None) or ""
+        year = getattr(info, "year", 0) or 0
 
-        # Existing track?
-        track = (
-            await session.execute(select(Track).where(Track.url == url))
-        ).scalar_one_or_none()
-
+        track = track_by_url.get(url)
         if track is None:
             track = Track(
                 url=url,
@@ -229,7 +316,7 @@ class MusicImporter:
                 compilation=1 if compilation else 0,
             )
             session.add(track)
-            await session.flush()  # get track.id
+            track_by_url[url] = track
         else:
             # Update mutable fields
             track.title = title
@@ -246,18 +333,29 @@ class MusicImporter:
             track.lastscanned = datetime.utcnow()
             await session.flush()
 
-        # Album (create/get) — eager-load tracks to avoid sync lazy loads
-        from sqlalchemy.orm import selectinload
-        album = (
-            await session.execute(
-                select(Album)
-                .options(selectinload(Album.tracks))
-                .where(
-                    Album.titlesort == _sort_string(album_name),
-                    Album.year == (year or None),
-                )
-            )
-        ).scalar_one_or_none()
+    async def _import_links(
+        self, session, file_path: Path, info: Any,
+        track_by_url: dict[str, Track],
+        album_by_key: dict[tuple, Album],
+        contrib_by_name: dict[str, Contributor],
+        ta_set: set, tc_set: set, ac_set: set,
+    ) -> None:
+        """Album + contributor links for a track (Core inserts only)."""
+        from lyrion.database.schema import (
+            Album, Contributor, albums_contributors,
+            tracks_albums, tracks_contributors,
+        )
+        from sqlalchemy import select
+
+        url = _file_url(file_path)
+        track = track_by_url[url]
+        artist = (info.artist or "Unknown Artist") if hasattr(info, "artist") else "Unknown Artist"
+        album_name = info.album or "Unknown Album" if hasattr(info, "album") else "Unknown Album"
+        year = getattr(info, "year", 0) or 0
+        compilation = bool(getattr(info, "compilation", False))
+        key = (_sort_string(album_name), year or None)
+
+        album = album_by_key.get(key)
         if album is None:
             album = Album(
                 titlesort=_sort_string(album_name),
@@ -267,23 +365,14 @@ class MusicImporter:
             )
             session.add(album)
             await session.flush()
-        if track not in album.tracks:
-            album.tracks.append(track)
+            album_by_key[key] = album
+        if (track.id, album.id) not in ta_set:
+            await session.execute(
+                tracks_albums.insert().values(track=track.id, album=album.id))
+            ta_set.add((track.id, album.id))
 
-        # Artist contributor (create/get) — eager-load to avoid sync lazy loads
         if artist and artist != "Unknown Artist":
-            contrib = (
-                await session.execute(
-                    select(Contributor)
-                    .options(
-                        selectinload(Contributor.tracks),
-                        selectinload(Contributor.albums),
-                    )
-                    .where(
-                        Contributor.namespell == artist.strip().lower()
-                    )
-                )
-            ).scalar_one_or_none()
+            contrib = contrib_by_name.get(artist.strip().lower())
             if contrib is None:
                 contrib = Contributor(
                     namespell=artist.strip().lower(),
@@ -292,10 +381,17 @@ class MusicImporter:
                 )
                 session.add(contrib)
                 await session.flush()
-            if track not in contrib.tracks:
-                contrib.tracks.append(track)
-            if album not in contrib.albums:
-                contrib.albums.append(album)
+                contrib_by_name[artist.strip().lower()] = contrib
+            if (track.id, contrib.id) not in tc_set:
+                await session.execute(
+                    tracks_contributors.insert().values(
+                        track=track.id, contributor=contrib.id, role=1))
+                tc_set.add((track.id, contrib.id))
+            if (album.id, contrib.id) not in ac_set:
+                await session.execute(
+                    albums_contributors.insert().values(
+                        album=album.id, contributor=contrib.id, role=1))
+                ac_set.add((album.id, contrib.id))
 
     @staticmethod
     def _guess_mime(path: Path) -> str:
