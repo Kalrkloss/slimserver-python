@@ -318,7 +318,7 @@ Jede Phase ist einzeln commitbar; nach jeder Phase:
 | — | 3.2(Zusatz), 10.3(Teil) | ✅ erledigt in `6e5fe21`: cli_server.py war ein Stub (fast alle Kommandos → „ok"); delegiert jetzt an die Registry. MAC-Normalisierung in allen Player-Lookups. `mixer volume` direkt. |
 | P2-1…P2-7, P3-1…P3-5, P4-1…P4-4, P5-2…P5-4, P6-1…P6-3 | restliche Gaps | ⏳ offen |
 
-Phase-2-Status (Commit `?`):
+Phase-2-Status (Commit `bc53774`):
 
 | Plan-ID | Gap | Status |
 |---------|-----|--------|
