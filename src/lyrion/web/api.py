@@ -79,6 +79,9 @@ class JSONRPCAPI:
         # Short-TTL cache for status/serverstatus/players polls
         # (misbehaving clients can flood the server otherwise).
         self._status_cache: dict[tuple, tuple[float, Any]] = {}
+        # P4-4: active display popup (showBriefly) + expiry timestamp
+        self._popup: Optional[dict] = None
+        self._popup_expires: float = 0.0
         self._register_default_methods()
 
     # ------------------------------------------------------------------
@@ -451,6 +454,32 @@ class JSONRPCAPI:
         return loop
 
 
+    async def _displaystatus(self, pid: str | None, args: list[str]) -> dict:
+        """displaystatus [showBriefly:<text> <duration>] — now-playing popup.
+
+        'showBriefly:<text>' sets a popup (jive block) that expires after
+        <duration> seconds (default 5); a bare query returns the active
+        popup or {} when idle.
+        """
+        now = time.time()
+        if self._popup_expires and now > self._popup_expires:
+            self._popup = None
+            self._popup_expires = 0.0
+        for i, a in enumerate(args or []):
+            s = str(a)
+            if s.startswith("showBriefly:"):
+                text = s[12:]
+                duration = 5
+                nxt = str(args[i + 1]) if i + 1 < len(args) else ""
+                if nxt.isdigit():
+                    duration = int(nxt)
+                self._popup = {
+                    "jive": {"text": text, "type": "popup", "duration": duration}
+                }
+                self._popup_expires = now + duration
+        return self._popup or {}
+
+
     async def _slim_request(self, player_id: str, command: list[str]) -> Any:
         """LMS-compatible slim.request — returns structured JSON dicts.
 
@@ -533,11 +562,41 @@ class JSONRPCAPI:
                 "player count": len(players),
                 # SqueezeClient's ServerStatusResponse requires mediadirs
                 "mediadirs": [],
+                # P4-3: real library totals (were hardcoded 0)
                 "info total genres": 0,
                 "info total artists": 0,
                 "info total albums": 0,
                 "info total songs": 0,
+                "info total duration": 0,
             }
+            try:
+                r = _db_query(
+                    "SELECT COUNT(*) AS n, COALESCE(SUM(duration),0) AS d FROM tracks"
+                )
+                if r:
+                    result["info total songs"] = r[0]["n"]
+                    result["info total duration"] = int(r[0]["d"])
+                r = _db_query(
+                    "SELECT COUNT(DISTINCT c.id) AS n FROM contributors c "
+                    "JOIN tracks_contributors tc ON tc.contributor = c.id "
+                    "AND tc.role = 1"
+                )
+                if r:
+                    result["info total artists"] = r[0]["n"]
+                r = _db_query("SELECT COUNT(*) AS n FROM albums")
+                if r:
+                    result["info total albums"] = r[0]["n"]
+                r = _db_query(
+                    "SELECT COUNT(DISTINCT genre) AS n FROM tracks WHERE genre != ''"
+                )
+                if r:
+                    result["info total genres"] = r[0]["n"]
+            except Exception:
+                pass
+            # P4-3: subscribe:<seconds> tag — the Cometd layer pushes fresh
+            # serverstatus on player connect/disconnect for these clients.
+            if any(str(a).startswith("subscribe:") for a in (args or [])):
+                result["subscribe"] = "60"
             # Jive controllers subscribe with
             # ['serverstatus', 0, 50, 'subscribe:60'] and expect the
             # player list in players_loop (like the real LMS). Also
@@ -733,7 +792,7 @@ class JSONRPCAPI:
         # Squeezer's parseDisplayStatus does getDataAsMap() — an
         # 'unknown command' list response crashes it. Empty map is fine.
         if cmd == "displaystatus":
-            return {}
+            return await self._displaystatus(pid, args)
 
         # ── playerstatus (SqueezeCtrl/Orange Squeeze subscribe) ─────
         # The apps subscribe to /<cid>/slim/playerstatus/<player> and
@@ -792,6 +851,11 @@ class JSONRPCAPI:
         int_ids = [i for i in playlist_ids if isinstance(i, int)]
         track_rows = await self._load_tracks(int_ids) if int_ids else {}
 
+        # P4-2: tags:<code> filters the loop/track fields
+        # (t=title a=artist l=album d=duration u=url g=genre y=year)
+        tags = next((str(a)[5:] for a in (args or []) if str(a).startswith("tags:")), "")
+        tag_ok = lambda f: (not tags) or f in tags  # noqa: E731
+
         for i, tid in enumerate(playlist_ids):
             if isinstance(tid, int):
                 info = track_rows.get(tid, {})
@@ -814,18 +878,21 @@ class JSONRPCAPI:
                         title = host.replace("www.", "")
                 except Exception:
                     pass
-            loop.append({
-                "id": tid,
-                "index": i,
-                "title": title,
-                "artist": artist,
-                "album": album,
-                "duration": duration,
-                "url": url,
-                # Orange Squeeze does firstItem.get("trackType").asText()
-                # — a missing field is a NULL NPE crash.
-                "trackType": "local" if isinstance(tid, int) else "remote",
-            })
+            item: dict = {"id": tid, "index": i}
+            if tag_ok("t"):
+                item["title"] = title
+            if tag_ok("a"):
+                item["artist"] = artist
+            if tag_ok("l"):
+                item["album"] = album
+            if tag_ok("d"):
+                item["duration"] = duration
+            if tag_ok("u"):
+                item["url"] = url
+            # Orange Squeeze does firstItem.get("trackType").asText()
+            # — a missing field is a NULL NPE crash. Always present.
+            item["trackType"] = "local" if isinstance(tid, int) else "remote"
+            loop.append(item)
 
         cur = player.playlist_position or 0
         if cur < len(playlist_ids) and isinstance(playlist_ids[cur], int):
@@ -869,7 +936,16 @@ class JSONRPCAPI:
             # ARRAY directly ((Object[]) record.get("menu")) — not an
             # object with item_loop.
             menu_block = self._home_menu()
-        return {
+
+        # P4-1: sync fields (only when synced) + optional status fields
+        sync_fields: dict[str, str] = {}
+        if getattr(player, "sync_master", None):
+            sync_fields["sync_master"] = player.sync_master
+        if getattr(player, "sync_slaves", None):
+            sync_fields["sync_slaves"] = ",".join(player.sync_slaves)
+        cur_tid = playlist_ids[cur] if cur < len(playlist_ids) else None
+
+        result: dict = {
             "mode": player.mode,
             "power": 1 if player.power else 0,
             "player_name": player.name or player.mac,
@@ -890,8 +966,20 @@ class JSONRPCAPI:
             "playlist_loop": loop,
             # SqueezeCtrl/Squeezer read the current track from item_loop
             "item_loop": loop,
-        } | ({"remoteMeta": remote_meta} if remote_meta else {}) \
-          | ({"menu": menu_block} if menu_block else {})
+            # P4-1: optional status fields (LMS 'status' completeness)
+            "digital_volume_control": 0,
+            "can_seek": 1 if isinstance(cur_tid, int) else 0,
+            "signalstrength": 0,
+            "seq_no": 0,
+            "playlist_timestamp": int(time.time()),
+            "waitingToPlay": 0,
+            "alarm_state": "off",
+        } | sync_fields
+        if remote_meta:
+            result["remoteMeta"] = remote_meta
+        if menu_block:
+            result["menu"] = menu_block
+        return result
 
     def _home_menu(self) -> list[dict]:
         """The root browse menu (Home) shared by menu/menustatus/status."""

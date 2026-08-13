@@ -351,3 +351,17 @@ Verifikation Phase 3: Suite `all checks passed`, Ad-hoc-Skript
 gruppiert; albums genre:Rock → 652; songinfo vollständig; favorites id
 `0.0` + item_id:0.0 → 5 Kinder; Cometd disconnect/ping; menu nextWindow).
 
+Phase-4-Status (Commit `?`):
+
+| Plan-ID | Gap | Status |
+|---------|-----|--------|
+| P4-1 | 9.1, 9.3 | ✅ `status` liefert `sync_master`/`sync_slaves` (nur wenn synced), `digital_volume_control`, `can_seek` (1 für lokale Tracks), `signalstrength`, `seq_no`, `playlist_timestamp`, `waitingToPlay`, `alarm_state` |
+| P4-2 | 9.2 | ✅ `tags:<code>` filtert die `item_loop`-Felder (t=title a=artist l=album d=duration u=url; `trackType` immer, OSQ-NPE-Schutz); ohne tags weiterhin alle Felder |
+| P4-3 | 9.4 | ✅ `serverstatus` mit echten DB-Totals (`info total songs/duration/artists/albums/genres`, waren hartkodiert 0) + `subscribe:`-Tag; Cometd-Push bei Player-Connect/Disconnect (`CometdManager.notify_server_status` + Singleton `get_manager()`, Trigger in protocol.py HELO/bye) |
+| P4-4 | 9.5 | ✅ `displaystatus` mit `showBriefly:<text> [<dauer>]` → jive-Popup-Block mit Ablauf-Timer; Abfrage liefert aktiven Popup oder `{}` |
+
+Verifikation Phase 4: Suite `all checks passed`, Ad-hoc-Skript
+`/tmp/hermes-verify-s6o68brc.py` 19/19, Live-Tests (status sync/optional
+Felder; serverstatus songs 58603/duration 17278167/artists 5725/albums 5135 +
+subscribe; displaystatus Popup setzen+abrufen).
+

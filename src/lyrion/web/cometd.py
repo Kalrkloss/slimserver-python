@@ -26,6 +26,7 @@ import logging
 import time
 import uuid
 from dataclasses import dataclass, field
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -41,13 +42,34 @@ class CometdClient:
     notify: asyncio.Event = field(default_factory=asyncio.Event)
 
 
+# Module-level manager singleton — lets the slimproto layer wake
+# /slim/serverstatus subscribers when players connect/disconnect.
+_manager: Optional["CometdManager"] = None
+
+
+def _set_manager(mgr: "CometdManager") -> None:
+    global _manager
+    _manager = mgr
+
+
+def get_manager() -> Optional["CometdManager"]:
+    """Return the active CometdManager (created at startup), or None."""
+    return _manager
+
+
 class CometdManager:
-    """Holds Cometd clients and dispatches /slim/request payloads."""
+    """Server-side Bayeux/Cometd endpoint for LMS-style controllers.
+
+    Clients are Jive-family apps (Orange Squeeze, SqueezeCtrl, Squeezer,
+    SqueezeClient, Jivelite, Material) that subscribe to /slim/... and
+    /meta/... channels over /cometd (long-polling or streaming).
+    """
 
     def __init__(self, jsonrpc) -> None:
         self._jsonrpc = jsonrpc
         self._clients: dict[str, CometdClient] = {}
         self._counter = itertools.count(1)
+        _set_manager(self)
 
     # ------------------------------------------------------------------
     # Client lifecycle
@@ -94,6 +116,28 @@ class CometdManager:
             return
         client.events.append(event)
         client.notify.set()
+
+    async def notify_server_status(self) -> None:
+        """Push a fresh serverstatus to all /slim/serverstatus subscribers.
+
+        Called when players connect/disconnect so subscribed controllers
+        (Jive/SqueezeCtrl/ioBroker) see the player list change.
+        """
+        for client in list(self._clients.values()):
+            for sub, data in list(client.subscriptions.items()):
+                if "serverstatus" not in sub:
+                    continue
+                try:
+                    request = (data.get("request") if isinstance(data, dict)
+                               else None) or ["", ["serverstatus", "0", "100"]]
+                    result = await self._dispatch(request)
+                    self.push(client.client_id, {
+                        "channel": sub,
+                        "data": result,
+                        "id": 0,
+                    })
+                except Exception:  # noqa: BLE001
+                    pass
 
     # ------------------------------------------------------------------
     # Message handling

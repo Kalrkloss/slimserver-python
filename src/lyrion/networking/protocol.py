@@ -111,6 +111,21 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+
+def _notify_cometd_server_status() -> None:
+    """Wake Cometd /slim/serverstatus subscribers (player list changed).
+
+    Called after player register/unregister; schedules the fresh
+    serverstatus push on the running event loop.
+    """
+    try:
+        from lyrion.web.cometd import get_manager
+        mgr = get_manager()
+        if mgr is not None:
+            asyncio.create_task(mgr.notify_server_status())
+    except Exception:  # noqa: BLE001
+        pass
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -783,6 +798,9 @@ class SlimProtoClient:
                 except Exception as exc:
                     logger.warning("Squeezelite register failed: %s", exc)
 
+                # Wake /slim/serverstatus Cometd subscribers (player list changed)
+                _notify_cometd_server_status()
+
                 # ── Sync volume like the real LMS (audg frame) ──
                 # Squeezelite zero-initialises its internal gain; until an
                 # audg frame arrives all audio is multiplied by 0 → the
@@ -939,6 +957,8 @@ class SlimProtoClient:
                 logger.info("Player registered via SlimProto: %s (%s)", mac_formatted, player_ip)
             except Exception as exc:
                 logger.warning("Could not register player %s: %s", mac_formatted, exc)
+            # Wake /slim/serverstatus Cometd subscribers (player list changed)
+            _notify_cometd_server_status()
 
             # ── Sync volume like the real LMS (audg frame) ──
             # Same as the text-HELO path above: without an audg frame the
@@ -1002,6 +1022,8 @@ class SlimProtoClient:
                         else:
                             PlayerManager().unregister_player(mac_clean)
                             logger.info("Player unregistered: %s", mac_clean)
+                            # Wake /slim/serverstatus Cometd subscribers
+                            _notify_cometd_server_status()
                     else:
                         self._player_connections[key] = count
             except Exception:
