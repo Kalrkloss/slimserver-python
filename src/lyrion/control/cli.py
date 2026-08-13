@@ -101,6 +101,7 @@ class CLIContext:
     tags: str = ""  # tag string (e.g. "aLyZ" for web UI)
     charset: str = "utf-8"
     subscribed_player: Optional[str] = None
+    subscribe_interval: int = 0  # seconds between keep-alive status pushes
 
 
 # ---------------------------------------------------------------------------
@@ -169,6 +170,33 @@ class CLIHandler:
         # Subscriptions: player_mac -> asyncio.Queue of events
         self._subscriptions: dict[str, asyncio.Queue[list[str]]] = {}
 
+    # All active CLI handler instances (for cross-layer status pushes).
+    _active_handlers: set["CLIHandler"] = set()
+
+    @classmethod
+    def notify_subscribers(cls, player_id: str) -> None:
+        """Wake all CLI subscriptions bound to a player (status changed).
+
+        Called by the slimproto layer after a STAT update; the per-client
+        write loop re-reads the current status and pushes it.
+        """
+        for handler in list(cls._active_handlers):
+            queues = handler._subscriptions
+            queue = queues.get(player_id)
+            if queue is None:
+                try:
+                    from lyrion.player.manager import PlayerManager
+                    p = PlayerManager().get_player(player_id)
+                    if p is not None:
+                        queue = queues.get(p.mac)
+                except Exception:  # noqa: BLE001
+                    pass
+            if queue is not None:
+                try:
+                    queue.put_nowait(["status"])
+                except Exception:  # noqa: BLE001
+                    pass
+
     # -----------------------------------------------------------------------
     # Configuration
     # -----------------------------------------------------------------------
@@ -212,9 +240,13 @@ class CLIHandler:
         client_id = f"cli-{addr[1]}" if addr else "cli-unknown"
         ctx = CLIContext(client_id=client_id)
         ctx.player_id = self._get_default_player()
+        self._active_handlers.add(self)
         try:
             yield ctx
         finally:
+            self._active_handlers.discard(self)
+            # Drop subscriptions for this client
+            self._subscriptions.clear()
             # Send final blank line
             writer.write(self.REQUEST_END)
             await writer.drain()
@@ -341,12 +373,43 @@ class CLIHandler:
         ctx: CLIContext,
         lines: list[str],
     ) -> None:
-        """Write response lines to the client."""
+        """Write response lines to the client.
+
+        For subscribed clients (ctx.subscribed_player) the writer then waits
+        up to ctx.subscribe_interval seconds for a status-change event and
+        pushes the current status (event-driven update or keep-alive tick).
+        The wait is bounded, so the client can still send commands
+        (e.g. 'unsubscribe') between pushes.
+        """
         for line in lines:
             data = line.encode(ctx.charset, errors="replace") + self.LINE_END
             writer.write(data)
         writer.write(self.REQUEST_END)
         await writer.drain()
+
+        player_id = ctx.subscribed_player
+        if not player_id:
+            return
+        queue = self._subscriptions.get(player_id)
+        if queue is None:
+            return
+        interval = ctx.subscribe_interval if ctx.subscribe_interval > 0 else 5
+        try:
+            await asyncio.wait_for(queue.get(), timeout=interval)
+        except asyncio.TimeoutError:
+            pass  # keep-alive tick
+        if ctx.subscribed_player != player_id:
+            return  # unsubscribed while waiting
+        try:
+            if not ctx.player_id:
+                ctx.player_id = player_id  # bind subscribed player for the push
+            status_lines = await self.dispatch(ctx, ("status", ["-", "1"]))
+            for line in status_lines:
+                writer.write(line.encode(ctx.charset, errors="replace") + self.LINE_END)
+            writer.write(self.REQUEST_END)
+            await writer.drain()
+        except Exception:  # noqa: BLE001
+            pass
 
     # -----------------------------------------------------------------------
     # Public helper — format a response

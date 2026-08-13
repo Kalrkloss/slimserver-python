@@ -1766,6 +1766,12 @@ class SlimProtoClient:
                     elif event == "load":
                         player.mode = "loading"
                     player.last_activity = __import__("time").time()
+                    # Wake CLI subscribers so they push the fresh status.
+                    try:
+                        from lyrion.control.cli import CLIHandler
+                        CLIHandler.notify_subscribers(player.mac)
+                    except Exception:
+                        pass
             except Exception:
                 pass
         except Exception as exc:

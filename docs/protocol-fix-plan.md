@@ -318,3 +318,21 @@ Jede Phase ist einzeln commitbar; nach jeder Phase:
 | — | 3.2(Zusatz), 10.3(Teil) | ✅ erledigt in `6e5fe21`: cli_server.py war ein Stub (fast alle Kommandos → „ok"); delegiert jetzt an die Registry. MAC-Normalisierung in allen Player-Lookups. `mixer volume` direkt. |
 | P2-1…P2-7, P3-1…P3-5, P4-1…P4-4, P5-2…P5-4, P6-1…P6-3 | restliche Gaps | ⏳ offen |
 
+Phase-2-Status (Commit `?`):
+
+| Plan-ID | Gap | Status |
+|---------|-----|--------|
+| P2-1 | 3.4 | ✅ Browse-Queries im LMS-Tagged-Format (`count:`) + Filter (`search`, `artist_id`, `album_id`, `track_id`, `year`, `genre`) + `titles`-Alias |
+| P2-2 | 3.5 | ✅ `info total <genres\|artists\|albums\|songs\|duration> [?]` ohne Doppelpunkt, echte DB-Zahlen |
+| P2-3 | 3.6 | ✅ `serverstatus` mit version/uuid/name/httpport, info-Totals, `player count` + `players_loop` (playerindex/playerid/name/…) |
+| P2-4 | 3.7, 7.1, 7.2 | ✅ favorites: Tagged-Add (`url:`/`title:`/`parent:`), `exists`, `playlist <play\|load\|insert\|add> item_id:` |
+| P2-5 | 3.8 | ✅ `status`: Mode ungemappt (`play`/`pause`/`stop`), `tags:`-Auswertung, Playlist-Loop (`playlist index:N title:… artist:… album:…`), `subscribe:`-Tag |
+| P2-6 | 3.9 | ✅ subscribe echt: Queue je Player, Push bei STAT-Änderung (`CLIHandler.notify_subscribers`) + Keep-Alive-Intervall; Live-Test: Push mit `player_name: Küche` |
+| P2-7 | 3.10 | ✅ `name`, `player count\|id\|name\|model`, `sync`/`unsync`/`syncgroups`, `mixer bass\|treble\|pitch\|muting`, `songinfo`, `years`, `musicfolder`, `playlists tracks\|new\|delete\|rename`, `menu`, `playerstatus`, `displaystatus`, `rescanprogress`, `abortscan` |
+| Zusatz | — | ✅ `_write_db`-Helper (Playlist-CRUD); Test-Restart-Fix: `name ?` setzt nicht mehr den Namen „?" |
+
+Verifikation Phase 2: Suite `all checks passed` (9000+9080), Ad-hoc-Skript
+`/tmp/hermes-verify-s939esg1.py` 21/21, CLI-Socket-Live-Tests (artists
+count:5725, genre-Filter 6981 Treffer, info total songs 56503, songinfo
+vollständig, Subscribe-Push mit Player-Daten, `name Küche` Query/Set).
+

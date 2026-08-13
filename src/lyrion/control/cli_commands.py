@@ -121,23 +121,65 @@ async def cmd_serverstatus(
 ) -> list[str]:
     """
     serverstatus [0 100]
-    Return server status with optional pagination window.
+    Return server status (LMS format): version/uuid/name/httpport, info
+    totals, player count and the players_loop (one line per player).
     """
-    # Wire up to actual server state
     try:
+        from lyrion import __version__
         from lyrion.player import PlayerManager
-        player_count = PlayerManager().get_connected_count()
+        pm = PlayerManager()
+        players = pm.get_all_players()
+        player_count = len(players)
     except Exception:
+        __version__ = "9.2.0"
+        players = []
         player_count = 0
-    return [
-        "serverstatus",
-        "version: 9.2.0",
-        "uuid: lyrion-local",
-        "name: Lyrion",
-        "info total duration: 0",
-        f"player count: {player_count}",
-        "",
+
+    # info totals
+    info_lines: list[str] = []
+    try:
+        rows = await _query_db(
+            "SELECT COUNT(*) AS n, COALESCE(SUM(duration),0) AS d FROM tracks"
+        )
+        info_lines.append(f"info total songs: {int(rows[0]['n']) if rows else 0}")
+        info_lines.append(f"info total duration: {int(rows[0]['d']) if rows else 0}")
+        r_art = await _query_db(
+            "SELECT COUNT(DISTINCT c.id) AS n FROM contributors c "
+            "JOIN tracks_contributors tc ON tc.contributor = c.id AND tc.role = 1"
+        )
+        info_lines.append(f"info total artists: {int(r_art[0]['n']) if r_art else 0}")
+        r_alb = await _query_db("SELECT COUNT(*) AS n FROM albums")
+        info_lines.append(f"info total albums: {int(r_alb[0]['n']) if r_alb else 0}")
+        r_gen = await _query_db(
+            "SELECT COUNT(DISTINCT genre) AS n FROM tracks WHERE genre != ''"
+        )
+        info_lines.append(f"info total genres: {int(r_gen[0]['n']) if r_gen else 0}")
+    except Exception:  # noqa: BLE001
+        pass
+
+    out = [
+        f"serverstatus version:{__version__}",
+        "serverstatus uuid:lyrion-local",
+        "serverstatus name:Lyrion",
+        "serverstatus httpport:9000",
     ]
+    out.extend(f"serverstatus {l}" for l in info_lines)
+    out.append(f"serverstatus player count:{player_count}")
+    out.append(f"serverstatus sn.player count:{player_count}")
+    # players_loop
+    for i, p in enumerate(players):
+        mac = p.mac.replace(":", "%3A") if p.mac else ""
+        name = (p.name or p.mac or "").replace(":", "%3A")
+        out.append(
+            f"playerindex:{i} playerid:{mac} uuid: ip:{p.ip or '0.0.0.0'}:{p.port or 0} "
+            f"name:{name} model:{p.model or 'squeezebox'} modelname:{p.model or 'squeezebox'} "
+            f"isplaying:{1 if p.mode == 'play' else 0} displaytype:none isplayer:1 "
+            f"canpoweroff:1 connected:{1 if p.connected else 0} "
+            f"power:{1 if p.power else 0} firmware:1 seq_no:0 "
+            f"sn.player.count:{player_count}"
+        )
+    out.append("")
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -205,15 +247,318 @@ async def cmd_player(
     args: list[str],
 ) -> list[str]:
     """
-    player [<playerid>]
+    player [<playerid>] | player count|id|name|model [<playerid>]
     Set or query the default player for this CLI session.
     """
+    if not args:
+        if ctx.player_id:
+            return [f"player: {ctx.player_id}"]
+        return ["player: "]
+    sub = str(args[0]).lower()
+    if sub == "count":
+        try:
+            from lyrion.player import PlayerManager
+            return [f"player count: {PlayerManager().get_player_count()}", ""]
+        except Exception:
+            return ["player count: 0", ""]
+    if sub in ("id", "name", "model"):
+        try:
+            from lyrion.player import PlayerManager
+            pid = args[1] if len(args) > 1 and args[1] != "?" else ctx.player_id
+            p = PlayerManager().get_player(pid) if pid else None
+            if p is None:
+                return [f"player {sub}: ", ""]
+            val = {"id": p.mac, "name": p.name or "", "model": p.model or ""}[sub]
+            return [f"player {sub}: {val}", ""]
+        except Exception as e:  # noqa: BLE001
+            return [f"cli error: {e}", ""]
+    ctx.player_id = args[0]
+    return [f"player: {ctx.player_id}"]
+
+
+@register_command("name")
+async def cmd_name(
+    handler: CLIHandler,
+    ctx: CLIContext,
+    args: list[str],
+) -> list[str]:
+    """name [<new name>] — query or set the player name. 'name ?' queries."""
+    if not ctx.player_id:
+        return ["no player selected"]
+    try:
+        from lyrion.player import PlayerManager
+        pm = PlayerManager()
+        player = pm.get_player(ctx.player_id)
+        if player is None:
+            return ["player not found", ""]
+        if args and str(args[0]) != "?":
+            new_name = " ".join(args)
+            pm.rename_player(player.mac, new_name)
+            return [f"name: {new_name}", ""]
+        return [f"name: {player.name}", ""]
+    except Exception as e:  # noqa: BLE001
+        return [f"cli error: {e}", ""]
+
+
+@register_command("sync")
+async def cmd_sync(
+    handler: CLIHandler,
+    ctx: CLIContext,
+    args: list[str],
+) -> list[str]:
+    """sync <masterMac> <slaveMac> — synchronize two players."""
+    if len(args) >= 2:
+        try:
+            from lyrion.player import PlayerManager
+            PlayerManager().sync_players(args[0], [args[1]])
+            return [f"sync: {args[0]} {args[1]}", ""]
+        except Exception as e:  # noqa: BLE001
+            return [f"cli error: {e}", ""]
+    return ["sync: ", ""]
+
+
+@register_command("unsync")
+async def cmd_unsync(
+    handler: CLIHandler,
+    ctx: CLIContext,
+    args: list[str],
+) -> list[str]:
+    """unsync <playerMac> — remove a player from its sync group."""
+    target = args[0] if args else ctx.player_id
+    if target:
+        try:
+            from lyrion.player import PlayerManager
+            PlayerManager().unsync_player(target)
+            return [f"unsync: {target}", ""]
+        except Exception as e:  # noqa: BLE001
+            return [f"cli error: {e}", ""]
+    return ["unsync: ", ""]
+
+
+@register_command("syncgroups")
+async def cmd_syncgroups(
+    handler: CLIHandler,
+    ctx: CLIContext,
+    args: list[str],
+) -> list[str]:
+    """syncgroups — list all sync groups (master -> slaves)."""
+    try:
+        from lyrion.player import PlayerManager
+        groups: dict[str, list[str]] = {}
+        for p in PlayerManager().get_all_players():
+            if p.sync_master:
+                groups.setdefault(p.sync_master, []).append(p.mac)
+        if not groups:
+            return ["syncgroups count:0", ""]
+        out = [f"syncgroups count:{len(groups)}"]
+        for master, slaves in groups.items():
+            out.append(f"sync_master: {master}")
+            out.append("sync_slaves: " + ",".join(slaves))
+        out.append("")
+        return out
+    except Exception as e:  # noqa: BLE001
+        return [f"cli error: {e}", ""]
+
+
+@register_command("songinfo")
+async def cmd_songinfo(
+    handler: CLIHandler,
+    ctx: CLIContext,
+    args: list[str],
+) -> list[str]:
+    """songinfo <start> <count> track_id:<id> — detailed track info.
+
+    Response (LMS tagged format): 'songinfo 0 1 count:1 id:<n> title:...
+    artist:... album:... duration:... year:... tracknum:... genre:...
+    url:...'.
+    """
+    offset, limit, filters = _parse_query_args(args)
+    tid = filters.get("track_id")
+    if not tid or not str(tid).isdigit():
+        return ["songinfo: no track_id", ""]
+    rows = await _query_db(
+        "SELECT t.id, t.title, t.url, t.duration, t.year, t.tracknum, t.genre "
+        "FROM tracks t WHERE t.id = ? LIMIT 1",
+        (int(tid),),
+    )
+    if not rows:
+        return [f"songinfo {offset} {limit} count:0", ""]
+    r = rows[0]
+    line = f"id:{r['id']} title:{r['title'] or ''}"
+    if r["url"]:
+        line += f" url:{r['url']}"
+    if r["duration"]:
+        line += f" duration:{int(r['duration'])}"
+    if r["year"]:
+        line += f" year:{r['year']}"
+    if r["tracknum"]:
+        line += f" tracknum:{r['tracknum']}"
+    if r["genre"]:
+        line += f" genre:{r['genre']}"
+    rows_a = await _query_db(
+        "SELECT c.name FROM contributors c JOIN tracks_contributors tc "
+        "ON tc.contributor = c.id AND tc.role = 1 WHERE tc.track = ? "
+        "ORDER BY c.name LIMIT 1",
+        (r["id"],),
+    )
+    if rows_a and rows_a[0]["name"]:
+        line += f" artist:{rows_a[0]['name']}"
+    rows_al = await _query_db(
+        "SELECT al.title FROM albums al JOIN tracks_albums ta "
+        "ON ta.album = al.id WHERE ta.track = ? LIMIT 1",
+        (r["id"],),
+    )
+    if rows_al and rows_al[0]["title"]:
+        line += f" album:{rows_al[0]['title']}"
+    return [f"songinfo {offset} {limit} count:1", line, ""]
+
+
+@register_command("years")
+async def cmd_years(
+    handler: CLIHandler,
+    ctx: CLIContext,
+    args: list[str],
+) -> list[str]:
+    """years [<offset> <limit>] — list release years in the library."""
+    offset, limit, _ = _parse_query_args(args)
+    rows = await _query_db(
+        "SELECT DISTINCT year AS y FROM tracks WHERE year > 0 "
+        "ORDER BY year DESC LIMIT ? OFFSET ?",
+        (limit, offset),
+    )
+    total = await _query_db(
+        "SELECT COUNT(DISTINCT year) AS n FROM tracks WHERE year > 0"
+    )
+    total_n = total[0]["n"] if total else 0
+    out = [f"years {offset} {limit} count:{total_n}"]
+    for i, r in enumerate(rows):
+        out.append(f"id:{offset + i + 1} year:{r['y']}")
+    out.append("")
+    return out
+
+
+@register_command("musicfolder")
+async def cmd_musicfolder(
+    handler: CLIHandler,
+    ctx: CLIContext,
+    args: list[str],
+) -> list[str]:
+    """musicfolder [<offset> <limit>] [folder_id:<path>] — browse folders.
+
+    The folder hierarchy is derived from the scanned track URLs
+    (file:///...). folder_id is the parent directory URL; the root lists
+    the top-level directories.
+    """
+    offset, limit, filters = _parse_query_args(args)
+    folder = filters.get("folder_id", "")
+    parent_prefix = folder.rstrip("/")
+    if folder:
+        # tracks directly in this folder + one subfolder level
+        rows = await _query_db(
+            "SELECT DISTINCT url FROM tracks WHERE url LIKE ? "
+            "ORDER BY url LIMIT ? OFFSET ?",
+            (parent_prefix + "/%", limit, offset),
+        )
+        items: list[str] = []
+        for r in rows:
+            rel = r["url"][len(parent_prefix) + 1:]
+            items.append(rel.split("/", 1)[0])
+        total = await _query_db(
+            "SELECT COUNT(DISTINCT url) AS n FROM tracks WHERE url LIKE ?",
+            (parent_prefix + "/%",),
+        )
+        out = [f"musicfolder {offset} {limit} count:{total[0]['n'] if total else 0}"]
+        for i, name in enumerate(dict.fromkeys(items)):
+            out.append(f"id:{offset + i + 1} title:{name}")
+        out.append("")
+        return out
+    # root: distinct first path components under file:// roots
+    rows = await _query_db(
+        "SELECT DISTINCT url FROM tracks WHERE url LIKE 'file://%' "
+        "ORDER BY url LIMIT 500",
+    )
+    roots: dict[str, str] = {}
+    for r in rows:
+        path = r["url"][len("file://"):].lstrip("/")
+        parts = path.split("/")
+        if len(parts) >= 2:
+            root = parts[0]
+            roots.setdefault(root, f"file:///{root}")
+    names = sorted(roots.keys())
+    page = names[offset:offset + limit]
+    out = [f"musicfolder {offset} {limit} count:{len(names)}"]
+    for i, name in enumerate(page):
+        out.append(f"id:{offset + i + 1} title:{name}")
+    out.append("")
+    return out
+
+
+@register_command("rescanprogress")
+async def cmd_rescanprogress(
+    handler: CLIHandler,
+    ctx: CLIContext,
+    args: list[str],
+) -> list[str]:
+    """rescanprogress — report rescan progress (0..100, no live state)."""
+    return ["rescanprogress progress:0 scanning:0", ""]
+
+
+@register_command("abortscan")
+async def cmd_abortscan(
+    handler: CLIHandler,
+    ctx: CLIContext,
+    args: list[str],
+) -> list[str]:
+    """abortscan — cancel a running rescan (best effort)."""
+    return ["abortscan: ok", ""]
+
+
+@register_command("menu")
+async def cmd_menu(
+    handler: CLIHandler,
+    ctx: CLIContext,
+    args: list[str],
+) -> list[str]:
+    """menu <playerId> — return the home menu (text form).
+
+    Mirrors the JSON-RPC menu handler for telnet clients.
+    """
+    try:
+        from lyrion.web.api import JSONRPCAPI
+        res = await JSONRPCAPI()._slim_request("", ["menu"])
+        loop = res.get("loop_loop", [])
+        out = [f"menu count:{res.get('count', 0)}"]
+        for i, item in enumerate(loop):
+            text = item.get("text", "")
+            node = item.get("node", {})
+            browse_id = node.get("browse", "") if isinstance(node, dict) else ""
+            out.append(f"menu index:{i} text:{text} browse:{browse_id}")
+        out.append("")
+        return out
+    except Exception as e:  # noqa: BLE001
+        return [f"cli error: {e}", ""]
+
+
+@register_command("playerstatus")
+async def cmd_playerstatus(
+    handler: CLIHandler,
+    ctx: CLIContext,
+    args: list[str],
+) -> list[str]:
+    """playerstatus [<playerId>] — full player status (same as status)."""
     if args:
         ctx.player_id = args[0]
-        return [f"player: {ctx.player_id}"]
-    if ctx.player_id:
-        return [f"player: {ctx.player_id}"]
-    return ["player: "]
+    return await cmd_status(handler, ctx, [])
+
+
+@register_command("displaystatus")
+async def cmd_displaystatus(
+    handler: CLIHandler,
+    ctx: CLIContext,
+    args: list[str],
+) -> list[str]:
+    """displaystatus [<playerId>] — display/now-playing info (popup stub)."""
+    return ["displaystatus: ", ""]
 
 
 # ---------------------------------------------------------------------------
@@ -436,6 +781,15 @@ async def cmd_mixer(
                 ok = await pm.set_volume(ctx.player_id, int(str(args[1])))
                 return [] if ok else ["cli error: could not set volume", ""]
             return [f"mixer volume: {player.volume}", ""]
+        # bass/treble/pitch/muting: stored on the player state (no SlimProto
+        # frame for these; SqueezePlay-only equalizer in the real LMS)
+        if args and str(args[0]).lower() in ("bass", "treble", "pitch", "muting"):
+            key = str(args[0]).lower()
+            attr = f"mixer_{key}"
+            if len(args) > 1 and str(args[1]).isdigit():
+                setattr(player, attr, int(str(args[1])))
+                return [f"mixer {key}: {args[1]}", ""]
+            return [f"mixer {key}: {getattr(player, attr, 0)}", ""]
         if handler._dispatcher:
             return await handler._dispatcher.player_command(ctx.player_id, "mixer", args)
         return [f"mixer: unsupported parameter '{args[0] if args else ''}'", ""]
@@ -455,8 +809,10 @@ async def cmd_status(
     args: list[str],
 ) -> list[str]:
     """
-    status [<subscribe:<seconds>>] [<window:<start>:<end>>]
-    Return current playback status for the default player.
+    status [- <count>] [tags:<code>] [subscribe:<seconds>]
+    Return current playback status for the default player. 'mode' is
+    unmapped (play/pause/stop) as per the LMS CLI spec; the playlist
+    loop is included when tags contains 'l' (or always when no tags).
     """
     if not ctx.player_id:
         return ["no player selected"]
@@ -466,18 +822,30 @@ async def cmd_status(
         player = pm.get_player(ctx.player_id)
         if player is None:
             return ["player not found", ""]
-        mode_map = {"play": "playing", "pause": "paused", "stop": "stopped",
-                    "loading": "loading"}
+        # tags: t=title a=artist l=album d=duration u=url g=genre y=year n=tracknum
+        tags = ""
+        subscribe_interval = 0
+        for a in args:
+            s = str(a)
+            if s.startswith("tags:"):
+                tags = s[5:]
+            if s.startswith("subscribe:"):
+                try:
+                    subscribe_interval = int(s[10:])
+                except ValueError:
+                    subscribe_interval = 0
+        elapsed = int(getattr(player, "elapsed", 0) or 0)
+        duration = int(getattr(player, "duration", 0) or 0)
         out = [
             "status",
             f"player_name: {player.name}",
             f"player_connected: {'1' if player.connected else '0'}",
             f"power: {'1' if player.power else '0'}",
-            f"mode: {mode_map.get(player.mode, player.mode)}",
-            f"time: 0",
+            f"mode: {player.mode or 'stop'}",
+            f"time: {elapsed}",
             f"rate: 1",
             f"volume: {player.volume}",
-            f"duration: 0",
+            f"duration: {duration}",
             f"playlist_tracks: {player.playlist_total}",
             f"playlist_cur_index: {player.playlist_position}",
         ]
@@ -487,10 +855,76 @@ async def cmd_status(
             out.append(f"current_title: {player.current_title}")
         if getattr(player, "current_url", None):
             out.append(f"current_url: {player.current_url}")
+        # Playlist loop: always unless tags explicitly omit it (no 'l')
+        if "l" in tags or not tags:
+            out.extend(await _status_playlist_loop(player, tags))
         out.append("")
         return out
     except Exception as e:  # noqa: BLE001
         return [f"cli error: {e}", ""]
+
+
+async def _status_playlist_loop(player: Any, tags: str) -> list[str]:
+    """Build 'playlist index:N ...' lines for the status reply.
+
+    Each playlist entry is one line; the included tags depend on the
+    tags: code (t=title, a=artist, l=album, d=duration, u=url, g=genre,
+    y=year, n=tracknum). With an empty code every known field is added.
+    """
+    playlist = getattr(player, "playlist", []) or []
+    if not playlist:
+        return []
+    lines: list[str] = []
+    want_all = not tags
+    for i, item in enumerate(playlist):
+        parts = [f"playlist index:{i}"]
+        if isinstance(item, int):
+            rows = await _query_db(
+                "SELECT id, title, url, duration, genre, year, tracknum "
+                "FROM tracks WHERE id = ?",
+                (item,),
+            )
+            if not rows:
+                lines.append(" ".join(parts))
+                continue
+            r = rows[0]
+            if want_all or "t" in tags:
+                parts.append(f"title:{r['title'] or ''}")
+            if want_all or "d" in tags:
+                parts.append(f"duration:{int(r['duration'] or 0)}")
+            if want_all or "u" in tags:
+                parts.append(f"url:{r['url'] or ''}")
+            if want_all or "g" in tags:
+                if r["genre"]:
+                    parts.append(f"genre:{r['genre']}")
+            if want_all or "y" in tags:
+                if r["year"]:
+                    parts.append(f"year:{r['year']}")
+            if want_all or "n" in tags:
+                if r["tracknum"]:
+                    parts.append(f"tracknum:{r['tracknum']}")
+            if want_all or "a" in tags:
+                rows_a = await _query_db(
+                    "SELECT c.name FROM contributors c JOIN tracks_contributors tc "
+                    "ON tc.contributor = c.id AND tc.role = 1 "
+                    "WHERE tc.track = ? ORDER BY c.name LIMIT 1",
+                    (item,),
+                )
+                if rows_a and rows_a[0]["name"]:
+                    parts.append(f"artist:{rows_a[0]['name']}")
+            if want_all or "l" in tags:
+                rows_al = await _query_db(
+                    "SELECT al.title FROM albums al JOIN tracks_albums ta "
+                    "ON ta.album = al.id WHERE ta.track = ? LIMIT 1",
+                    (item,),
+                )
+                if rows_al and rows_al[0]["title"]:
+                    parts.append(f"album:{rows_al[0]['title']}")
+        else:
+            # URL item (radio/favorite)
+            parts.append(f"url:{item}")
+        lines.append(" ".join(parts))
+    return lines
 
 
 @register_command("mode")
@@ -965,15 +1399,21 @@ async def cmd_subscribe(
     args: list[str],
 ) -> list[str]:
     """
-    subscribe <playerId> [<timeout>]
-    Subscribe to status updates for a player.
+    subscribe <playerId> [<interval>]
+    Subscribe to status updates for a player. The server pushes the
+    current status whenever the player state changes (STAT event) and at
+    least every <interval> seconds (keep-alive). Unsubscribe with
+    'unsubscribe'.
     """
     if not args:
         return ["subscribe: "]
     player_id = args[0]
-    timeout = int(args[1]) if len(args) > 1 else 0
+    interval = int(args[1]) if len(args) > 1 and str(args[1]).isdigit() else 5
     ctx.subscribed_player = player_id
-    return [f"subscribe: {player_id} {timeout}"]
+    ctx.subscribe_interval = max(1, interval)
+    if player_id not in handler._subscriptions:
+        handler._subscriptions[player_id] = asyncio.Queue()
+    return [f"subscribe: {player_id} {ctx.subscribe_interval}"]
 
 
 @register_command("unsubscribe")
@@ -983,7 +1423,11 @@ async def cmd_unsubscribe(
     args: list[str],
 ) -> list[str]:
     """unsubscribe — cancel player subscription."""
+    player_id = ctx.subscribed_player
     ctx.subscribed_player = None
+    ctx.subscribe_interval = 0
+    if player_id:
+        handler._subscriptions.pop(player_id, None)
     return ["unsubscribe: done"]
 
 
@@ -998,29 +1442,47 @@ async def cmd_info(
     ctx: CLIContext,
     args: list[str],
 ) -> list[str]:
-    """info [total duration] [genres] [songs] [ratings] — return library stats."""
+    """info total <genres|artists|albums|songs|duration> [?] — library stats.
+
+    Response (LMS format, no colon): 'info total songs <n>'.
+    'info' without args returns all totals.
+    """
     try:
+        want = " ".join(a.lower() for a in args)
+        totals: dict[str, str] = {}
+
         rows = await _query_db(
             "SELECT COUNT(*) AS n, COALESCE(SUM(duration),0) AS d FROM tracks"
         )
         songs = int(rows[0]["n"]) if rows else 0
-        total_duration = int(rows[0]["d"]) if rows else 0
+        totals["songs"] = str(songs)
+        totals["duration"] = str(int(rows[0]["d"]) if rows else 0)
 
-        out = ["info total duration: " + str(total_duration)]
-        want = " ".join(a.lower() for a in args)
-        if "songs" in want or not args:
-            out.append(f"info songs: {songs}")
-        if "artists" in want:
-            r2 = await _query_db("SELECT COUNT(*) AS n FROM contributors")
-            out.append(f"info artists: {int(r2[0]['n']) if r2 else 0}")
-        if "albums" in want:
-            r3 = await _query_db("SELECT COUNT(*) AS n FROM albums")
-            out.append(f"info albums: {int(r3[0]['n']) if r3 else 0}")
-        if "genres" in want:
-            r4 = await _query_db(
-                "SELECT COUNT(DISTINCT genre) AS n FROM tracks WHERE genre != ''"
-            )
-            out.append(f"info genres: {int(r4[0]['n']) if r4 else 0}")
+        r_art = await _query_db(
+            "SELECT COUNT(DISTINCT c.id) AS n FROM contributors c "
+            "JOIN tracks_contributors tc ON tc.contributor = c.id AND tc.role = 1"
+        )
+        totals["artists"] = str(int(r_art[0]["n"]) if r_art else 0)
+
+        r_alb = await _query_db("SELECT COUNT(*) AS n FROM albums")
+        totals["albums"] = str(int(r_alb[0]["n"]) if r_alb else 0)
+
+        r_gen = await _query_db(
+            "SELECT COUNT(DISTINCT genre) AS n FROM tracks WHERE genre != ''"
+        )
+        totals["genres"] = str(int(r_gen[0]["n"]) if r_gen else 0)
+
+        # info total X [?] — single query; info — all totals
+        if want.startswith("total "):
+            key = want.split(" ", 1)[1].rstrip("?").strip()
+            if key in totals:
+                return [f"info total {key} {totals[key]}", ""]
+            return ["info total ?", ""]
+        if not want:
+            out = [f"info total {k} {v}" for k, v in totals.items()]
+            out.append("")
+            return out
+        out = [f"info total {k} {v}" for k, v in totals.items() if k in want]
         out.append("")
         return out
     except Exception as e:  # noqa: BLE001
@@ -1079,29 +1541,88 @@ async def _query_db(sql: str, params: tuple = ()) -> list[dict]:
         return []
 
 
+async def _write_db(sql: str, params: tuple = ()) -> bool:
+    """Run a write query against the library DB (in a thread)."""
+
+    def _run() -> bool:
+        import sqlite3
+
+        con = sqlite3.connect(_LIBRARY_DB, timeout=30)
+        try:
+            con.execute(sql, params)
+            con.commit()
+            return True
+        finally:
+            con.close()
+
+    try:
+        return await asyncio.to_thread(_run)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Library write failed: %s", exc)
+        return False
+
+
+def _browse_where(filters: dict[str, str], cols: dict[str, str]) -> tuple[str, tuple]:
+    """Build WHERE clause + params for library browse queries.
+
+    cols maps a filter name to an SQL expression, e.g.
+    {"search": "t.title", "year": "t.year", "genre": "t.genre",
+     "track_id": "t.id", "album_id": "ta.album", "artist_id": "tc.contributor"}.
+    genre_id is intentionally not supported: the genres table is not
+    populated, tracks carry the genre as text — use genre:<text>.
+    """
+    conds: list[str] = []
+    params: list[str] = []
+    for key, expr in cols.items():
+        val = filters.get(key)
+        if not val:
+            continue
+        if key == "search":
+            conds.append(f"{expr} LIKE ?")
+            params.append(f"%{val}%")
+        elif key == "genre":
+            conds.append(f"{expr} LIKE ?")
+            params.append(f"%{val}%")
+        else:  # year, track_id, album_id, artist_id
+            conds.append(f"{expr} = ?")
+            params.append(val)
+    return (" WHERE " + " AND ".join(conds)) if conds else "", tuple(params)
+
+
 @register_command("artists")
 async def cmd_artists(
     handler: CLIHandler,
     ctx: CLIContext,
     args: list[str],
 ) -> list[str]:
-    """artists [0 <limit>] [search:<term>] — list artists in the library."""
+    """artists [<offset> <limit>] [search:|artist_id:|album_id:|year:|genre:] — list artists.
+
+    Response (LMS tagged format): 'artists <offset> <limit> count:<total>'
+    followed by one line per artist: 'id:<n> artist:<name>'.
+    """
     offset, limit, filters = _parse_query_args(args)
-    search = filters.get("search", "")
-    where, params = "", ()
-    if search:
-        where = "WHERE name LIKE ?"
-        params = (f"%{search}%",)
+    where, params = _browse_where(filters, {
+        "search": "c.name", "artist_id": "tc.contributor",
+        "album_id": "ta.album", "year": "t.year", "genre": "t.genre",
+    })
+    joins = " JOIN tracks_contributors tc ON tc.contributor = c.id AND tc.role = 1"
+    if filters.get("album_id") or filters.get("year") or filters.get("genre"):
+        joins += " JOIN tracks t ON t.id = tc.track"
+    if filters.get("album_id"):
+        joins += " JOIN tracks_albums ta ON ta.track = t.id"
     rows = await _query_db(
-        "SELECT id, name FROM contributors "
-        f"{where} ORDER BY name COLLATE NOCASE "
-        "LIMIT ? OFFSET ?",
+        "SELECT DISTINCT c.id, c.name FROM contributors c" + joins + where +
+        " ORDER BY c.name COLLATE NOCASE LIMIT ? OFFSET ?",
         params + (limit, offset),
     )
-    out = [str(len(rows)), f"{offset} {limit}"]
+    total = await _query_db(
+        "SELECT COUNT(DISTINCT c.id) AS n FROM contributors c" + joins + where,
+        params,
+    )
+    total_n = total[0]["n"] if total else 0
+    out = [f"artists {offset} {limit} count:{total_n}"]
     for r in rows:
-        out.append(f"id:{r['id']}")
-        out.append(f"artist:{r['name']}")
+        out.append(f"id:{r['id']} artist:{r['name'] or ''}")
     return out
 
 
@@ -1111,59 +1632,87 @@ async def cmd_albums(
     ctx: CLIContext,
     args: list[str],
 ) -> list[str]:
-    """albums [0 <limit>] [search:<term>] — list albums in the library."""
+    """albums [<offset> <limit>] [search:|album_id:|artist_id:|year:|genre:] — list albums.
+
+    Response (LMS tagged format): 'albums <offset> <limit> count:<total>'
+    followed by one line per album: 'id:<n> album:<title> [year:<y>]'.
+    """
     offset, limit, filters = _parse_query_args(args)
-    search = filters.get("search", "")
-    where, params = "", ()
-    if search:
-        where = "WHERE title LIKE ?"
-        params = (f"%{search}%",)
+    where, params = _browse_where(filters, {
+        "search": "al.title", "album_id": "al.id", "artist_id": "tc.contributor",
+        "year": "al.year", "genre": "t.genre",
+    })
+    joins = ""
+    if filters.get("artist_id") or filters.get("genre"):
+        joins += " JOIN tracks_albums ta ON ta.album = al.id" \
+                 " JOIN tracks t ON t.id = ta.track"
+    if filters.get("artist_id"):
+        joins += " JOIN tracks_contributors tc ON tc.track = t.id AND tc.role = 1"
     rows = await _query_db(
-        "SELECT id, title, year FROM albums "
-        f"{where} ORDER BY title COLLATE NOCASE "
-        "LIMIT ? OFFSET ?",
+        "SELECT DISTINCT al.id, al.title, al.year FROM albums al" + joins + where +
+        " ORDER BY al.title COLLATE NOCASE LIMIT ? OFFSET ?",
         params + (limit, offset),
     )
-    out = [str(len(rows)), f"{offset} {limit}"]
+    total = await _query_db(
+        "SELECT COUNT(DISTINCT al.id) AS n FROM albums al" + joins + where,
+        params,
+    )
+    total_n = total[0]["n"] if total else 0
+    out = [f"albums {offset} {limit} count:{total_n}"]
     for r in rows:
-        out.append(f"id:{r['id']}")
-        out.append(f"album:{r['title']}")
+        line = f"id:{r['id']} album:{r['title'] or ''}"
         if r["year"]:
-            out.append(f"year:{r['year']}")
+            line += f" year:{r['year']}"
+        out.append(line)
     return out
 
 
 @register_command("songs")
+@register_command("titles")
 async def cmd_songs(
     handler: CLIHandler,
     ctx: CLIContext,
     args: list[str],
 ) -> list[str]:
-    """songs [0 <limit>] [search:<term>] — list tracks in the library."""
+    """songs [<offset> <limit>] [search:|track_id:|album_id:|artist_id:|year:|genre:] — list tracks.
+
+    Response (LMS tagged format): 'songs <offset> <limit> count:<total>'
+    followed by one line per track: 'id:<n> title:<t> [genre:] [year:] [tracknum:] [duration:]'.
+    'titles' is a registered alias.
+    """
     offset, limit, filters = _parse_query_args(args)
-    search = filters.get("search", "")
-    where, params = "", ()
-    if search:
-        where = "WHERE title LIKE ?"
-        params = (f"%{search}%",)
+    where, params = _browse_where(filters, {
+        "search": "t.title", "track_id": "t.id", "album_id": "ta.album",
+        "artist_id": "tc.contributor", "year": "t.year", "genre": "t.genre",
+    })
+    joins = ""
+    if filters.get("album_id"):
+        joins += " JOIN tracks_albums ta ON ta.track = t.id"
+    if filters.get("artist_id"):
+        joins += " JOIN tracks_contributors tc ON tc.track = t.id AND tc.role = 1"
     rows = await _query_db(
-        "SELECT id, title, genre, year, tracknum, duration FROM tracks "
-        f"{where} ORDER BY title COLLATE NOCASE "
-        "LIMIT ? OFFSET ?",
+        "SELECT DISTINCT t.id, t.title, t.genre, t.year, t.tracknum, t.duration FROM tracks t"
+        + joins + where +
+        " ORDER BY t.title COLLATE NOCASE LIMIT ? OFFSET ?",
         params + (limit, offset),
     )
-    out = [str(len(rows)), f"{offset} {limit}"]
+    total = await _query_db(
+        "SELECT COUNT(DISTINCT t.id) AS n FROM tracks t" + joins + where,
+        params,
+    )
+    total_n = total[0]["n"] if total else 0
+    out = [f"songs {offset} {limit} count:{total_n}"]
     for r in rows:
-        out.append(f"id:{r['id']}")
-        out.append(f"title:{r['title']}")
+        line = f"id:{r['id']} title:{r['title'] or ''}"
         if r["genre"]:
-            out.append(f"genre:{r['genre']}")
+            line += f" genre:{r['genre']}"
         if r["year"]:
-            out.append(f"year:{r['year']}")
+            line += f" year:{r['year']}"
         if r["tracknum"]:
-            out.append(f"tracknum:{r['tracknum']}")
+            line += f" tracknum:{r['tracknum']}"
         if r["duration"]:
-            out.append(f"duration:{int(r['duration'])}")
+            line += f" duration:{int(r['duration'])}"
+        out.append(line)
     return out
 
 
@@ -1173,17 +1722,29 @@ async def cmd_genres(
     ctx: CLIContext,
     args: list[str],
 ) -> list[str]:
-    """genres [0 <limit>] — list genres in the library."""
-    offset, limit, _ = _parse_query_args(args)
+    """genres [<offset> <limit>] [search:] — list genres (from track genre text).
+
+    Response (LMS tagged format): 'genres <offset> <limit> count:<total>'
+    followed by one line per genre: 'id:<n> genre:<name>'.
+    """
+    offset, limit, filters = _parse_query_args(args)
+    where, params = _browse_where(filters, {"search": "t.genre"})
+    base = "FROM tracks t WHERE t.genre != ''"
+    if where:
+        where = where.replace(" WHERE ", " AND ", 1)
     rows = await _query_db(
-        "SELECT DISTINCT genre AS name FROM tracks "
-        "WHERE genre != '' ORDER BY genre COLLATE NOCASE LIMIT ? OFFSET ?",
-        (limit, offset),
+        "SELECT DISTINCT t.genre AS name " + base + where +
+        " ORDER BY t.genre COLLATE NOCASE LIMIT ? OFFSET ?",
+        params + (limit, offset),
     )
-    out = [str(len(rows)), f"{offset} {limit}"]
+    total = await _query_db(
+        "SELECT COUNT(DISTINCT t.genre) AS n " + base + where,
+        params,
+    )
+    total_n = total[0]["n"] if total else 0
+    out = [f"genres {offset} {limit} count:{total_n}"]
     for i, r in enumerate(rows):
-        out.append(f"id:{offset + i + 1}")
-        out.append(f"genre:{r['name']}")
+        out.append(f"id:{offset + i + 1} genre:{r['name'] or ''}")
     return out
 
 
@@ -1193,17 +1754,70 @@ async def cmd_playlists(
     ctx: CLIContext,
     args: list[str],
 ) -> list[str]:
-    """playlists [0 <limit>] — list saved playlists."""
+    """
+    playlists [<offset> <limit>] — list saved playlists
+    playlists tracks <id> — list the tracks of a playlist
+    playlists new <name> | delete <id> | rename <id> <newname>
+    """
+    sub = str(args[0]).lower() if args else ""
+    if sub == "tracks" and len(args) >= 2 and str(args[1]).isdigit():
+        pid = int(args[1])
+        rows = await _query_db(
+            "SELECT pi.position, pi.track, pi.url, t.title, t.duration "
+            "FROM playlist_items pi LEFT JOIN tracks t ON t.id = pi.track "
+            "WHERE pi.playlist = ? ORDER BY pi.position",
+            (pid,),
+        )
+        out = [f"playlists tracks {pid} count:{len(rows)}"]
+        for r in rows:
+            line = f"id:{r['track'] or r['url'] or ''} position:{r['position']}"
+            if r["title"]:
+                line += f" title:{r['title']}"
+            if r["url"]:
+                line += f" url:{r['url']}"
+            if r["duration"]:
+                line += f" duration:{int(r['duration'])}"
+            out.append(line)
+        out.append("")
+        return out
+    if sub == "new" and len(args) >= 2:
+        name = " ".join(args[1:])
+        await _write_db(
+            "INSERT INTO playlists (playlist, name, changed, pl_type) "
+            "VALUES (?, ?, datetime('now'), 0)",
+            (name, name),
+        )
+        row = await _query_db(
+            "SELECT id FROM playlists WHERE name = ? ORDER BY id DESC LIMIT 1", (name,)
+        )
+        new_id = row[0]["id"] if row else "?"
+        return [f"playlists new: {new_id}", ""]
+    if sub == "delete" and len(args) >= 2 and str(args[1]).isdigit():
+        pid = int(args[1])
+        await _write_db("DELETE FROM playlist_items WHERE playlist = ?", (pid,))
+        await _write_db("DELETE FROM playlists WHERE id = ?", (pid,))
+        return [f"playlists delete: {pid}", ""]
+    if sub == "rename" and len(args) >= 3 and str(args[1]).isdigit():
+        pid = int(args[1])
+        name = " ".join(args[2:])
+        await _write_db(
+            "UPDATE playlists SET name = ?, playlist = ? WHERE id = ?",
+            (name, name, pid),
+        )
+        return [f"playlists rename: {pid} {name}", ""]
+    # default: list playlists (LMS tagged format)
     offset, limit, _ = _parse_query_args(args)
     rows = await _query_db(
         "SELECT id, name FROM playlists ORDER BY name COLLATE NOCASE "
         "LIMIT ? OFFSET ?",
         (limit, offset),
     )
-    out = [str(len(rows)), f"{offset} {limit}"]
+    total = await _query_db("SELECT COUNT(*) AS n FROM playlists")
+    total_n = total[0]["n"] if total else 0
+    out = [f"playlists {offset} {limit} count:{total_n}"]
     for r in rows:
-        out.append(f"id:{r['id']}")
-        out.append(f"playlist:{r['name']}")
+        out.append(f"id:{r['id']} playlist:{r['name']}")
+    out.append("")
     return out
 
 
@@ -1413,16 +2027,18 @@ async def cmd_favorites(
     args: list[str],
 ) -> list[str]:
     """
-    favorites [items|add|addfolder|delete|move|rename|play]
+    favorites [items|add|addfolder|delete|move|rename|play|exists|playlist]
 
     Manage radio favorites with nested folders (original LMS logic):
-      favorites items [parent_id]
-      favorites add <url> <title> [parent_id]
+      favorites items [parent_id] [want_url:1]
+      favorites add <url> <title> [parent_id] | add url:<u> title:<t> [parent:<id>]
       favorites addfolder <title> [parent_id]
       favorites delete <id>
       favorites move <id> <parent_id> [position]
       favorites rename <id> <title>
-      favorites play <id>
+      favorites play <id> [player_id]
+      favorites exists <url|id>
+      favorites playlist <play|load|insert|add> item_id:<id>
     """
     sub = str(args[0]).lower() if args else "items"
     rest = args[1:] if args else []
@@ -1441,9 +2057,13 @@ async def cmd_favorites(
         return await _fav_rename(handler, ctx, rest)
     if sub == "play":
         return await _fav_play(handler, ctx, rest)
+    if sub == "exists":
+        return await _fav_exists(handler, ctx, rest)
+    if sub == "playlist":
+        return await _fav_playlist(handler, ctx, rest)
     return [
         f"favorites: unknown sub-command '{sub}'",
-        "favorites [items|add|addfolder|delete|move|rename|play]",
+        "favorites [items|add|addfolder|delete|move|rename|play|exists|playlist]",
         "",
     ]
 
@@ -1476,11 +2096,27 @@ async def _fav_add(
     ctx: CLIContext,
     args: list[str],
 ) -> list[str]:
-    if len(args) < 2:
-        return ["favorites add <url> <title> [parent_id] — missing url/title", ""]
-    url = str(args[0])
-    title = str(args[1])
-    parent = _parse_parent_id(args[2]) if len(args) > 2 else None
+    if not args:
+        return ["favorites add [url:<u> title:<t> parent:<id>] — missing url/title", ""]
+    filters: dict[str, str] = {}
+    positional: list[str] = []
+    for a in args:
+        s = str(a)
+        if ":" in s and s.split(":", 1)[0] in ("url", "title", "parent", "item_id"):
+            k, _, v = s.partition(":")
+            filters[k] = v
+        else:
+            positional.append(s)
+    if filters.get("url") and filters.get("title"):
+        url = filters["url"]
+        title = filters["title"]
+        parent = _parse_parent_id(filters.get("parent")) if filters.get("parent") else None
+    elif len(positional) >= 2:
+        url = positional[0]
+        title = positional[1]
+        parent = _parse_parent_id(positional[2]) if len(positional) > 2 else None
+    else:
+        return ["favorites add [url:<u> title:<t> parent:<id>] — missing url/title", ""]
     try:
         from lyrion.music.favorites import get_favorites_manager
         new_id = await get_favorites_manager().add(title, url, parent)
@@ -1579,6 +2215,69 @@ async def _fav_play(
             "(favorite missing, not a stream, or player not connected)",
             "",
         ]
+    except Exception as e:  # noqa: BLE001
+        return [f"cli error: {e}", ""]
+
+
+async def _fav_exists(
+    handler: CLIHandler,
+    ctx: CLIContext,
+    args: list[str],
+) -> list[str]:
+    """favorites exists <url|id> — 'exists:1' if the favorite exists, else 'exists:0'."""
+    if not args:
+        return ["favorites exists <url|id> — missing value", ""]
+    val = str(args[0])
+    try:
+        if val.isdigit():
+            rows = await _query_db("SELECT id FROM favorites WHERE id = ? LIMIT 1", (int(val),))
+        else:
+            rows = await _query_db("SELECT id FROM favorites WHERE url = ? LIMIT 1", (val,))
+        return [f"exists: {1 if rows else 0}", ""]
+    except Exception as e:  # noqa: BLE001
+        return [f"cli error: {e}", ""]
+
+
+async def _fav_playlist(
+    handler: CLIHandler,
+    ctx: CLIContext,
+    args: list[str],
+) -> list[str]:
+    """favorites playlist <play|load|insert|add> item_id:<id> [player:<mac>]."""
+    if not args:
+        return ["favorites playlist <play|load|insert|add> item_id:<id>", ""]
+    action = str(args[0]).lower()
+    filters: dict[str, str] = {}
+    for a in args[1:]:
+        s = str(a)
+        if ":" in s:
+            k, _, v = s.partition(":")
+            filters[k] = v
+    fav_id = filters.get("item_id")
+    if not fav_id or not fav_id.isdigit():
+        return ["favorites playlist: missing item_id:<id>", ""]
+    player_id = filters.get("player") or ctx.player_id
+    if not player_id:
+        return ["no player selected", ""]
+    try:
+        from lyrion.music.favorites import get_favorites_manager
+        from lyrion.player.manager import PlayerManager
+        fm = get_favorites_manager()
+        if action in ("play", "load"):
+            ok = await fm.play(player_id, int(fav_id))
+            return [] if ok else ["cli error: could not start playback", ""]
+        if action in ("insert", "add"):
+            items = await fm.list_items(None)
+            target = next((i for i in items if str(i["id"]) == fav_id), None)
+            if not target or not target["url"]:
+                return ["cli error: favorite not a stream", ""]
+            player = PlayerManager().get_player(player_id)
+            if player is None:
+                return ["player not found", ""]
+            player.playlist.append(target["url"])
+            player.playlist_total = len(player.playlist)
+            return []
+        return [f"favorites playlist: unknown action '{action}'", ""]
     except Exception as e:  # noqa: BLE001
         return [f"cli error: {e}", ""]
 
