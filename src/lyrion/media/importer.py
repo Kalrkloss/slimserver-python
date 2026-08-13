@@ -48,8 +48,9 @@ class ImportStats:
 
 # Supported audio extensions (kept in sync with the media scanner)
 SUPPORTED_EXTENSIONS: frozenset[str] = frozenset({
-    "mp3", "flac", "ogg", "oga", "m4a", "aac", "aiff", "aif",
+    "mp3", "flac", "ogg", "oga", "m4a", "mp4", "aac", "aiff", "aif",
     "wav", "wma", "opus", "spx", "ape", "tak", "m4b", "mpc", "mp+",
+    "wv", "dsf", "dff", "ac3", "mp2",
 })
 
 

@@ -68,7 +68,8 @@ async def init_db(
     if _db_engine is not None:
         return _db_engine
 
-    db_path = Path(db_path) if db_path else Path.home() / ".lyrion" / "Lyrion" / "lyrion.db"
+    db_path = Path(db_path) if db_path else (
+        Path.home() / ".lyrion" / "Lyrion" / "Prefs" / "lyrion.db")
     db_path.parent.mkdir(parents=True, exist_ok=True)
     DEFAULT_DB_PATH = db_path
 
