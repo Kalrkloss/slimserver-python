@@ -453,6 +453,21 @@ class JSONRPCAPI:
                 "parent_id": str(it["parent_id"]) if it["parent_id"] is not None else "",
                 "position": i,
             }
+            if is_folder:
+                # Folder: go opens the folder's items (LMS hierarchical id
+                # or DB id both work via item_id).
+                item["actions"] = {
+                    "go": {"player": 0, "cmd": ["favorites", "items"],
+                           "params": {"item_id": str(it["id"])}},
+                }
+            else:
+                # Stream: play/do plays the favorite.
+                item["actions"] = {
+                    "play": {"player": 0, "cmd": ["playlist", "play"],
+                             "params": {"item_id": str(it["id"])}},
+                    "do": {"player": 0, "cmd": ["playlist", "play"],
+                           "params": {"item_id": str(it["id"])}},
+                }
             if feed_mode and is_folder:
                 item["items"] = await self._fav_items_loop(
                     fm, int(it["id"]), path, feed_mode)
@@ -753,9 +768,9 @@ class JSONRPCAPI:
                     parent = int(str(rest[0]))
                     parent_path = f"0.{rest[0]}"
                 loop = await self._fav_items_loop(fm, parent, parent_path, feed_mode)
-                return {"count": len(loop), "loop_loop": loop}
+                return self._browse_response(loop)
             except Exception:
-                return {"count": 0, "loop_loop": []}
+                return self._browse_response([])
 
         # favorites changed — event subscription (SqueezeCtrl): the app
         # watches this channel and reloads the list when a 'changed' event
@@ -1018,27 +1033,37 @@ class JSONRPCAPI:
         return result
 
     def _home_menu(self) -> list[dict]:
-        """The root browse menu (Home) shared by menu/menustatus/status."""
+        """The root browse menu (Home) shared by menu/menustatus/status.
 
-        def _home_item(browse_id: str, name: str, typ: str, weight: int = 0) -> dict:
+        Jive/SlimBrowse format (lyrion.org/reference/slimbrowse): the
+        actions.go is a JSON command {player, cmd, params} where cmd is
+        the LMS query name (artists/albums/titles/...) and params.menu
+        declares the next browse level. The Android controllers execute
+        exactly this command when the item is tapped — 'browse://' cmd
+        strings were never understood, so no sub-menu ever opened.
+        """
+
+        def _home_item(cmd: list[str], name: str, typ: str, weight: int = 0,
+                       params: dict | None = None) -> dict:
+            go: dict = {"player": 0, "cmd": cmd}
+            if params:
+                go["params"] = params
             return {
-                "id": f"browse://{browse_id}",
+                "id": f"browse://{cmd[0]}",
                 "name": name,
                 "text": name,  # OpenSqueeze shows getText()
-                "node": browse_id,  # SqueezeClient HomeMenuItemResponse
+                "node": cmd[0],  # SqueezeClient HomeMenuItemResponse
                 "parent": "home",  # Jive home root
                 "type": typ,
                 "hasitems": 1,
                 "weight": weight,
                 # Squeezer reads 'icon' (or 'icon-id') — 'image' is ignored
-                "icon": f"html/images/{browse_id}.png",
-                # Jive navigation: go/do action triggers browse
-                "actions": {
-                    "go": {"cmd": ["browse", browse_id]},
-                    "do": {"cmd": ["browse", browse_id]},
-                },
-                "browse": {"id": browse_id, "name": name, "type": typ},
-                # P3-5: Jive window hints — the menu push opens/refreshes a
+                "icon": f"html/images/{cmd[0]}.png",
+                # Jive navigation: go/do action is the LMS command that
+                # opens the next browse level (with the menu: param).
+                "actions": {"go": go, "do": go},
+                "browse": {"id": cmd[0], "name": name, "type": typ},
+                # Jive window hints — the menu push opens/refreshes a
                 # text list window with the item's title.
                 "nextWindow": "refresh",
                 "window": {
@@ -1049,13 +1074,21 @@ class JSONRPCAPI:
             }
 
         return [
-            _home_item("artists", "Artists", "artist", 0),
-            _home_item("albums", "Albums", "album", 1),
-            _home_item("songs", "Songs", "song", 2),
-            _home_item("genres", "Genres", "genre", 3),
-            _home_item("favorites", "Favorites", "link", 4),
-            _home_item("radios", "Radio", "link", 5),
+            _home_item(["artists"], "Artists", "artist", 0, {"menu": "albums"}),
+            _home_item(["albums"], "Albums", "album", 1, {"menu": "tracks"}),
+            _home_item(["titles"], "Songs", "song", 2, {"menu": "songinfo"}),
+            _home_item(["genres"], "Genres", "genre", 3, {"menu": "artists"}),
+            # Favorites: the app sends 'favorites items' — the menu list
+            # with the DB ids the controllers parse as numbers.
+            _home_item(["favorites", "items"], "Favorites", "link", 4),
+            _home_item(["browse", "radios"], "Radio", "link", 5),
         ]
+
+    @staticmethod
+    def _browse_response(loop: list) -> dict:
+        """Browse/menu response — Jive expects 'item_loop', the older
+        JSON-RPC clients 'loop_loop'; deliver both (identical)."""
+        return {"count": len(loop), "loop_loop": loop, "item_loop": loop}
 
     async def _load_tracks(self, track_ids: list[int]) -> dict:
         """Load track metadata for ids (songinfo/status tag fields)."""
@@ -1361,9 +1394,9 @@ class JSONRPCAPI:
                     from lyrion.music.favorites import get_favorites_manager
                     loop = await self._fav_items_loop(
                         get_favorites_manager(), None, "0", False)
-                    return {"count": len(loop), "loop_loop": loop}
+                    return self._browse_response(loop)
                 except Exception:
-                    return {"count": 0, "loop_loop": []}
+                    return self._browse_response([])
             if target == "radios":
                 try:
                     from lyrion.music.radio import get_radio_manager
@@ -1376,13 +1409,20 @@ class JSONRPCAPI:
                             "url": s.url,
                             "type": "radio",
                             "hasitems": 0,
+                            # Jive actions: play/do plays the station.
+                            "actions": {
+                                "play": {"player": 0, "cmd": ["playlist", "play"],
+                                         "params": {"item_id": str(s.id)}},
+                                "do": {"player": 0, "cmd": ["playlist", "play"],
+                                       "params": {"item_id": str(s.id)}},
+                            },
                         }
                         for s in stations
                     ]
-                    return {"count": len(loop), "loop_loop": loop}
+                    return self._browse_response(loop)
                 except Exception:
-                    return {"count": 0, "loop_loop": []}
-            return {"count": 0, "loop_loop": []}
+                    return self._browse_response([])
+            return self._browse_response([])
 
         start = int(args[0]) if args and str(args[0]).isdigit() else 0
         count = int(args[1]) if len(args) > 1 and str(args[1]).isdigit() else 50
@@ -1442,7 +1482,19 @@ class JSONRPCAPI:
                     + joins + extra_joins + where +
                     " ORDER BY c.name LIMIT ? OFFSET ?",
                     params + (count, start)).fetchall()
-                loop = [{"id": r["id"], "artist": r["name"] or ""} for r in rows]
+                loop = []
+                for r in rows:
+                    loop.append({
+                        "id": r["id"], "artist": r["name"] or "",
+                        # Jive actions: go opens the artist's albums
+                        # (menu: next level), play plays all artist tracks.
+                        "actions": {
+                            "go": {"player": 0, "cmd": ["albums"],
+                                   "params": {"artist_id": r["id"], "menu": "tracks"}},
+                            "play": {"player": 0, "cmd": ["playlist", "play"],
+                                     "params": {"artist_id": r["id"]}},
+                        },
+                    })
                 total = db.execute(
                     "SELECT COUNT(DISTINCT c.id) FROM contributors c"
                     + joins + extra_joins + where, params).fetchone()[0]
@@ -1459,8 +1511,18 @@ class JSONRPCAPI:
                     + joins + where +
                     " ORDER BY al.title LIMIT ? OFFSET ?",
                     params + (count, start)).fetchall()
-                loop = [{"id": r["id"], "album": r["title"] or "", "year": r["year"] or 0}
-                        for r in rows]
+                loop = []
+                for r in rows:
+                    item = {"id": r["id"], "album": r["title"] or "", "year": r["year"] or 0}
+                    # Jive actions: go opens the album's tracks, play
+                    # plays the whole album.
+                    item["actions"] = {
+                        "go": {"player": 0, "cmd": ["titles"],
+                               "params": {"album_id": r["id"], "menu": "songinfo"}},
+                        "play": {"player": 0, "cmd": ["playlist", "play"],
+                                 "params": {"album_id": r["id"]}},
+                    }
+                    loop.append(item)
                 total = db.execute(
                     "SELECT COUNT(DISTINCT al.id) FROM albums al" + joins + where,
                     params).fetchone()[0]
@@ -1476,8 +1538,19 @@ class JSONRPCAPI:
                     + joins + where +
                     " ORDER BY t.title LIMIT ? OFFSET ?",
                     params + (count, start)).fetchall()
-                loop = [{"id": r["id"], "title": r["title"] or "", "url": r["url"] or "",
-                         "duration": r["duration"] or 0} for r in rows]
+                loop = []
+                for r in rows:
+                    loop.append({
+                        "id": r["id"], "title": r["title"] or "", "url": r["url"] or "",
+                        "duration": r["duration"] or 0,
+                        # Jive actions: go opens songinfo, play plays the track.
+                        "actions": {
+                            "go": {"player": 0, "cmd": ["songinfo"],
+                                   "params": {"track_id": r["id"]}},
+                            "play": {"player": 0, "cmd": ["playlist", "play"],
+                                     "params": {"track_id": r["id"]}},
+                        },
+                    })
                 total = db.execute(
                     "SELECT COUNT(DISTINCT t.id) FROM tracks t" + joins + where,
                     params).fetchone()[0]
@@ -1493,8 +1566,17 @@ class JSONRPCAPI:
                     "SELECT DISTINCT genre FROM tracks" + where +
                     " ORDER BY genre COLLATE NOCASE LIMIT ? OFFSET ?",
                     params + (count, start)).fetchall()
-                loop = [{"id": start + i, "genre": r["genre"] or ""}
-                        for i, r in enumerate(rows)]
+                loop = []
+                for i, r in enumerate(rows):
+                    gid = start + i
+                    loop.append({
+                        "id": gid, "genre": r["genre"] or "",
+                        # Jive actions: go opens the genre's artists.
+                        "actions": {
+                            "go": {"player": 0, "cmd": ["artists"],
+                                   "params": {"genre_id": gid, "menu": "albums"}},
+                        },
+                    })
                 total = db.execute(
                     "SELECT COUNT(DISTINCT genre) FROM tracks" + where,
                     params).fetchone()[0]
@@ -1534,12 +1616,12 @@ class JSONRPCAPI:
             elif cmd == "songinfo":
                 tid = filters.get("track_id") or (args[0] if args and str(args[0]).isdigit() else "")
                 if not str(tid).isdigit():
-                    return {"count": 0, "loop_loop": []}
+                    return self._browse_response([])
                 r = db.execute(
                     "SELECT t.id, t.title, t.url, t.duration, t.year, t.tracknum, t.genre "
                     "FROM tracks t WHERE t.id = ? LIMIT 1", (int(tid),)).fetchone()
                 if r is None:
-                    return {"count": 0, "loop_loop": []}
+                    return self._browse_response([])
                 item: dict = {"id": r["id"], "title": r["title"] or "",
                               "url": r["url"] or "", "duration": r["duration"] or 0}
                 if r["year"]:
@@ -1560,14 +1642,14 @@ class JSONRPCAPI:
                     (r["id"],)).fetchone()
                 if al:
                     item["album"] = al["title"]
-                return {"count": 1, "loop_loop": [item]}
+                return self._browse_response([item])
             else:
                 db.close()
-                return {"count": 0, "loop_loop": []}
+                return self._browse_response([])
             db.close()
-            return {"count": total, "loop_loop": loop}
+            return self._browse_response(loop)
         except Exception:
-            return {"count": 0, "loop_loop": []}
+            return self._browse_response([])
 
 
 class WebAPIHandler:

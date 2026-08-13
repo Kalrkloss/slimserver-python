@@ -1103,7 +1103,15 @@ async def cmd_playlist_play(
     ctx: CLIContext,
     args: list[str],
 ) -> list[str]:
-    """playlist play <trackId|index> — play a track in the playlist."""
+    """playlist play <trackId|index|tag:value> — play a track.
+
+    Extended (tagged) parameters from the Jive actions:
+      track_id:<n>   play a library track
+      item_id:<n>    play a favorite (stream)
+      album_id:<n>   play all tracks of an album
+      artist_id:<n>  play all tracks of an artist
+      index:<n>      jump to a playlist index
+    """
     if not ctx.player_id:
         return ["no player selected"]
     if not args:
@@ -1112,13 +1120,89 @@ async def cmd_playlist_play(
         from lyrion.player import PlayerManager
         pm = PlayerManager()
         player = pm.get_player(ctx.player_id)
-        # If the arg is a valid playlist index, use it; otherwise treat as track id
-        if str(args[0]).isdigit():
-            idx = int(str(args[0]))
+
+        # Tagged parameters (Jive action format)
+        tags: dict[str, str] = {}
+        positional: list[str] = []
+        for a in args:
+            s = str(a)
+            if ":" in s:
+                k, _, v = s.partition(":")
+                if k in ("track_id", "item_id", "album_id", "artist_id", "index"):
+                    tags[k] = v
+                    continue
+            positional.append(s)
+
+        if "item_id" in tags:
+            # Play a favorite (stream or folder entry)
+            try:
+                from lyrion.music.favorites import get_favorites_manager
+                from lyrion.control.cli_commands import _fav_resolve_id
+                fm = get_favorites_manager()
+                fav_id = await _fav_resolve_id(fm, tags["item_id"])
+                if fav_id is not None:
+                    ok = await fm.play(ctx.player_id, fav_id)
+                    return [f"playlist play {tags['item_id']}", ""] if ok \
+                        else ["cli error: could not play favorite", ""]
+                # Fallback: radio station id
+                from lyrion.music.radio import get_radio_manager
+                station = await get_radio_manager().get_station(int(tags["item_id"]))
+                if station is not None:
+                    ok = await pm.play_url(ctx.player_id, station.url, station.name)
+                    return [f"playlist play {station.name}", ""] if ok \
+                        else ["cli error: could not play station", ""]
+                return ["favorites play: unknown id", ""]
+            except Exception as exc:  # noqa: BLE001
+                return [f"cli error: {exc}", ""]
+        if "track_id" in tags:
+            tid = int(tags["track_id"])
+            pm.playlist_add(ctx.player_id, tid)
+            ok = await pm.play_track(ctx.player_id, tid)
+            return [f"playlist play {tid}", ""] if ok else ["cli error: could not play", ""]
+        if "album_id" in tags or "artist_id" in tags:
+            # Expand to all tracks of the album/artist (one query)
+            try:
+                import sqlite3
+                db = sqlite3.connect(
+                    "file:/root/.lyrion/Lyrion/Prefs/lyrion.db?mode=ro", uri=True)
+                if "album_id" in tags:
+                    rows = db.execute(
+                        "SELECT t.id FROM tracks t JOIN tracks_albums ta ON ta.track = t.id "
+                        "WHERE ta.album = ? ORDER BY t.tracknum, t.title",
+                        (int(tags["album_id"]),)).fetchall()
+                else:
+                    rows = db.execute(
+                        "SELECT t.id FROM tracks t JOIN tracks_contributors tc ON tc.track = t.id "
+                        "WHERE tc.contributor = ? AND tc.role = 1 ORDER BY t.title",
+                        (int(tags["artist_id"]),)).fetchall()
+                db.close()
+                ids = [r[0] for r in rows]
+                if not ids:
+                    return ["cli error: no tracks found", ""]
+                pm.playlist_clear(ctx.player_id)
+                for tid in ids:
+                    pm.playlist_add(ctx.player_id, tid)
+                ok = await pm.play_track(ctx.player_id, ids[0])
+                return [f"playlist play {len(ids)} tracks", ""] if ok \
+                    else ["cli error: could not play", ""]
+            except Exception as exc:  # noqa: BLE001
+                return [f"cli error: {exc}", ""]
+        if "index" in tags:
+            idx = int(tags["index"])
+            ok = await pm.playlist_play(ctx.player_id, idx)
+            return [f"playlist play {idx}", ""] if ok else ["cli error: could not play", ""]
+
+        # Positional form: playlist index if valid, else track id
+        if positional and str(positional[0]).isdigit():
+            idx = int(str(positional[0]))
             if player and idx < len(player.playlist):
                 ok = await pm.playlist_play(ctx.player_id, idx)
                 return [f"playlist play {idx}", ""] if ok else ["cli error: could not play", ""]
-        track_id = int(args[0])
+            track_id = idx
+        elif positional:
+            track_id = int(positional[0])
+        else:
+            return ["playlist play <trackId> — missing id", ""]
         pm.playlist_add(ctx.player_id, track_id)
         ok = await pm.play_track(ctx.player_id, track_id)
         return [f"playlist play {track_id}", ""] if ok else ["cli error: could not play", ""]
