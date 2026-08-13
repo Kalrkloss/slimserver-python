@@ -420,13 +420,27 @@ async def cmd_mixer(
 ) -> list[str]:
     """
     mixer <parameter> [value]
-    Query or set a mixer parameter.
+    Query or set a mixer parameter. 'mixer volume [0-100]' works directly
+    (audg frame); other parameters fall back to the dispatcher.
     """
     if not ctx.player_id:
         return ["no player selected"]
-    if handler._dispatcher:
-        return await handler._dispatcher.player_command(ctx.player_id, "mixer", args)
-    return []
+    try:
+        from lyrion.player.manager import PlayerManager
+        pm = PlayerManager()
+        player = pm.get_player(ctx.player_id)
+        if player is None:
+            return ["player not found", ""]
+        if args and str(args[0]).lower() == "volume":
+            if len(args) > 1 and str(args[1]).isdigit():
+                ok = await pm.set_volume(ctx.player_id, int(str(args[1])))
+                return [] if ok else ["cli error: could not set volume", ""]
+            return [f"mixer volume: {player.volume}", ""]
+        if handler._dispatcher:
+            return await handler._dispatcher.player_command(ctx.player_id, "mixer", args)
+        return [f"mixer: unsupported parameter '{args[0] if args else ''}'", ""]
+    except Exception as e:  # noqa: BLE001
+        return [f"cli error: {e}", ""]
 
 
 # ---------------------------------------------------------------------------

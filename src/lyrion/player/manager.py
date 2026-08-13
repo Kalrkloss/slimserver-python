@@ -197,7 +197,7 @@ class PlayerManager:
             # confirmed name from players.db.
             logger.warning("Rejecting player name containing U+FFFD: %r", name)
             return False
-        player = self.players.get(mac)
+        player = self.get_player(mac)
         confirmed = False
         if player:
             player.name = name
@@ -257,12 +257,12 @@ class PlayerManager:
             # Unsynchronize if needed
             if player.sync_slaves:
                 for slave_mac in list(player.sync_slaves):
-                    slave = self.players.get(slave_mac)
+                    slave = self.get_player(slave_mac)
                     if slave:
                         slave.sync_master = None
                 player.sync_slaves.clear()
             if player.sync_master:
-                master = self.players.get(player.sync_master)
+                master = self.get_player(player.sync_master)
                 if master and mac in master.sync_slaves:
                     master.sync_slaves.remove(mac)
                 player.sync_master = None
@@ -312,11 +312,11 @@ class PlayerManager:
 
     def get_sync_group(self, mac: str) -> list[PlayerState]:
         """Return all players in the same sync group as the given MAC."""
-        player = self.players.get(mac)
+        player = self.get_player(mac)
         if not player:
             return []
         if player.sync_master:
-            master = self.players.get(player.sync_master)
+            master = self.get_player(player.sync_master)
             if master:
                 return [master] + [
                     self.players[s] for s in master.sync_slaves
@@ -340,7 +340,7 @@ class PlayerManager:
             mac: Player MAC address.
             on: True for power on, False for power off.
         """
-        player = self.players.get(mac)
+        player = self.get_player(mac)
         if not player:
             logger.warning("set_power: unknown player %s", mac)
             return
@@ -359,7 +359,7 @@ class PlayerManager:
         Returns:
             True if the audg frame was sent to a connected player.
         """
-        player = self.players.get(mac)
+        player = self.get_player(mac)
         if not player:
             return False
         volume = max(0, min(100, volume))
@@ -377,7 +377,7 @@ class PlayerManager:
             mac: Player MAC address.
             mode: One of "stop", "play", "pause", "loading".
         """
-        player = self.players.get(mac)
+        player = self.get_player(mac)
         if not player:
             return
         player.mode = mode
@@ -391,7 +391,7 @@ class PlayerManager:
             mac: Player MAC address.
             track_id: Database track ID.
         """
-        player = self.players.get(mac)
+        player = self.get_player(mac)
         if not player:
             return
         player.current_track_id = track_id
@@ -407,7 +407,7 @@ class PlayerManager:
             position: Current track index (0-based).
             total: Total number of tracks in playlist.
         """
-        player = self.players.get(mac)
+        player = self.get_player(mac)
         if not player:
             return
         player.playlist_position = position
@@ -424,7 +424,7 @@ class PlayerManager:
             master_mac: MAC address of the sync master.
             slave_macs: List of MAC addresses to become slaves.
         """
-        master = self.players.get(master_mac)
+        master = self.get_player(master_mac)
         if not master:
             logger.error("Sync master %s not found", master_mac)
             return
@@ -435,12 +435,12 @@ class PlayerManager:
         for slave_mac in slave_macs:
             if slave_mac == master_mac:
                 continue
-            slave = self.players.get(slave_mac)
+            slave = self.get_player(slave_mac)
             if not slave:
                 continue
             # Remove from any existing sync group
             if slave.sync_master:
-                old_master = self.players.get(slave.sync_master)
+                old_master = self.get_player(slave.sync_master)
                 if old_master and master_mac in old_master.sync_slaves:
                     old_master.sync_slaves.remove(slave_mac)
             slave.sync_master = master_mac
@@ -457,13 +457,13 @@ class PlayerManager:
         Args:
             mac: MAC address of the player to unsync.
         """
-        player = self.players.get(mac)
+        player = self.get_player(mac)
         if not player:
             return
 
         if player.sync_master:
             # This player is a slave — remove from master list
-            master = self.players.get(player.sync_master)
+            master = self.get_player(player.sync_master)
             if master and mac in master.sync_slaves:
                 master.sync_slaves.remove(mac)
             player.sync_master = None
@@ -471,7 +471,7 @@ class PlayerManager:
         elif player.sync_slaves:
             # This player is a master — unsync all slaves
             for slave_mac in list(player.sync_slaves):
-                slave = self.players.get(slave_mac)
+                slave = self.get_player(slave_mac)
                 if slave:
                     slave.sync_master = None
                     self.send_command(slave_mac, "sync -")
@@ -495,7 +495,7 @@ class PlayerManager:
             logger.warning("No protocol handler set, cannot send command")
             return
 
-        player = self.players.get(mac)
+        player = self.get_player(mac)
         if not player or not player.connected:
             logger.warning("Cannot send command to disconnected player %s", mac)
             return

@@ -119,6 +119,24 @@ def _parse_mixer_param(param: str) -> tuple[str, Optional[str]]:
     return param, None
 
 
+def _looks_like_player_id(token: str) -> bool:
+    """True if token is a player id: MAC shape or a known player MAC.
+
+    Player names are deliberately NOT matched here — a name collision
+    with a command word (e.g. 'play') would misroute the command.
+    """
+    import re
+
+    if re.fullmatch(r"(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}", token):
+        return True
+    try:
+        from lyrion.player.manager import PlayerManager
+
+        return PlayerManager().get_player(token) is not None
+    except Exception:
+        return False
+
+
 # ---------------------------------------------------------------------------
 # CLI Handler
 # ---------------------------------------------------------------------------
@@ -214,31 +232,33 @@ class CLIHandler:
         """
         Yield (command_name, args_list) tuples from the wire.
 
-        The LMS CLI is line-based; commands are newline-separated and
-        terminated by a blank line.
+        The LMS CLI is line-oriented (spec: one command per line, LF/CR/0x00
+        as line end, reply after every line) — NOT blank-line terminated.
+        Each non-empty line is a complete command.
         """
-        buf: list[bytes] = []
         while True:
             line_bytes = await reader.readline()
             if not line_bytes:
                 break  # EOF
-            line_bytes = line_bytes.rstrip(b"\r\n")
+            line_bytes = line_bytes.rstrip(b"\r\n\x00")
             if not line_bytes:
-                # blank line — flush accumulated request
-                if buf:
-                    request = b" ".join(buf).decode("utf-8", errors="replace")
-                    buf.clear()
-                    cmd_name, *args = self._parse_request(request)
-                    yield cmd_name, args
-            else:
-                buf.append(line_bytes)
+                continue  # blank line: separator only, no command
+            request = line_bytes.decode("utf-8", errors="replace")
+            cmd_name, args = self._parse_request(request)
+            yield cmd_name, args
 
     def _parse_request(self, request: str) -> tuple[str, list[str]]:
-        """Split a raw request line into command + args."""
+        """Split a raw request line into command + args.
+
+        LMS CLI parameters are percent-escaped (URL style, e.g.
+        'The%20Clash' → 'The Clash'); the command name itself is not.
+        """
+        from urllib.parse import unquote
+
         parts = shlex.split(request)
         if not parts:
             return "", []
-        return parts[0].lower(), parts[1:]
+        return parts[0].lower(), [unquote(p) for p in parts[1:]]
 
     # -----------------------------------------------------------------------
     # Command dispatch
@@ -263,6 +283,14 @@ class CLIHandler:
             cmd, args = self._parse_request(raw)
         else:
             cmd, args = raw
+
+        # LMS CLI format: <playerid> <command> <args...>. A leading token in
+        # MAC shape (or a known player id) binds the player to the context,
+        # e.g. "CA:C8:C7:26:6D:38 status - 2".
+        if args and _looks_like_player_id(cmd):
+            ctx.player_id = cmd
+            cmd = str(args[0]).lower()
+            args = args[1:]
 
         # Authentication check
         if not ctx.authenticated and cmd not in ("login", "exit", ""):

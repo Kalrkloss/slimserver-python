@@ -1068,6 +1068,54 @@ class JSONRPCAPI:
 
     async def _json_browse(self, cmd: str, args: list[str]) -> dict:
         """Browse library tables (albums/artists/songs/genres) as JSON."""
+        # browse <target> [<start> <count>] — the home menu items carry
+        # actions.go/do.cmd = ["browse", <id>]; map the target onto the
+        # library queries / favorites / radios so menu navigation works.
+        if cmd == "browse" and args:
+            target = str(args[0]).lower()
+            rest = args[1:]
+            if target in ("artists", "albums", "songs", "titles", "genres"):
+                return await self._json_browse(target, rest)
+            if target == "favorites":
+                try:
+                    from lyrion.music.favorites import get_favorites_manager
+                    items = await get_favorites_manager().list_items(None)
+                    loop = [
+                        {
+                            "id": str(it["id"]),
+                            "name": it["title"],
+                            "text": it["title"],
+                            "url": it["url"] or "",
+                            "hasitems": 1 if it["type"] == "folder" else 0,
+                            "isFolder": 1 if it["type"] == "folder" else 0,
+                            "isItem": 0 if it["type"] == "folder" else 1,
+                            "type": it["type"],
+                        }
+                        for it in items
+                    ]
+                    return {"count": len(loop), "loop_loop": loop}
+                except Exception:
+                    return {"count": 0, "loop_loop": []}
+            if target == "radios":
+                try:
+                    from lyrion.music.radio import get_radio_manager
+                    stations = await get_radio_manager().list_stations()
+                    loop = [
+                        {
+                            "id": str(s.id),
+                            "name": s.name,
+                            "text": s.name,
+                            "url": s.url,
+                            "type": "radio",
+                            "hasitems": 0,
+                        }
+                        for s in stations
+                    ]
+                    return {"count": len(loop), "loop_loop": loop}
+                except Exception:
+                    return {"count": 0, "loop_loop": []}
+            return {"count": 0, "loop_loop": []}
+
         start = int(args[0]) if args and str(args[0]).isdigit() else 0
         count = int(args[1]) if len(args) > 1 and str(args[1]).isdigit() else 50
         try:
@@ -1077,17 +1125,23 @@ class JSONRPCAPI:
             db.row_factory = sqlite3.Row
 
             if cmd == "artists":
+                # Contributors have no role column; the role lives in
+                # tracks_contributors.role (1 = artist).
                 rows = db.execute(
-                    "SELECT id, name FROM contributors WHERE role = 'artist' "
-                    "ORDER BY name LIMIT ? OFFSET ?", (count, start)).fetchall()
+                    "SELECT DISTINCT c.id, c.name FROM contributors c "
+                    "JOIN tracks_contributors tc ON tc.contributor = c.id "
+                    "WHERE tc.role = 1 ORDER BY c.name LIMIT ? OFFSET ?",
+                    (count, start)).fetchall()
                 loop = [{"id": r["id"], "artist": r["name"] or ""} for r in rows]
                 total = db.execute(
-                    "SELECT COUNT(*) FROM contributors WHERE role = 'artist'").fetchone()[0]
+                    "SELECT COUNT(DISTINCT c.id) FROM contributors c "
+                    "JOIN tracks_contributors tc ON tc.contributor = c.id "
+                    "WHERE tc.role = 1").fetchone()[0]
             elif cmd == "albums":
                 rows = db.execute(
-                    "SELECT id, name, year FROM albums ORDER BY name LIMIT ? OFFSET ?",
+                    "SELECT id, title, year FROM albums ORDER BY title LIMIT ? OFFSET ?",
                     (count, start)).fetchall()
-                loop = [{"id": r["id"], "album": r["name"] or "", "year": r["year"] or 0} for r in rows]
+                loop = [{"id": r["id"], "album": r["title"] or "", "year": r["year"] or 0} for r in rows]
                 total = db.execute("SELECT COUNT(*) FROM albums").fetchone()[0]
             elif cmd == "songs" or cmd == "titles":
                 rows = db.execute(
@@ -1097,11 +1151,17 @@ class JSONRPCAPI:
                          "duration": r["duration"] or 0} for r in rows]
                 total = db.execute("SELECT COUNT(*) FROM tracks").fetchone()[0]
             elif cmd == "genres":
+                # The genres table is not populated by the importer — use the
+                # track genre text (same source as the CLI command).
                 rows = db.execute(
-                    "SELECT id, name FROM genres ORDER BY name LIMIT ? OFFSET ?",
+                    "SELECT DISTINCT genre FROM tracks WHERE genre != '' "
+                    "ORDER BY genre COLLATE NOCASE LIMIT ? OFFSET ?",
                     (count, start)).fetchall()
-                loop = [{"id": r["id"], "genre": r["name"] or ""} for r in rows]
-                total = db.execute("SELECT COUNT(*) FROM genres").fetchone()[0]
+                loop = [{"id": start + i, "genre": r["genre"] or ""}
+                        for i, r in enumerate(rows)]
+                total = db.execute(
+                    "SELECT COUNT(DISTINCT genre) FROM tracks WHERE genre != ''"
+                ).fetchone()[0]
             else:
                 db.close()
                 return {"count": 0, "loop_loop": []}

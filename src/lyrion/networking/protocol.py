@@ -940,6 +940,18 @@ class SlimProtoClient:
             except Exception as exc:
                 logger.warning("Could not register player %s: %s", mac_formatted, exc)
 
+            # ── Sync volume like the real LMS (audg frame) ──
+            # Same as the text-HELO path above: without an audg frame the
+            # player's internal gain stays 0 and everything is silent.
+            try:
+                pstate = PlayerManager().get_player(mac_formatted)
+                if pstate is not None:
+                    await self.send_volume_to_player(mac_formatted, pstate.volume)
+                    logger.info("Sent audg volume=%d to %s on connect (binary HELO)",
+                                pstate.volume, mac_formatted)
+            except Exception as exc:
+                logger.warning("Volume sync failed for %s: %s", mac_formatted, exc)
+
             # Read loop for this player
             while True:
                 frame = await self._read_single_frame_from_reader(reader)
