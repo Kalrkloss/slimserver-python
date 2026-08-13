@@ -1097,7 +1097,7 @@ async def cmd_playlist(
         return [f"cli error: {e}", ""]
 
 
-@register_command("playlist play")
+# Sub-command "playlist play" — routed via the base handler, not the registry.
 async def cmd_playlist_play(
     handler: CLIHandler,
     ctx: CLIContext,
@@ -1128,7 +1128,7 @@ async def cmd_playlist_play(
         return [f"cli error: {e}", ""]
 
 
-@register_command("playlist add")
+# Sub-command "playlist add" — routed via the base handler, not the registry.
 async def cmd_playlist_add(
     handler: CLIHandler,
     ctx: CLIContext,
@@ -1154,7 +1154,7 @@ async def cmd_playlist_add(
         return [f"cli error: {e}", ""]
 
 
-@register_command("playlist clear")
+# Sub-command "playlist clear" — routed via the base handler, not the registry.
 async def cmd_playlist_clear(
     handler: CLIHandler,
     ctx: CLIContext,
@@ -1171,7 +1171,7 @@ async def cmd_playlist_clear(
         return [f"cli error: {e}", ""]
 
 
-@register_command("playlist save")
+# Sub-command "playlist save" — routed via the base handler, not the registry.
 async def cmd_playlist_save(
     handler: CLIHandler,
     ctx: CLIContext,
@@ -1187,7 +1187,7 @@ async def cmd_playlist_save(
     return []
 
 
-@register_command("playlist load")
+# Sub-command "playlist load" — routed via the base handler, not the registry.
 async def cmd_playlist_load(
     handler: CLIHandler,
     ctx: CLIContext,
@@ -1948,7 +1948,7 @@ async def cmd_radio_list(
     return out
 
 
-@register_command("radio add")
+# Sub-command "radio add" — routed via the base handler, not the registry.
 async def cmd_radio_add(
     handler: CLIHandler,
     ctx: CLIContext,
@@ -1975,7 +1975,7 @@ async def cmd_radio_add(
         return [f"cli error: {e}", ""]
 
 
-@register_command("radio delete")
+# Sub-command "radio delete" — routed via the base handler, not the registry.
 async def cmd_radio_delete(
     handler: CLIHandler,
     ctx: CLIContext,
@@ -1993,7 +1993,7 @@ async def cmd_radio_delete(
         return ["cli error: id must be a number", ""]
 
 
-@register_command("radio search")
+# Sub-command "radio search" — routed via the base handler, not the registry.
 async def cmd_radio_search(
     handler: CLIHandler,
     ctx: CLIContext,
@@ -2030,7 +2030,7 @@ async def cmd_radio_search(
         return [f"cli error: {e}", ""]
 
 
-@register_command("radio top")
+# Sub-command "radio top" — routed via the base handler, not the registry.
 async def cmd_radio_top(
     handler: CLIHandler,
     ctx: CLIContext,
@@ -2052,7 +2052,7 @@ async def cmd_radio_top(
         return [f"cli error: {e}", ""]
 
 
-@register_command("radio play")
+# Sub-command "radio play" — routed via the base handler, not the registry.
 async def cmd_radio_play(
     handler: CLIHandler,
     ctx: CLIContext,

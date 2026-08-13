@@ -365,3 +365,21 @@ Verifikation Phase 4: Suite `all checks passed`, Ad-hoc-Skript
 Felder; serverstatus songs 58603/duration 17278167/artists 5725/albums 5135 +
 subscribe; displaystatus Popup setzen+abrufen).
 
+Phase-5+6-Status (Commit `?`):
+
+| Plan-ID | Gap | Status |
+|---------|-----|--------|
+| P5-2 | 1.2 | ✅ Binärer HELO-ACK jetzt 11 Bytes (`<BHII`: num_ext/buffer/max_channels/`supported_commands`=0x07 strm\|audg\|aude) — Socket-verifiziert |
+| P5-3 | 1.3 | ✅ STAT-`STMf` (Flush/Stop → stop, außer bei pause), `STMp`/`STMr` (pause/play), `STMn` (decode error → stop + Log), `STMo` (underrun → Log, kein State-Change) |
+| P5-4 | 1.4 | ✅ `send_aude(mac, spdif, dac)`-Frame-Sender. Display-Frames (grfb/grfe/serv/visu) bewusst offen (nur Squeezebox-Hardware) |
+| P6-1 | 10.1 | ✅ `PlayerState` deklariert jetzt `elapsed`/`current_title`/`current_url`/`shuffle`/`repeat` (waren setattr-dynamisch) |
+| P6-2 | 10.2 | ✅ `playlist: list[int \| str]` (Track-ID oder Stream-URL) |
+| P6-3 | 10.3 | ✅ 10 tote Sub-Registrierungen entfernt (`playlist play/add/clear/save/load`, `radio add/delete/search/top/play`) — die Basis-Handler routen die Subs; ein Weg pro Sub-Kommando |
+
+Verifikation Phase 5+6: Suite `all checks passed`, Ad-hoc-Skript
+`/tmp/hermes-verify-sh7ipbpt.py` 15/15, Live/Unit-Tests (HELO-ACK 11 Bytes
+supported_commands=7; STMf/p/r/n/o State-Transitions; aude-Frame; PlayerState-
+Felder; playlist/radio-Subs via Basis-Handler).
+
+Damit sind alle Phasen des Fix-Plans abgeschlossen: P1, P2, P3, P4, P5, P6 ✅
+

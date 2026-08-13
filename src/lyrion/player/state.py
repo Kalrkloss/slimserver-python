@@ -35,9 +35,17 @@ class PlayerState:
     volume: int = 50
     mode: Literal["stop", "play", "pause", "loading"] = "stop"
     current_track_id: Optional[int] = None
+    # P6-1: fields used by the status handlers were set via setattr —
+    # declare them so tooling/linters see them and typos fail early.
+    elapsed: float = 0.0          # seconds into the current track (STAT)
+    current_title: str = ""       # station name / override title
+    current_url: Optional[str] = None  # currently streaming URL
+    shuffle: int = 0              # playlist shuffle mode (0/1/2)
+    repeat: int = 0               # playlist repeat mode (0/1/2)
     playlist_position: int = 0
     playlist_total: int = 0
-    playlist: list[int] = field(default_factory=list)  # track ids
+    # P6-2: playlist holds track ids AND stream URLs (radio/favorites).
+    playlist: list[int | str] = field(default_factory=list)
     sync_master: Optional[str] = None
     sync_slaves: list[str] = field(default_factory=list)
     display_state: Optional[dict] = None

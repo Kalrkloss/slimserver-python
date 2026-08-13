@@ -908,12 +908,17 @@ class SlimProtoClient:
                 hello.capabilities,
             )
 
-            # Send HELO ACK
+            # Send HELO ACK — num_ext(1) + buffer_size(2) + max_channels(4)
+            # + supported_commands(4) = 11 bytes. The spec-complete layout
+            # lets strict players parse the u32 at offset 7 (previously the
+            # field was missing entirely).
+            supported_commands = 0x00000007  # strm|audg|aude (audio frames)
             ack_payload = struct.pack(
-                "<BHI",  # num_ext(1), buffer_size(2), max_channels(4)
+                "<BHII",
                 0,  # no extensions for now
                 8192,  # buffer size
                 2,  # stereo
+                supported_commands,
             )
             writer.write(pack_frame(0, ack_payload))
             await writer.drain()
@@ -1679,6 +1684,27 @@ class SlimProtoClient:
         except (ConnectionError, OSError, RuntimeError):
             return False
 
+    async def send_aude(self, mac: str, spdif: bool = False, dac: bool = True) -> bool:
+        """Send an 'aude' frame (enable/disable audio outputs).
+
+        aude_packet: opcode(4) spdif(1) dac(1) — 1 = output enabled.
+        Squeezebox hardware uses this to route audio; software players
+        (squeezelite/jive) ignore it.
+        """
+        mac = mac.upper().replace(":", "")
+        writer = self._player_writers.get(mac)
+        if writer is None or writer.is_closing():
+            return False
+        payload = b"aude" + bytes([1 if spdif else 0, 1 if dac else 0])
+        frame = struct.pack(">H", len(payload)) + payload
+        try:
+            writer.write(frame)
+            await writer.drain()
+            logger.info("Sent aude spdif=%d dac=%d to %s", spdif, dac, mac)
+            return True
+        except (ConnectionError, OSError, RuntimeError):
+            return False
+
     def _handle_resp_frame(self, mac_str: str, payload: bytes) -> None:
         """Handle a RESP frame: the player forwards the source's HTTP
         response headers after connecting for a direct stream (Squeezelite
@@ -1779,6 +1805,26 @@ class SlimProtoClient:
                     elif event == "STMs":
                         # TRACK_STARTED — a new track started playing
                         player.mode = "play"
+                    elif event == "STMf":
+                        # FLUSH/STOP ack — the player stopped; mark stop
+                        # only if the server didn't already (natural end
+                        # vs. user stop).
+                        if player.mode not in ("pause",):
+                            player.mode = "stop"
+                    elif event == "STMp":
+                        # PAUSE ack
+                        player.mode = "pause"
+                    elif event == "STMr":
+                        # RESUME ack
+                        player.mode = "play"
+                    elif event == "STMn":
+                        # DECODE_ERROR — the player could not decode the
+                        # stream; log and fall back to stop.
+                        logger.warning("STAT STMn (decode error) from %s", mac_str)
+                        player.mode = "stop"
+                    elif event == "STMo":
+                        # UNDERRUN — buffer underrun, harmless, log only
+                        logger.debug("STAT STMo (underrun) from %s", mac_str)
                     elif event == "pause":
                         player.mode = "pause"
                     elif event == "stop":
