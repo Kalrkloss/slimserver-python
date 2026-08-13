@@ -578,7 +578,10 @@ class JSONRPCAPI:
                 "uuid": "lyrion-server-0001",
                 "name": "Lyrion Music Server",
                 "httpport": http_port,
+                "ip": "192.168.1.90",
                 "player count": len(players),
+                "other player count": 0,
+                "lastscan": 0,
                 # SqueezeClient's ServerStatusResponse requires mediadirs
                 "mediadirs": [],
                 # P4-3: real library totals (were hardcoded 0)
@@ -1088,10 +1091,18 @@ class JSONRPCAPI:
         ]
 
     @staticmethod
-    def _browse_response(loop: list) -> dict:
+    def _browse_response(loop: list, total: int | None = None,
+                         plural: str | None = None) -> dict:
         """Browse/menu response — Jive expects 'item_loop', the older
-        JSON-RPC clients 'loop_loop'; deliver both (identical)."""
-        return {"count": len(loop), "loop_loop": loop, "item_loop": loop}
+        JSON-RPC clients 'loop_loop' and the controllers read the
+        category-specific name ('artists_loop' etc., LMS reference);
+        deliver all (identical). count = the total number of matches
+        (not the page length)."""
+        resp: dict = {"count": len(loop) if total is None else total,
+                      "loop_loop": loop, "item_loop": loop}
+        if plural:
+            resp[plural] = loop
+        return resp
 
     async def _load_tracks(self, track_ids: list[int]) -> dict:
         """Load track metadata for ids (songinfo/status tag fields)."""
@@ -1320,9 +1331,9 @@ class JSONRPCAPI:
         term = next((str(a)[5:] for a in args if str(a).startswith("term:")), "")
         empty = {
             "count": 0, "artists_count": 0, "albums_count": 0,
-            "genres_count": 0, "tracks_count": 0,
-            "artists_loop": [], "albums_loop": [], "genres_loop": [],
-            "tracks_loop": [],
+            "genres_count": 0, "tracks_count": 0, "contributors_count": 0,
+            "artists_loop": [], "contributors_loop": [], "albums_loop": [],
+            "genres_loop": [], "tracks_loop": [],
         }
         if not term:
             return empty
@@ -1371,13 +1382,23 @@ class JSONRPCAPI:
                      + (g_count[0]["n"] if g_count else 0)
                      + (t_count[0]["n"] if t_count else 0),
             "artists_count": a_count[0]["n"] if a_count else 0,
+            "contributors_count": a_count[0]["n"] if a_count else 0,
             "albums_count": al_count[0]["n"] if al_count else 0,
             "genres_count": g_count[0]["n"] if g_count else 0,
             "tracks_count": t_count[0]["n"] if t_count else 0,
-            "artists_loop": [{"id": r["id"], "artist": r["name"] or ""} for r in artists],
-            "albums_loop": [{"id": r["id"], "album": r["title"] or ""} for r in albums],
-            "genres_loop": [{"id": i + 1, "genre": r["name"] or ""} for i, r in enumerate(genres)],
+            "artists_loop": [{"id": r["id"], "artist": r["name"] or "",
+                              "contributor_id": r["id"], "contributor": r["name"] or ""}
+                             for r in artists],
+            # LMS reference name for the artist group.
+            "contributors_loop": [{"id": r["id"], "artist": r["name"] or "",
+                                   "contributor_id": r["id"], "contributor": r["name"] or ""}
+                                  for r in artists],
+            "albums_loop": [{"id": r["id"], "album": r["title"] or "",
+                             "album_id": r["id"]} for r in albums],
+            "genres_loop": [{"id": i + 1, "genre": r["name"] or "",
+                             "genre_id": i + 1} for i, r in enumerate(genres)],
             "tracks_loop": [{"id": r["id"], "title": r["title"] or "",
+                             "track": r["title"] or "", "track_id": r["id"],
                              "url": r["url"] or "", "duration": r["duration"] or 0}
                             for r in tracks],
         }
@@ -1440,6 +1461,7 @@ class JSONRPCAPI:
                          "year", "search", "tags"):
                     filters[k] = v
         tags = filters.pop("tags", "")
+        plural: str | None = None  # category-specific loop name (LMS ref)
         try:
             import sqlite3
             db = sqlite3.connect(
@@ -1501,6 +1523,7 @@ class JSONRPCAPI:
                 total = db.execute(
                     "SELECT COUNT(DISTINCT c.id) FROM contributors c"
                     + joins + extra_joins + where, params).fetchone()[0]
+                plural = "artists_loop"
             elif cmd == "albums":
                 where, params = _conds("al.title")
                 joins = ""
@@ -1529,6 +1552,7 @@ class JSONRPCAPI:
                 total = db.execute(
                     "SELECT COUNT(DISTINCT al.id) FROM albums al" + joins + where,
                     params).fetchone()[0]
+                plural = "albums_loop"
             elif cmd == "songs" or cmd == "titles":
                 where, params = _conds("t.title")
                 joins = ""
@@ -1563,6 +1587,7 @@ class JSONRPCAPI:
                 total = db.execute(
                     "SELECT COUNT(DISTINCT t.id) FROM tracks t" + joins + where,
                     params).fetchone()[0]
+                plural = "titles_loop"
             elif cmd == "genres":
                 # The genres table is not populated by the importer — use the
                 # track genre text (same source as the CLI command).
@@ -1589,6 +1614,7 @@ class JSONRPCAPI:
                 total = db.execute(
                     "SELECT COUNT(DISTINCT genre) FROM tracks" + where,
                     params).fetchone()[0]
+                plural = "genres_loop"
             elif cmd == "musicfolder":
                 # folder browser derived from the track URLs
                 folder = filters.get("search", "")
@@ -1622,6 +1648,7 @@ class JSONRPCAPI:
                     loop = [{"id": roots[n], "name": n, "text": n,
                              "type": "folder", "hasitems": 1} for n in page]
                     total = len(names)
+                plural = plural or "musicfolder_loop"
             elif cmd == "songinfo":
                 tid = filters.get("track_id") or (args[0] if args and str(args[0]).isdigit() else "")
                 if not str(tid).isdigit():
@@ -1651,12 +1678,12 @@ class JSONRPCAPI:
                     (r["id"],)).fetchone()
                 if al:
                     item["album"] = al["title"]
-                return self._browse_response([item])
+                return self._browse_response([item], 1, "songinfo_loop")
             else:
                 db.close()
                 return self._browse_response([])
             db.close()
-            return self._browse_response(loop)
+            return self._browse_response(loop, total, plural)
         except Exception:
             return self._browse_response([])
 
