@@ -1451,9 +1451,10 @@ async function loadBrowseData() {
       } catch(e) { return []; }
     };
 
-    // The CLI protocol returns lines like "id:1", "title:X", "artist:Y"
-    // with items separated by blank lines — but browse responses have NO
-    // blank lines between items, so a new item starts at each "id:".
+    // Server responses come as a JSON dict {count, item_loop, loop_loop}
+    // (the same format the Android controllers use). Older/fallback
+    // paths return CLI lines ("id:1","title:X") — keep the line parser
+    // for those.
     const parse = (lines) => {
       const items = [];
       let cur = null;
@@ -1475,29 +1476,33 @@ async function loadBrowseData() {
       return items.filter(o => o.id || o.name || o.title);
     };
 
+    const fromResponse = (r) => {
+      if (r && typeof r === 'object' && !Array.isArray(r)) {
+        const items = r.item_loop || r.loop_loop || [];
+        return { items, total: typeof r.count === 'number' ? r.count : items.length };
+      }
+      return { items: parse(Array.isArray(r) ? r : []), total: 0 };
+    };
+
     switch (appState.browseType) {
       case 'artists': {
-        const r = await req(['artists', start, perPage, 'tags:']);
-        data = parse(Array.isArray(r) ? r : []);
-        total = data.length >= perPage ? start + perPage + 1 : start + data.length;
+        const { items, total: t } = fromResponse(await req(['artists', start, perPage, 'tags:']));
+        data = items; total = t || (data.length >= perPage ? start + perPage + 1 : start + data.length);
         break;
       }
       case 'albums': {
-        const r = await req(['albums', start, perPage, 'tags:']);
-        data = parse(Array.isArray(r) ? r : []);
-        total = data.length >= perPage ? start + perPage + 1 : start + data.length;
+        const { items, total: t } = fromResponse(await req(['albums', start, perPage, 'tags:']));
+        data = items; total = t || (data.length >= perPage ? start + perPage + 1 : start + data.length);
         break;
       }
       case 'songs': {
-        const r = await req(['songs', start, perPage, 'tags:']);
-        data = parse(Array.isArray(r) ? r : []);
-        total = data.length >= perPage ? start + perPage + 1 : start + data.length;
+        const { items, total: t } = fromResponse(await req(['songs', start, perPage, 'tags:']));
+        data = items; total = t || (data.length >= perPage ? start + perPage + 1 : start + data.length);
         break;
       }
       case 'genres': {
-        const r = await req(['genres', start, perPage, 'tags:']);
-        data = parse(Array.isArray(r) ? r : []);
-        total = data.length >= perPage ? start + perPage + 1 : start + data.length;
+        const { items, total: t } = fromResponse(await req(['genres', start, perPage, 'tags:']));
+        data = items; total = t || (data.length >= perPage ? start + perPage + 1 : start + data.length);
         break;
       }
       case 'radio': {

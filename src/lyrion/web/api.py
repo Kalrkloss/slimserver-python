@@ -433,44 +433,42 @@ class JSONRPCAPI:
         except Exception:
             return []
         loop: list[dict] = []
+        path = parent_path  # hierarchical prefix for the item ids
         for i, it in enumerate(items):
             is_folder = it["type"] == "folder"
-            path = f"{parent_path}.{i}"
+            # LMS reference format (lyrion.org): hierarchical id
+            # '<root>.<position>' (the apps re-send it as item_id:),
+            # name/image/isaudio/hasitems, type 'audio' for streams.
             item = {
-                # id stays the DB id (integer) — the Android controllers
-                # (Orange Squeeze/SqueezeCtrl/Squeezer) parse it as a
-                # number; the LMS hierarchical path is available as
-                # id_hierarchical for clients that expect it.
-                "id": str(it["id"]),
-                "id_hierarchical": path,
+                "id": path + f".{i}",
                 "name": it["title"],
-                "url": it["url"] or "",
+                "image": "html/images/favorites.png",
+                "isaudio": 0 if is_folder else 1,
                 "hasitems": 1 if is_folder else 0,
-                "isItem": 0 if is_folder else 1,
-                "isFolder": 1 if is_folder else 0,
-                "image": "",
-                "type": it["type"],
-                "parent_id": str(it["parent_id"]) if it["parent_id"] is not None else "",
                 "position": i,
             }
+            if not is_folder:
+                item["type"] = "audio"
+                item["url"] = it["url"] or ""
+                item["id_hierarchical"] = path + f".{i}"
+                item["dbid"] = str(it["id"])
             if is_folder:
-                # Folder: go opens the folder's items (LMS hierarchical id
-                # or DB id both work via item_id).
+                # Folder: go opens the folder's items (hierarchical id).
                 item["actions"] = {
                     "go": {"player": 0, "cmd": ["favorites", "items"],
-                           "params": {"item_id": str(it["id"])}},
+                           "params": {"item_id": path + f".{i}"}},
                 }
             else:
                 # Stream: play/do plays the favorite.
                 item["actions"] = {
                     "play": {"player": 0, "cmd": ["playlist", "play"],
-                             "params": {"item_id": str(it["id"])}},
+                             "params": {"item_id": path + f".{i}"}},
                     "do": {"player": 0, "cmd": ["playlist", "play"],
-                           "params": {"item_id": str(it["id"])}},
+                           "params": {"item_id": path + f".{i}"}},
                 }
             if feed_mode and is_folder:
                 item["items"] = await self._fav_items_loop(
-                    fm, int(it["id"]), path, feed_mode)
+                    fm, int(it["id"]), path + f".{i}", feed_mode)
             loop.append(item)
         return loop
 
@@ -768,9 +766,14 @@ class JSONRPCAPI:
                     parent = int(str(rest[0]))
                     parent_path = f"0.{rest[0]}"
                 loop = await self._fav_items_loop(fm, parent, parent_path, feed_mode)
-                return self._browse_response(loop)
+                resp = self._browse_response(loop)
+                # LMS reference: 'title' on the response level.
+                resp["title"] = "Favorites"
+                return resp
             except Exception:
-                return self._browse_response([])
+                resp = self._browse_response([])
+                resp["title"] = "Favorites"
+                return resp
 
         # favorites changed — event subscription (SqueezeCtrl): the app
         # watches this channel and reloads the list when a 'changed' event
@@ -1538,11 +1541,17 @@ class JSONRPCAPI:
                     + joins + where +
                     " ORDER BY t.title LIMIT ? OFFSET ?",
                     params + (count, start)).fetchall()
+                # Enrich with artist/album (songinfo tags g/a/l/d) for the
+                # Web UI columns and the controller stream info.
+                enrich = await self._load_tracks([r["id"] for r in rows])
                 loop = []
                 for r in rows:
+                    info = enrich.get(r["id"], {})
                     loop.append({
                         "id": r["id"], "title": r["title"] or "", "url": r["url"] or "",
                         "duration": r["duration"] or 0,
+                        "artist": info.get("artist", ""),
+                        "album": info.get("album", ""),
                         # Jive actions: go opens songinfo, play plays the track.
                         "actions": {
                             "go": {"player": 0, "cmd": ["songinfo"],

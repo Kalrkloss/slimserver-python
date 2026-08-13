@@ -240,9 +240,9 @@ def test_squeezer(host: str, port: int) -> None:
     check("favorites -> loop_loop", len(loop) > 0, f"{len(loop)} Favoriten")
     if loop:
         it = loop[0]
-        check("favorites Felder (isItem/isFolder/image)",
-              "isItem" in it and "isFolder" in it and "image" in it
-              and "hasitems" in it and "url" in it, str(sorted(it.keys())))
+        check("favorites Felder (isaudio/hasitems/image)",
+              "isaudio" in it and "hasitems" in it and "image" in it
+              and "name" in it, str(sorted(it.keys())))
 
     pid = _first_player(host, port)
     if not pid:
