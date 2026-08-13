@@ -365,7 +365,7 @@ Verifikation Phase 4: Suite `all checks passed`, Ad-hoc-Skript
 Felder; serverstatus songs 58603/duration 17278167/artists 5725/albums 5135 +
 subscribe; displaystatus Popup setzen+abrufen).
 
-Phase-5+6-Status (Commit `?`):
+Phase-5+6-Status (Commit `fbe3ff9`):
 
 | Plan-ID | Gap | Status |
 |---------|-----|--------|
