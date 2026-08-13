@@ -185,6 +185,68 @@ class CometdManager:
                 })
 
     # ------------------------------------------------------------------
+    # subscribe:N keep-alive
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _subscribe_interval(data: dict | None) -> int:
+        """Parse the 'subscribe:<seconds>' token from a subscription request.
+
+        The Android controllers subscribe to playerstatus with
+        'status - 1 ... subscribe:30' — they expect a fresh status push
+        every 30 s even when nothing changed (keep-alive). Returns 0 when
+        no interval is requested.
+        """
+        if not isinstance(data, dict):
+            return 0
+        request = data.get("request")
+        if not isinstance(request, list):
+            return 0
+        # The subscribe token lives in the nested command array, e.g.
+        # ["<player>", ["status", "-", "1", "subscribe:30"]].
+        for item in request:
+            tokens = item if isinstance(item, list) else [item]
+            for token in tokens:
+                if isinstance(token, str) and token.startswith("subscribe:"):
+                    try:
+                        return max(0, int(token[len("subscribe:"):]))
+                    except ValueError:
+                        return 0
+        return 0
+
+    async def keepalive_loop(self) -> None:
+        """Push fresh status to subscribe:N subscriptions on schedule.
+
+        Runs for the lifetime of the server (started from the app/CLI
+        entrypoints). Without it the controller apps never get status
+        updates while a player is idle (mode=stop → no STAT events) and
+        treat the silent stream as dead, reconnecting every ~75 s.
+        """
+        last: dict[tuple[str, str], float] = {}
+        while True:
+            await asyncio.sleep(1)
+            now = time.time()
+            for client in list(self._clients.values()):
+                for sub, data in list(client.subscriptions.items()):
+                    interval = self._subscribe_interval(data)
+                    if interval <= 0:
+                        continue
+                    key = (client.client_id, sub)
+                    if now - last.get(key, 0) < interval:
+                        continue
+                    last[key] = now
+                    try:
+                        result = await self._dispatch(
+                            data.get("request") or ["", ["status", "-", "1"]])
+                        self.push(client.client_id, {
+                            "channel": sub,
+                            "data": result,
+                            "id": 0,
+                        })
+                    except Exception:  # noqa: BLE001
+                        pass
+
+    # ------------------------------------------------------------------
     # Message handling
     # ------------------------------------------------------------------
 

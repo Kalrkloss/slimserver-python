@@ -208,6 +208,10 @@ async def _run_server(
             # streaming server must see the same clients/subscriptions).
             jsonrpc_api = JSONRPCAPI()
             cometd_mgr = CometdManager(jsonrpc_api)
+            # subscribe:N keep-alive — pushes fresh status to controller
+            # subscriptions on their requested interval (else the apps
+            # see no updates while a player is idle and reconnect).
+            asyncio.create_task(cometd_mgr.keepalive_loop())
 
             base_dir = Path(__file__).parent.parent.parent
             static_dir = str(base_dir / "html")

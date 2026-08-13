@@ -6,6 +6,8 @@ import logging
 import time
 from typing import Any, Callable, Optional
 
+logger = logging.getLogger(__name__)
+
 try:
     import orjson
 
@@ -861,26 +863,36 @@ class JSONRPCAPI:
         int_ids = [i for i in playlist_ids if isinstance(i, int)]
         track_rows = await self._load_tracks(int_ids) if int_ids else {}
 
-        # P4-2: tags:<code> filters the loop/track fields
-        # (t=title a=artist l=album d=duration u=url g=genre y=year)
+        # tags:<code> — songinfo letter codes (lyrion.org CLI docs).
+        # Each returned tag is identified by a letter; the default tags
+        # value for status is 'gald'. Without a tags parameter we return
+        # all available fields (Web UI/SqueezeTray rely on that).
+        TAG_FIELDS: dict[str, str] = {
+            "a": "artist", "A": "artist", "s": "artist_id", "S": "artist_id",
+            "l": "album", "e": "album_id",
+            "d": "duration", "y": "year", "t": "tracknum", "u": "url",
+            "r": "bitrate", "T": "samplerate", "I": "samplesize",
+            "x": "remote", "g": "genre", "p": "genre_id",
+            "c": "coverid", "j": "coverart", "J": "artwork_track_id",
+            "K": "artwork_url", "i": "disc", "N": "remote_title",
+            "o": "type", "f": "filesize", "k": "comment", "w": "lyrics",
+        }
         tags = next((str(a)[5:] for a in (args or []) if str(a).startswith("tags:")), "")
-        tag_ok = lambda f: (not tags) or f in tags  # noqa: E731
+        # 'title' has no letter code (always returned by songinfo).
+        def tag_ok(code: str) -> bool:  # noqa: N802
+            return (not tags) or code in tags
 
         for i, tid in enumerate(playlist_ids):
             if isinstance(tid, int):
                 info = track_rows.get(tid, {})
                 title = info.get("title", "Unknown")
-                artist = info.get("artist", "")
-                album = info.get("album", "")
-                duration = info.get("duration", 0) or 0
                 url = info.get("url", "")
+                duration = info.get("duration", 0) or 0
             else:
                 # Remote stream URL (radio) — title from the URL host
                 title = str(tid)
-                artist = ""
-                album = ""
-                duration = 0
                 url = str(tid)
+                duration = 0
                 try:
                     from urllib.parse import urlparse
                     host = urlparse(url).hostname or ""
@@ -888,20 +900,34 @@ class JSONRPCAPI:
                         title = host.replace("www.", "")
                 except Exception:
                     pass
+                info = {"remote": 1}
             item: dict = {"id": tid, "index": i}
-            if tag_ok("t"):
-                item["title"] = title
-            if tag_ok("a"):
-                item["artist"] = artist
-            if tag_ok("l"):
-                item["album"] = album
-            if tag_ok("d"):
-                item["duration"] = duration
-            if tag_ok("u"):
-                item["url"] = url
-            # Orange Squeeze does firstItem.get("trackType").asText()
-            # — a missing field is a NULL NPE crash. Always present.
+            # title/trackType are always present (Orange Squeeze does
+            # firstItem.get("trackType").asText() — a missing field is a
+            # NULL NPE crash).
+            item["title"] = title
             item["trackType"] = "local" if isinstance(tid, int) else "remote"
+            for code, field in TAG_FIELDS.items():
+                if not tag_ok(code):
+                    continue
+                value = info.get(field)
+                if value is None or value == "":
+                    continue
+                if field == "cover":
+                    # coverid/coverart/artwork for the /music/<id>/cover.jpg
+                    # route (LMS convention).
+                    if tag_ok("c"):
+                        item["coverid"] = value
+                    if tag_ok("j"):
+                        item["coverart"] = 1
+                    if tag_ok("J"):
+                        item["artwork_track_id"] = value
+                    if tag_ok("K"):
+                        item["artwork_url"] = f"/music/{value}/cover.jpg"
+                elif field == "remote":
+                    item["remote"] = 1 if value else 0
+                else:
+                    item[field] = value
             loop.append(item)
 
         cur = player.playlist_position or 0
@@ -1032,7 +1058,7 @@ class JSONRPCAPI:
         ]
 
     async def _load_tracks(self, track_ids: list[int]) -> dict:
-        """Load track metadata (title/artist/album/duration/url) for ids."""
+        """Load track metadata for ids (songinfo/status tag fields)."""
         result: dict = {}
         if not track_ids:
             return result
@@ -1044,41 +1070,64 @@ class JSONRPCAPI:
                 "file:/root/.lyrion/Lyrion/Prefs/lyrion.db?mode=ro", uri=True)
             db.row_factory = sqlite3.Row
             placeholders = ",".join("?" * len(track_ids))
+            # Track fields (songinfo tags: d,y,t,u,r,T,I,x,g,c,j,J,K,i,o,f,k,w)
             rows = db.execute(
-                f"SELECT id, title, url, duration FROM tracks WHERE id IN ({placeholders})",
+                f"""SELECT id, title, url, duration, year, tracknum, bitrate,
+                           samplerate, bitspersample, genre, cover, remote,
+                           disc, filesize, comment, lyrics, content_type
+                    FROM tracks WHERE id IN ({placeholders})""",
                 track_ids,
             ).fetchall()
-            # Artist/album via join tables
+            # Artists (role 1 = artist → a=name, s=id) and albums
+            # (l=name, e=id) in bulk — one query per join table. The join
+            # tables use 'track'/'contributor'/'album' columns and the
+            # role is an INTEGER (1 = artist), not a string.
+            artists: dict[int, dict] = {}
+            for r in db.execute(
+                f"""SELECT tc.track, c.id AS artist_id, c.name AS artist
+                    FROM tracks_contributors tc
+                    JOIN contributors c ON c.id = tc.contributor
+                    WHERE tc.track IN ({placeholders}) AND tc.role = 1""",
+                track_ids,
+            ):
+                artists.setdefault(r["track"], {})["artist_id"] = r["artist_id"]
+                artists.setdefault(r["track"], {})["artist"] = r["artist"]
+            albums: dict[int, dict] = {}
+            for r in db.execute(
+                f"""SELECT ta.track, a.id AS album_id, a.title AS album
+                    FROM tracks_albums ta
+                    JOIN albums a ON a.id = ta.album
+                    WHERE ta.track IN ({placeholders})""",
+                track_ids,
+            ):
+                albums.setdefault(r["track"], {})["album_id"] = r["album_id"]
+                albums.setdefault(r["track"], {})["album"] = r["album"]
             for row in rows:
                 tid = row["id"]
-                artist = ""
-                album = ""
-                try:
-                    a = db.execute(
-                        "SELECT c.name FROM contributors c JOIN tracks_contributors tc ON tc.contributor_id = c.id "
-                        "WHERE tc.track_id = ? AND tc.role = 'artist' LIMIT 1", (tid,)
-                    ).fetchone()
-                    if a: artist = a["name"]
-                except Exception:
-                    pass
-                try:
-                    al = db.execute(
-                        "SELECT a.name FROM albums a JOIN tracks_albums ta ON ta.album_id = a.id "
-                        "WHERE ta.track_id = ? LIMIT 1", (tid,)
-                    ).fetchone()
-                    if al: album = al["name"]
-                except Exception:
-                    pass
-                result[tid] = {
+                info: dict = {
                     "title": row["title"] or "",
                     "url": row["url"] or "",
                     "duration": row["duration"] or 0,
-                    "artist": artist,
-                    "album": album,
+                    "year": row["year"],
+                    "tracknum": row["tracknum"],
+                    "bitrate": row["bitrate"],
+                    "samplerate": row["samplerate"],
+                    "samplesize": row["bitspersample"],
+                    "genre": row["genre"] or "",
+                    "cover": row["cover"],
+                    "remote": 1 if row["remote"] else 0,
+                    "disc": row["disc"],
+                    "filesize": row["filesize"],
+                    "comment": row["comment"],
+                    "lyrics": row["lyrics"],
+                    "type": row["content_type"],
                 }
+                info.update(artists.get(tid, {}))
+                info.update(albums.get(tid, {}))
+                result[tid] = info
             db.close()
         except Exception:
-            pass
+            logger.exception("_load_tracks failed for %d ids", len(track_ids))
         return result
 
     async def _json_control(self, pm, pid: str | None, cmd: str, args: list[str]) -> None:
