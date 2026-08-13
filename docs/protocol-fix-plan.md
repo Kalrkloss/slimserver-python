@@ -336,3 +336,18 @@ Verifikation Phase 2: Suite `all checks passed` (9000+9080), Ad-hoc-Skript
 count:5725, genre-Filter 6981 Treffer, info total songs 56503, songinfo
 vollständig, Subscribe-Push mit Player-Daten, `name Küche` Query/Set).
 
+Phase-3-Status (Commit `?`):
+
+| Plan-ID | Gap | Status |
+|---------|-----|--------|
+| P3-1 | 8.1, 3.3 | ✅ `search <start> <count> term:<x>` im LMS-Format (JSON gruppiert: count + artists/albums/genres/tracks_count + Loops; CLI-`_search_lms` analog). Alt-Format `search <type> <query>` bleibt. |
+| P3-2 | 8.2, 8.3, 6.2 | ✅ `_json_browse` Filter (`genre:`/`genre_id:` (als Index in die DISTINCT-Genre-Liste, genres-Tabelle leer)/`album_id:`/`track_id:`/`artist_id:`/`year:`/`search:`), `musicfolder`- und `songinfo`-JSON-Zweige |
+| P3-3 | 7.3, 7.4 | ✅ Favoriten liefern hierarchische Punkt-Notation (`0.0`, `0.3.1`) als `id` (DB-ID als `dbid`); `item_id:`-Auflösung via `FavoritesManager.resolve_path`; `feedMode:1` → eingebettete `items`; CLI-Subs (play/delete/move/rename/playlist) akzeptieren Pfad-IDs |
+| P3-4 | 5.2, 5.3 | ✅ `/meta/disconnect` entfernt den Client + `successful:True`; `/meta/ping` → `successful:True` |
+| P3-5 | 6.3 | ✅ Menü-Items mit `nextWindow:"refresh"` + `window:{windowStyle:"text_list", title, hasMore}` |
+
+Verifikation Phase 3: Suite `all checks passed`, Ad-hoc-Skript
+`/tmp/hermes-verify-pg20eywg.py` 15/15, Live-Tests (search metal → count 555
+gruppiert; albums genre:Rock → 652; songinfo vollständig; favorites id
+`0.0` + item_id:0.0 → 5 Kinder; Cometd disconnect/ping; menu nextWindow).
+

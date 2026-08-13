@@ -190,6 +190,18 @@ class CometdManager:
                 else:
                     reply.update({"successful": False})
 
+            elif channel == "/meta/disconnect":
+                # Remove the client so its subscriptions/events are freed.
+                self.remove(cid)
+                reply.update({
+                    "successful": True,
+                    "advice": {"reconnect": "none", "interval": 0},
+                })
+                logger.info("Cometd disconnect -> client %s", cid)
+
+            elif channel == "/meta/ping":
+                reply.update({"successful": True})
+
             else:
                 reply.update({"successful": True})
 

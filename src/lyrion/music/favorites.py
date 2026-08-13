@@ -84,6 +84,28 @@ class FavoritesManager:
             result = await session.execute(stmt)
             return [self._fav_to_dict(f, include_children=True) for f in result.scalars().all()]
 
+    async def resolve_path(self, path: str) -> Optional[int]:
+        """Resolve an LMS hierarchical id ('0.3.1') to a DB favorite id.
+
+        '0' is the virtual root; each following number is the index into
+        the sorted item list of the parent (same ordering as list_items:
+        folders first, then streams, both alphabetical). Returns None if
+        the path does not exist.
+        """
+        try:
+            parts = [int(p) for p in str(path).split(".") if p]
+        except ValueError:
+            return None
+        if not parts or parts[0] != 0:
+            return None
+        parent: Optional[int] = None
+        for idx in parts[1:]:
+            items = await self.list_items(parent)
+            if idx < 0 or idx >= len(items):
+                return None
+            parent = int(items[idx]["id"])
+        return parent
+
     async def get(self, fav_id: int) -> Optional[dict[str, Any]]:
         async with self._db_session() as session:
             fav = await session.get(Favorite, fav_id)

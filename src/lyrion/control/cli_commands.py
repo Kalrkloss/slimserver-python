@@ -1208,6 +1208,80 @@ async def cmd_playlist_load(
 # ---------------------------------------------------------------------------
 
 
+async def _search_lms(
+    handler: CLIHandler,
+    ctx: CLIContext,
+    args: list[str],
+) -> list[str]:
+    """LMS grouped search: 'search <start> <count> term:<begriff>'.
+
+    Response: 'search <start> <count> count:<total> artists_count:N
+    albums_count:N genres_count:N tracks_count:N' followed by the page
+    items per group.
+    """
+    nums = [int(a) for a in args if str(a).isdigit()]
+    start = nums[0] if nums else 0
+    count = nums[1] if len(nums) > 1 else 20
+    term = next((str(a)[5:] for a in args if str(a).startswith("term:")), "")
+    if not term:
+        return ["search: no term", ""]
+    like = f"%{term}%"
+    try:
+        artists = await _query_db(
+            "SELECT DISTINCT c.id, c.name FROM contributors c "
+            "JOIN tracks_contributors tc ON tc.contributor = c.id AND tc.role = 1 "
+            "WHERE c.name LIKE ? ORDER BY c.name COLLATE NOCASE LIMIT ? OFFSET ?",
+            (like, count, start),
+        )
+        albums = await _query_db(
+            "SELECT id, title FROM albums WHERE title LIKE ? "
+            "ORDER BY title COLLATE NOCASE LIMIT ? OFFSET ?",
+            (like, count, start),
+        )
+        genres = await _query_db(
+            "SELECT DISTINCT genre AS name FROM tracks WHERE genre LIKE ? "
+            "ORDER BY genre COLLATE NOCASE LIMIT ? OFFSET ?",
+            (like, count, start),
+        )
+        tracks = await _query_db(
+            "SELECT id, title FROM tracks WHERE title LIKE ? "
+            "ORDER BY title COLLATE NOCASE LIMIT ? OFFSET ?",
+            (like, count, start),
+        )
+        a_total = await _query_db(
+            "SELECT COUNT(DISTINCT c.id) AS n FROM contributors c "
+            "JOIN tracks_contributors tc ON tc.contributor = c.id AND tc.role = 1 "
+            "WHERE c.name LIKE ?", (like,))
+        al_total = await _query_db(
+            "SELECT COUNT(*) AS n FROM albums WHERE title LIKE ?", (like,))
+        g_total = await _query_db(
+            "SELECT COUNT(DISTINCT genre) AS n FROM tracks WHERE genre LIKE ?",
+            (like,))
+        t_total = await _query_db(
+            "SELECT COUNT(*) AS n FROM tracks WHERE title LIKE ?", (like,))
+    except Exception as e:  # noqa: BLE001
+        return [f"cli error: {e}", ""]
+    a_n = a_total[0]["n"] if a_total else 0
+    al_n = al_total[0]["n"] if al_total else 0
+    g_n = g_total[0]["n"] if g_total else 0
+    t_n = t_total[0]["n"] if t_total else 0
+    out = [
+        f"search {start} {count} count:{a_n + al_n + g_n + t_n} "
+        f"artists_count:{a_n} albums_count:{al_n} genres_count:{g_n} "
+        f"tracks_count:{t_n}",
+    ]
+    for r in artists:
+        out.append(f"id:{r['id']} artist:{r['name']}")
+    for r in albums:
+        out.append(f"id:{r['id']} album:{r['title']}")
+    for i, r in enumerate(genres):
+        out.append(f"id:{i + 1} genre:{r['name']}")
+    for r in tracks:
+        out.append(f"id:{r['id']} title:{r['title']}")
+    out.append("")
+    return out
+
+
 @register_command("search")
 async def cmd_search(
     handler: CLIHandler,
@@ -1215,12 +1289,15 @@ async def cmd_search(
     args: list[str],
 ) -> list[str]:
     """
-    search <type> <query> [0 <limit>]
-    Search the media library.
+    search <type> <query> [0 <limit>] — legacy typed search
+    search <start> <count> term:<begriff> — LMS grouped search
     Types: tracks, artists, albums, genres, playlists, titles
     """
     if not args:
         return ["search: "]
+    # LMS grouped format: search <start> <count> term:<begriff>
+    if any(str(a).startswith("term:") for a in args):
+        return await _search_lms(handler, ctx, args)
     search_type = args[0].lower()
     query = args[1] if len(args) > 1 else ""
     offset = int(args[2]) if len(args) > 2 else 0
@@ -2146,16 +2223,29 @@ async def _fav_add_folder(
         return [f"cli error: {e}", ""]
 
 
+async def _fav_resolve_id(fm: Any, val: str) -> Optional[int]:
+    """Resolve a favorite id: LMS hierarchical path ('0.3.1') or DB id."""
+    if "." in val:
+        return await fm.resolve_path(val)
+    if val.isdigit():
+        return int(val)
+    return None
+
+
 async def _fav_delete(
     handler: CLIHandler,
     ctx: CLIContext,
     args: list[str],
 ) -> list[str]:
-    if not args or not str(args[0]).isdigit():
+    if not args:
         return ["favorites delete <id> — missing id", ""]
     try:
         from lyrion.music.favorites import get_favorites_manager
-        ok = await get_favorites_manager().delete(int(str(args[0])))
+        fm = get_favorites_manager()
+        fav_id = await _fav_resolve_id(fm, str(args[0]))
+        if fav_id is None:
+            return ["favorites delete <id> — missing id", ""]
+        ok = await fm.delete(fav_id)
         return ["deleted"] if ok else ["cli error: favorite not found", ""]
     except Exception as e:  # noqa: BLE001
         return [f"cli error: {e}", ""]
@@ -2166,14 +2256,19 @@ async def _fav_move(
     ctx: CLIContext,
     args: list[str],
 ) -> list[str]:
-    if not args or not str(args[0]).isdigit():
+    if not args:
         return ["favorites move <id> <parent_id> [position] — missing id", ""]
-    fav_id = int(str(args[0]))
-    parent = _parse_parent_id(args[1]) if len(args) > 1 else None
-    position = int(str(args[2])) if len(args) > 2 and str(args[2]).isdigit() else None
     try:
         from lyrion.music.favorites import get_favorites_manager
-        ok = await get_favorites_manager().move(fav_id, parent, position)
+        fm = get_favorites_manager()
+        fav_id = await _fav_resolve_id(fm, str(args[0]))
+        if fav_id is None:
+            return ["favorites move <id> <parent_id> [position] — missing id", ""]
+        parent = None
+        if len(args) > 1:
+            parent = await _fav_resolve_id(fm, str(args[1])) if str(args[1]) != "0" else None
+        position = int(str(args[2])) if len(args) > 2 and str(args[2]).isdigit() else None
+        ok = await fm.move(fav_id, parent, position)
         return ["moved"] if ok else ["cli error: move failed", ""]
     except Exception as e:  # noqa: BLE001
         return [f"cli error: {e}", ""]
@@ -2184,12 +2279,16 @@ async def _fav_rename(
     ctx: CLIContext,
     args: list[str],
 ) -> list[str]:
-    if len(args) < 2 or not str(args[0]).isdigit():
+    if len(args) < 2:
         return ["favorites rename <id> <title> [url] — missing id/title", ""]
     try:
         from lyrion.music.favorites import get_favorites_manager
+        fm = get_favorites_manager()
+        fav_id = await _fav_resolve_id(fm, str(args[0]))
+        if fav_id is None:
+            return ["favorites rename <id> <title> [url] — missing id/title", ""]
         url = str(args[2]) if len(args) > 2 else None
-        ok = await get_favorites_manager().rename(int(str(args[0])), str(args[1]), url)
+        ok = await fm.rename(fav_id, str(args[1]), url)
         return ["renamed"] if ok else ["cli error: favorite not found", ""]
     except Exception as e:  # noqa: BLE001
         return [f"cli error: {e}", ""]
@@ -2200,14 +2299,18 @@ async def _fav_play(
     ctx: CLIContext,
     args: list[str],
 ) -> list[str]:
-    if not args or not str(args[0]).isdigit():
+    if not args:
         return ["favorites play <id> — missing id", ""]
     player_id = args[1] if len(args) > 1 else ctx.player_id
     if not player_id:
         return ["no player selected — pass player_id or call via slim.request <player_id>", ""]
     try:
         from lyrion.music.favorites import get_favorites_manager
-        ok = await get_favorites_manager().play(player_id, int(str(args[0])))
+        fm = get_favorites_manager()
+        fav_id = await _fav_resolve_id(fm, str(args[0]))
+        if fav_id is None:
+            return ["favorites play <id> — missing id", ""]
+        ok = await fm.play(player_id, fav_id)
         if ok:
             return []
         return [
@@ -2253,8 +2356,8 @@ async def _fav_playlist(
         if ":" in s:
             k, _, v = s.partition(":")
             filters[k] = v
-    fav_id = filters.get("item_id")
-    if not fav_id or not fav_id.isdigit():
+    fav_id_raw = filters.get("item_id")
+    if not fav_id_raw:
         return ["favorites playlist: missing item_id:<id>", ""]
     player_id = filters.get("player") or ctx.player_id
     if not player_id:
@@ -2263,12 +2366,15 @@ async def _fav_playlist(
         from lyrion.music.favorites import get_favorites_manager
         from lyrion.player.manager import PlayerManager
         fm = get_favorites_manager()
+        fav_id = await _fav_resolve_id(fm, fav_id_raw)
+        if fav_id is None:
+            return ["favorites playlist: unknown item_id", ""]
         if action in ("play", "load"):
-            ok = await fm.play(player_id, int(fav_id))
+            ok = await fm.play(player_id, fav_id)
             return [] if ok else ["cli error: could not start playback", ""]
         if action in ("insert", "add"):
             items = await fm.list_items(None)
-            target = next((i for i in items if str(i["id"]) == fav_id), None)
+            target = next((i for i in items if int(i["id"]) == fav_id), None)
             if not target or not target["url"]:
                 return ["cli error: favorite not a stream", ""]
             player = PlayerManager().get_player(player_id)

@@ -27,6 +27,21 @@ except ImportError:
         return json.dumps(obj).encode("utf-8")
 
 
+_LIBRARY_DB = "/root/.lyrion/Lyrion/Prefs/lyrion.db"
+
+
+def _db_query(sql: str, params: tuple = ()) -> list[dict]:
+    """Run a read-only query against the library DB (synchronous)."""
+    import sqlite3
+
+    con = sqlite3.connect(f"file:{_LIBRARY_DB}?mode=ro", uri=True, timeout=30)
+    try:
+        con.row_factory = sqlite3.Row
+        return [dict(r) for r in con.execute(sql, params).fetchall()]
+    finally:
+        con.close()
+
+
 class JSONRPCError(Exception):
     """JSON-RPC error exception."""
 
@@ -400,6 +415,42 @@ class JSONRPCAPI:
             logging.getLogger("lyrion.web.api").warning("_playlist_prev failed: %s", e)
             return False
 
+    async def _fav_items_loop(self, fm: Any, parent: Optional[int],
+                              parent_path: str, feed_mode: bool) -> list[dict]:
+        """Build the favorites loop with LMS hierarchical ids.
+
+        id = display-position path from the virtual root ('0.0', '0.3.1');
+        dbid carries the internal DB id; feed_mode embeds children in
+        'items' arrays.
+        """
+        try:
+            items = await fm.list_items(parent)
+        except Exception:
+            return []
+        loop: list[dict] = []
+        for i, it in enumerate(items):
+            is_folder = it["type"] == "folder"
+            path = f"{parent_path}.{i}"
+            item = {
+                "id": path,
+                "name": it["title"],
+                "url": it["url"] or "",
+                "hasitems": 1 if is_folder else 0,
+                "isItem": 0 if is_folder else 1,
+                "isFolder": 1 if is_folder else 0,
+                "image": "",
+                "type": it["type"],
+                "parent_id": parent_path,
+                "position": i,
+                "dbid": str(it["id"]),
+            }
+            if feed_mode and is_folder:
+                item["items"] = await self._fav_items_loop(
+                    fm, int(it["id"]), path, feed_mode)
+            loop.append(item)
+        return loop
+
+
     async def _slim_request(self, player_id: str, command: list[str]) -> Any:
         """LMS-compatible slim.request — returns structured JSON dicts.
 
@@ -612,40 +663,35 @@ class JSONRPCAPI:
         if cmd == "favorites" and args and str(args[0]) == "items":
             try:
                 from lyrion.music.favorites import get_favorites_manager
+                fm = get_favorites_manager()
                 rest = args[1:]
                 parent = None
-                # item_id:<n> (SqueezeTray folder children) — highest priority
+                parent_path = "0"
+                feed_mode = any(str(a).startswith("feedMode:") and str(a)[9:] == "1"
+                                for a in rest)
+                # item_id:<n> (SqueezeTray folder children) — highest priority;
+                # accepts the LMS hierarchical id ('0.3.1') and the DB id.
                 for a in rest:
                     if str(a).startswith("item_id:"):
-                        try:
-                            parent = int(str(a)[8:])
-                        except ValueError:
-                            parent = None
+                        val = str(a)[8:]
+                        if "." in val:
+                            parent = await fm.resolve_path(val)
+                            parent_path = val if parent is not None else "0"
+                        elif val.isdigit():
+                            parent = int(val)
+                            parent_path = f"0.{val}"
                         break
                 if parent is None and len(rest) == 1 and str(rest[0]).isdigit():
                     # Web UI: ['favorites','items','<parent_id>'] — a bare
                     # number is the folder id (SqueezeTray sends multiple
                     # args: start/count/want_url — never a bare parent).
                     parent = int(str(rest[0]))
-                items = await get_favorites_manager().list_items(parent)
-                loop = []
-                for it in items:
-                    is_folder = it["type"] == "folder"
-                    loop.append({
-                        "id": str(it["id"]),
-                        "name": it["title"],
-                        "url": it["url"] or "",
-                        "hasitems": 1 if is_folder else 0,
-                        "isItem": 0 if is_folder else 1,
-                        "isFolder": 1 if is_folder else 0,
-                        "image": "",
-                        "type": it["type"],
-                        "parent_id": str(it["parent_id"]) if it["parent_id"] is not None else "",
-                        "position": it["position"],
-                    })
+                    parent_path = f"0.{rest[0]}"
+                loop = await self._fav_items_loop(fm, parent, parent_path, feed_mode)
                 return {"count": len(loop), "loop_loop": loop}
-            except Exception as e:  # noqa: BLE001
-                return {"error": str(e)}
+            except Exception:
+                return {"count": 0, "loop_loop": []}
+
         if cmd == "favorites":
             try:
                 from lyrion.control.cli import CLIHandler, CLIContext
@@ -672,6 +718,10 @@ class JSONRPCAPI:
             except Exception as e:  # noqa: BLE001
                 return {"error": str(e)}
             return {}
+
+        # ── search (LMS format: search <start> <count> term:<begriff>) ──
+        if cmd == "search":
+            return await self._json_search(args)
 
         # ── Browse commands (library) ──────────────────────────────
         if cmd in ("albums", "artists", "genres", "songs", "titles",
@@ -864,6 +914,14 @@ class JSONRPCAPI:
                     "do": {"cmd": ["browse", browse_id]},
                 },
                 "browse": {"id": browse_id, "name": name, "type": typ},
+                # P3-5: Jive window hints — the menu push opens/refreshes a
+                # text list window with the item's title.
+                "nextWindow": "refresh",
+                "window": {
+                    "windowStyle": "text_list",
+                    "title": name,
+                    "hasMore": 1,
+                },
             }
 
         return [
@@ -1066,6 +1124,81 @@ class JSONRPCAPI:
             logger = __import__("logging").getLogger("lyrion.web.api")
             logger.warning("_play_playlist_item failed: %s", exc)
 
+    async def _json_search(self, args: list[str]) -> dict:
+        """LMS 'search <start> <count> term:<begriff>' — grouped results.
+
+        Returns count plus artists_count/albums_count/genres_count/
+        tracks_count and the per-group loops (id + name), like the real
+        LMS grouped search response.
+        """
+        nums = [int(s) for s in args if str(s).isdigit()]
+        start = nums[0] if nums else 0
+        count = nums[1] if len(nums) > 1 else 20
+        term = next((str(a)[5:] for a in args if str(a).startswith("term:")), "")
+        empty = {
+            "count": 0, "artists_count": 0, "albums_count": 0,
+            "genres_count": 0, "tracks_count": 0,
+            "artists_loop": [], "albums_loop": [], "genres_loop": [],
+            "tracks_loop": [],
+        }
+        if not term:
+            return empty
+        like = f"%{term}%"
+        try:
+            artists = _db_query(
+                "SELECT DISTINCT c.id, c.name FROM contributors c "
+                "JOIN tracks_contributors tc ON tc.contributor = c.id "
+                "AND tc.role = 1 WHERE c.name LIKE ? "
+                "ORDER BY c.name COLLATE NOCASE LIMIT ? OFFSET ?",
+                (like, count, start),
+            )
+            albums = _db_query(
+                "SELECT id, title FROM albums WHERE title LIKE ? "
+                "ORDER BY title COLLATE NOCASE LIMIT ? OFFSET ?",
+                (like, count, start),
+            )
+            genres = _db_query(
+                "SELECT DISTINCT genre AS name FROM tracks "
+                "WHERE genre LIKE ? ORDER BY genre COLLATE NOCASE "
+                "LIMIT ? OFFSET ?",
+                (like, count, start),
+            )
+            tracks = _db_query(
+                "SELECT id, title, url, duration FROM tracks "
+                "WHERE title LIKE ? ORDER BY title COLLATE NOCASE "
+                "LIMIT ? OFFSET ?",
+                (like, count, start),
+            )
+        except Exception:
+            return empty
+        a_count = _db_query(
+            "SELECT COUNT(DISTINCT c.id) AS n FROM contributors c "
+            "JOIN tracks_contributors tc ON tc.contributor = c.id "
+            "AND tc.role = 1 WHERE c.name LIKE ?", (like,))
+        al_count = _db_query(
+            "SELECT COUNT(*) AS n FROM albums WHERE title LIKE ?", (like,))
+        g_count = _db_query(
+            "SELECT COUNT(DISTINCT genre) AS n FROM tracks WHERE genre LIKE ?",
+            (like,))
+        t_count = _db_query(
+            "SELECT COUNT(*) AS n FROM tracks WHERE title LIKE ?", (like,))
+        return {
+            "count": (a_count[0]["n"] if a_count else 0)
+                     + (al_count[0]["n"] if al_count else 0)
+                     + (g_count[0]["n"] if g_count else 0)
+                     + (t_count[0]["n"] if t_count else 0),
+            "artists_count": a_count[0]["n"] if a_count else 0,
+            "albums_count": al_count[0]["n"] if al_count else 0,
+            "genres_count": g_count[0]["n"] if g_count else 0,
+            "tracks_count": t_count[0]["n"] if t_count else 0,
+            "artists_loop": [{"id": r["id"], "artist": r["name"] or ""} for r in artists],
+            "albums_loop": [{"id": r["id"], "album": r["title"] or ""} for r in albums],
+            "genres_loop": [{"id": i + 1, "genre": r["name"] or ""} for i, r in enumerate(genres)],
+            "tracks_loop": [{"id": r["id"], "title": r["title"] or "",
+                             "url": r["url"] or "", "duration": r["duration"] or 0}
+                            for r in tracks],
+        }
+
     async def _json_browse(self, cmd: str, args: list[str]) -> dict:
         """Browse library tables (albums/artists/songs/genres) as JSON."""
         # browse <target> [<start> <count>] — the home menu items carry
@@ -1079,20 +1212,8 @@ class JSONRPCAPI:
             if target == "favorites":
                 try:
                     from lyrion.music.favorites import get_favorites_manager
-                    items = await get_favorites_manager().list_items(None)
-                    loop = [
-                        {
-                            "id": str(it["id"]),
-                            "name": it["title"],
-                            "text": it["title"],
-                            "url": it["url"] or "",
-                            "hasitems": 1 if it["type"] == "folder" else 0,
-                            "isFolder": 1 if it["type"] == "folder" else 0,
-                            "isItem": 0 if it["type"] == "folder" else 1,
-                            "type": it["type"],
-                        }
-                        for it in items
-                    ]
+                    loop = await self._fav_items_loop(
+                        get_favorites_manager(), None, "0", False)
                     return {"count": len(loop), "loop_loop": loop}
                 except Exception:
                     return {"count": 0, "loop_loop": []}
@@ -1118,50 +1239,181 @@ class JSONRPCAPI:
 
         start = int(args[0]) if args and str(args[0]).isdigit() else 0
         count = int(args[1]) if len(args) > 1 and str(args[1]).isdigit() else 50
+        # P3-2: filters (genre_id/album_id/track_id/artist_id/year/search)
+        # + tags: code (t=title a=artist l=album d=duration u=url g=genre y=year)
+        filters: dict[str, str] = {}
+        for a in args:
+            s = str(a)
+            if ":" in s:
+                k, _, v = s.partition(":")
+                if k in ("genre_id", "genre", "album_id", "track_id", "artist_id",
+                         "year", "search", "tags"):
+                    filters[k] = v
+        tags = filters.pop("tags", "")
         try:
             import sqlite3
             db = sqlite3.connect(
                 "file:/root/.lyrion/Lyrion/Prefs/lyrion.db?mode=ro", uri=True)
             db.row_factory = sqlite3.Row
 
+            # genre_id: the genres table is empty — resolve the id as the
+            # index into the DISTINCT track-genre list (stable order).
+            if filters.get("genre_id") and str(filters["genre_id"]).isdigit():
+                g = db.execute(
+                    "SELECT DISTINCT genre FROM tracks WHERE genre != '' "
+                    "ORDER BY genre COLLATE NOCASE LIMIT 1 OFFSET ?",
+                    (int(filters["genre_id"]),)).fetchone()
+                if g:
+                    filters["genre"] = g["genre"]
+
+            def _conds(name_col: str) -> tuple[str, tuple]:
+                c: list[str] = []
+                p: list = []
+                if filters.get("search"):
+                    c.append(f"{name_col} LIKE ?")
+                    p.append(f"%{filters['search']}%")
+                if filters.get("year"):
+                    c.append("year = ?")
+                    p.append(filters["year"])
+                if filters.get("genre"):
+                    c.append("genre LIKE ?")
+                    p.append(f"%{filters['genre']}%")
+                return (" WHERE " + " AND ".join(c)) if c else "", tuple(p)
+
             if cmd == "artists":
                 # Contributors have no role column; the role lives in
                 # tracks_contributors.role (1 = artist).
+                where, params = _conds("c.name")
+                joins = " JOIN tracks_contributors tc ON tc.contributor = c.id AND tc.role = 1"
+                extra_joins = ""
+                if filters.get("album_id") or filters.get("year") or filters.get("genre"):
+                    extra_joins += " JOIN tracks t ON t.id = tc.track"
+                    extra_joins += " JOIN tracks_albums ta ON ta.track = t.id" \
+                        if filters.get("album_id") else ""
                 rows = db.execute(
-                    "SELECT DISTINCT c.id, c.name FROM contributors c "
-                    "JOIN tracks_contributors tc ON tc.contributor = c.id "
-                    "WHERE tc.role = 1 ORDER BY c.name LIMIT ? OFFSET ?",
-                    (count, start)).fetchall()
+                    "SELECT DISTINCT c.id, c.name FROM contributors c"
+                    + joins + extra_joins + where +
+                    " ORDER BY c.name LIMIT ? OFFSET ?",
+                    params + (count, start)).fetchall()
                 loop = [{"id": r["id"], "artist": r["name"] or ""} for r in rows]
                 total = db.execute(
-                    "SELECT COUNT(DISTINCT c.id) FROM contributors c "
-                    "JOIN tracks_contributors tc ON tc.contributor = c.id "
-                    "WHERE tc.role = 1").fetchone()[0]
+                    "SELECT COUNT(DISTINCT c.id) FROM contributors c"
+                    + joins + extra_joins + where, params).fetchone()[0]
             elif cmd == "albums":
+                where, params = _conds("al.title")
+                joins = ""
+                if filters.get("artist_id") or filters.get("genre"):
+                    joins += " JOIN tracks_albums ta ON ta.album = al.id" \
+                             " JOIN tracks t ON t.id = ta.track"
+                if filters.get("artist_id"):
+                    joins += " JOIN tracks_contributors tc ON tc.track = t.id AND tc.role = 1"
                 rows = db.execute(
-                    "SELECT id, title, year FROM albums ORDER BY title LIMIT ? OFFSET ?",
-                    (count, start)).fetchall()
-                loop = [{"id": r["id"], "album": r["title"] or "", "year": r["year"] or 0} for r in rows]
-                total = db.execute("SELECT COUNT(*) FROM albums").fetchone()[0]
+                    "SELECT DISTINCT al.id, al.title, al.year FROM albums al"
+                    + joins + where +
+                    " ORDER BY al.title LIMIT ? OFFSET ?",
+                    params + (count, start)).fetchall()
+                loop = [{"id": r["id"], "album": r["title"] or "", "year": r["year"] or 0}
+                        for r in rows]
+                total = db.execute(
+                    "SELECT COUNT(DISTINCT al.id) FROM albums al" + joins + where,
+                    params).fetchone()[0]
             elif cmd == "songs" or cmd == "titles":
+                where, params = _conds("t.title")
+                joins = ""
+                if filters.get("album_id"):
+                    joins += " JOIN tracks_albums ta ON ta.track = t.id"
+                if filters.get("artist_id"):
+                    joins += " JOIN tracks_contributors tc ON tc.track = t.id AND tc.role = 1"
                 rows = db.execute(
-                    "SELECT id, title, url, duration FROM tracks ORDER BY title LIMIT ? OFFSET ?",
-                    (count, start)).fetchall()
+                    "SELECT DISTINCT t.id, t.title, t.url, t.duration FROM tracks t"
+                    + joins + where +
+                    " ORDER BY t.title LIMIT ? OFFSET ?",
+                    params + (count, start)).fetchall()
                 loop = [{"id": r["id"], "title": r["title"] or "", "url": r["url"] or "",
                          "duration": r["duration"] or 0} for r in rows]
-                total = db.execute("SELECT COUNT(*) FROM tracks").fetchone()[0]
+                total = db.execute(
+                    "SELECT COUNT(DISTINCT t.id) FROM tracks t" + joins + where,
+                    params).fetchone()[0]
             elif cmd == "genres":
                 # The genres table is not populated by the importer — use the
                 # track genre text (same source as the CLI command).
+                where, params = _conds("genre")
+                if where:
+                    where = where.replace(" WHERE ", " WHERE genre != '' AND ", 1)
+                else:
+                    where = " WHERE genre != ''"
                 rows = db.execute(
-                    "SELECT DISTINCT genre FROM tracks WHERE genre != '' "
-                    "ORDER BY genre COLLATE NOCASE LIMIT ? OFFSET ?",
-                    (count, start)).fetchall()
+                    "SELECT DISTINCT genre FROM tracks" + where +
+                    " ORDER BY genre COLLATE NOCASE LIMIT ? OFFSET ?",
+                    params + (count, start)).fetchall()
                 loop = [{"id": start + i, "genre": r["genre"] or ""}
                         for i, r in enumerate(rows)]
                 total = db.execute(
-                    "SELECT COUNT(DISTINCT genre) FROM tracks WHERE genre != ''"
-                ).fetchone()[0]
+                    "SELECT COUNT(DISTINCT genre) FROM tracks" + where,
+                    params).fetchone()[0]
+            elif cmd == "musicfolder":
+                # folder browser derived from the track URLs
+                folder = filters.get("search", "")
+                if folder:
+                    rows = db.execute(
+                        "SELECT DISTINCT url FROM tracks WHERE url LIKE ? "
+                        "ORDER BY url LIMIT ? OFFSET ?",
+                        (folder.rstrip("/") + "/%", count, start)).fetchall()
+                    names: list[str] = []
+                    for r in rows:
+                        rel = r["url"][len(folder.rstrip("/")) + 1:]
+                        names.append(rel.split("/", 1)[0])
+                    loop = [{"id": str(folder.rstrip("/") + "/" + name), "name": name,
+                             "text": name, "type": "folder", "hasitems": 1}
+                            for name in dict.fromkeys(names)]
+                    total = db.execute(
+                        "SELECT COUNT(DISTINCT url) FROM tracks WHERE url LIKE ?",
+                        (folder.rstrip("/") + "/%",)).fetchone()[0]
+                else:
+                    rows = db.execute(
+                        "SELECT DISTINCT url FROM tracks WHERE url LIKE 'file://%' "
+                        "ORDER BY url LIMIT 500").fetchall()
+                    roots: dict[str, str] = {}
+                    for r in rows:
+                        path = r["url"][len("file://"):].lstrip("/")
+                        parts = path.split("/")
+                        if len(parts) >= 2:
+                            roots.setdefault(parts[0], f"file:///{parts[0]}")
+                    names = sorted(roots)
+                    page = names[start:start + count]
+                    loop = [{"id": roots[n], "name": n, "text": n,
+                             "type": "folder", "hasitems": 1} for n in page]
+                    total = len(names)
+            elif cmd == "songinfo":
+                tid = filters.get("track_id") or (args[0] if args and str(args[0]).isdigit() else "")
+                if not str(tid).isdigit():
+                    return {"count": 0, "loop_loop": []}
+                r = db.execute(
+                    "SELECT t.id, t.title, t.url, t.duration, t.year, t.tracknum, t.genre "
+                    "FROM tracks t WHERE t.id = ? LIMIT 1", (int(tid),)).fetchone()
+                if r is None:
+                    return {"count": 0, "loop_loop": []}
+                item: dict = {"id": r["id"], "title": r["title"] or "",
+                              "url": r["url"] or "", "duration": r["duration"] or 0}
+                if r["year"]:
+                    item["year"] = r["year"]
+                if r["tracknum"]:
+                    item["tracknum"] = r["tracknum"]
+                if r["genre"]:
+                    item["genre"] = r["genre"]
+                a = db.execute(
+                    "SELECT c.name FROM contributors c JOIN tracks_contributors tc "
+                    "ON tc.contributor = c.id AND tc.role = 1 WHERE tc.track = ? "
+                    "ORDER BY c.name LIMIT 1", (r["id"],)).fetchone()
+                if a:
+                    item["artist"] = a["name"]
+                al = db.execute(
+                    "SELECT al.title FROM albums al JOIN tracks_albums ta "
+                    "ON ta.album = al.id WHERE ta.track = ? LIMIT 1",
+                    (r["id"],)).fetchone()
+                if al:
+                    item["album"] = al["title"]
+                return {"count": 1, "loop_loop": [item]}
             else:
                 db.close()
                 return {"count": 0, "loop_loop": []}
