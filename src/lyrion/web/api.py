@@ -435,7 +435,12 @@ class JSONRPCAPI:
             is_folder = it["type"] == "folder"
             path = f"{parent_path}.{i}"
             item = {
-                "id": path,
+                # id stays the DB id (integer) — the Android controllers
+                # (Orange Squeeze/SqueezeCtrl/Squeezer) parse it as a
+                # number; the LMS hierarchical path is available as
+                # id_hierarchical for clients that expect it.
+                "id": str(it["id"]),
+                "id_hierarchical": path,
                 "name": it["title"],
                 "url": it["url"] or "",
                 "hasitems": 1 if is_folder else 0,
@@ -443,9 +448,8 @@ class JSONRPCAPI:
                 "isFolder": 1 if is_folder else 0,
                 "image": "",
                 "type": it["type"],
-                "parent_id": parent_path,
+                "parent_id": str(it["parent_id"]) if it["parent_id"] is not None else "",
                 "position": i,
-                "dbid": str(it["id"]),
             }
             if feed_mode and is_folder:
                 item["items"] = await self._fav_items_loop(
@@ -750,6 +754,12 @@ class JSONRPCAPI:
                 return {"count": len(loop), "loop_loop": loop}
             except Exception:
                 return {"count": 0, "loop_loop": []}
+
+        # favorites changed — event subscription (SqueezeCtrl): the app
+        # watches this channel and reloads the list when a 'changed' event
+        # arrives. Answer empty/ok (no 'unknown command').
+        if cmd == "favorites" and args and str(args[0]) == "changed":
+            return {}
 
         if cmd == "favorites":
             try:

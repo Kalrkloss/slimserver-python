@@ -140,6 +140,15 @@ async def _handle_connection(manager, reader: asyncio.StreamReader,
                     messages = []
                 logger.info("NativeCometd Body: %s", ",".join(
                     m.get("channel", "?") for m in messages if isinstance(m, dict)))
+                # DEBUG: dump the full request/subscription payloads so we
+                # can see exactly what the controller apps send.
+                for _m in messages:
+                    if not isinstance(_m, dict):
+                        continue
+                    _ch = _m.get("channel", "")
+                    _data = _m.get("data")
+                    if isinstance(_data, dict) and (_data.get("request") or _data.get("subscription")):
+                        logger.debug("Cometd PAYLOAD %s: %s", _ch, _data)
 
                 replies = await manager.handle_messages(messages)
                 connect_msgs = [m for m in messages if isinstance(m, dict)

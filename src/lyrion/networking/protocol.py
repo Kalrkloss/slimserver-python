@@ -1840,6 +1840,15 @@ class SlimProtoClient:
                         CLIHandler.notify_subscribers(player.mac)
                     except Exception:
                         pass
+                    # Wake Cometd status/playerstatus subscribers (Android
+                    # controllers) with the fresh player status.
+                    try:
+                        from lyrion.web.cometd import get_manager
+                        _mgr = get_manager()
+                        if _mgr is not None:
+                            asyncio.create_task(_mgr.notify_player_status(player.mac))
+                    except Exception:
+                        pass
             except Exception:
                 pass
         except Exception as exc:

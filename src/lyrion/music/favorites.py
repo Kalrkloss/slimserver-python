@@ -145,6 +145,7 @@ class FavoritesManager:
             session.add(fav)
             await session.commit()
             await session.refresh(fav)
+            _notify_favorites_changed()
             return fav.id
 
     async def delete(self, fav_id: int) -> bool:
@@ -154,6 +155,7 @@ class FavoritesManager:
                 return False
             await session.delete(fav)  # children cascade
             await session.commit()
+            _notify_favorites_changed()
             return True
 
     async def rename(self, fav_id: int, title: str, url: str | None = None) -> bool:
@@ -168,6 +170,8 @@ class FavoritesManager:
                 update(Favorite).where(Favorite.id == fav_id).values(**values)
             )
             await session.commit()
+            if result.rowcount:
+                _notify_favorites_changed()
             return bool(result.rowcount)
 
     async def move(
@@ -190,6 +194,7 @@ class FavoritesManager:
             else:
                 fav.position = max(0, int(position))
             await session.commit()
+            _notify_favorites_changed()
             return True
 
     async def play(self, player_id: str, fav_id: int) -> bool:
@@ -214,6 +219,22 @@ def get_favorites_manager() -> FavoritesManager:
     if _manager is None:
         _manager = FavoritesManager()
     return _manager
+
+
+def _notify_favorites_changed() -> None:
+    """Wake Cometd favorites subscribers ('changed' event).
+
+    Called after favorite mutations; schedules the event push on the
+    running event loop. SqueezeCtrl reloads the list on the event.
+    """
+    try:
+        from lyrion.web.cometd import get_manager
+        mgr = get_manager()
+        if mgr is not None:
+            import asyncio as _asyncio
+            _asyncio.create_task(mgr.notify_favorites_changed())
+    except Exception:  # noqa: BLE001
+        pass
 
 
 async def ensure_opml_imported() -> None:

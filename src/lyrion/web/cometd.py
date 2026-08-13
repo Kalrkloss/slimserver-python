@@ -139,6 +139,51 @@ class CometdManager:
                 except Exception:  # noqa: BLE001
                     pass
 
+    async def notify_player_status(self, player_id: str) -> None:
+        """Push a fresh player status to status/playerstatus subscribers.
+
+        Called by the slimproto layer on every STAT change so the
+        Android controllers (SqueezeCtrl, Orange Squeeze, Squeezer) get
+        the new state immediately instead of on their next poll.
+        """
+        for client in list(self._clients.values()):
+            for sub in list(client.subscriptions.keys()):
+                if "playerstatus" not in sub and "status/" not in sub:
+                    continue
+                parts = sub.split("/")
+                sub_player = parts[-1] if len(parts) >= 2 else ""
+                # Match the changed player. The /null/... and
+                # 00:00:00:00:00:00 forms (SqueezeCtrl) are app-chosen and
+                # player-agnostic — deliver to them for ANY player change.
+                if sub_player and sub_player not in (
+                        player_id, "null", "00:00:00:00:00:00", ""):
+                    continue
+                try:
+                    result = await self._dispatch([player_id, ["playerstatus", "-", "1"]])
+                    self.push(client.client_id, {
+                        "channel": sub,
+                        "data": result,
+                        "id": 0,
+                    })
+                except Exception:  # noqa: BLE001
+                    pass
+
+    async def notify_favorites_changed(self) -> None:
+        """Push a 'favorites changed' event to all favorites subscribers.
+
+        SqueezeCtrl subscribes to /<cid>/slim/favorites/* with
+        ['favorites', ['changed']] and reloads the list on the event.
+        """
+        for client in list(self._clients.values()):
+            for sub in list(client.subscriptions.keys()):
+                if "favorites" not in sub:
+                    continue
+                self.push(client.client_id, {
+                    "channel": sub,
+                    "data": ["favorites", ["changed"]],
+                    "id": 0,
+                })
+
     # ------------------------------------------------------------------
     # Message handling
     # ------------------------------------------------------------------
@@ -191,6 +236,16 @@ class CometdManager:
                         # Squeezer subscribes to /<cid>/slim/menustatus/*
                         # without a request — deliver the home menu array
                         request = ["", ["menustatus"]]
+                    elif not request and "favorites" in subscription:
+                        # SqueezeCtrl subscribes to /<cid>/slim/favorites/* —
+                        # deliver the favorites list (DB ids; the apps parse
+                        # them as numbers).
+                        request = ["", ["favorites", "items"]]
+                    elif not request and "playerstatus" in subscription:
+                        # SqueezeCtrl subscribes to /<cid>/slim/playerstatus/<player>
+                        parts = subscription.split("/")
+                        sub_player = parts[-1] if len(parts) >= 2 else ""
+                        request = [sub_player, ["playerstatus", "-", "1"]]
                     result = await self._dispatch(request)
                     self.push(cid, {
                         "channel": subscription,
