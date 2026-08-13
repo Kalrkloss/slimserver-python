@@ -336,7 +336,7 @@ Verifikation Phase 2: Suite `all checks passed` (9000+9080), Ad-hoc-Skript
 count:5725, genre-Filter 6981 Treffer, info total songs 56503, songinfo
 vollständig, Subscribe-Push mit Player-Daten, `name Küche` Query/Set).
 
-Phase-3-Status (Commit `?`):
+Phase-3-Status (Commit `23c4902`):
 
 | Plan-ID | Gap | Status |
 |---------|-----|--------|
