@@ -278,7 +278,11 @@ def test_squeezer(host: str, port: int) -> None:
     check("mixer volume ? -> _volume", "_volume" in r and isinstance(r["_volume"], int),
           str(r))
 
-    # Transport: stop -> mode stop, play -> mode play (state check)
+    # Transport: stop -> mode stop, play -> mode play (state check).
+    # Load a real track first — after a server restart the player
+    # playlist is empty and play cannot start (mode stays stop).
+    _rpc(host, port, pid, ["playlist", "play", "1"])
+    time.sleep(1.5)
     _rpc(host, port, pid, ["stop"])
     time.sleep(0.5)
     r = _rpc(host, port, pid, ["mode", "?"])
