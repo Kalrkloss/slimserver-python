@@ -583,12 +583,36 @@ class JSONRPCAPI:
                 http_port = int(get_config().get("serverport", 9000))
             except Exception:
                 http_port = 9000
+            # Local IP + stable UUID like the real LMS (prefs 'server_uuid').
+            local_ip = "127.0.0.1"
+            try:
+                import socket as _s
+                _probe = _s.socket(_s.AF_INET, _s.SOCK_DGRAM)
+                _probe.settimeout(0.5)
+                try:
+                    _probe.connect(("192.168.1.1", 1))
+                    local_ip = _probe.getsockname()[0]
+                finally:
+                    _probe.close()
+            except Exception:
+                pass
+            try:
+                prefs = get_config()
+                server_uuid = str(prefs.get("server_uuid", "") or "")
+                if not server_uuid:
+                    import uuid as _uuid
+                    server_uuid = str(_uuid.uuid4())
+                    await prefs._prefs.set("server_uuid", server_uuid)
+                server_name = str(prefs.get("server_name", "") or "Lyrion")
+            except Exception:
+                server_uuid = "lyrion-server-0001"
+                server_name = "Lyrion"
             result = {
                 "version": __version__,
-                "uuid": "lyrion-server-0001",
-                "name": "Lyrion Music Server",
+                "uuid": server_uuid,
+                "name": server_name,
                 "httpport": http_port,
-                "ip": "192.168.1.90",
+                "ip": local_ip,
                 "player count": len(players),
                 "other player count": 0,
                 "lastscan": 0,
@@ -701,6 +725,10 @@ class JSONRPCAPI:
                 val: Any = ""
                 if cmd == "mode":
                     val = player.mode
+                elif cmd == "time":
+                    val = int(getattr(player, "elapsed", 0) or 0)
+                elif cmd == "duration":
+                    val = float(getattr(player, "duration", 0) or 0)
                 elif cmd == "name":
                     val = player.name or ""
                 elif cmd == "power":
@@ -866,7 +894,14 @@ class JSONRPCAPI:
         async def _do():
             from lyrion.config import get_config
             from lyrion.media.importer import MusicImporter, ImportConfig
-            musicdir = get_config().get("musicdir", "/mnt/media/Musik") or "/mnt/media/Musik"
+            musicdir = get_config().get("musicdir", "") or ""
+            if not str(musicdir).strip():
+                from pathlib import Path as _P
+                fallback = _P.home() / "Music"
+                logger.warning(
+                    "Preference 'musicdir' is empty — falling back to %s "
+                    "(set it via serverpref)", fallback)
+                musicdir = str(fallback)
             importer = MusicImporter(ImportConfig(source_path=_Path(musicdir)))
             stats = await importer.import_music()
             return stats

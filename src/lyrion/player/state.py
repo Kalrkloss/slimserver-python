@@ -38,6 +38,7 @@ class PlayerState:
     # P6-1: fields used by the status handlers were set via setattr —
     # declare them so tooling/linters see them and typos fail early.
     elapsed: float = 0.0          # seconds into the current track (STAT)
+    duration: float = 0.0         # duration of the current track in seconds
     current_title: str = ""       # station name / override title
     current_url: Optional[str] = None  # currently streaming URL
     shuffle: int = 0              # playlist shuffle mode (0/1/2)

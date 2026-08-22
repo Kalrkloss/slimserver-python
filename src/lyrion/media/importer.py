@@ -96,9 +96,12 @@ class MusicImporter:
         self.stats = ImportStats()
         self.stats.start_time = datetime.now()
 
+        from lyrion.media.scan_state import SCAN_STATE
+
         if not self.config.source_path.is_dir():
             logger.error("Music directory does not exist: %s", self.config.source_path)
             self.stats.end_time = datetime.now()
+            SCAN_STATE.finish()
             return self.stats
 
         from lyrion.database.sqlite_helper import db_session
@@ -108,6 +111,7 @@ class MusicImporter:
         self.stats.total_files = len(files)
         self.stats.scanned_files = 0
         logger.info("Found %d audio files", len(files))
+        SCAN_STATE.start(total=len(files))
 
         # Import in batches. Extract metadata BEFORE opening the DB session:
         # the write transaction must only be open during the (fast) inserts,
@@ -141,6 +145,8 @@ class MusicImporter:
                 r = await task
                 if r:
                     extracted.append(r)
+                SCAN_STATE.update(done=self.stats.scanned_files,
+                                  total=self.stats.total_files)
 
             # Phase 2: short-lived session, inserts only. Batch lookups
             # (existing tracks/albums/contributors + join membership) run
@@ -155,6 +161,7 @@ class MusicImporter:
 
         self.stats.end_time = datetime.now()
         self._emit_progress()
+        SCAN_STATE.finish()
         logger.info(
             "Import complete: %d imported, %d errors, %d total "
             "(took %.1fs)",

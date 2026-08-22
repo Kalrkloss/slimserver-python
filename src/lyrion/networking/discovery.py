@@ -474,6 +474,33 @@ class DiscoveryService:
         finally:
             sock.close()
 
+    async def _local_server_addr(self) -> tuple[str, int]:
+        """Best-effort (ip, http_port) of THIS server for discovery replies.
+
+        The IP is the local address reachable from the requester's subnet
+        probe; the port comes from the running config ('serverport').
+        """
+        import socket as _socket
+        local_ip = "0.0.0.0"
+        for probe_host in ("192.168.1.1", "8.8.8.8"):
+            try:
+                probe = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
+                probe.settimeout(1)
+                probe.connect((probe_host, 1))
+                ip = probe.getsockname()[0]
+                probe.close()
+                if ip and ip != "0.0.0.0":
+                    local_ip = ip
+                    break
+            except Exception:
+                continue
+        try:
+            from lyrion.config import get_config
+            http_port = int(get_config().get("serverport", 9000) or 9000)
+        except Exception:
+            http_port = 9000
+        return local_ip, http_port
+
     async def _handle_ssdp(
         self,
         data: bytes,
@@ -496,13 +523,13 @@ class DiscoveryService:
         st = headers.get("ST", "")
         if "squeezebox" in st.lower() and "ssdp:discover" in man.lower():
             try:
-                server_ip = "192.168.1.90"
+                server_ip, http_port = await self._local_server_addr()
                 sock = self._ssdp_socket
                 if sock:
                     response = (
                         "HTTP/1.1 200 OK\r\n"
                         "CACHE-CONTROL: max-age=1800\r\n"
-                        f"LOCATION: http://{server_ip}:9000/\r\n"
+                        f"LOCATION: http://{server_ip}:{http_port}/\r\n"
                         "SERVER: Lyrion/9.2.0 UPnP/1.0\r\n"
                         "ST: urn:schemas-squeezebox:device:Server:1\r\n"
                         "USN: uuid:lyrion-server-0001::urn:schemas-squeezebox:device:Server:1\r\n"

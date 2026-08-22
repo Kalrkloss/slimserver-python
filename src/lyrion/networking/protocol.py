@@ -1846,6 +1846,10 @@ class SlimProtoClient:
                         # running; otherwise remember it as "pending" and
                         # let the following STMs confirm the start.
                         player._last_stmd = time.time()
+                        # Track the decode format for diagnostics: a FLAC
+                        # that decodes but stays silent shows STMs/STMd
+                        # exactly like a healthy WAV — compare codecs.
+                        player._last_stmd_codec = getattr(player, "_current_codec", "")
                     elif event == "STMt":
                         # PERIODIC TICK (~1/s) — squeezelite sends STMt
                         # every second while playing, right after STMs, and

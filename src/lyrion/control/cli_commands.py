@@ -499,8 +499,23 @@ async def cmd_rescanprogress(
     ctx: CLIContext,
     args: list[str],
 ) -> list[str]:
-    """rescanprogress — report rescan progress (0..100, no live state)."""
-    return ["rescanprogress progress:0 scanning:0", ""]
+    """rescanprogress — report rescan progress (LMS tagged format).
+
+    Real scan state from the shared ScanState singleton; while idle:
+    'rescanprogress progress:0 scanning:0'.
+    """
+    try:
+        from lyrion.media.scan_state import SCAN_STATE
+        st = SCAN_STATE.snapshot()
+        return [
+            "rescanprogress progress:%d scanning:%d" % (
+                int(st.get("progress", 0)),
+                1 if st.get("scanning") else 0,
+            ),
+            "",
+        ]
+    except Exception:  # noqa: BLE001
+        return ["rescanprogress progress:0 scanning:0", ""]
 
 
 @register_command("abortscan")
@@ -835,7 +850,20 @@ async def cmd_status(
                 except ValueError:
                     subscribe_interval = 0
         elapsed = int(getattr(player, "elapsed", 0) or 0)
+        # Duration: prefer the live player state (filled on track load),
+        # fall back to the DB row of the current track.
         duration = int(getattr(player, "duration", 0) or 0)
+        if not duration and player.current_track_id is not None:
+            rows_d = await _query_db(
+                "SELECT duration FROM tracks WHERE id = ?",
+                (player.current_track_id,),
+            )
+            if rows_d:
+                duration = int(rows_d[0]["duration"] or 0)
+                try:
+                    player.duration = float(duration)
+                except Exception:
+                    pass
         out = [
             "status",
             f"player_name: {player.name}",
@@ -941,6 +969,57 @@ async def cmd_mode(
         player = PlayerManager().get_player(ctx.player_id)
         mode = player.mode if player else "stop"
         return [f"mode: {mode}", ""]
+    except Exception as e:  # noqa: BLE001
+        return [f"cli error: {e}", ""]
+
+
+@register_command("time")
+async def cmd_time(
+    handler: CLIHandler,
+    ctx: CLIContext,
+    args: list[str],
+) -> list[str]:
+    """
+    time [<seconds>|<mm:ss>|?<delta>]
+    Query or set the playback position. 'time ?' queries, a plain number
+    seeks to that second, '<n>-'/'<n>+' jumps relative (LMS format).
+    """
+    if not ctx.player_id:
+        return ["no player selected"]
+    try:
+        from lyrion.player import PlayerManager
+        pm = PlayerManager()
+        player = pm.get_player(ctx.player_id)
+        if player is None:
+            return ["player not found", ""]
+        if not args or str(args[0]) == "?":
+            return [f"time: {int(getattr(player, 'elapsed', 0) or 0)}", ""]
+        val = str(args[0])
+        if val.startswith("?"):  # '?-5' / '?+10' relative query
+            try:
+                delta = int(val[2:] if val[1] in "+-" else val[1:])
+                cur = int(getattr(player, "elapsed", 0) or 0)
+                return [f"time: {max(0, cur + delta)}", ""]
+            except ValueError:
+                return [f"time: {int(getattr(player, 'elapsed', 0) or 0)}", ""]
+        # mm:ss form
+        if ":" in val:
+            parts = val.split(":")
+            try:
+                seconds = float(parts[0]) * 60 + float(parts[-1]) \
+                    if len(parts) == 2 else float(parts[-1])
+            except ValueError:
+                seconds = 0.0
+        else:
+            seconds = float(val.rstrip("+-") or 0)
+            if val.endswith("-"):
+                seconds = max(0.0, (getattr(player, "elapsed", 0) or 0) - seconds)
+            elif val.endswith("+"):
+                seconds = (getattr(player, "elapsed", 0) or 0) + seconds
+        await pm.seek_to(ctx.player_id, int(seconds))
+        return ["time: %d" % int(max(0, seconds)), ""]
+    except ValueError:
+        return ["cli error: time must be a number", ""]
     except Exception as e:  # noqa: BLE001
         return [f"cli error: {e}", ""]
 
@@ -1092,6 +1171,78 @@ async def cmd_playlist(
             if ok:
                 return [f"playlist {sub}: {rest[0]}", ""]
             return [f"cli error: playlist '{rest[0]}' not found", ""]
+        if sub == "url":
+            # playlist url <url> [title] — replace queue with a stream URL
+            if not rest:
+                player2 = pm.get_player(ctx.player_id)
+                return ["playlist url: %s" % (getattr(player2, "current_url", "") or ""), ""]
+            title = " ".join(rest[1:]) if len(rest) > 1 else ""
+            ok = await pm.play_url(ctx.player_id, rest[0], title)
+            return [] if ok else ["cli error: could not play url", ""]
+        if sub in ("index", "jump"):
+            # playlist index <n> — jump to a playlist index (no restart of
+            # an identical index; LMS 'index' only plays when changed)
+            if not rest or not str(rest[0]).lstrip("-").isdigit():
+                return ["playlist %s <index> — missing index" % sub, ""]
+            idx = int(rest[0])
+            player3 = pm.get_player(ctx.player_id)
+            cur = getattr(player3, "playlist_position", 0) if player3 else 0
+            if sub == "index" and idx == cur and player3 is not None \
+                    and player3.mode == "play":
+                return []
+            ok = await pm.playlist_play(ctx.player_id, idx)
+            return [] if ok else ["cli error: could not jump", ""]
+        if sub == "shuffle":
+            # playlist shuffle <0|1|2|?> — off/song/album shuffle state
+            player4 = pm.get_player(ctx.player_id)
+            if player4 is None:
+                return ["player not found", ""]
+            if not rest or str(rest[0]) == "?":
+                return [f"playlist shuffle: {getattr(player4, 'shuffle', 0)}", ""]
+            try:
+                player4.shuffle = max(0, min(2, int(str(rest[0]))))
+                return ["playlist shuffle: %d" % player4.shuffle, ""]
+            except ValueError:
+                return ["cli error: shuffle must be a number", ""]
+        if sub == "repeat":
+            # playlist repeat <0|1|2|?> — off/repeat-one/repeat-all
+            player5 = pm.get_player(ctx.player_id)
+            if player5 is None:
+                return ["player not found", ""]
+            if not rest or str(rest[0]) == "?":
+                return [f"playlist repeat: {getattr(player5, 'repeat', 0)}", ""]
+            try:
+                player5.repeat = max(0, min(2, int(str(rest[0]))))
+                return ["playlist repeat: %d" % player5.repeat, ""]
+            except ValueError:
+                return ["cli error: repeat must be a number", ""]
+        if sub == "loop":
+            player6 = pm.get_player(ctx.player_id)
+            if player6 is None:
+                return ["player not found", ""]
+            rep = getattr(player6, "repeat", 0)
+            shu = getattr(player6, "shuffle", 0)
+            return [
+                f"loop: {['off','song','playlist'][min(2, rep)]}",
+                f"shuffle: {['none','track','album'][min(2, shu)]}",
+                "",
+            ]
+        if sub in ("genres", "genre"):
+            # LMS: playlist genres ? → comma-separated genre list
+            player7 = pm.get_player(ctx.player_id)
+            ids = [e for e in (player7.playlist if player7 else [])
+                   if isinstance(e, int)] if player7 else []
+            if not ids:
+                return ["genres: ", ""]
+            placeholders = ",".join("?" * len(ids))
+            g_rows = await _query_db(
+                "SELECT DISTINCT t.genre AS g FROM tracks t "
+                f"WHERE t.id IN ({placeholders}) AND t.genre != '' "
+                "ORDER BY t.genre",
+                tuple(ids),
+            )
+            names = ",".join(r["g"] for r in g_rows)
+            return [f"genres: {names}", ""]
         return [f"playlist: unknown subcommand '{sub}'", ""]
     except Exception as e:  # noqa: BLE001
         return [f"cli error: {e}", ""]
@@ -1461,9 +1612,17 @@ async def cmd_rescan(
 
         async def _do() -> None:
             try:
+                import logging as _logging
                 from pathlib import Path as _Path
                 from lyrion.config import get_config
-                musicdir = get_config().get("musicdir", "/mnt/media/Musik") or "/mnt/media/Musik"
+                from lyrion.media.importer import ImportConfig, MusicImporter
+                musicdir = get_config().get("musicdir", "") or ""
+                if not str(musicdir).strip():
+                    fallback = _Path.home() / "Music"
+                    _logging.getLogger("lyrion").warning(
+                        "Preference 'musicdir' is empty — falling back to %s "
+                        "(set it via serverpref)", fallback)
+                    musicdir = str(fallback)
                 imp = MusicImporter(ImportConfig(source_path=_Path(musicdir)))
                 await imp.import_music()
             except Exception as exc:  # noqa: BLE001
@@ -1474,7 +1633,6 @@ async def cmd_rescan(
         return [f"rescan: {mode} started"]
     except Exception as e:  # noqa: BLE001
         return [f"cli error: {e}", ""]
-
 
 @register_command("wipecache")
 async def cmd_wipecache(
@@ -2511,6 +2669,7 @@ __all__ = [
     "cmd_mixer",
     "cmd_status",
     "cmd_mode",
+    "cmd_time",
     "cmd_current_title",
     "cmd_playlist",
     "cmd_playlist_play",
