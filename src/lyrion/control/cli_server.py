@@ -34,8 +34,9 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
     write_responses() terminates each reply with a blank line.
     """
     from lyrion.control.cli import CLIHandler
+    from lyrion.control.request import RequestDispatcher
 
-    handler = CLIHandler()
+    handler = CLIHandler(RequestDispatcher())
     try:
         async with handler.connect(reader, writer) as ctx:
             async for cmd, args in handler.read_commands(reader):

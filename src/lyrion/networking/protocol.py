@@ -100,6 +100,7 @@ from collections.abc import Coroutine
 from dataclasses import dataclass, field
 from enum import IntEnum, IntFlag
 from typing import Any, Callable
+import time
 
 # Install uvloop as the default event loop policy at import time.
 try:
@@ -861,19 +862,21 @@ class SlimProtoClient:
                                     except Exception as exc:
                                         logger.warning("SETD rename failed for %s: %s", mac_str, exc)
                     elif op in ("bye", "dsco", "quit"):
-                        logger.info("Player %s sent '%s' — closing connection", mac_str, op)
                         if op == "dsco":
                             # DSCO = end-of-stream notification: Squeezelite
                             # sends it whenever the current stream disconnects
                             # (e.g. after EOF — for fast local files that is
                             # right after the strm, because the whole file is
-                            # buffered instantly) and then IMMEDIATELY opens a
-                            # new connection with a fresh HELO. The real LMS
-                            # treats DSCO as end-of-stream and KEEPS the
-                            # player (playlist, volume, mode survive the
-                            # reconnect). Unregistering here would destroy the
-                            # playlist before the track even finished playing.
+                            # buffered instantly). The real LMS treats DSCO
+                            # as end-of-stream and KEEPS BOTH the player AND
+                            # the control connection open — the player keeps
+                            # sending STAT frames on this same socket while
+                            # the buffered audio plays out. Closing here
+                            # forces a reconnect mid-playback (squeezelite:
+                            # "error reading from socket: closed").
                             keep_registered = True
+                            continue
+                        logger.info("Player %s sent '%s' — closing connection", mac_str, op)
                         break
                     elif op == "helo":
                         # Player re-sent HELO (reconnect after control drop) — reply again
@@ -1112,6 +1115,7 @@ class SlimProtoClient:
         server_ip: int = 0,
         flags: int = 0,
         threshold: int = 50,
+        pcm_params: tuple[str, str, str, str] | None = None,
     ) -> bytes:
         """Build the 24-byte LMS ``strm`` packet plus its HTTP request.
 
@@ -1128,15 +1132,25 @@ class SlimProtoClient:
         """
         if autostart not in (0, 1, 2, 3):
             raise ValueError(f"invalid strm autostart: {autostart}")
+        # PCM parameter bytes: '?' means "unknown, container carries the
+        # format" — correct for framed codecs (mp3/flac/ogg). For codec
+        # 'p' (raw PCM) squeezelite reads these values DIRECTLY
+        # (pcm_open: sample_size=size-'0'+1 etc.), so the server must
+        # parse the WAV/AIFF header and send explicit codes — exactly
+        # what the Perl LMS does.
+        if pcm_params is not None:
+            p_size, p_rate, p_chan, p_endian = pcm_params
+        else:
+            p_size = p_rate = p_chan = p_endian = "?"
         payload = b"".join([
             b"strm",
             b"s",
             str(autostart).encode("ascii"),  # LMS/squeezelite: '0'..'3'
             codec.encode("ascii"),
-            b"?",                    # pcm_sample_size: unknown for MP3
-            b"?",                    # pcm_sample_rate: unknown for MP3
-            b"?",                    # pcm_channels: unknown for MP3
-            b"?",                    # pcm_endianness: unknown for MP3
+            p_size.encode("ascii"),   # pcm_sample_size ('0'..'3' or '?')
+            p_rate.encode("ascii"),   # pcm_sample_rate (index or '?')
+            p_chan.encode("ascii"),   # pcm_channels ('1'/'2' or '?')
+            p_endian.encode("ascii"), # pcm_endianness ('0' big/'1' little)
             bytes([max(0, min(255, threshold))]),
             bytes([0]),               # SPDIF auto
             bytes([0]),               # transition period
@@ -1209,6 +1223,7 @@ class SlimProtoClient:
 
         # Load track metadata for codec
         mime = None
+        track_path = None
         try:
             from sqlalchemy import select
             from lyrion.database.schema import Track
@@ -1219,10 +1234,34 @@ class SlimProtoClient:
                 )).scalar_one_or_none()
                 if track is not None:
                     mime = track.content_type
+                    if track.url:
+                        from lyrion.web.stream import _track_path_from_url
+                        track_path = _track_path_from_url(track.url)
         except Exception as exc:  # noqa: BLE001
             logger.warning("Could not load track %d for codec: %s", track_id, exc)
 
         codec = self._codec_char(mime)
+
+        # For raw-PCM codecs the strm frame must carry the explicit format
+        # (squeezelite pcm_open reads it straight from the frame); parse the
+        # WAV/AIFF header server-side like the Perl LMS.
+        pcm_params = None
+        if codec == "p" and track_path is not None and track_path.is_file():
+            from lyrion.web.stream import parse_pcm_header, pcm_params_for_strm
+            info = parse_pcm_header(track_path)
+            if info is not None:
+                pcm_params = pcm_params_for_strm(info)
+                logger.info(
+                    "strm PCM params for track %d (%s): bits=%d rate=%d "
+                    "chan=%d bigendian=%s",
+                    track_id, track_path.name, info["bits"], info["rate"],
+                    info["channels"], info["bigendian"],
+                )
+            else:
+                logger.warning(
+                    "track %d is PCM but header unparsable; sending '?'",
+                    track_id,
+                )
 
         # HTTP request string Squeezelite will send to our web server.
         # LMS format (Slim/Player/Squeezebox.pm stream_s): the request is
@@ -1239,6 +1278,7 @@ class SlimProtoClient:
         frame = self._build_stream_frame(
             request=request, codec=codec, autostart=1,
             server_port=self.web_port,
+            pcm_params=pcm_params,
         )
         # Flush old stream buffers first (Perl LMS behaviour) so the
         # switch is immediate instead of playing out the old buffer.
@@ -1749,8 +1789,12 @@ class SlimProtoClient:
             # jiffies is at 25:29 and elapsed_seconds at 37:41.
             jiffies = int.from_bytes(payload[25:29], "big") if len(payload) >= 29 else 0
             elapsed = int.from_bytes(payload[37:41], "big") if len(payload) >= 41 else 0
-            logger.debug("STAT from %s: event=%s jiffies=%d elapsed=%ds hex=%s",
-                         mac_str, event, jiffies, elapsed, payload[:60].hex())
+            # output buffer fullness (33:37) — counts DOWN as the audio
+            # drains. End-of-track = STMt while the output buffer has
+            # fully drained after the decoder ran dry (STMd).
+            out_fullness = int.from_bytes(payload[33:37], "big") if len(payload) >= 37 else 0
+            logger.debug("STAT from %s: event=%s jiffies=%d elapsed=%ds out_fullness=%d hex=%s",
+                         mac_str, event, jiffies, elapsed, out_fullness, payload[:60].hex())
 
             # event "setd" carries the player-assigned name (squeezelite/IPAD style)
             if event == "setd":
@@ -1788,23 +1832,37 @@ class SlimProtoClient:
                     if elapsed and elapsed < 3600 * 24:  # sanity: < 24h
                         player.elapsed = elapsed
                     if event == "STMd":
-                        # DECODE_COMPLETE — decoder has no more data. This
-                        # fires BOTH at natural track end AND when the user
-                        # stopped the player (strm 'q' also runs the decoder
-                        # to completion) AND when pausing a live stream
-                        # (pause = stop for streams). Only auto-advance on
-                        # natural end: if the server already set mode=stop
-                        # or mode=pause, the STMd is the player
-                        # acknowledging the stop.
-                        if player.mode not in ("stop", "pause"):
+                        # DECODE_COMPLETE — decoder has no more data. With
+                        # small local files this fires LONG before the
+                        # track has finished PLAYING: squeezelite decodes
+                        # the whole file into its output buffer within
+                        # milliseconds. The real LMS treats STMd as
+                        # "start preloading the next track", NOT as
+                        # track end. Track end = underrun (STMu/STMo with
+                        # empty output buffer) or an STMt after drain.
+                        # NOTE: squeezelite emits STMd just BEFORE STMs at
+                        # track start (decode of the first buffer chunk),
+                        # so record it only when a track is already
+                        # running; otherwise remember it as "pending" and
+                        # let the following STMs confirm the start.
+                        player._last_stmd = time.time()
+                    elif event == "STMt":
+                        # PERIODIC TICK (~1/s) — squeezelite sends STMt
+                        # every second while playing, right after STMs, and
+                        # at real end of track. Distinguish via the output
+                        # buffer: a tick during playback still has data
+                        # buffered (fullness > 0). Real end-of-track: the
+                        # decoder ran dry earlier (STMd seen since the
+                        # last track start, allowing the start-burst STMd)
+                        # AND the output buffer fully drained.
+                        stmd_at = getattr(player, "_last_stmd", None)
+                        if player.mode == "play" and out_fullness == 0 and stmd_at:
+                            player._last_stmd = None  # consume the signal
                             asyncio.create_task(_advance_after_track(pm, mac_str))
-                        # Keep "pause" if the player was paused (pause of a
-                        # live stream = stop, STMd acknowledges it).
-                        if player.mode != "pause":
-                            player.mode = "stop"
                     elif event == "STMs":
                         # TRACK_STARTED — a new track started playing
                         player.mode = "play"
+                        player._track_started_at = time.time()
                     elif event == "STMf":
                         # FLUSH/STOP ack — the player stopped; mark stop
                         # only if the server didn't already (natural end
@@ -1822,9 +1880,17 @@ class SlimProtoClient:
                         # stream; log and fall back to stop.
                         logger.warning("STAT STMn (decode error) from %s", mac_str)
                         player.mode = "stop"
-                    elif event == "STMo":
-                        # UNDERRUN — buffer underrun, harmless, log only
-                        logger.debug("STAT STMo (underrun) from %s", mac_str)
+                    elif event in ("STMo", "STMu"):
+                        # OUTPUT_UNDERRUN (STMo legacy / STMu current) —
+                        # harmless mid-stream, BUT when the decoder has
+                        # run dry at some point (STMd seen) an underrun
+                        # with an EMPTY output buffer means the buffered
+                        # audio played out completely: natural track end.
+                        logger.debug("STAT %s (underrun) from %s", event, mac_str)
+                        stmd_at = getattr(player, "_last_stmd", None)
+                        if player.mode == "play" and out_fullness == 0 and stmd_at:
+                            player._last_stmd = None  # consume the signal
+                            asyncio.create_task(_advance_after_track(pm, mac_str))
                     elif event == "pause":
                         player.mode = "pause"
                     elif event == "stop":

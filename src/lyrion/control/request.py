@@ -577,9 +577,25 @@ class RequestDispatcher:
         key: str,
         value: Optional[str] = None,
     ) -> list[str]:
-        """Get or set a server preference."""
-        # TODO: integrate with prefs system
-        return [f"pref {key}: {value or ''}"]
+        """Get or set a server preference (LMS 'pref' command)."""
+        from lyrion.config import get_prefs, get_config
+
+        # LMS also supports namespaced forms: pref.<namespace>.<key> and
+        # the special 'pref <key> ?' query form.
+        prefs = get_prefs()
+        cfg = get_config()
+        if value is None:
+            current = cfg.get(key, "")
+            return [f"pref {key}: {current}"]
+        # Set
+        try:
+            await prefs.set(key, value)
+            logger.info("Preference %s set to %r", key, value)
+            return [f"pref {key}: {value}"]
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("pref set failed for %s: %s", key, exc)
+            return [f"pref {key}: error"]
+
 
     # -----------------------------------------------------------------------
     # Subscription system

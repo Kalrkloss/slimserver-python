@@ -306,7 +306,7 @@ def test_discovery(host: str, port: int) -> None:
 
     # classic: deviceid(1) + revision(1) + mac(6) → 'D' + hostname
     s.sendto(struct.pack(">BB", 2, 16) + bytes.fromhex("000420123456"),
-             (host, 3483))
+             (host, port))
     try:
         d, _ = s.recvfrom(4096)
         check("klassisch 'd' -> 'D'-Antwort",
@@ -320,7 +320,7 @@ def test_discovery(host: str, port: int) -> None:
 
     e_pkt = (b"e" + tlv(b"NAME", b"jive") + tlv(b"IPAD", b"")
              + tlv(b"JSON", b"") + tlv(b"VERS", b"") + tlv(b"UUID", b""))
-    s.sendto(e_pkt, (host, 3483))
+    s.sendto(e_pkt, (host, port))
     try:
         d, _ = s.recvfrom(4096)
         check("Jive 'e'-TLV -> 'E' mit IPAD/JSON/VERS",
@@ -335,12 +335,14 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=9000)
+    ap.add_argument("--discovery-port", type=int, default=3483,
+                    help="UDP discovery/slimproto port (default 3483)")
     args = ap.parse_args()
 
     test_squeezeclient(args.host, args.port)
     test_jive(args.host, args.port)
     test_squeezer(args.host, args.port)
-    test_discovery(args.host, args.port)
+    test_discovery(args.host, args.discovery_port)
 
     print()
     if failures:

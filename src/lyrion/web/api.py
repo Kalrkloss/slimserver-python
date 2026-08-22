@@ -29,6 +29,16 @@ except ImportError:
         return json.dumps(obj).encode("utf-8")
 
 
+def _library_db_path() -> str:
+    """Resolve the library DB path from the active config (test/dev runs use
+    LYRION_SERVERDATA; the production default stays /root/.lyrion)."""
+    try:
+        from lyrion.config import get_config
+        return str(get_config().db_path)
+    except Exception:  # noqa: BLE001
+        return "/root/.lyrion/Lyrion/Prefs/lyrion.db"
+
+
 _LIBRARY_DB = "/root/.lyrion/Lyrion/Prefs/lyrion.db"
 
 
@@ -36,7 +46,7 @@ def _db_query(sql: str, params: tuple = ()) -> list[dict]:
     """Run a read-only query against the library DB (synchronous)."""
     import sqlite3
 
-    con = sqlite3.connect(f"file:{_LIBRARY_DB}?mode=ro", uri=True, timeout=30)
+    con = sqlite3.connect(f"file:{_library_db_path()}?mode=ro", uri=True, timeout=30)
     try:
         con.row_factory = sqlite3.Row
         return [dict(r) for r in con.execute(sql, params).fetchall()]
@@ -1114,7 +1124,7 @@ class JSONRPCAPI:
             # Read-only connection: status polls from many clients must
             # never block on (or lock) the writer (aiosqlite session).
             db = sqlite3.connect(
-                "file:/root/.lyrion/Lyrion/Prefs/lyrion.db?mode=ro", uri=True)
+                f"file:{_library_db_path()}?mode=ro", uri=True)
             db.row_factory = sqlite3.Row
             placeholders = ",".join("?" * len(track_ids))
             # Track fields (songinfo tags: d,y,t,u,r,T,I,x,g,c,j,J,K,i,o,f,k,w)
@@ -1465,7 +1475,7 @@ class JSONRPCAPI:
         try:
             import sqlite3
             db = sqlite3.connect(
-                "file:/root/.lyrion/Lyrion/Prefs/lyrion.db?mode=ro", uri=True)
+                f"file:{_library_db_path()}?mode=ro", uri=True)
             db.row_factory = sqlite3.Row
 
             # genre_id: the genres table is empty — resolve the id as the
@@ -1721,6 +1731,13 @@ class WebAPIHandler:
             return await self._handle_rest(method, path, body)
 
         if path == "/" or path.startswith("/html/") or path.startswith("/material"):
+            return self._serve_static(path)
+
+        # Skin assets (Classic/EN/Logic/…): the original LMS serves every
+        # file under html/<skin>/ for GET requests. Try the static dir as a
+        # last resort before answering 404 — unknown API paths still 404
+        # because _serve_static only returns 200 for existing files.
+        if method == "GET":
             return self._serve_static(path)
 
         # Fallback: 404

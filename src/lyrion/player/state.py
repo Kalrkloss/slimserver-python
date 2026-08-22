@@ -68,6 +68,10 @@ class PlayerState:
     # (like the Perl LMS: canDirectStream honours CanHTTPS).
     can_https: bool = False
 
+    # SlimProto STAT bookkeeping (set by the protocol handler):
+    _last_stmd: Optional[float] = None        # last DECODE_COMPLETE time
+    _track_started_at: Optional[float] = None  # last STMs time
+
     def update_activity(self) -> None:
         """Mark the last activity timestamp to now."""
         self.last_activity = time.time()

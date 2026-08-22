@@ -134,6 +134,15 @@ class PreferenceStore:
         self._cli_overrides: dict[str, Any] = {}
         self._loaded = False
 
+    def set_db_path(self, path: Path) -> None:
+        """Point the store at another SQLite file BEFORE init(). Used by
+        LyrionConfig so preferences live under the serverdata directory
+        (like the Perl LMS server prefs dir) instead of a fixed home
+        path."""
+        if self._loaded:
+            raise RuntimeError("PreferenceStore already initialized")
+        self._db_path = Path(path)
+
     @classmethod
     def instance(cls) -> PreferenceStore:
         """Return the singleton PreferenceStore instance."""
@@ -530,6 +539,12 @@ class LyrionConfig:
             metavar="PORT",
             help="CLI port for telnet/text protocol (default: 9090)",
         )
+        parser.add_argument(
+            "--slimprotoport",
+            type=int,
+            metavar="PORT",
+            help="SlimProto TCP port for players (default: 3483)",
+        )
         self._cli_args = parser.parse_args(args)
 
         # Apply CLI overrides to preference store
@@ -555,6 +570,10 @@ class LyrionConfig:
 
     async def init(self) -> None:
         """Initialize the configuration system."""
+        # Preferences live under the serverdata dir (Perl-LMS layout:
+        # <serverdata>/Prefs/prefs.db). Wire the singleton store there
+        # before it opens its DB.
+        self._prefs.set_db_path(self.prefs_dir / "prefs.db")
         self.load_conf()
         await self._prefs.init()
         # Register known preferences

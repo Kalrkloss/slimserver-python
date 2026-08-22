@@ -38,6 +38,112 @@ _EXT_MIME = {
 _RANGE_RE = re.compile(r"bytes=(\d*)-(\d*)")
 
 
+def parse_pcm_header(path: Path) -> dict | None:
+    """Parse WAV/AIFF headers server-side, like the Perl LMS does
+    (Slim/Player/Source.pm -> Squeezebox2 stream('s') fills the strm PCM
+    fields from the parsed header and serves *headerless* raw PCM).
+
+    Returns None for non-PCM files or unparsable headers; otherwise:
+      {"bits": 16, "rate": 44100, "channels": 2, "bigendian": False,
+       "data_offset": 44}
+    data_offset is the byte offset of the first sample frame — the
+    /stream endpoint skips everything before it.
+    """
+    try:
+        with open(path, "rb") as f:
+            head = f.read(128)
+        if len(head) < 44:
+            return None
+        if head[:4] == b"RIFF" and head[8:12] == b"WAVE":
+            # walk chunks to 'fmt ' and 'data'
+            pos = 12
+            fmt = None
+            data_offset = None
+            while pos + 8 <= len(head):
+                cid = head[pos:pos + 4]
+                clen = int.from_bytes(head[pos + 4:pos + 8], "little")
+                if cid == b"fmt " and pos + 8 + 16 <= len(head):
+                    body = head[pos + 8:pos + 8 + 16]
+                    audio_fmt = int.from_bytes(body[0:2], "little")
+                    channels = int.from_bytes(body[2:4], "little")
+                    rate = int.from_bytes(body[4:8], "little")
+                    bits = int.from_bytes(body[14:16], "little")
+                    fmt = (audio_fmt, channels, rate, bits)
+                elif cid == b"data":
+                    data_offset = pos + 8
+                    break
+                pos += 8 + clen + (clen & 1)  # chunks are word-aligned
+            if fmt is None or data_offset is None:
+                return None
+            audio_fmt, channels, rate, bits = fmt
+            if audio_fmt not in (1, 3) or not (1 <= channels <= 2) \
+                    or bits not in (8, 16, 24, 32) or rate == 0:
+                return None
+            return {"bits": bits, "rate": rate, "channels": channels,
+                    "bigendian": False, "data_offset": data_offset}
+        if head[:4] == b"FORM" and head[8:12] in (b"AIFF", b"AIFC"):
+            pos = 12
+            comm = None
+            ssnd = None
+            while pos + 8 <= len(head):
+                cid = head[pos:pos + 4]
+                clen = int.from_bytes(head[pos + 4:pos + 8], "big")
+                if cid == b"COMM" and pos + 8 + 18 <= len(head):
+                    body = head[pos + 8:pos + 8 + 18]
+                    channels = int.from_bytes(body[0:2], "big")
+                    bits = int.from_bytes(body[6:8], "big")
+                    # 80-bit IEEE extended sample rate: only the common
+                    # integer rates are produced by real encoders.
+                    exponent = ((body[8] & 0x7F) << 8 | body[9]) - 16383 - 31
+                    mantissa = int.from_bytes(body[10:14], "big")
+                    rate = mantissa
+                    while exponent < 0:
+                        rate >>= 1
+                        exponent += 1
+                    while exponent > 0:
+                        rate <<= 1
+                        exponent -= 1
+                    comm = (channels, bits, rate)
+                elif cid == b"SSND":
+                    offset = int.from_bytes(head[pos + 8:pos + 12], "big")
+                    ssnd = pos + 16 + offset
+                    break
+                pos += 8 + clen + (clen & 1)
+            if comm is None or ssnd is None:
+                return None
+            channels, bits, rate = comm
+            if not (1 <= channels <= 2) or bits not in (8, 16, 24, 32) \
+                    or rate == 0:
+                return None
+            return {"bits": bits, "rate": rate, "channels": channels,
+                    "bigendian": True, "data_offset": ssnd}
+    except OSError:
+        return None
+    return None
+
+
+# squeezelite pcm.c tables (strm bytes are ASCII digits):
+#   sample_size = size-'0'+1  → '0'=8bit '1'=16bit '2'=24bit '3'=32bit
+#   sample_rate = sample_rates[rate-'0']
+_SL_SAMPLE_SIZE = {8: "0", 16: "1", 24: "2", 32: "3"}
+_SL_SAMPLE_RATE = {
+    11025: "0", 22050: "1", 32000: "2", 44100: "3", 48000: "4",
+    8000: "5", 12000: "6", 16000: "7", 24000: "8", 96000: "9",
+    88200: ":", 176400: ";", 192000: "<", 352800: "=", 384000: ">",
+}
+
+
+def pcm_params_for_strm(info: dict) -> tuple[str, str, str, str]:
+    """(sample_size, sample_rate, channels, endianness) ASCII codes for
+    the strm frame from a parse_pcm_header() result."""
+    size = _SL_SAMPLE_SIZE.get(info["bits"], "?")
+    rate = _SL_SAMPLE_RATE.get(info["rate"], "?")
+    chan = str(info["channels"])
+    endian = "0" if info["bigendian"] else "1"
+    return size, rate, chan, endian
+
+
+
 def _track_path_from_url(url: str) -> Path | None:
     """Convert an LMS file:// URL (or plain path) to a local Path."""
     if url.startswith("file://"):
@@ -137,13 +243,22 @@ async def stream_track(scope: dict, receive, send) -> None:
     if not mime:
         mime = _EXT_MIME.get(path.suffix.lower(), "audio/mpeg")
 
+    # PCM (wav/aiff) is served as HEADERLESS raw samples: the strm frame
+    # carries the parsed format and squeezelite's pcm decoder expects the
+    # byte stream to start at the first sample frame (Perl LMS behaviour).
+    pcm_info = None
+    if mime in ("audio/wav", "audio/x-wav", "audio/wave", "audio/aiff",
+                "audio/x-aiff", "audio/aif"):
+        pcm_info = parse_pcm_header(path)
+
     # Headers from the ASGI scope (uvicorn lowercases them)
     headers = {k.decode("latin1").lower(): v.decode("latin1")
                for k, v in scope.get("headers", [])}
     range_header = headers.get("range", "")
 
     file_size = path.stat().st_size
-    start = 0
+    data_start = pcm_info["data_offset"] if pcm_info else 0
+    start = data_start
     end = file_size - 1
     status = 200
 
@@ -151,7 +266,7 @@ async def stream_track(scope: dict, receive, send) -> None:
     if m:
         status = 206
         if m.group(1):
-            start = int(m.group(1))
+            start = max(int(m.group(1)), data_start)
         if m.group(2):
             end = min(int(m.group(2)), file_size - 1)
         if start >= file_size:

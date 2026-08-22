@@ -24,9 +24,28 @@ from lyrion.database.schema import Favorite
 
 logger = logging.getLogger("lyrion.music.favorites")
 
-_OPML_PATH = Path("/var/lib/squeezeboxserver/prefs/favorites.opml")
+_OPML_CANDIDATES = (
+    Path("/var/lib/squeezeboxserver/prefs/favorites.opml"),  # Debian LMS
+    Path("/etc/squeezeboxserver/prefs/favorites.opml"),      # alt. Debian
+)
 _opml_lock = asyncio.Lock()
 _opml_import_done = False
+
+
+def _opml_path() -> Path | None:
+    """Find favorites.opml: config prefs dir first (LYRION_SERVERDATA-aware),
+    then the standard Perl-LMS locations."""
+    try:
+        from lyrion.config import get_config
+        p = get_config().prefs_dir / "favorites.opml"
+        if p.exists():
+            return p
+    except Exception:  # noqa: BLE001
+        pass
+    for c in _OPML_CANDIDATES:
+        if c.exists():
+            return c
+    return None
 
 
 class FavoritesManager:
@@ -253,7 +272,8 @@ async def ensure_opml_imported() -> None:
             return
         _opml_import_done = True  # set before the work: add() re-enters
         try:
-            if not _OPML_PATH.exists():
+            opml = _opml_path()
+            if opml is None:
                 return
             mgr = FavoritesManager()
             async with mgr._db_session() as session:
@@ -283,13 +303,13 @@ async def ensure_opml_imported() -> None:
                 for child in outline.findall("outline"):
                     await _merge(child, new_id)
 
-            tree = ET.parse(_OPML_PATH)
+            tree = ET.parse(opml)
             body = tree.getroot().find("body")
             if body is None:
                 return
             for outline in body.findall("outline"):
                 await _merge(outline, None)
             if added:
-                logger.info("Merged %d favorite(s) from %s into DB", added, _OPML_PATH)
+                logger.info("Merged %d favorite(s) from %s into DB", added, opml)
         except Exception as exc:  # noqa: BLE001
             logger.warning("OPML favorites import failed: %s", exc)

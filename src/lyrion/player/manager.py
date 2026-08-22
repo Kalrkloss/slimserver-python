@@ -119,6 +119,15 @@ class PlayerManager:
     # Player name persistence (players table)
     # ------------------------------------------------------------------
 
+    def _players_db_path(self) -> str:
+        """Resolve the players.db path from the active config (test/dev runs
+        use LYRION_SERVERDATA; production default stays /root/.lyrion)."""
+        try:
+            from lyrion.config import get_config
+            return str(get_config().prefs_dir / "players.db")
+        except Exception:  # noqa: BLE001
+            return "/root/.lyrion/Lyrion/Prefs/players.db"
+
     def _stored_player_name(self, mac: str) -> str | None:
         """Return the *confirmed* name for a MAC from the players table.
 
@@ -128,7 +137,7 @@ class PlayerManager:
         try:
             import sqlite3
             db = sqlite3.connect(
-                "file:/root/.lyrion/Lyrion/Prefs/players.db?mode=ro",
+                f"file:{self._players_db_path()}?mode=ro",
                 uri=True, timeout=0,
             )
             db.row_factory = sqlite3.Row
@@ -160,7 +169,7 @@ class PlayerManager:
         confirmed=0: HELO placeholder — not treated as a real name."""
         try:
             import sqlite3
-            db = sqlite3.connect("/root/.lyrion/Lyrion/Prefs/players.db", timeout=2)
+            db = sqlite3.connect(self._players_db_path(), timeout=2)
             db.execute("PRAGMA busy_timeout = 2000")
             db.execute(
                 "CREATE TABLE IF NOT EXISTS players ("
@@ -226,7 +235,7 @@ class PlayerManager:
         try:
             import sqlite3
             import time as _t
-            db = sqlite3.connect("/root/.lyrion/Lyrion/Prefs/players.db", timeout=2)
+            db = sqlite3.connect(self._players_db_path(), timeout=2)
             db.execute("PRAGMA busy_timeout = 2000")
             db.execute(
                 "CREATE TABLE IF NOT EXISTS players ("
@@ -550,9 +559,13 @@ class PlayerManager:
         elif track_id in player.playlist:
             player.playlist_position = player.playlist.index(track_id)
         else:
-            player.playlist = [track_id]
-            player.playlist_position = 0
-            player.playlist_total = 1
+            # Track not yet in playlist: append it (LMS 'playlist play'
+            # semantics = clear + load + play of that track, but keeping
+            # an existing playlist and jumping to it is friendlier for
+            # multi-item queues built with 'playlist add').
+            player.playlist.append(track_id)
+            player.playlist_position = len(player.playlist) - 1
+            player.playlist_total = len(player.playlist)
 
         ok = await handler.send_strm_to_player(player.mac, track_id)
         if ok:

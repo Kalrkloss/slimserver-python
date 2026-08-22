@@ -137,8 +137,10 @@ async def _run_server(
     # Use None as sentinel so absent arg != explicit False.
     cli_noweb: bool | None = getattr(cfg.cli_args, "noweb", None)
     noweb = cli_noweb if cli_noweb is not None else bool(cfg.get("noweb", False))
-    http_port = int(cfg.get("serverport", 9000))
-    cli_port = int(cfg.get("cliport", 9090))
+    http_port = int(getattr(cfg.cli_args, "httpport", None)
+                    or cfg.get("serverport", 9000))
+    cli_port = int(getattr(cfg.cli_args, "cliport", None)
+                   or cfg.get("cliport", 9090))
 
     log.info("Starting server on http://:%s (web=%s)", http_port, not noweb)
 
@@ -153,7 +155,8 @@ async def _run_server(
         log.debug("CLI server module not available yet")
 
     # Start Slimproto TCP server (port 3483 — players connect here)
-    slimproto_port = int(cfg.get("slimproto_port", 3483))
+    slimproto_port = int(getattr(cfg.cli_args, "slimprotoport", None)
+                         or cfg.get("slimproto_port", 3483))
     try:
         from lyrion.networking.protocol import SlimProtoClient
         slimproto = SlimProtoClient(web_port=http_port)
@@ -213,7 +216,14 @@ async def _run_server(
             # see no updates while a player is idle and reconnect).
             asyncio.create_task(cometd_mgr.keepalive_loop())
 
-            base_dir = Path(__file__).parent.parent.parent
+            # Installed (site-packages) checkouts: src/lyrion lives under
+            # site-packages, so parent.parent.parent is the venv root — fall
+            # back to the repository checkout layout when html/ is missing.
+            import lyrion as _lyrion_pkg
+            _pkg_dir = Path(_lyrion_pkg.__file__).resolve().parent
+            base_dir = _pkg_dir.parent.parent  # .../src/lyrion -> repo root
+            if not (base_dir / "html").is_dir():
+                base_dir = Path.cwd()
             static_dir = str(base_dir / "html")
             config_uvicorn = create_config(
                 host="0.0.0.0",
@@ -486,6 +496,10 @@ Examples:
     parser.add_argument(
         "--upnp", action="store_true",
         help="Enable UPnP/DLNA media server",
+    )
+    parser.add_argument(
+        "--slimprotoport", type=int, metavar="PORT",
+        help="SlimProto TCP port for players (default: 3483)",
     )
 
     args = parser.parse_args(argv)

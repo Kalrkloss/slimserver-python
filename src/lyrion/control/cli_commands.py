@@ -1164,7 +1164,7 @@ async def cmd_playlist_play(
             try:
                 import sqlite3
                 db = sqlite3.connect(
-                    "file:/root/.lyrion/Lyrion/Prefs/lyrion.db?mode=ro", uri=True)
+                    f"file:{_library_db_path()}?mode=ro", uri=True)
                 if "album_id" in tags:
                     rows = db.execute(
                         "SELECT t.id FROM tracks t JOIN tracks_albums ta ON ta.track = t.id "
@@ -1228,8 +1228,14 @@ async def cmd_playlist_add(
         pm = PlayerManager()
         added = 0
         for a in args:
+            # Accept both plain ids and 'track_id:<n>' tagged form
+            s = str(a)
+            if ":" in s:
+                k, _, v = s.partition(":")
+                if k in ("track_id", "item_id"):
+                    s = v
             try:
-                pm.playlist_add(ctx.player_id, int(a))
+                pm.playlist_add(ctx.player_id, int(s))
                 added += 1
             except ValueError:
                 continue
@@ -1479,7 +1485,8 @@ async def cmd_wipecache(
     """wipecache — clear the album art and other cached data."""
     try:
         from pathlib import Path
-        cache_dir = Path("/root/.lyrion/Lyrion/Cache")
+        from lyrion.config import get_config
+        cache_dir = Path(get_config().cache_dir)
         removed = 0
         if cache_dir.is_dir():
             for p in cache_dir.rglob("*"):
@@ -1661,6 +1668,16 @@ async def cmd_info(
 # (where no RequestDispatcher is attached).
 # ---------------------------------------------------------------------------
 
+def _library_db_path() -> str:
+    """Resolve the library DB path from the active config (test/dev runs use
+    LYRION_SERVERDATA; the production default stays /root/.lyrion)."""
+    try:
+        from lyrion.config import get_config
+        return str(get_config().db_path)
+    except Exception:  # noqa: BLE001
+        return "/root/.lyrion/Lyrion/Prefs/lyrion.db"
+
+
 _LIBRARY_DB = "/root/.lyrion/Lyrion/Prefs/lyrion.db"
 
 
@@ -1690,7 +1707,7 @@ async def _query_db(sql: str, params: tuple = ()) -> list[dict]:
     def _run() -> list[dict]:
         import sqlite3
 
-        con = sqlite3.connect(f"file:{_LIBRARY_DB}?mode=ro", uri=True, timeout=30)
+        con = sqlite3.connect(f"file:{_library_db_path()}?mode=ro", uri=True, timeout=30)
         try:
             con.row_factory = sqlite3.Row
             rows = con.execute(sql, params).fetchall()
@@ -1711,7 +1728,7 @@ async def _write_db(sql: str, params: tuple = ()) -> bool:
     def _run() -> bool:
         import sqlite3
 
-        con = sqlite3.connect(_LIBRARY_DB, timeout=30)
+        con = sqlite3.connect(_library_db_path(), timeout=30)
         try:
             con.execute(sql, params)
             con.commit()
