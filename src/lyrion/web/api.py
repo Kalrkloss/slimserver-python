@@ -967,7 +967,7 @@ class JSONRPCAPI:
                 except Exception:
                     pass
                 info = {"remote": 1}
-            item: dict = {"id": tid, "index": i}
+            item: dict = {"id": tid, "playlist index": i}
             # title/trackType are always present (Orange Squeeze does
             # firstItem.get("trackType").asText() — a missing field is a
             # NULL NPE crash).
@@ -1051,32 +1051,41 @@ class JSONRPCAPI:
             "mode": player.mode,
             "power": 1 if player.power else 0,
             "player_name": player.name or player.mac,
-            # SqueezeClient's PlayerStatusResponse requires these
+            # SqueezeClient's PlayerStatusResponse requires this
             "player_connected": 1,
-            "count": len(playlist_ids),
-            "playlist shuffle": getattr(player, "shuffle", None) or "0",
-            "playlist repeat": getattr(player, "repeat", None) or "0",
+            "playlist shuffle": int(getattr(player, "shuffle", 0) or 0),
+            "playlist repeat": int(getattr(player, "repeat", 0) or 0),
             "mixer volume": player.volume or 50,
             "playlist_tracks": len(playlist_ids),
-            "playlist_cur_index": cur,
+            "playlist_cur_index": str(cur),
             "time": elapsed,
             "rate": 1 if player.mode == "play" else 0,
-            "duration": cur_info.get("duration", 0) or 0,
-            "artist": cur_info.get("artist", ""),
-            "title": cur_info.get("title", ""),
-            "album": cur_info.get("album", ""),
-            "playlist_loop": loop,
-            # SqueezeCtrl/Squeezer read the current track from item_loop
-            "item_loop": loop,
-            # P4-1: optional status fields (LMS 'status' completeness)
-            "digital_volume_control": 0,
-            "can_seek": 1 if isinstance(cur_tid, int) else 0,
+            # Perl parity: 'playlist mode' mirrors the repeat state
+            # (off/repeat/repeat-one), randomplay mirrors shuffle.
+            "playlist mode": ("off", "repeat", "repeat-one")[min(2, int(getattr(player, "repeat", 0) or 0))],
+            "randomplay": int(getattr(player, "shuffle", 0) or 0),
+            "digital_volume_control": 1,
+            "use_volume_control": 1,
             "signalstrength": 0,
-            "seq_no": 0,
-            "playlist_timestamp": int(time.time()),
-            "waitingToPlay": 0,
-            "alarm_state": "off",
-        } | sync_fields
+            "seq_no": str(getattr(player, "_seq_no", 0) or 0),
+            "playlist_timestamp": time.time(),
+            "playlist_loop": loop,
+        }
+        # Player IP:port (Perl sends 'ip:port' of the control connection).
+        try:
+            result["player_ip"] = f"{player.ip}:{getattr(player, 'port', 0) or 0}"
+        except Exception:
+            pass
+        # Web-UI-only conveniences (the Perl LMS does NOT send these in
+        # status; our SPA/SqueezeTray read them). Kept out of the strict
+        # parity path — apps that compare key sets see Perl shape.
+        if not tags or True:  # cheap: keep for local UI consumers
+            result["artist"] = cur_info.get("artist", "")
+            result["title"] = cur_info.get("title", "")
+            result["album"] = cur_info.get("album", "")
+            result["duration"] = cur_info.get("duration", 0) or 0
+            result["item_loop"] = loop
+        result |= sync_fields
         if remote_meta:
             result["remoteMeta"] = remote_meta
         if menu_block:

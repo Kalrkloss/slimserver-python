@@ -11,13 +11,14 @@ import json
 import sys
 import urllib.request
 
-PY = 9000
-PERL = 9003
+PY = 9002
+PERL = 9000
 
 
 def ask(port: int, params: list) -> dict:
+    host = "192.168.1.90" if port == PERL else "127.0.0.1"
     req = urllib.request.Request(
-        f"http://127.0.0.1:{port}/jsonrpc.js",
+        f"http://{host}:{port}/jsonrpc.js",
         data=json.dumps({"id": 1, "method": "slim.request", "params": params}).encode(),
         headers={"Content-Type": "application/json"},
     )
