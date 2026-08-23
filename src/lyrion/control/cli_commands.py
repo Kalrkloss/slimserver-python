@@ -1922,6 +1922,55 @@ async def cmd_pref(
     return []
 
 
+@register_command("alarms")
+async def cmd_alarms(
+    handler: CLIHandler,
+    ctx: CLIContext,
+    args: list[str],
+) -> list[str]:
+    """alarms [<start> <count>] — list alarm clocks.
+
+    LMS returns count + fade (fade-in seconds, global). We currently
+    persist no alarms, so both are 0. SqueezePlay/controllers poll this
+    to show the alarm clock page; an empty list is a valid state.
+    """
+    return ["alarms count:0", "alarms fade:0", ""]
+
+
+@register_command("alarm")
+async def cmd_alarm(
+    handler: CLIHandler,
+    ctx: CLIContext,
+    args: list[str],
+) -> list[str]:
+    """alarm <index> [key:value ...] — query or set a single alarm.
+
+    LMS 'alarm 0 ?' returns the fields for alarm index 0 (id, enabled,
+    time, days, ...). 'alarm <index> <key>:<value>' sets a field. We
+    persist no alarms, so a known index returns a disabled 06:00 default
+    and an out-of-range index is a no-op (LMS silently ignores).
+    """
+    if not args:
+        return ["alarm: ", ""]
+    try:
+        idx = int(args[0])
+    except ValueError:
+        return ["alarm: invalid index", ""]
+    if len(args) == 1 or (len(args) == 2 and args[1] == "?"):
+        # Query form: report the (default/empty) alarm index fields.
+        return [
+            f"alarm index:{idx}"
+            f" enabled:0 time:06:00 days:1111111 volume:-1"
+            f" fade:-1 duration:0 repeat:0",
+            "",
+        ]
+    # Set form — consume the key:value pairs (no-op unless persisted).
+    if idx == 0:
+        # Acknowledge, but treat as a no-op unless we later persist alarms.
+        return [f"alarm index:{idx} ", ""]
+    return [f"alarm index:{idx} ", ""]
+
+
 # ---------------------------------------------------------------------------
 # Subscribe / Unsubscribe
 # ---------------------------------------------------------------------------
