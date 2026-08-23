@@ -24,6 +24,13 @@ Stand der Analyse: 2026-08-13, Code-Basis Commit `ac346b8`.
 > - `playlist index ?`/`jump` geben den aktuellen Index zurück.
 > - `cli_server.py`: Dispatcher pro Verbindung wird gestartet (sonst
 >   antwortet jeder player_command mit „server shutting down").
+> - `playerpref <key> [?|<value>]` (Query/Set, war `unknown command`).
+> - `button <name>` (play/pause/stop/prev/next/power, war `unknown command`).
+> - `artist [?]`/`album [?]`/`genre [?]` (aktuelle Track-Metadaten);
+>   `album` löst über `tracks_albums -> albums` auf.
+> - Alias-Echo: `titles`/`songs` geben den tatsächlich aufgerufenen
+>   Command-Namen zurück (über `ctx.command`).
+> - `alarms`/`alarm <idx> ?` (LMS-Form).
 
 ---
 
