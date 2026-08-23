@@ -1,0 +1,10 @@
+{
+  "name": "lyrion (slimserver-python)",
+  "kind": "python-module",
+  "bootstrap": ["pip install -e ."],
+  "build": [],
+  "test": ["python3 -m compileall -q src/"],
+  "start": null,
+  "port": null,
+  "readinessPath": null
+}
