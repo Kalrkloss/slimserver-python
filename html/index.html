@@ -749,6 +749,7 @@ const appState = {
   error: null,
   refreshInterval: null,
   npPollInterval: null,
+  alarmPlayer: null,   // per-player alarm settings selection (mac)
 };
 
 // ─────────────────────────────────────────────
@@ -2456,17 +2457,26 @@ const DAY_NAMES = ['Mo', 'Di', 'Mi', 'Do', 'Fr', 'Sa', 'So'];
 async function renderAlarmSettings() {
   const el = document.getElementById('settings-content');
   if (!el) return;
-  // active player (prefer currentPlayer, else first connected)
-  const mac = appState.currentPlayer || (appState.players.find(p => p.connected)?.mac || '');
+  // per-player selection: use the last chosen alarm player, else default.
+  if (!appState.alarmPlayer) {
+    appState.alarmPlayer = appState.currentPlayer || (appState.players.find(p => p.connected)?.mac || '');
+  }
+  const mac = appState.alarmPlayer || '-';
   try {
-    const alarms = await api('slim.request', [mac || '-', ['alarms', '0', '16']]);
+    const alarms = await api('slim.request', [mac, ['alarms', '0', '16']]);
     const loop = alarms?.alarm_loop || [];
+    const playerOpts = appState.players.map(p =>
+      `<option value="${p.mac}" ${p.mac === mac ? 'selected' : ''}>${escHtml(p.name || p.mac)}</option>`).join('');
     el.innerHTML = `
       <div class="settings-grid">
         <div class="settings-card">
-          <div class="settings-card-header">Alarm Clock — ${escHtml((appState.players.find(p=>p.mac===mac)||{}).name || mac || 'No player')}</div>
+          <div class="settings-card-header">Alarm Clock</div>
           <div class="settings-card-body">
-            <div class="empty-msg" style="margin-bottom:10px">Set wake-up alarms. Each alarm turns the player on, applies the volume and starts the wake source (radio station or track URL).</div>
+            <div class="info-grid" style="grid-template-columns:auto 1fr;margin-bottom:12px">
+              <span class="label">Player:</span>
+              <select id="alarm-player-select" onchange="alarmSelectPlayer(this.value)" style="max-width:280px">${playerOpts}</select>
+            </div>
+            <div class="empty-msg" style="margin-bottom:10px">Set wake-up alarms for this player. Each alarm turns the player on, applies the volume and starts the wake source (radio stream or music-library file).</div>
             ${loop.map((a,i) => `
               <div class="alarm-row" id="alarm-row-${i}" style="border:1px solid var(--border);border-radius:6px;padding:10px;margin-bottom:10px">
                 <div class="info-grid" style="grid-template-columns:auto 1fr">
@@ -2500,10 +2510,11 @@ async function renderAlarmSettings() {
                   </select>
                 </div>
                 <div class="info-grid" style="grid-template-columns:auto 1fr">
-                  <span class="label">Wake source (URL):</span>
-                  <input id="alarm-url-${i}" type="text" value="${escHtml(alarmUrlValue(a))}" placeholder="http://… or https://…"
-                    style="font-family:monospace;font-size:12px;padding:5px;border:1px solid var(--border);border-radius:3px;width:100%;box-sizing:border-box"
-                    onchange="saveAlarm(${i})">
+                  <span class="label">Wake source:</span>
+                  <span>
+                    <button class="btn-secondary btn-sm" onclick="alarmPickSource(${i})">📻 Choose stream / file…</button>
+                    <span id="alarm-wake-label-${i}" style="font-size:12px;color:var(--text-light);margin-left:8px">${escHtml(alarmWakeLabel(a, i))}</span>
+                  </span>
                 </div>
                 <div style="margin-top:8px">
                   <button class="btn-secondary btn-sm" onclick="deleteAlarm(${i})">🗑 Delete</button>
@@ -2522,21 +2533,17 @@ async function renderAlarmSettings() {
   }
 }
 
-function alarmUrlValue(a) {
-  // a.wake may be "url:http://…" or the url field directly; Material/SqueezePlay
-  // use the raw url. Return a clean http(s) URL for the input.
-  if (a && a.url) return a.url;
-  if (a && a.wake && a.wake !== '') return a.wake.replace(/^url:/, '').replace(/^wake:/, '');
-  return '';
+async function alarmSelectPlayer(mac) {
+  appState.alarmPlayer = mac;
+  renderAlarmSettings();
 }
 
-async function saveAlarm(i) {
-  const mac = appState.currentPlayer || (appState.players.find(p => p.connected)?.mac || '');
+async function saveAlarm(i, wake) {
+  const mac = appState.alarmPlayer || (appState.players.find(p => p.connected)?.mac || '');
   const enabled = document.getElementById(`alarm-enabled-${i}`)?.checked ? 1 : 0;
   const hour = parseInt(document.getElementById(`alarm-hour-${i}`)?.value ?? 0, 10);
   const minute = parseInt(document.getElementById(`alarm-minute-${i}`)?.value ?? 0, 10);
   const volume = parseInt(document.getElementById(`alarm-volume-${i}`)?.value ?? -1, 10);
-  const rawUrl = (document.getElementById(`alarm-url-${i}`)?.value || '').trim();
   let day = 0;
   document.querySelectorAll(`#alarm-row-${i} input[data-day]`).forEach(cb => {
     if (cb.checked) day |= (1 << (parseInt(cb.dataset.day, 10) - 1));
@@ -2544,14 +2551,25 @@ async function saveAlarm(i) {
   try {
     const args = ['alarm', String(i), `enabled:${enabled}`, `hour:${hour}`, `minute:${minute}`, `volume:${volume}`,
                   `day:${day}`];
-    if (rawUrl) args.push(`url:${rawUrl}`);
+    if (wake && wake.wake) args.push(`wake:${wake.wake}`);
     await api('slim.request', [mac || '-', args]);
+    if (wake && wake.wake) renderAlarmSettings();  // refresh the wake label
     showToast('Alarm gespeichert');
   } catch(e) { showToast('Fehler: ' + e.message); }
 }
 
+// Store a chosen wake source for alarm<i> without reverting other fields.
+async function alarmSetWake(i, wake) {
+  const mac = appState.alarmPlayer || (appState.players.find(p => p.connected)?.mac || '');
+  try {
+    await api('slim.request', [mac || '-', ['alarm', String(i), `wake:${wake}`]]);
+    renderAlarmSettings();
+    showToast('Weckquelle gesetzt');
+  } catch(e) { showToast('Fehler: ' + e.message); }
+}
+
 async function addAlarm() {
-  const mac = appState.currentPlayer || (appState.players.find(p => p.connected)?.mac || '');
+  const mac = appState.alarmPlayer || (appState.players.find(p => p.connected)?.mac || '');
   try {
     // find first free alarm index (0..15)
     const alarms = await api('slim.request', [mac || '-', ['alarms', '0', '16']]);
@@ -2566,12 +2584,105 @@ async function addAlarm() {
 }
 
 async function deleteAlarm(i) {
-  const mac = appState.currentPlayer || (appState.players.find(p => p.connected)?.mac || '');
+  const mac = appState.alarmPlayer || (appState.players.find(p => p.connected)?.mac || '');
   try {
     await api('slim.request', [mac || '-', ['alarm', String(i), 'delete']]);
     renderAlarmSettings();
     showToast('Alarm gelöscht');
   } catch(e) { showToast('Fehler: ' + e.message); }
+}
+
+function alarmCloseDialog() {
+  const ov = document.getElementById('alarm-picker-overlay');
+  if (ov) ov.remove();
+}
+
+// Open the wake-source chooser: favorites (streams) or music-library tracks.
+async function alarmPickSource(i) {
+  appState._alarmPickIndex = i;
+  let ov = document.getElementById('alarm-picker-overlay');
+  if (ov) ov.remove();
+  ov = document.createElement('div');
+  ov.id = 'alarm-picker-overlay';
+  ov.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:9999;display:flex;align-items:center;justify-content:center';
+  const box = document.createElement('div');
+  box.style.cssText = 'background:var(--bg,#fff);color:var(--text,#333);border-radius:8px;max-width:600px;width:90%;max-height:80vh;display:flex;flex-direction:column;box-shadow:0 8px 30px rgba(0,0,0,.4)';
+  box.innerHTML = `
+    <div style="padding:12px 16px;border-bottom:1px solid var(--border,#ddd);font-weight:600">Weckquelle für Alarm ${i+1}</div>
+    <div style="display:flex;gap:8px;padding:10px 16px;border-bottom:1px solid var(--border,#eee)">
+      <button class="btn-secondary btn-sm ${'alarm-pick-tab'} active" data-tab="fav" onclick="alarmTab(this,'fav')">📻 Favoriten / Streams</button>
+      <button class="btn-secondary btn-sm ${'alarm-pick-tab'}" data-tab="songs" onclick="alarmTab(this,'songs')">🎵 Musiksammlung</button>
+    </div>
+    <div id="alarm-picker-body" style="overflow:auto;flex:1;padding:12px 16px;min-height:200px"></div>
+    <div style="padding:10px 16px;border-top:1px solid var(--border,#eee);text-align:right">
+      <button class="btn btn" onclick="alarmCloseDialog()">Abbrechen</button>
+    </div>`;
+  ov.appendChild(box);
+  document.body.appendChild(ov);
+  await alarmTab(box.querySelector('[data-tab=fav]'), 'fav');
+}
+
+function alarmTab(btn, tab) {
+  document.querySelectorAll('.alarm-pick-tab').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+  if (tab === 'fav') alarmLoadFavorites();
+  else alarmLoadSongs('');
+}
+
+async function alarmLoadFavorites() {
+  const body = document.getElementById('alarm-picker-body');
+  body.innerHTML = loadingEl();
+  try {
+    const r = await api('slim.request', ['-', ['favorites', 'items']]);
+    const items = parseFavItems(r).filter(f => f.type !== 'folder');
+    if (!items.length) { body.innerHTML = emptyEl('Keine Favoriten/Streams.'); return; }
+    body.innerHTML = items.map(f => `
+      <div style="display:flex;justify-content:space-between;align-items:center;padding:6px 4px;border-bottom:1px solid var(--border,#eee)">
+        <span>${escHtml(f.title || f.url)}</span>
+        <a href="#" onclick="alarmChooseWake(event,'fr:${encodeURIComponent(f.fav_id)}','${escHtml(f.title||'').replace(/'/g,"&#39;")}');return false">Auswählen</a>
+      </div>`).join('');
+  } catch(e) { body.innerHTML = errEl(e.message); }
+}
+
+// Music-library track chooser (search box + list).
+async function alarmLoadSongs(term) {
+  const body = document.getElementById('alarm-picker-body');
+  body.innerHTML = `
+    <input id="alarm-song-search" type="text" placeholder="Suchen…" value="${escHtml(term||'')}" style="width:100%;box-sizing:border-box;padding:6px;margin-bottom:10px;border:1px solid var(--border,#ddd);border-radius:3px"
+      oninput="alarmLoadSongs(this.value)">
+    <div id="alarm-song-list">${loadingEl()}</div>`;
+  try {
+    const q = term ? ['songs', '0', '200', 'tags:', 'title', term] : ['songs', '0', '200', 'tags:'];
+    const r = await api('slim.request', [appState.alarmPlayer || '-', q]);
+    const tracks = (r && (r.titles_loop || r.item_list || r.loop_loop || [])) || [];
+    const list = document.getElementById('alarm-song-list');
+    if (!tracks.length) { list.innerHTML = emptyEl('Keine Titel.'); return; }
+    list.innerHTML = tracks.map(s => `
+      <div style="display:flex;justify-content:space-between;align-items:center;padding:5px 2px;border-bottom:1px solid var(--border,#eee)">
+        <span>${escHtml(s.title||s.titile||'')} <small style="color:var(--text-light)">${escHtml(s.artist||s.creator||'')}</small></span>
+        <a href="#" onclick="alarmChooseWake(event,'track:${s.id}','${escHtml((s.title||'').replace(/'/g,"&#39;"))}');return false">Auswählen</a>
+      </div>`).join('');
+  } catch(e) { const l=document.getElementById('alarm-song-list'); if(l) l.innerHTML = errEl(e.message); }
+}
+
+// Confirm and store the chosen wake source for the last-clicked alarm.
+async function alarmChooseWake(ev, wake, label) {
+  ev.preventDefault();
+  const i = appState._alarmPickIndex;
+  // store display label client-side (avoid "🎵 1" instead of the track name)
+  appState._alarmWakeLabels = appState._alarmWakeLabels || {};
+  appState._alarmWakeLabels[i] = label || wake;
+  alarmCloseDialog();
+  await alarmSetWake(i, wake);
+}
+
+function alarmWakeLabel(a, i) {
+  const cached = (appState._alarmWakeLabels || {})[i];
+  if (cached) return cached;
+  if (!a) return 'none';
+  if (a.wake) return a.wake.replace(/^url:/, '').replace(/^track:/, '🎵 ').replace(/^fr:/, '📻 ').replace(/^wake:/, '');
+  if (a.url) return a.url;
+  return 'none';
 }
 
 async function togglePlayerPower(mac) {

@@ -209,11 +209,23 @@ class AlarmScheduler:
             return False
         return days[weekday] == "1"
 
-    def _players(self):
+    def _players(self) -> list:
         from lyrion.player.manager import PlayerManager
 
-        return PlayerManager().players.values() if hasattr(
+        return list(PlayerManager().players.values()) if hasattr(
             PlayerManager(), "players") else []
+
+    async def _favorite_url(self, fav_id: str) -> str | None:
+        """Resolve a favorite id to its URL (for a 'fr:' wake source)."""
+        try:
+            from lyrion.music.favorites import get_favorites_manager
+
+            fav = await get_favorites_manager().get(int(fav_id))
+            if fav:
+                return fav.get("url") or fav.get("type")
+        except Exception as exc:  # pragma: no cover
+            logger.warning("alarm: cannot resolve favorite %s: %s", fav_id, exc)
+        return None
 
     def fire(self, mac: str, alarm: Alarm) -> None:
         """Power on the player and start the wake source."""
@@ -242,6 +254,14 @@ class AlarmScheduler:
                         await pm.play_track(mac, int(alarm.wake[6:]))
                     except ValueError:
                         logger.warning("alarm: bad wake track %r", alarm.wake)
+                elif alarm.wake.startswith("fr:"):
+                    # Wake with a favorite: resolve fav_id → its URL, then play.
+                    fav_id = alarm.wake[3:]
+                    furl = await self._favorite_url(fav_id)
+                    if furl:
+                        await pm.play_url(mac, furl, title=alarm.time)
+                    else:
+                        logger.info("alarm: favorite %r not found for %s", fav_id, mac)
                 else:
                     logger.info("alarm: no wake source configured for %s", mac)
                 # A non-repeat alarm should switch itself off after firing.
@@ -305,7 +325,7 @@ def _alarm_from_parts(index: int, parts: dict[str, str]) -> Alarm:
         if w in parts and parts[w]:
             a.wake = f"{w}:{parts[w]}"
     if "wake" in parts and parts["wake"]:
-        a.wake = parts["wake"] if parts["wake"].startswith(("url:", "track:")) \
+        a.wake = parts["wake"] if parts["wake"].startswith(("url:", "track:", "fr:")) \
             else f"url:{parts['wake']}"
     return a
 

@@ -1210,8 +1210,13 @@ class JSONRPCAPI:
             "duration": alarm.duration if alarm else 0,
             "repeat": 1 if (alarm and alarm.repeat) else 0,
             "wake": (alarm.wake if alarm else "") or "",
-            "url": (alarm.wake.split(":", 1)[1] if alarm and ":" in alarm.wake
+            # 'url:' only → url; 'track:' → track id; 'fr:' → favorite id
+            "url": (alarm.wake[4:] if alarm and alarm.wake.startswith("url:")
                     else ""),
+            "track": (alarm.wake[6:] if alarm and alarm.wake.startswith("track:")
+                      else ""),
+            "favorite": (alarm.wake[3:] if alarm and alarm.wake.startswith("fr:")
+                         else ""),
         }
 
     async def _json_alarms(self, pid: str | None, args: list) -> dict:
