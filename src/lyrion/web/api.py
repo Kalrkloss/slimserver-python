@@ -660,19 +660,22 @@ class JSONRPCAPI:
             result["count"] = len(players)
             result["players_loop"] = [
                 {
-                    "playerindex": i,
+                    # Perl parity: playerindex/uuid/seq_no are STRINGS in
+                    # players_loop (int elsewhere), displaytype present.
+                    "playerindex": str(i),
                     "playerid": p.mac,
                     "name": p.name,
                     "model": getattr(p, "model", "squeezebox"),
                     "modelname": getattr(p, "model", "squeezebox"),
                     "ip": f"{p.ip}:{p.port}" if p.port else p.ip,
-                    "uuid": p.mac,
+                    "uuid": None,
                     "firmware": getattr(p, "firmware", "2.0.0"),
                     "isplaying": 1 if p.mode == "play" else 0,
                     "isplayer": 1,
                     "canpoweroff": 1,
                     "connected": 1 if p.connected else 0,
                     "power": 1 if p.power else 0,
+                    "displaytype": "None",
                     "seq_no": 0,
                 }
                 for i, p in enumerate(players)
@@ -1430,6 +1433,10 @@ class JSONRPCAPI:
             (like,))
         t_count = _db_query(
             "SELECT COUNT(*) AS n FROM tracks WHERE title LIKE ?", (like,))
+        # Perl parity for the search loops: the Perl LMS returns MINIMAL
+        # items — contributors_loop {contributor, contributor_id},
+        # albums_loop {album, album_id}, tracks_loop {track, track_id}.
+        # Extra keys (id/title/url) are additive; controllers ignore them.
         return {
             "count": (a_count[0]["n"] if a_count else 0)
                      + (al_count[0]["n"] if al_count else 0)
@@ -1440,21 +1447,18 @@ class JSONRPCAPI:
             "albums_count": al_count[0]["n"] if al_count else 0,
             "genres_count": g_count[0]["n"] if g_count else 0,
             "tracks_count": t_count[0]["n"] if t_count else 0,
-            "artists_loop": [{"id": r["id"], "artist": r["name"] or "",
-                              "contributor_id": r["id"], "contributor": r["name"] or ""}
+            "artists_loop": [{"contributor": r["name"] or "",
+                              "contributor_id": r["id"]}
                              for r in artists],
-            # LMS reference name for the artist group.
-            "contributors_loop": [{"id": r["id"], "artist": r["name"] or "",
-                                   "contributor_id": r["id"], "contributor": r["name"] or ""}
+            "contributors_loop": [{"contributor": r["name"] or "",
+                                   "contributor_id": r["id"]}
                                   for r in artists],
-            "albums_loop": [{"id": r["id"], "album": r["title"] or "",
+            "albums_loop": [{"album": r["title"] or "",
                              "album_id": r["id"]} for r in albums],
-            "genres_loop": [{"id": i + 1, "genre": r["name"] or "",
+            "genres_loop": [{"genre": r["name"] or "",
                              "genre_id": i + 1} for i, r in enumerate(genres)],
-            "tracks_loop": [{"id": r["id"], "title": r["title"] or "",
-                             "track": r["title"] or "", "track_id": r["id"],
-                             "url": r["url"] or "", "duration": r["duration"] or 0}
-                            for r in tracks],
+            "tracks_loop": [{"track": r["title"] or "",
+                             "track_id": r["id"]} for r in tracks],
         }
 
     async def _json_browse(self, cmd: str, args: list[str]) -> dict:
@@ -1563,17 +1567,20 @@ class JSONRPCAPI:
                     params + (count, start)).fetchall()
                 loop = []
                 for r in rows:
-                    loop.append({
-                        "id": r["id"], "artist": r["name"] or "",
-                        # Jive actions: go opens the artist's albums
-                        # (menu: next level), play plays all artist tracks.
-                        "actions": {
-                            "go": {"player": 0, "cmd": ["albums"],
-                                   "params": {"artist_id": r["id"], "menu": "tracks"}},
-                            "play": {"player": 0, "cmd": ["playlist", "play"],
-                                     "params": {"artist_id": r["id"]}},
-                        },
-                    })
+                    name = r["name"] or ""
+                    from urllib.parse import quote as _qa
+                    item = {
+                        "id": r["id"], "artist": name,
+                        # Perl parity: favorites_url in artists_loop.
+                        "favorites_url": f"db:contributor.name={_qa(name)}",
+                    }
+                    item["actions"] = {
+                        "go": {"player": 0, "cmd": ["albums"],
+                               "params": {"artist_id": r["id"], "menu": "tracks"}},
+                        "play": {"player": 0, "cmd": ["playlist", "play"],
+                                 "params": {"artist_id": r["id"]}},
+                    }
+                    loop.append(item)
                 total = db.execute(
                     "SELECT COUNT(DISTINCT c.id) FROM contributors c"
                     + joins + extra_joins + where, params).fetchone()[0]
@@ -1593,7 +1600,19 @@ class JSONRPCAPI:
                     params + (count, start)).fetchall()
                 loop = []
                 for r in rows:
-                    item = {"id": r["id"], "album": r["title"] or "", "year": r["year"] or 0}
+                    # Perl parity (albums without tags:): id, album,
+                    # performance, favorites_url, favorites_title. The
+                    # Jive actions stay — controllers need them.
+                    title = r["title"] or ""
+                    from urllib.parse import quote as _q
+                    fav_url = f"db:album.title={_q(title)}"
+                    item = {
+                        "id": r["id"], "album": title,
+                        "performance": "",
+                        "favorites_url": fav_url,
+                        "favorites_title": title,
+                        "year": r["year"] or 0,
+                    }
                     # Jive actions: go opens the album's tracks, play
                     # plays the whole album.
                     item["actions"] = {
@@ -1708,31 +1727,56 @@ class JSONRPCAPI:
                 if not str(tid).isdigit():
                     return self._browse_response([])
                 r = db.execute(
-                    "SELECT t.id, t.title, t.url, t.duration, t.year, t.tracknum, t.genre "
-                    "FROM tracks t WHERE t.id = ? LIMIT 1", (int(tid),)).fetchone()
+                    "SELECT t.id, t.title, t.url, t.duration, t.year, t.tracknum, t.genre, "
+                    "t.filesize, t.samplerate, t.bitspersample AS samplesize, t.channels, "
+                    "t.content_type AS ctype, t.modtime FROM tracks t WHERE t.id = ? LIMIT 1",
+                    (int(tid),)).fetchone()
                 if r is None:
                     return self._browse_response([])
-                item: dict = {"id": r["id"], "title": r["title"] or "",
-                              "url": r["url"] or "", "duration": r["duration"] or 0}
-                if r["year"]:
-                    item["year"] = r["year"]
-                if r["tracknum"]:
-                    item["tracknum"] = r["tracknum"]
-                if r["genre"]:
-                    item["genre"] = r["genre"]
+                # Perl parity: songinfo_loop = one item PER FIELD.
+                fields: list[tuple] = [("id", r["id"]), ("title", r["title"] or "")]
+                if r["duration"]:
+                    fields.append(("duration", round(float(r["duration"]), 3)))
+                if r["url"]:
+                    fields.append(("url", r["url"]))
                 a = db.execute(
-                    "SELECT c.name FROM contributors c JOIN tracks_contributors tc "
+                    "SELECT c.id, c.name FROM contributors c JOIN tracks_contributors tc "
                     "ON tc.contributor = c.id AND tc.role = 1 WHERE tc.track = ? "
                     "ORDER BY c.name LIMIT 1", (r["id"],)).fetchone()
                 if a:
-                    item["artist"] = a["name"]
+                    fields.append(("artist", a["name"]))
+                    fields.append(("artist_id", str(a["id"])))
                 al = db.execute(
-                    "SELECT al.title FROM albums al JOIN tracks_albums ta "
+                    "SELECT al.id, al.title FROM albums al JOIN tracks_albums ta "
                     "ON ta.album = al.id WHERE ta.track = ? LIMIT 1",
                     (r["id"],)).fetchone()
                 if al:
-                    item["album"] = al["title"]
-                return self._browse_response([item], 1, "songinfo_loop")
+                    fields.append(("album", al["title"]))
+                    fields.append(("album_id", str(al["id"])))
+                if r["genre"]:
+                    fields.append(("genre", r["genre"]))
+                if r["year"]:
+                    fields.append(("year", str(r["year"])))
+                if r["tracknum"]:
+                    fields.append(("tracknum", str(r["tracknum"])))
+                if r["filesize"]:
+                    fields.append(("filesize", str(r["filesize"])))
+                type_code = {
+                    "audio/flac": "flc", "audio/x-flac": "flc",
+                    "audio/mpeg": "mp3", "audio/mp3": "mp3",
+                    "audio/wav": "wav", "audio/x-wav": "wav",
+                }.get((r["ctype"] or "").lower(), "")
+                if type_code:
+                    fields.append(("type", type_code))
+                if r["samplerate"]:
+                    fields.append(("samplerate", str(int(r["samplerate"]))))
+                if r["channels"]:
+                    fields.append(("channels", str(int(r["channels"]))))
+                fields.append(("remote", "0"))
+                if r["modtime"]:
+                    fields.append(("modificationTime", str(r["modtime"])))
+                loop = [{k: v} for k, v in fields]
+                return self._browse_response(loop, len(fields), "songinfo_loop")
             else:
                 db.close()
                 return self._browse_response([])
