@@ -609,19 +609,30 @@ async def cmd_menu(
     ctx: CLIContext,
     args: list[str],
 ) -> list[str]:
-    """menu <playerId> — return the home menu (text form).
+    """menu [<start> <count>] [direct:1] — return the home menu (text form).
 
-    Mirrors the JSON-RPC menu handler for telnet clients.
+    Mirrors the JSON-RPC menu handler for telnet clients. The JSON-RPC
+    response uses 'item_loop' (not 'loop_loop'), so read that key.
     """
     try:
         from lyrion.web.api import JSONRPCAPI
-        res = await JSONRPCAPI()._slim_request("", ["menu"])
-        loop = res.get("loop_loop", [])
-        out = [f"menu count:{res.get('count', 0)}"]
+        res = await JSONRPCAPI()._slim_request(ctx.player_id or "", ["menu"] + list(args))
+        # JSON-RPC menu returns item_loop + count (+ offset). Fall back to
+        # the bare home-menu list if the shape differs.
+        loop = res.get("item_loop")
+        if loop is None:
+            home = JSONRPCAPI()._home_menu()
+            start = int(args[0]) if args and str(args[0]).isdigit() else 0
+            count = int(args[1]) if len(args) > 1 and str(args[1]).isdigit() else len(home)
+            loop = home[start:start + count]
+        total = res.get("count")
+        if total is None:
+            total = len(loop)
+        out = [f"menu count:{total}"]
         for i, item in enumerate(loop):
-            text = item.get("text", "")
-            node = item.get("node", {})
-            browse_id = node.get("browse", "") if isinstance(node, dict) else ""
+            text = item.get("text") or item.get("name", "")
+            node = item.get("node") or item.get("id", "")
+            browse_id = item.get("browse", {}).get("id", "") if isinstance(item.get("browse"), dict) else item.get("browse", "")
             out.append(f"menu index:{i} text:{text} browse:{browse_id}")
         out.append("")
         return out
@@ -1256,11 +1267,15 @@ async def cmd_playlist(
             return [] if ok else ["cli error: could not play url", ""]
         if sub in ("index", "jump"):
             # playlist index <n> — jump to a playlist index (no restart of
-            # an identical index; LMS 'index' only plays when changed)
-            if not rest or not str(rest[0]).lstrip("-").isdigit():
-                return ["playlist %s <index> — missing index" % sub, ""]
-            idx = int(rest[0])
+            # an identical index; LMS 'index' only plays when changed).
+            # 'playlist index ?' returns the current index (LMS parity).
             player3 = pm.get_player(ctx.player_id)
+            if not rest or str(rest[0]) == "?":
+                cur = getattr(player3, "playlist_position", 0) if player3 else 0
+                return [f"playlist index: {cur}", ""]
+            if not str(rest[0]).lstrip("-").isdigit():
+                return [f"playlist {sub} <index> — missing index", ""]
+            idx = int(rest[0])
             cur = getattr(player3, "playlist_position", 0) if player3 else 0
             if sub == "index" and idx == cur and player3 is not None \
                     and player3.mode == "play":
