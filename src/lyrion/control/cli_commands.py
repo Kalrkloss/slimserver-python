@@ -368,49 +368,119 @@ async def cmd_songinfo(
 ) -> list[str]:
     """songinfo <start> <count> track_id:<id> — detailed track info.
 
-    Response (LMS tagged format): 'songinfo 0 1 count:1 id:<n> title:...
-    artist:... album:... duration:... year:... tracknum:... genre:...
-    url:...'.
+    Perl-LMS format: one line PER FIELD (songinfo_loop items), e.g.
+        songinfo 0 100 count:27
+        id:2
+        title:Sabkah
+        artist:Nils Petter Molvær
+        duration:314.546
+        ...
+    Fields present depend on the track; 'id' and 'title' always come.
     """
     offset, limit, filters = _parse_query_args(args)
     tid = filters.get("track_id")
     if not tid or not str(tid).isdigit():
         return ["songinfo: no track_id", ""]
     rows = await _query_db(
-        "SELECT t.id, t.title, t.url, t.duration, t.year, t.tracknum, t.genre "
+        "SELECT t.id, t.title, t.url, t.duration, t.year, t.tracknum, t.genre, "
+        "t.filesize, t.samplerate, t.bitspersample AS samplesize, t.channels, "
+        "t.content_type AS ctype, t.modtime, t.remote AS lossless "
         "FROM tracks t WHERE t.id = ? LIMIT 1",
         (int(tid),),
     )
     if not rows:
         return [f"songinfo {offset} {limit} count:0", ""]
     r = rows[0]
-    line = f"id:{r['id']} title:{r['title'] or ''}"
-    if r["url"]:
-        line += f" url:{r['url']}"
+
+    import os as _os
+
+    fields: list[tuple] = [
+        ("id", r["id"]),
+        ("title", r["title"] or ""),
+    ]
     if r["duration"]:
-        line += f" duration:{int(r['duration'])}"
-    if r["year"]:
-        line += f" year:{r['year']}"
-    if r["tracknum"]:
-        line += f" tracknum:{r['tracknum']}"
-    if r["genre"]:
-        line += f" genre:{r['genre']}"
+        try:
+            fields.append(("duration", round(float(r["duration"]), 3)))
+        except Exception:
+            pass
+    if r["url"]:
+        fields.append(("url", r["url"]))
+    # artist / artist_id
     rows_a = await _query_db(
-        "SELECT c.name FROM contributors c JOIN tracks_contributors tc "
+        "SELECT c.id, c.name FROM contributors c JOIN tracks_contributors tc "
         "ON tc.contributor = c.id AND tc.role = 1 WHERE tc.track = ? "
         "ORDER BY c.name LIMIT 1",
         (r["id"],),
     )
     if rows_a and rows_a[0]["name"]:
-        line += f" artist:{rows_a[0]['name']}"
+        fields.append(("artist", rows_a[0]["name"]))
+        fields.append(("artist_id", str(rows_a[0]["id"])))
+    # album / album_id
     rows_al = await _query_db(
-        "SELECT al.title FROM albums al JOIN tracks_albums ta "
+        "SELECT al.id, al.title FROM albums al JOIN tracks_albums ta "
         "ON ta.album = al.id WHERE ta.track = ? LIMIT 1",
         (r["id"],),
     )
     if rows_al and rows_al[0]["title"]:
-        line += f" album:{rows_al[0]['title']}"
-    return [f"songinfo {offset} {limit} count:1", line, ""]
+        fields.append(("album", rows_al[0]["title"]))
+        fields.append(("album_id", str(rows_al[0]["id"])))
+        fields.append(("compilation", "0"))
+    if r["genre"]:
+        fields.append(("genre", r["genre"]))
+        rows_g = await _query_db(
+            "SELECT id FROM genres WHERE name = ? LIMIT 1", (r["genre"],))
+        if rows_g:
+            fields.append(("genre_id", str(rows_g[0]["id"])))
+    if r["year"]:
+        fields.append(("year", str(r["year"])))
+    if r["tracknum"]:
+        fields.append(("tracknum", str(r["tracknum"])))
+    # File-derived fields (Perl parity: filesize/type/bitrate/samplerate/…)
+    fsize = r["filesize"]
+    if not fsize and r["url"]:
+        try:
+            from urllib.parse import unquote, urlparse
+            p = urlparse(r["url"]).path
+            fsize = _os.path.getsize(unquote(p)) if p.startswith("/") else ""
+        except OSError:
+            fsize = ""
+    if fsize:
+        fields.append(("filesize", str(fsize)))
+    ctype = r["ctype"] or ""
+    type_code = {
+        "audio/flac": "flc", "audio/x-flac": "flc",
+        "audio/mpeg": "mp3", "audio/mp3": "mp3",
+        "audio/wav": "wav", "audio/x-wav": "wav", "audio/aiff": "aif",
+        "audio/ogg": "ogg", "audio/aac": "aac", "audio/mp4": "m4a",
+    }.get(ctype.lower(), "")
+    if type_code:
+        fields.append(("type", type_code))
+    if r["samplerate"]:
+        fields.append(("samplerate", str(int(r["samplerate"]))))
+    if r["samplesize"]:
+        fields.append(("samplesize", str(int(r["samplesize"]))))
+    if r["channels"]:
+        fields.append(("channels", str(int(r["channels"]))))
+    lossless = r["lossless"]
+    if type_code in ("flc", "wav", "aif"):
+        lossless = 1
+    elif type_code:
+        lossless = 0
+    if lossless is not None and lossless != "":
+        fields.append(("lossless", "1" if lossless else "0"))
+    fields.append(("remote", "0"))
+    if r["modtime"]:
+        fields.append(("modificationTime", r["modtime"]))
+        fields.append(("addedTime", r["modtime"]))
+        fields.append(("lastUpdated", r["modtime"]))
+    fields.append(("work", ""))
+    fields.append(("artwork_url", "0"))
+
+    out = [f"songinfo {offset} {limit} count:{len(fields)}"]
+    for key, value in fields:
+        out.append(f"{key}:{value}")
+    out.append("")
+    return out
 
 
 @register_command("years")
