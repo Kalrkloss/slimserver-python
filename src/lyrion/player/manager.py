@@ -644,12 +644,21 @@ class PlayerManager:
         player.playlist = [url]
         player.playlist_position = 0
         player.playlist_total = 1
-        ok = await handler.send_remote_stream(player.mac, url, "m")
+        # Guess the source codec from the URL so the strm frame tells the
+        # player the real format (an AAC stream announced as 'm' makes
+        # squeezelite decode AAC with the MP3 decoder → heavy distortion).
+        from lyrion.networking.protocol import SlimProtoClient
+
+        codec = SlimProtoClient._guess_codec_from_url(url)
+        ok = await handler.send_remote_stream(player.mac, url, codec)
+        if ok:
+            logger.info("play_url codec guess: %s -> '%s'", url[:60], codec)
         if ok:
             player.power = True  # playing implies power-on
             player.current_title = title or url
             player.current_url = url
             player.current_track_id = None
+            player.remote = 1  # radio stream: never "track end"
             player.mode = "play"
             player.last_activity = time.time()
             logger.info("play_url %s: %s (%s)", player_id, title or url, url[:60])

@@ -1,65 +1,43 @@
-# Transkodierung (Format-Fallback) — Stand & zurückgestellt
+# Transkodierung (Format-Fallback) — Stand
 
-**Status: IMPLEMENTIERT, aber WEITERE ARBEIT ZURÜCKGESTELLT**
-(Entscheidung am 2026-08-23: „Mach eine Notiz, aber stelle die Transkodierung erstmal zurück.")
+**Status: TEILWEISE IMPLEMENTIERT**
+(2026-08-23: lokaler Datei-Fallback + Radio-AAC-Fallback aktiv; Feintuning offen)
 
-## Was gebaut wurde (Commit `1399487bd`)
+## Was implementiert ist
 
-Ein Format-Fallback, der greift, wenn ein Player das Audioformat eines
-Sources nicht nativ dekodieren kann. Der Direktstream bleibt die Norm;
-Transcodierung läuft nur bei Bedarf (keine unnötige Server-Last).
+### 1. Lokale Dateien (`/stream.mp3?id=…&transcode=1`)
+- `send_strm_to_player` prüft `supported_formats` des Players (aus HELO-Model)
+- Kann der Player den Codec nicht, wird auf PCM (`codec='p'`) + `&transcode=1`
+  umgeschaltet; `stream_track` transkodiert via ffmpeg zu rohem PCM
+- Ohne ffmpeg: Warnung im Log + Statusleisten-Notice
+  „ffmpeg not found - transcoding not possible" (serverstatus-Feld `notice`),
+  der Stream wird trotzdem (direkt) versucht
 
-1. **Player-Format-Erkennung** — `supported_formats` pro Player aus dem
-   HELO-`Model`:
-   - `squeezelite` / `squeezeplay` → moderne Codec-Menge
-     (mp3, flac, aac, ogg, wav, aiff, pcm)
-   - klassische Squeezebox (squeezebox/2/3/classic) → kein AAC/ALAC
-   - unbekannte Modelle / leere Liste → „kann alles" (nie unnötig transkodieren)
-   - Dateien: `src/lyrion/player/state.py`, `src/lyrion/player/manager.py`
-     (`_formats_for_model`)
+### 2. Radio-Streams (AAC) — Commit nach SWR3-Bug
+- Problem: squeezelites faad2 versagt stumm bei vielen Radio-AAC-Varianten
+  (HE-AAC/SBR): Decoder konsumiert Bytes (`faad_decode consume…`), aber der
+  Output startet nie (STMf/STMc, dann kein STMt mehr) → keine Störungen mehr,
+  sondern Stille. Zuvor (codec falsch 'm'): mad_decode-Wall → starke Störungen.
+- Fix-Kette:
+  a) Codec-Erkennung aus URL (`_guess_codec_from_url`, .aac/.flac/.ogg/…)
+     statt fest 'm' in `play_url` + `_play_playlist_item`
+  b) `send_remote_stream`: codec 'a' → Proxy mit ffmpeg-Re-Encoding zu MP3
+     (`_send_proxy_stream(..., transcode="mp3")`, Endpoint
+     `/stream.mp3?remote=<url>&transcode=mp3`)
+  c) `_proxy_remote(transcode=…)`: holt Upstream (httpx, TLS-fähig),
+     piped durch ffmpeg (`_transcode_pipe`) → libmp3lame 192k live
+- Radio-Underruns führen nicht mehr zu "Track end" (`_advance_after_track`
+  bricht bei `player.remote=1` ab); STMt-Heartbeat reconciliert mode→play
 
-2. **Transcode-Entscheidung** — `protocol.py: _player_can_decode()` +
-   `send_strm_to_player`: wenn der Player den Codec nicht native kann,
-   wird das `strm`-Frame auf `codec='p'` (PCM) gesetzt und die Request-URL
-   um `&transcode=1` ergänzt.
+## Bekannte Einschränkungen / offene Punkte (zurückgestellt)
 
-3. **ffmpeg-PCM-Pipeline** — `src/lyrion/web/stream.py`:
-   - `ffmpeg_available()` (cached), `ffprobe_audio_info()`
-   - `_transcode_to_pcm_pipe()`: Datei via ffmpeg → rohes Little-Endian-PCM
-     (Rate/Kanäle/Bits aus ffprobe der Quelle, kein Resampling)
-   - `?transcode=1`-Zweig in `stream_track`
-
-4. **Graceful ohne ffmpeg** — Wenn ffmpeg fehlt, läuft der LMS normal
-   weiter (liefert den Source direkt) und zeigt in der Statusleiste:
-   `ffmpeg not found - transcoding not possible`.
-   - `src/lyrion/web/api.py`: `_SERVER_NOTICE` + `set_server_notice()`,
-     `notice`-Feld in `serverstatus`
-   - `html/index.html`: Statusleisten-Notice-Slot + serverstatus-Poll
-
-## Verifiziert
-
-- Transcode-Endpoint: FLAC → PCM korrekt (529200B, `audio/L16`,
-  kein `fLaC`-Header mehr, sofort beim ersten Sample).
-- Entscheidungslogik (Unit-Test):
-  - SqueezeLite → flac ✓, aac ✓ (kann alles)
-  - Classic Squeezebox → flac ✓, **aac ✗** (→ Transcode)
-  - unbekannt / None → kann alles ✓
-- Normale FLAC-Wiedergabe nach den Änderungen weiterhin sauber
-  („ein Ton" vom Nutzer bestätigt; kein Bruch durch den Fallback).
-- `test-clients.py` + `test-jive-cometd.py` grün; `hermes verify` → ok.
-
-## Offene Punkte (weil zurückgestellt — NICHT anfangen)
-
-- **Doppel-`strm`:** Im Log erscheint bei einem Play manchmal zweimal
-  `Sent strm to ... track=2 codec=f` (hörbar aber nur ein Ton). Ursache
-  ungeklärt — evtl. doppelter Command-Trigger. Nicht weiter verfolgt.
-- **Live-Test „ffmpeg fehlt"** nicht end-to-end geprüft, da ffmpeg
-  inzwischen installiert ist. Die Notice erscheint nur, wenn der Player
-  einen Codec nicht kann UND ffmpeg fehlt. Logik per Unit-Test bestätigt.
-- **Simulierter „Classic Squeezebox"-Player** (der AAC/FLAC nicht kann)
-  wurde nicht als end-to-end Fallback-Test gefahren.
-
-## Wieder aufnehmen
-
-Wenn die Transkodierung wieder aufgenommen werden soll: obige offene
-Punkte zuerst (Doppel-`strm`, echter „ffmpeg fehlt" / Classic-Player-Test).
+- **Wiedergabe-Stutter bei Transcode:** Live-Transkodierung kostet CPU;
+  bei Lastspitzen kann der Stream-Puffer leerlaufen (kurze Stops).
+  Optionen: Ziel-Bitrate senken (192k→128k), Player-Puffer vergrößern
+  (squeezelite `-b <streambuf>:<outputbuf>` in KB), oder schnelleren Server.
+- AAC wird pauschal über den Proxy geroutet — Player mit nachweislich
+  funktionierendem AAC-Dekoder könnten direkt spielen (feine Granularung
+  pro Player-Modell möglich).
+- OGG/Vorbis-Transcodes sind vorbereitet (ctype_map), aber ungetestet.
+- „ffmpeg fehlt"-Notice für Radio-Fallback: setzt aktuell nur beim
+  lokalen Datei-Pfad an; der Radio-Pfad loggt stattdessen.

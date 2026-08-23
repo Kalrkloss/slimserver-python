@@ -300,9 +300,13 @@ async def stream_track(scope: dict, receive, send) -> None:
     # Remote stream proxy: ?remote=<url> relays an external stream (radio
     # favorite) through the server. Squeezelite cannot do TLS, so https://
     # streams are fetched here and re-served as plain http.
+    # ?transcode=mp3 additionally re-encodes via ffmpeg (format fallback).
     remote_url = query.get("remote", [None])[0]
     if remote_url:
-        await _proxy_remote(send, remote_url)
+        transcode = (query.get("transcode", [""])[0] or "").strip().lower()
+        if transcode in ("0", "1", "true"):
+            transcode = "mp3"  # bare flag → default target mp3
+        await _proxy_remote(send, remote_url, transcode=transcode)
         return
 
     # Test tone (like original LMS "Test tone" in player settings):
@@ -556,7 +560,72 @@ async def _strip_icy_meta(chunks, metaint: int, send) -> None:
                 audio_left -= take
 
 
-async def _proxy_remote(send, remote_url: str) -> None:
+async def _transcode_pipe(send, source_chunks, enc_args: list[str]) -> None:
+    """Pipe ``source_chunks`` through ffmpeg, forward the encoded bytes.
+
+    Format fallback for streams the player cannot decode natively
+    (e.g. HE-AAC radio that squeezelite's faad chokes on). ffmpeg reads
+    the raw source from stdin and re-encodes to ``enc_args``; output
+    chunks are forwarded as they arrive (live transcoding).
+    """
+    import asyncio as _asyncio
+
+    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error",
+           "-i", "pipe:0", "-vn", *enc_args,
+           "-f", _ffmpeg_output_format(enc_args), "pipe:1"]
+    logger.info("Transcode: %s", " ".join(cmd))
+    proc = await _asyncio.create_subprocess_exec(
+        *cmd,
+        stdin=_asyncio.subprocess.PIPE,
+        stdout=_asyncio.subprocess.PIPE,
+        stderr=_asyncio.subprocess.DEVNULL,
+    )
+
+    async def _feed() -> None:
+        try:
+            async for chunk in source_chunks:
+                proc.stdin.write(chunk)
+                await proc.stdin.drain()
+        except Exception:
+            pass
+        finally:
+            try:
+                proc.stdin.close()
+            except Exception:
+                pass
+
+    feeder = _asyncio.create_task(_feed())
+    try:
+        while True:
+            out = await proc.stdout.read(CHUNK_SIZE)
+            if not out:
+                break
+            await send({"type": "http.response.body", "body": out,
+                        "more_body": True})
+    except (ConnectionError, BrokenPipeError, asyncio.CancelledError):
+        proc.kill()
+        return
+    feeder.cancel()
+    try:
+        await _asyncio.wait_for(proc.wait(), timeout=5)
+    except Exception:
+        proc.kill()
+    await send({"type": "http.response.body", "body": b"",
+                "more_body": False})
+
+
+def _ffmpeg_output_format(enc_args: list[str]) -> str:
+    """Container/format name for the ffmpeg -f flag from the encoder args."""
+    if any("libmp3lame" in a or a == "mp3" for a in enc_args):
+        return "mp3"
+    if any("flac" in a for a in enc_args):
+        return "flac"
+    if any("pcm_s16le" in a for a in enc_args):
+        return "s16le"
+    return "adts"  # aac
+
+
+async def _proxy_remote(send, remote_url: str, transcode: str = "") -> None:
     """Relay an external stream URL (radio favorite) to the player.
 
     Squeezelite cannot handle https/TLS, so the server fetches the remote
@@ -570,6 +639,11 @@ async def _proxy_remote(send, remote_url: str) -> None:
     NOT parse icy-metaint from the response header (verified in
     stream.c: meta_interval is only set via a cont frame), so any metadata
     left in the stream would be decoded as audio → "lost synchronization".
+
+    transcode: target codec for the format fallback. When set (e.g.
+    'libmp3lame'), the source is piped through ffmpeg and re-encoded —
+    used when the player cannot decode the source format itself
+    (e.g. HE-AAC streams that squeezelite's faad cannot play).
     """
     import httpx
 
@@ -591,6 +665,31 @@ async def _proxy_remote(send, remote_url: str) -> None:
                                    remote_url[:80], resp.status_code)
                     await _send_simple(send, 502, "Upstream error", "text/plain")
                     return
+
+                # ── Format fallback: pipe through ffmpeg → target codec ──
+                if transcode:
+                    ctype_map = {
+                        "mp3": ("audio/mpeg", ["-c:a", "libmp3lame", "-b:a", "192k"]),
+                        "aac": ("audio/aac", ["-c:a", "aac", "-b:a", "160k"]),
+                        "flac": ("audio/flac", ["-c:a", "flac"]),
+                        "wav": ("audio/wav", ["-c:a", "pcm_s16le"]),
+                    }
+                    ctype, enc_args = ctype_map.get(
+                        transcode, ("audio/mpeg", ["-c:a", "libmp3lame", "-b:a", "192k"]))
+                    logger.info("Stream %s: transcoding to %s (%s)",
+                                remote_url[:60], transcode, ctype)
+                    await send({
+                        "type": "http.response.start",
+                        "status": 200,
+                        "headers": [
+                            (b"content-type", ctype.encode()),
+                            (b"cache-control", b"no-cache"),
+                        ],
+                    })
+                    await _transcode_pipe(
+                        send, resp.aiter_bytes(CHUNK_SIZE), enc_args)
+                    return
+
                 ctype = resp.headers.get("content-type", "audio/mpeg")
                 proxy_headers = [
                     (b"content-type", ctype.encode()),

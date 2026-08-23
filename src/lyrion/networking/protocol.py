@@ -100,6 +100,7 @@ from collections.abc import Coroutine
 from dataclasses import dataclass, field
 from enum import IntEnum, IntFlag
 from typing import Any, Callable
+from urllib.parse import urlparse
 import time
 
 # Install uvloop as the default event loop policy at import time.
@@ -1122,6 +1123,27 @@ class SlimProtoClient:
         }.get(codec, "mp3")
 
     @staticmethod
+    def _guess_codec_from_url(url: str) -> str:
+        """Guess the slimproto codec char from a stream/file URL.
+
+        Radio stream URLs usually end in .mp3/.aac/.pls etc. (or carry the
+        format in the path). Falls back to 'm' (mp3) when unknown — the
+        historical default.
+        """
+        try:
+            path = urlparse(url).path.lower()
+        except Exception:
+            return "m"
+        if path.endswith((".aac", ".m4a", ".mp4", ".adts")):
+            return "a"
+        if path.endswith((".flac",)):
+            return "f"
+        if path.endswith((".ogg", ".oga", ".opus", ".vorbis")):
+            return "o"
+        # .mp3, .pls, .m3u, no extension → mp3 (historical default)
+        return "m"
+
+    @staticmethod
     def _player_can_decode(player, codec: str) -> bool:
         """True if ``player`` natively decodes a source of the given codec
         char (''/no supported_formats ⇒ assume the common set)."""
@@ -1552,6 +1574,19 @@ class SlimProtoClient:
                         mac, url[:60])
             return await self._send_proxy_stream(mac, url, codec)
 
+        # ── Format fallback: AAC radio streams ──────────────────────────
+        # squeezelite's faad2 fails silently on many radio AAC flavours
+        # (HE-AAC/SBR): it consumes bytes but the output never starts
+        # (STMf/STMc then nothing). The Perl LMS transcodes those to MP3
+        # for players without native AAC support. Route them through the
+        # server proxy with an ffmpeg re-encode so the player gets plain
+        # MP3 it can always decode.
+        if codec == "a":
+            logger.info("AAC stream %s — using transcode proxy "
+                        "(faad2 unreliable on radio AAC) ", url[:60])
+            return await self._send_proxy_stream(mac, url, "m",
+                                                 transcode="mp3")
+
         try:
             parsed = urlparse(url)
             if parsed.scheme not in ("http", "https") or not parsed.hostname:
@@ -1610,17 +1645,24 @@ class SlimProtoClient:
         asyncio.create_task(self._send_cont_after_resp(mac, url))
         return True
 
-    async def _send_proxy_stream(self, mac: str, url: str, codec: str = "m") -> bool:
+    async def _send_proxy_stream(self, mac: str, url: str, codec: str = "m",
+                                 transcode: str = "") -> bool:
         """Fallback: server-side proxy stream (player fetches /stream.mp3
-        from this server, which relays the remote URL)."""
+        from this server, which relays the remote URL). With ``transcode``
+        set, the proxy re-encodes via ffmpeg to that target format."""
         mac = mac.upper().replace(":", "")
         writer = self._player_writers.get(mac)
         if writer is None or writer.is_closing():
             logger.warning("No active connection for player %s", mac)
             return False
 
+        from urllib.parse import quote
+
+        query = f"remote={quote(url, safe='')}"
+        if transcode:
+            query += f"&transcode={quote(transcode, safe='')}"
         request = (
-            f"GET /stream.mp3?player={mac} HTTP/1.0\r\n"
+            f"GET /stream.mp3?{query} HTTP/1.0\r\n"
             f"\r\n"
         ).encode("ascii")
 
@@ -2020,7 +2062,15 @@ class SlimProtoClient:
                     # with every STMt) — used for status 'time'.
                     if elapsed and elapsed < 3600 * 24:  # sanity: < 24h
                         player.elapsed = elapsed
-                    if event == "STMd":
+                    if event == "STMt":
+                        # TIMING heartbeat: only sent while the output is
+                        # RUNNING. If the UI state says otherwise (e.g. the
+                        # STMo start underrun flipped it), reconcile to play.
+                        # (Real LMS derives mode from the decoder/output
+                        # state the same way.)
+                        if player.mode != "play" and getattr(player, "remote", 0):
+                            player.mode = "play"
+                    elif event == "STMd":
                         # DECODE_COMPLETE — decoder has no more data. With
                         # small local files this fires LONG before the
                         # track has finished PLAYING: squeezelite decodes
@@ -2146,10 +2196,17 @@ async def _advance_after_track(pm, mac_str: str) -> None:
     LMS behaviour: after the last track the player stops; otherwise the
     next playlist item gets a new strm frame. Do NOT wrap around (LMS
     default has repeat off).
+
+    A remote (radio) stream NEVER ends — an underrun there is just a
+    buffer hiccup, not track end. Never advance/stop on it.
     """
     try:
         player = pm.get_player(mac_str)
         if player is None or not player.playlist:
+            return
+        if getattr(player, "remote", 0):
+            logger.info("Underrun on remote stream %s — not a track end, "
+                        "keeping playback", mac_str)
             return
         if player.playlist_position < len(player.playlist) - 1:
             logger.info("Track finished on %s — advancing playlist", mac_str)

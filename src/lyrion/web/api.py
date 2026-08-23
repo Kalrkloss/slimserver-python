@@ -1586,7 +1586,10 @@ class JSONRPCAPI:
             if isinstance(item, int):
                 ok = await handler.send_strm_to_player(player.mac, item)
             else:
-                ok = await handler.send_remote_stream(player.mac, str(item))
+                from lyrion.networking.protocol import SlimProtoClient
+
+                codec = SlimProtoClient._guess_codec_from_url(str(item))
+                ok = await handler.send_remote_stream(player.mac, str(item), codec)
             # If the strm could not be delivered (player disconnected /
             # writer gone), don't leave the player stuck in 'play': revert
             # to 'stop' so the UI poll flips the icon back. This mirrors the
