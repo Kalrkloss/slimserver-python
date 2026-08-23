@@ -292,10 +292,14 @@ def _alarm_from_parts(index: int, parts: dict[str, str]) -> Alarm:
             pass
     if "repeat" in parts:
         a.repeat = parts["repeat"] not in ("0", "false", "")
-    # wake source
-    for w in ("url", "track", "wake"):
+    # wake source — 'url:'/track:' wrap with their prefix; a 'wake:' value
+    # already carries it (don't double-prefix).
+    for w in ("url", "track"):
         if w in parts and parts[w]:
             a.wake = f"{w}:{parts[w]}"
+    if "wake" in parts and parts["wake"]:
+        a.wake = parts["wake"] if parts["wake"].startswith(("url:", "track:")) \
+            else f"url:{parts['wake']}"
     return a
 
 
