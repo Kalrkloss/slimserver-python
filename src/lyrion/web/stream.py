@@ -170,6 +170,33 @@ async def _load_track(track_id: int):
         return path, mime
 
 
+async def _revert_player_mode(mac: str) -> None:
+    """Set a player's mode back to stop after a failed stream attempt.
+
+    The strm frame was already sent and mode was set to 'play' (the UI shows
+    Pause optimistically). If the track turns out to be unplayable (missing
+    on disk, bad source), revert to 'stop' so the status poll flips the icon
+    back to Play — exactly like the real LMS when a track fails.
+    """
+    try:
+        from lyrion.player.manager import PlayerManager
+        pm = PlayerManager()
+        # Stream requests carry the MAC possibly URL-encoded (player=02%3A…)
+        mac = mac.replace("%3A", ":")
+        player = pm.get_player(mac)
+        if player is None:
+            cleaned = mac.upper().replace(":", "")
+            for p in pm.get_all_players():
+                if p.mac.upper().replace(":", "") == cleaned:
+                    player = p
+                    break
+        if player is not None and player.mode in ("play", "loading"):
+            player.mode = "stop"
+            pm.set_mode(player.mac, "stop")
+    except Exception:
+        pass
+
+
 async def stream_track(scope: dict, receive, send) -> None:
     """Serve a track file with HTTP range support (ASGI)."""
     query = parse_qs(urlparse(scope.get("raw_path", b"").decode("latin1")).query)
@@ -237,6 +264,12 @@ async def stream_track(scope: dict, receive, send) -> None:
     path, mime = await _load_track(track_id)
     if path is None or not path.is_file():
         logger.warning("Stream: track %d not found on disk (%s)", track_id, path)
+        # The strm frame was already sent and the player set mode=play (the
+        # UI shows Pause optimistically). Tell the player to stop so the
+        # status poll flips the icon back to Play — the track simply doesn't
+        # exist / is unplayable.
+        if player_mac:
+            await _revert_player_mode(player_mac)
         await _send_simple(send, 404, "Track not found", "text/plain")
         return
 

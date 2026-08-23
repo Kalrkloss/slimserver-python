@@ -1394,15 +1394,33 @@ class JSONRPCAPI:
             # Playing implies power-on (like real LMS)
             if not player.power:
                 player.power = True
-            if isinstance(item, int):
-                await handler.send_strm_to_player(player.mac, item)
-            else:
-                await handler.send_remote_stream(player.mac, str(item))
+            # Set the mode SYNCHRONOUSLY BEFORE the (async) stream send, so
+            # player.status reports 'playing' immediately after a play command
+            # (real LMS does this). Otherwise a remote/stream start lags and a
+            # status poll right after the command still reports the old mode,
+            # causing the UI icon to flip back momentarily.
             player.mode = "play"
             player.playlist_position = idx
             if isinstance(item, int):
                 player.current_track_id = item
             pm.set_mode(player.mac, "play")
+            ok = True
+            if isinstance(item, int):
+                ok = await handler.send_strm_to_player(player.mac, item)
+            else:
+                ok = await handler.send_remote_stream(player.mac, str(item))
+            # If the strm could not be delivered (player disconnected /
+            # writer gone), don't leave the player stuck in 'play': revert
+            # to 'stop' so the UI poll flips the icon back. This mirrors the
+            # real LMS, which only reports 'playing' once the stream is
+            # actually accepted.
+            if not ok:
+                logger = __import__("logging").getLogger("lyrion.web.api")
+                logger.warning("Failed to send strm to %s (item %d) — reverting to stop", player.mac, idx)
+                player.mode = "stop"
+                player.playlist_position = -1
+                pm.set_mode(player.mac, "stop")
+                return
             logger = __import__("logging").getLogger("lyrion.web.api")
             logger.info("Playing playlist item %d (%r) on %s", idx, item, player.mac)
         except Exception as exc:
