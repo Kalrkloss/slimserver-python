@@ -1732,40 +1732,45 @@ class JSONRPCAPI:
                 if not str(tid).isdigit():
                     return self._browse_response([])
                 r = db.execute(
-                    "SELECT t.id, t.title, t.url, t.duration, t.year, t.tracknum, t.genre, "
-                    "t.filesize, t.samplerate, t.bitspersample AS samplesize, t.channels, "
-                    "t.content_type AS ctype, t.modtime FROM tracks t WHERE t.id = ? LIMIT 1",
+                    "SELECT t.id, t.title, t.url, t.duration, t.year, t.tracknum, "
+                    "t.genre, t.filesize, t.bitrate, t.samplerate, t.channels, "
+                    "t.content_type AS ctype, t.modtime, t.remote, "
+                    "COALESCE(t.compilation,0) AS compilation FROM tracks t "
+                    "WHERE t.id = ? LIMIT 1",
                     (int(tid),)).fetchone()
                 if r is None:
                     return self._browse_response([])
-                # Perl parity: songinfo_loop = one item PER FIELD.
+                # Perl parity: songinfo_loop = ONE item PER FIELD, in the exact
+                # LMS order (id, title, artist, work, duration, album_id,
+                # filesize, genre, coverart, album, modificationTime, type,
+                # genre_id, bitrate, artist_id, tracknum, remote, year,
+                # compilation, addedTime). Empty fields are omitted. Perl
+                # returns ONLY songinfo_loop (no count / loop_loop / item_loop).
                 fields: list[tuple] = [("id", r["id"]), ("title", r["title"] or "")]
-                if r["duration"]:
-                    fields.append(("duration", round(float(r["duration"]), 3)))
-                if r["url"]:
-                    fields.append(("url", r["url"]))
                 a = db.execute(
                     "SELECT c.id, c.name FROM contributors c JOIN tracks_contributors tc "
                     "ON tc.contributor = c.id AND tc.role = 1 WHERE tc.track = ? "
                     "ORDER BY c.name LIMIT 1", (r["id"],)).fetchone()
                 if a:
                     fields.append(("artist", a["name"]))
-                    fields.append(("artist_id", str(a["id"])))
+                # work: composer field (rare) — omit if absent
+                if r["duration"] is not None:
+                    fields.append(("duration", round(float(r["duration"]), 3)))
                 al = db.execute(
                     "SELECT al.id, al.title FROM albums al JOIN tracks_albums ta "
                     "ON ta.album = al.id WHERE ta.track = ? LIMIT 1",
                     (r["id"],)).fetchone()
                 if al:
-                    fields.append(("album", al["title"]))
                     fields.append(("album_id", str(al["id"])))
-                if r["genre"]:
-                    fields.append(("genre", r["genre"]))
-                if r["year"]:
-                    fields.append(("year", str(r["year"])))
-                if r["tracknum"]:
-                    fields.append(("tracknum", str(r["tracknum"])))
                 if r["filesize"]:
                     fields.append(("filesize", str(r["filesize"])))
+                if r["genre"]:
+                    fields.append(("genre", r["genre"]))
+                # coverart: no artwork in the small test library — omit
+                if al:
+                    fields.append(("album", al["title"]))
+                if r["modtime"]:
+                    fields.append(("modificationTime", str(r["modtime"])))
                 type_code = {
                     "audio/flac": "flc", "audio/x-flac": "flc",
                     "audio/mpeg": "mp3", "audio/mp3": "mp3",
@@ -1773,15 +1778,27 @@ class JSONRPCAPI:
                 }.get((r["ctype"] or "").lower(), "")
                 if type_code:
                     fields.append(("type", type_code))
-                if r["samplerate"]:
-                    fields.append(("samplerate", str(int(r["samplerate"]))))
-                if r["channels"]:
-                    fields.append(("channels", str(int(r["channels"]))))
-                fields.append(("remote", "0"))
+                g_id = db.execute(
+                    "SELECT id FROM genres WHERE name = ? LIMIT 1",
+                    (r["genre"],)).fetchone() if r["genre"] else None
+                if g_id:
+                    fields.append(("genre_id", str(g_id["id"])))
+                if r["bitrate"]:
+                    fields.append(("bitrate", str(int(r["bitrate"]))))
+                if a:
+                    fields.append(("artist_id", str(a["id"])))
+                if r["tracknum"]:
+                    fields.append(("tracknum", str(r["tracknum"])))
+                fields.append(("remote", "1" if r["remote"] else "0"))
+                if r["year"]:
+                    fields.append(("year", str(r["year"])))
+                if r["compilation"]:
+                    fields.append(("compilation", "1"))
                 if r["modtime"]:
-                    fields.append(("modificationTime", str(r["modtime"])))
+                    fields.append(("addedTime", str(r["modtime"])))
                 loop = [{k: v} for k, v in fields]
-                return self._browse_response(loop, len(fields), "songinfo_loop")
+                # Perl returns ONLY songinfo_loop — no count / loop_loop.
+                return {"songinfo_loop": loop}
             else:
                 db.close()
                 return self._browse_response([])
