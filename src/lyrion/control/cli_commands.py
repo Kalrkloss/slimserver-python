@@ -1912,7 +1912,11 @@ async def cmd_pref(
     if not args:
         return []
     key = args[0]
-    value = args[1] if len(args) > 1 else None
+    # LMS 'pref <key> ?' is a QUERY — set value to None so the
+    # dispatcher reads the current value instead of writing '?'.
+    value = None
+    if len(args) > 1 and args[1] != "?":
+        value = args[1]
     if handler._dispatcher:
         return await handler._dispatcher.get_set_preference(key, value)
     return []
