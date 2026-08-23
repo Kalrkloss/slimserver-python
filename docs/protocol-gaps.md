@@ -7,6 +7,24 @@ Schweregrad: 🔴 kritisch · 🟠 mittel · 🟡 gering.
 
 Stand der Analyse: 2026-08-13, Code-Basis Commit `ac346b8`.
 
+> **Aktualisierung 2026-08-23 (Commit `a5441a203`):** Mehrere CLI-Gaps aus
+> diesem Dokument wurden inzwischen geschlossen:
+> - `serverstatus` (3.6): `players_loop`, roher `playerid` (kein %3A),
+>   `ip`, `lastscan`, `other player count` ergänzt.
+> - `status` (3.8): `tags`/`playlist_loop` vorhanden; dazu `seq_no`,
+>   `playlist_timestamp`, `playlist mode/shuffle/repeat`, `signalstrength`,
+>   `remote`, `randomplay`, `use_volume_control`, `digital_volume_control`,
+>   `mixer volume`, `remoteMeta.*` (auch `use_volume_control` als 1/0).
+> - `menu` (3.9): liest `item_loop` statt `loop_loop`, liefert nun
+>   `menu count:N` + `text:`/`browse:` pro Item.
+> - `pref <key> ?` war als Query nötig (wurde sonst als Wert gesetzt).
+> - `sleep`/`signalstrength`/`randomplay` (waren `unknown command`).
+> - `alarm`/`alarms` neu (LMS-Form, leere Liste ist gültig).
+> - `ir`/`display` über `PlayerManager` (slimproto `irm`/`grfe`).
+> - `playlist index ?`/`jump` geben den aktuellen Index zurück.
+> - `cli_server.py`: Dispatcher pro Verbindung wird gestartet (sonst
+>   antwortet jeder player_command mit „server shutting down").
+
 ---
 
 ## 1. SlimProto (TCP 3483) — Kapitel 2 der Spec
