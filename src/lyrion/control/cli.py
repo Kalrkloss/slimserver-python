@@ -102,6 +102,7 @@ class CLIContext:
     charset: str = "utf-8"
     subscribed_player: Optional[str] = None
     subscribe_interval: int = 0  # seconds between keep-alive status pushes
+    command: str = ""  # the command name actually invoked (for aliases)
 
 
 # ---------------------------------------------------------------------------
@@ -332,6 +333,7 @@ class CLIHandler:
         # Look up registered command
         if cmd in _COMMAND_REGISTRY:
             func, _ = _COMMAND_REGISTRY[cmd]
+            ctx.command = cmd  # expose the invoked name so aliases echo it
             try:
                 return await func(self, ctx, args)
             except Exception as exc:

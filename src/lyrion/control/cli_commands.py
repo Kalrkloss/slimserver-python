@@ -1258,6 +1258,68 @@ async def cmd_current_title(
         return [f"cli error: {e}", ""]
 
 
+@register_command("artist")
+async def cmd_artist(
+    handler: CLIHandler,
+    ctx: CLIContext,
+    args: list[str],
+) -> list[str]:
+    """artist [?] — return the artist of the currently playing track."""
+    return await _current_metadata(ctx, "artist")
+
+
+@register_command("album")
+async def cmd_album(
+    handler: CLIHandler,
+    ctx: CLIContext,
+    args: list[str],
+) -> list[str]:
+    """album [?] — return the album of the currently playing track."""
+    return await _current_metadata(ctx, "album")
+
+
+@register_command("genre")
+async def cmd_genre(
+    handler: CLIHandler,
+    ctx: CLIContext,
+    args: list[str],
+) -> list[str]:
+    """genre [?] — return the genre of the currently playing track."""
+    return await _current_metadata(ctx, "genre")
+
+
+async def _current_metadata(ctx: CLIContext, field: str) -> list[str]:
+    """Return a single metadata field (artist/album/genre) of the current track."""
+    if not ctx.player_id:
+        return ["no player selected"]
+    try:
+        from lyrion.player import PlayerManager
+        player = PlayerManager().get_player(ctx.player_id)
+        if player is None or player.current_track_id is None:
+            return ["", ""]
+        # Cache on player state, but fall back to the DB row.
+        cached = getattr(player, f"current_{field}", None)
+        if cached:
+            return [str(cached), ""]
+        if field == "artist":
+            sql = ("SELECT c.name AS v FROM contributors c "
+                   "JOIN tracks_contributors tc ON tc.contributor = c.id "
+                   "AND tc.role = 1 WHERE tc.track = ? LIMIT 1")
+        elif field == "album":
+            # tracks has no album column; resolve via tracks_albums -> albums.
+            sql = ("SELECT al.title AS v FROM albums al "
+                   "JOIN tracks_albums ta ON ta.album = al.id "
+                   "WHERE ta.track = ? LIMIT 1")
+        else:
+            sql = f"SELECT {field} AS v FROM tracks WHERE id = ?"
+        rows = await _query_db(sql, (player.current_track_id,))
+        if rows and rows[0]["v"]:
+            return [str(rows[0]["v"]), ""]
+        return ["", ""]
+    except Exception as e:  # noqa: BLE001
+        return [f"cli error: {e}", ""]
+
+
 # ---------------------------------------------------------------------------
 # Playlist commands
 # ---------------------------------------------------------------------------
@@ -2385,7 +2447,9 @@ async def cmd_songs(
         params,
     )
     total_n = total[0]["n"] if total else 0
-    out = [f"songs {offset} {limit} count:{total_n}"]
+    # Echo the invoked command name ('songs' or the 'titles' alias).
+    name = getattr(ctx, "command", "") or "songs"
+    out = [f"{name} {offset} {limit} count:{total_n}"]
     for r in rows:
         line = f"id:{r['id']} title:{r['title'] or ''}"
         if r["genre"]:
