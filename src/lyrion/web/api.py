@@ -355,12 +355,14 @@ class JSONRPCAPI:
                     titles = {}
             for i, entry in enumerate(tracks):
                 if isinstance(entry, str):
+                    stream_name = getattr(player, "stream_titles", {}).get(entry, "")
                     out.append({
                         "index": i,
                         "url": entry,
-                        "title": player.current_title
-                        if i == player.playlist_position and player.current_title
-                        else "Radio Stream",
+                        "title": stream_name
+                        or (player.current_title
+                            if i == player.playlist_position and player.current_title
+                            else "Radio Stream"),
                     })
                 else:
                     out.append({
@@ -1328,23 +1330,42 @@ class JSONRPCAPI:
                 # Accept a DB track id, a 'track_id:<n>' tag (controllers),
                 # or a plain URL. SqueezeTray adds URLs (radio/favorites);
                 # the SPA + Android controllers add tagged track ids.
+                # A stream URL may carry a display title (station name) via a
+                # paired 'title:<name>' so the playlist shows it instead of
+                # 'Radio Stream':
+                #   playlist add <url> title:<name>
                 player = pm.get_player(pid)
                 if player is not None:
+                    pending = ""
                     for item in rest:
-                        # 'track_id:2' / 'item_id:2' -> db id; 'url:...' -> url
                         low = str(item).lower()
                         if low.startswith("track_id:") or low.startswith("item_id:"):
                             tid = low.split(":", 1)[1]
                             if tid.isdigit():
                                 player.playlist.append(int(tid))
                         elif low.startswith("url:"):
-                            player.playlist.append(low.split(":", 1)[1])
+                            pending = low.split(":", 1)[1]
+                        elif low.startswith("title:"):
+                            title = str(item).split(":", 1)[1]
+                            # Append the pending bare URL (it was held waiting
+                            # for a paired title) and record its display name.
+                            if pending:
+                                player.playlist.append(pending)
+                                self._set_stream_title(player, pending, title)
+                                pending = ""
+                            else:
+                                # 'url:<x> title:<y>' form — URL already parsed.
+                                self._set_stream_title(player, pending or "", title)
                         elif str(item).isdigit():
                             player.playlist.append(int(item))
                         else:
-                            # bare URL:
-                            player.playlist.append(item)
+                            # bare URL — remember it and wait for a paired title
+                            if pending:
+                                player.playlist.append(pending)
+                            pending = str(item)
                         player.last_activity = time.time()
+                    if pending:
+                        player.playlist.append(pending)
                     player.playlist_total = len(player.playlist)
             elif sub == "index" and rest:
                 idx = rest[0]
@@ -1380,6 +1401,26 @@ class JSONRPCAPI:
                     player.playlist_total = 0
         else:
             send(f"{cmd} {' '.join(args)}")
+
+    @staticmethod
+    def _set_stream_title(player, url: str, title: str) -> None:
+        """Associate a display title with a stream URL held in the playlist.
+
+        'playlist add <url> title:<name>' stores the station name so playlist
+        rendering shows it instead of the generic 'Radio Stream'. The title is
+        keyed by URL on the player, not baked into the playlist entry (which
+        stays a str URL to keep the slimproto/CLI paths simple).
+        """
+        if not url or not title:
+            return
+        try:
+            titles = getattr(player, "stream_titles", None)
+            if titles is None:
+                titles = {}
+                player.stream_titles = titles
+            titles[url] = title
+        except Exception:
+            pass
 
     async def _play_playlist_item(self, pm, player, idx: int) -> None:
         """Send a strm frame for playlist item idx (track id or stream URL)."""
