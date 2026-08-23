@@ -54,6 +54,7 @@ class PlayerState:
     sleep_remaining: int = 0      # sleep-timer seconds remaining (0 = off)
     use_volume_control: bool = True
     remote_meta: dict = field(default_factory=dict)  # ICY/HTTP stream metadata
+    playerprefs: dict = field(default_factory=dict)  # per-player prefs (playerpref)
     # P6-2: playlist holds track ids AND stream URLs (radio/favorites).
     playlist: list[int | str] = field(default_factory=list)
     sync_master: Optional[str] = None

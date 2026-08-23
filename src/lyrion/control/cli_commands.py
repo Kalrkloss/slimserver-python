@@ -915,6 +915,42 @@ async def cmd_mixer(
         return [f"cli error: {e}", ""]
 
 
+@register_command("playerpref")
+async def cmd_playerpref(
+    handler: CLIHandler,
+    ctx: CLIContext,
+    args: list[str],
+) -> list[str]:
+    """playerpref <key> [<value>] — query or set a per-player preference.
+
+    LMS 'playerpref volume ?' returns _p2 '<value>'. 'playerpref <key> <v>'
+    sets it. Prefs are stored on the player state dict (in-memory).
+    """
+    if not ctx.player_id:
+        return ["no player selected"]
+    if not args:
+        return ["playerpref: ", ""]
+    key = str(args[0])
+    try:
+        from lyrion.player import PlayerManager
+        player = PlayerManager().get_player(ctx.player_id)
+        if player is None:
+            return ["player not found", ""]
+        prefs = getattr(player, "playerprefs", None)
+        if prefs is None:
+            prefs = {}
+            player.playerprefs = prefs
+        # Query form: '?'
+        if len(args) == 1 or (len(args) == 2 and str(args[1]) == "?"):
+            return [f"playerpref {key}: {prefs.get(key, '')}", ""]
+        # Set form: value may be multi-word (join the rest)
+        value = " ".join(str(a) for a in args[1:])
+        prefs[key] = value
+        return [f"playerpref {key}: {value}", ""]
+    except Exception as e:  # noqa: BLE001
+        return [f"cli error: {e}", ""]
+
+
 # ---------------------------------------------------------------------------
 # Status
 # ---------------------------------------------------------------------------
