@@ -1745,12 +1745,22 @@ async def cmd_display(
     ctx: CLIContext,
     args: list[str],
 ) -> list[str]:
-    """display <line1> <line2> — show text on player display."""
+    """display <line1> <line2> [<duration>] — show text on player display.
+
+    Sent as a slimproto 'grfe' frame (two-line text). Software players
+    (squeezelite/jive) render it on their UI.
+    """
     if not ctx.player_id:
         return ["no player selected"]
-    if handler._dispatcher:
-        return await handler._dispatcher.player_command(ctx.player_id, "display", args)
-    return []
+    try:
+        line1 = args[0] if args else ""
+        line2 = args[1] if len(args) > 1 else ""
+        duration = int(args[2]) if len(args) > 2 and str(args[2]).isdigit() else 3
+        from lyrion.player import PlayerManager
+        ok = await PlayerManager().show_display(ctx.player_id, line1, line2, duration)
+        return [] if ok else ["cli error: could not display"]
+    except Exception as e:  # noqa: BLE001
+        return [f"cli error: {e}"]
 
 
 @register_command("ir")
@@ -1759,12 +1769,80 @@ async def cmd_ir(
     ctx: CLIContext,
     args: list[str],
 ) -> list[str]:
-    """ir <button_code> — simulate an IR button press."""
+    """ir <button_code> — simulate an IR button press on the player.
+
+    The button code is a numeric SlimProto IR code. Named buttons
+    ('play','pause','arrow_up',...) are mapped to their codes here so
+    clients can use either form. Sent as an 'irm' slimproto frame.
+    """
     if not ctx.player_id:
         return ["no player selected"]
-    if handler._dispatcher:
-        return await handler._dispatcher.player_command(ctx.player_id, "ir", args)
-    return []
+    if not args:
+        return ["ir requires a button code or name"]
+    try:
+        code = _resolve_ir_code(args[0])
+        from lyrion.player import PlayerManager
+        ok = await PlayerManager().send_ir(ctx.player_id, code)
+        return [] if ok else ["cli error: could not send ir"]
+    except ValueError:
+        return [f"ir: unknown button '{args[0]}'"]
+    except Exception as e:  # noqa: BLE001
+        return [f"cli error: {e}"]
+
+
+# Common Squeezebox IR button codes (Slim::Hardware::IRBLaster / default map)
+_IR_CODES: dict[str, int] = {
+    "play": 0x7689C,
+    "pause": 0x76899,
+    "stop": 0x76893,
+    "skip": 0x76897,
+    "fwd": 0x76897,
+    "rew": 0x76891,
+    "prev": 0x76891,
+    "arrow_up": 0x7685A,
+    "arrow_down": 0x7685B,
+    "arrow_left": 0x7685C,
+    "arrow_right": 0x7685D,
+    "up": 0x7685A,
+    "down": 0x7685B,
+    "left": 0x7685C,
+    "right": 0x7685D,
+    "select": 0x76858,
+    "center": 0x76858,
+    "power": 0x76880,
+    "add": 0x76854,
+    "volume_up": 0x76855,
+    "volume_down": 0x76856,
+    "voldown": 0x76856,
+    "volup": 0x76855,
+    "sleep": 0x76888,
+    "shuffle": 0x76852,
+    "repeat": 0x76853,
+    "size": 0x76851,
+    "brightness": 0x76850,
+    "now_playing": 0x7685E,
+    "search": 0x7685F,
+    "browse": 0x76860,
+    "favorites": 0x76861,
+    "zero": 0x76862,
+    "display": 0x7685E,
+}
+
+
+def _resolve_ir_code(token: str) -> int:
+    """Resolve an IR token (name or decimal/hex code) to a numeric code."""
+    t = str(token).strip().lower()
+    if t in _IR_CODES:
+        return _IR_CODES[t]
+    # bare code: decimal "768989" or hex "0x768989" / "768989h"
+    s = t
+    if s.endswith("h"):
+        s = s[:-1]
+    base = 16 if (s.startswith("0x") or s.endswith("h")) else 10
+    try:
+        return int(s if not s.startswith("0x") else s[2:], base)
+    except ValueError:
+        raise ValueError(token)
 
 
 # ---------------------------------------------------------------------------

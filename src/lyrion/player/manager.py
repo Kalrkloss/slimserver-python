@@ -732,6 +732,52 @@ class PlayerManager:
         player.last_activity = time.time()
         return True
 
+    # ------------------------------------------------------------------
+    # IR / Display (player-facing commands)
+    # ------------------------------------------------------------------
+
+    async def send_ir(self, player_id: str, button_code: int) -> bool:
+        """Send an IR/button code to a player (slimproto 'irm' frame).
+
+        Args:
+            player_id: Player MAC address.
+            button_code: Numeric IR button code (e.g. 0x7689xx = play).
+
+        Returns:
+            True if the frame was sent to a connected player.
+        """
+        player = self.get_player(player_id)
+        if player is None:
+            return False
+        handler = self._protocol_handler
+        if handler is None:
+            return False
+        return await handler.send_ir_to_player(player.mac, button_code)
+
+    async def show_display(
+        self, player_id: str, line1: str, line2: str, duration: int = 3
+    ) -> bool:
+        """Show a two-line text message on a player (slimproto 'grfe' frame).
+
+        Args:
+            player_id: Player MAC address.
+            line1: First display line.
+            line2: Second display line.
+            duration: How many seconds to show the message.
+
+        Returns:
+            True if the frame was sent to a connected player.
+        """
+        player = self.get_player(player_id)
+        if player is None:
+            return False
+        handler = self._protocol_handler
+        if handler is None:
+            return False
+        return await handler.send_display_to_player(
+            player.mac, line1, line2, duration
+        )
+
     async def playlist_play(self, player_id: str, index: int) -> bool:
         """Play the track at a playlist index (0-based)."""
         player = self.get_player(player_id)

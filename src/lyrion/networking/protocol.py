@@ -1745,6 +1745,56 @@ class SlimProtoClient:
         except (ConnectionError, OSError, RuntimeError):
             return False
 
+    async def send_ir_to_player(self, mac: str, button_code: int) -> bool:
+        """Send an 'irm' (infra-red / button) frame to a player.
+
+        SlimProto irm packet: opcode(4) code(2, big-endian u16).
+        The code is the numeric IR button code; named buttons
+        ('play','pause',...) are resolved to codes by the caller.
+        """
+        mac = mac.upper().replace(":", "")
+        writer = self._player_writers.get(mac)
+        if writer is None or writer.is_closing():
+            return False
+        payload = b"".join([b"irm", struct.pack(">H", button_code & 0xFFFF)])
+        frame = struct.pack(">H", len(payload)) + payload
+        try:
+            writer.write(frame)
+            await writer.drain()
+            logger.info("Sent irm code=%d to %s", button_code, mac)
+            return True
+        except (ConnectionError, OSError, RuntimeError):
+            return False
+
+    async def send_display_to_player(
+        self, mac: str, line1: str, line2: str, duration: int = 3
+    ) -> bool:
+        """Send a 'grfe' (text display) frame to a player.
+
+        grfe packet: opcode(4) format(1, 0x01 = two lines of text)
+        duration(2, big-endian seconds) line1(0-term) line2(0-term).
+        Software players (squeezelite/jive) render this on their UI.
+        """
+        mac = mac.upper().replace(":", "")
+        writer = self._player_writers.get(mac)
+        if writer is None or writer.is_closing():
+            return False
+        payload = b"".join([
+            b"grfe",
+            bytes([0x01]),                 # format: two text lines
+            struct.pack(">H", max(0, min(65535, duration))),
+            line1.encode("utf-8", "replace"), b"\x00",
+            line2.encode("utf-8", "replace"), b"\x00",
+        ])
+        frame = struct.pack(">H", len(payload)) + payload
+        try:
+            writer.write(frame)
+            await writer.drain()
+            logger.info("Sent grfe to %s", mac)
+            return True
+        except (ConnectionError, OSError, RuntimeError):
+            return False
+
     def _handle_resp_frame(self, mac_str: str, payload: bytes) -> None:
         """Handle a RESP frame: the player forwards the source's HTTP
         response headers after connecting for a direct stream (Squeezelite
