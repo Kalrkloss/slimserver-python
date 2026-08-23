@@ -747,6 +747,7 @@ const appState = {
   loading: false,
   error: null,
   refreshInterval: null,
+  npPollInterval: null,
 };
 
 // ─────────────────────────────────────────────
@@ -951,6 +952,26 @@ function updateStatusBar() {
   document.getElementById('sb-volume').textContent = player ? `${player.volume ?? '—'}%` : '—';
 }
 
+// Poll the player status so the Now Playing play/pause icon and the
+// status bar stay in sync with the real server state (e.g. after a pause
+// or when a track auto-advances). Quick interval on the Now Playing page.
+async function startStatusPoll() {
+  try {
+    return await pollNowPlaying();
+  } catch (e) { /* silent */ }
+}
+
+async function pollNowPlaying() {
+  // Only refresh the Now Playing panel if we're on it (avoid extra work and
+  // DOM churn on other pages). Server state is the source of truth.
+  const onNowPlaying = (location.hash || '').startsWith('#/nowplaying');
+  if (!onNowPlaying || !appState.currentPlayer) return;
+  try {
+    await refreshNowPlayingContent();
+  } catch (e) { /* silent */ }
+}
+
+
 // ─────────────────────────────────────────────
 //  NAV
 // ─────────────────────────────────────────────
@@ -980,6 +1001,28 @@ async function renderNowPlaying() {
   `;
 
   await refreshNowPlayingContent();
+}
+
+// Refresh queue/metadata (playlist tracks, status) WITHOUT touching the
+// play/pause icon, so a call right after a toggle command doesn't overwrite
+// the icon with a stale server status that hasn't caught up yet.
+async function refreshNowPlayingData() {
+  if (!appState.currentPlayer) return;
+  try {
+    const st = await api('player.status', [appState.currentPlayer]);
+    if (st.playlist_cur_index !== undefined) {
+      appState.currentTrackIndex = st.playlist_cur_index >= 0 ? st.playlist_cur_index : -1;
+    }
+    appState.playlist = await api('playlist.tracks', [appState.currentPlayer]);
+  } catch (e) { /* silent */ }
+}
+
+// Update just the play/pause button icon + title from appState.isPlaying.
+function updatePlayButton() {
+  const btn = document.getElementById('play-btn');
+  if (!btn) return;
+  btn.textContent = appState.isPlaying ? '\u23F8' : '\u25B6';
+  btn.title = appState.isPlaying ? 'Pause' : 'Play';
 }
 
 async function refreshNowPlayingContent() {
@@ -1111,26 +1154,51 @@ async function onPlayerChange(mac) {
   await refreshNowPlayingContent();
 }
 
+let toggleQueued = false;
+let toggleInFlight = false;
 async function togglePlay() {
   if (!appState.currentPlayer) return;
+  // Serialize rapid clicks: while a toggle command is in flight, remember
+  // that another click arrived and run ONE more toggle when it settles.
+  // Without this, two fast clicks both read the pre-command status and both
+  // send 'play' — the player keeps restarting instead of pausing.
+  if (toggleQueued) return;
+  if (toggleInFlight) { toggleQueued = true; return; }
+  toggleInFlight = true;
   try {
-    const mode = appState.isPlaying ? 'pause' : 'play';
-    if (mode === 'pause') {
+    // Read the REAL server state, not the (possibly stale) local isPlaying.
+    // Otherwise toggling never leaves the play branch and the player just
+    // keeps restarting instead of pausing.
+    const st = await api('player.status', [appState.currentPlayer]);
+    const playing = st.mode === 'playing';
+    if (playing) {
       await api('playlist.pause', [appState.currentPlayer, 1]);
       appState.isPlaying = false;
     } else {
-      if (appState.currentTrackIndex >= 0) {
-        await api('playlist.play', [appState.currentPlayer, appState.currentTrackIndex]);
+      const idx = appState.currentTrackIndex >= 0
+        ? appState.currentTrackIndex
+        : (appState.playlist.length > 0 ? 0 : -1);
+      if (idx >= 0) {
+        await api('playlist.play', [appState.currentPlayer, idx]);
+        appState.currentTrackIndex = idx;
         appState.isPlaying = true;
-      } else if (appState.playlist.length > 0) {
-        await api('playlist.play', [appState.currentPlayer, 0]);
-        appState.isPlaying = true;
-        appState.currentTrackIndex = 0;
       }
     }
-    await refreshNowPlayingContent();
+    // Update the icon immediately from the intended state; the server's
+    // status may lag the command (async stream start), so don't wait for
+    // a stale player.status that still reports the previous mode.
+    updatePlayButton();
     updateStatusBar();
+    // Refresh the underlying data (queue, metadata) and keep polling so the
+    // icon stays in sync for external state changes (auto-advance, etc.).
+    await refreshNowPlayingData();
+    startStatusPoll();
   } catch(e) { console.error(e); }
+  finally {
+    toggleInFlight = false;
+    // Re-run a queued click (real toggle, not a lost one).
+    if (toggleQueued) { toggleQueued = false; togglePlay(); }
+  }
 }
 
 async function prevTrack() {
@@ -2418,8 +2486,10 @@ function showToast(msg) {
   await refreshPlayers();
   await refreshStatus();
 
-  // Auto-refresh status every 10s
+  // Auto-refresh status every 10s (server/players) and, faster, the Now
+  // Playing panel so the play/pause icon tracks the real player state.
   appState.refreshInterval = setInterval(refreshStatus, 10000);
+  appState.npPollInterval = setInterval(pollNowPlaying, 3000);
 
   // Initial route
   if (!location.hash) location.hash = '#/nowplaying';
