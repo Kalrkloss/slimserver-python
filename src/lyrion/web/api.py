@@ -1676,14 +1676,19 @@ class JSONRPCAPI:
                 loop = []
                 for i, r in enumerate(rows):
                     gid = start + i
-                    loop.append({
-                        "id": gid, "genre": r["genre"] or "",
+                    gname = r["genre"] or ""
+                    from urllib.parse import quote as _qg
+                    item = {
+                        "id": gid, "genre": r["genre"],
+                        # Perl parity: favorites_url in genres_loop.
+                        "favorites_url": f"db:genre.name={_qg(gname)}",
                         # Jive actions: go opens the genre's artists.
                         "actions": {
                             "go": {"player": 0, "cmd": ["artists"],
                                    "params": {"genre_id": gid, "menu": "albums"}},
                         },
-                    })
+                    }
+                    loop.append(item)
                 total = db.execute(
                     "SELECT COUNT(DISTINCT genre) FROM tracks" + where,
                     params).fetchone()[0]

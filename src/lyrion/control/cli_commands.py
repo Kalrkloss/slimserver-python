@@ -500,9 +500,12 @@ async def cmd_years(
         "SELECT COUNT(DISTINCT year) AS n FROM tracks WHERE year > 0"
     )
     total_n = total[0]["n"] if total else 0
+    # Perl parity: years_loop items carry year + favorites_url
+    # (db:year.id=<year>); no id field.
     out = [f"years {offset} {limit} count:{total_n}"]
-    for i, r in enumerate(rows):
-        out.append(f"id:{offset + i + 1} year:{r['y']}")
+    for r in rows:
+        y = r["y"]
+        out.append(f"year:{y} favorites_url:db:year.id={y}")
     out.append("")
     return out
 
@@ -539,7 +542,8 @@ async def cmd_musicfolder(
         )
         out = [f"musicfolder {offset} {limit} count:{total[0]['n'] if total else 0}"]
         for i, name in enumerate(dict.fromkeys(items)):
-            out.append(f"id:{offset + i + 1} title:{name}")
+            # Perl parity: folder items = id + filename + type (no title).
+            out.append(f"id:{offset + i + 1} filename:{name} type:folder")
         out.append("")
         return out
     # root: distinct first path components under file:// roots
@@ -558,7 +562,8 @@ async def cmd_musicfolder(
     page = names[offset:offset + limit]
     out = [f"musicfolder {offset} {limit} count:{len(names)}"]
     for i, name in enumerate(page):
-        out.append(f"id:{offset + i + 1} title:{name}")
+        # Perl parity: id + filename + type (no title).
+        out.append(f"id:{offset + i + 1} filename:{name} type:folder")
     out.append("")
     return out
 
