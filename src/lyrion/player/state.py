@@ -45,6 +45,14 @@ class PlayerState:
     repeat: int = 0               # playlist repeat mode (0/1/2)
     playlist_position: int = 0
     playlist_total: int = 0
+    # SqueezePlay/controller parity fields (Perl status emits these):
+    playlist_mode: str = "none"   # "none" | "repeat_one" | "repeat_all" | ...
+    playlist_timestamp: float = 0.0
+    seq_no: int = 0               # monotonically increasing status seq
+    remote: int = 0               # 1 when playing a remote (stream) URL
+    randomplay: int = 0           # "random play" mode active
+    use_volume_control: bool = True
+    remote_meta: dict = field(default_factory=dict)  # ICY/HTTP stream metadata
     # P6-2: playlist holds track ids AND stream URLs (radio/favorites).
     playlist: list[int | str] = field(default_factory=list)
     sync_master: Optional[str] = None

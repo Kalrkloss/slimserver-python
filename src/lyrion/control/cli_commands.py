@@ -961,7 +961,19 @@ async def cmd_status(
             f"volume: {player.volume}",
             f"duration: {duration}",
             f"playlist_tracks: {player.playlist_total}",
+            # LMS reports playlist_cur_index as a string (1-based).
             f"playlist_cur_index: {player.playlist_position}",
+            f"playlist_timestamp: {int(getattr(player, 'playlist_timestamp', 0) or 0)}",
+            f"playlist mode: {getattr(player, 'playlist_mode', 'none')}",
+            f"playlist_shuffle: {getattr(player, 'shuffle', 0)}",
+            f"playlist_repeat: {getattr(player, 'repeat', 0)}",
+            f"seq_no: {getattr(player, 'seq_no', 0)}",
+            f"signalstrength: {getattr(player, 'signal_strength', 0)}",
+            f"remote: {getattr(player, 'remote', 0)}",
+            f"randomplay: {getattr(player, 'randomplay', 0)}",
+            f"use_volume_control: {1 if getattr(player, 'use_volume_control', 1) else 0}",
+            f"digital_volume_control: {1 if getattr(player, 'digital_volume_control', 1) else 0}",
+            f"mixer volume: {player.volume}",
         ]
         if player.current_track_id is not None:
             out.append(f"playlist_cur_id: {player.current_track_id}")
@@ -969,6 +981,11 @@ async def cmd_status(
             out.append(f"current_title: {player.current_title}")
         if getattr(player, "current_url", None):
             out.append(f"current_url: {player.current_url}")
+        # remoteMeta: the now-playing stream metadata (HTTP headers / ICY)
+        remote_meta = getattr(player, "remote_meta", None)
+        if remote_meta:
+            for k, v in remote_meta.items():
+                out.append(f"remoteMeta.{k}: {v}")
         # Playlist loop: always unless tags explicitly omit it (no 'l')
         if "l" in tags or not tags:
             out.extend(await _status_playlist_loop(player, tags))
