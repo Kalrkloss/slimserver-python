@@ -1144,6 +1144,96 @@ async def cmd_time(
         return [f"cli error: {e}", ""]
 
 
+@register_command("sleep")
+async def cmd_sleep(
+    handler: CLIHandler,
+    ctx: CLIContext,
+    args: list[str],
+) -> list[str]:
+    """sleep [<seconds>|off|?] — query or set the sleep timer.
+
+    LMS 'sleep ?' returns the remaining seconds (_sleep), 'sleep off'
+    cancels, 'sleep <n>' sets a countdown. We report the player's
+    sleep_remaining field (0 = no timer).
+    """
+    if not ctx.player_id:
+        return ["no player selected"]
+    try:
+        from lyrion.player import PlayerManager
+        player = PlayerManager().get_player(ctx.player_id)
+        if player is None:
+            return ["player not found", ""]
+        remaining = int(getattr(player, "sleep_remaining", 0) or 0)
+        if not args or str(args[0]) == "?":
+            return [f"sleep: {remaining}", ""]
+        t = str(args[0]).lower()
+        if t == "off":
+            player.sleep_remaining = 0
+            return ["sleep: 0", ""]
+        try:
+            player.sleep_remaining = int(t)
+        except ValueError:
+            return ["cli error: sleep must be a number or off", ""]
+        return [f"sleep: {player.sleep_remaining}", ""]
+    except Exception as e:  # noqa: BLE001
+        return [f"cli error: {e}", ""]
+
+
+@register_command("signalstrength")
+async def cmd_signalstrength(
+    handler: CLIHandler,
+    ctx: CLIContext,
+    args: list[str],
+) -> list[str]:
+    """signalstrength [?] — return the player's WiFi signal strength.
+
+    LMS 'signalstrength ?' returns '_signalstrength <pct>'. Wired /
+    software players report 0.
+    """
+    if not ctx.player_id:
+        return ["no player selected"]
+    try:
+        from lyrion.player import PlayerManager
+        player = PlayerManager().get_player(ctx.player_id)
+        if player is None:
+            return ["player not found", ""]
+        sig = int(getattr(player, "signal_strength", 0) or 0)
+        return [f"signalstrength: {sig}", ""]
+    except Exception as e:  # noqa: BLE001
+        return [f"cli error: {e}", ""]
+
+
+@register_command("randomplay")
+async def cmd_randomplay(
+    handler: CLIHandler,
+    ctx: CLIContext,
+    args: list[str],
+) -> list[str]:
+    """randomplay [<mode>] — query or set the random-play (DJ) mode.
+
+    LMS 'randomplay ?' returns the current mode index ("random playlist"
+    / "similar songs"); 'randomplay <mode>' enables it.
+    """
+    if not ctx.player_id:
+        return ["no player selected"]
+    try:
+        from lyrion.player import PlayerManager
+        player = PlayerManager().get_player(ctx.player_id)
+        if player is None:
+            return ["player not found", ""]
+        mode = int(getattr(player, "randomplay", 0) or 0)
+        if not args or str(args[0]) == "?":
+            labels = ["", "random", "similar"]
+            return [f"randomplay: {mode}", ""]
+        try:
+            player.randomplay = max(0, min(2, int(str(args[0]))))
+        except ValueError:
+            return ["cli error: randomplay must be 0-2", ""]
+        return [f"randomplay: {player.randomplay}", ""]
+    except Exception as e:  # noqa: BLE001
+        return [f"cli error: {e}", ""]
+
+
 @register_command("current_title")
 async def cmd_current_title(
     handler: CLIHandler,

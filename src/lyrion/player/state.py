@@ -51,6 +51,7 @@ class PlayerState:
     seq_no: int = 0               # monotonically increasing status seq
     remote: int = 0               # 1 when playing a remote (stream) URL
     randomplay: int = 0           # "random play" mode active
+    sleep_remaining: int = 0      # sleep-timer seconds remaining (0 = off)
     use_volume_control: bool = True
     remote_meta: dict = field(default_factory=dict)  # ICY/HTTP stream metadata
     # P6-2: playlist holds track ids AND stream URLs (radio/favorites).
