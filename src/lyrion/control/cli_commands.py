@@ -951,6 +951,55 @@ async def cmd_playerpref(
         return [f"cli error: {e}", ""]
 
 
+@register_command("button")
+async def cmd_button(
+    handler: CLIHandler,
+    ctx: CLIContext,
+    args: list[str],
+) -> list[str]:
+    """button <name> — simulate a front-panel button press on the player.
+
+    Named buttons map to transport actions (play/pause/stop/prev/next/
+    power). LMS 'button play' returns {} (control command); we echo the
+    action result. Unknown button -> "button: unhandled".
+    """
+    if not ctx.player_id:
+        return ["no player selected"]
+    if not args:
+        return ["button: no button", ""]
+    name = str(args[0]).lower()
+    try:
+        from lyrion.player import PlayerManager
+        pm = PlayerManager()
+        if name == "play":
+            player = pm.get_player(ctx.player_id)
+            if player is not None and player.mode != "play":
+                await pm.pause_player(ctx.player_id, False)
+            return ["play", ""]
+        if name == "pause":
+            player = pm.get_player(ctx.player_id)
+            if player is not None:
+                await pm.pause_player(ctx.player_id, player.mode != "pause")
+            return ["pause", ""]
+        if name == "power":
+            player = pm.get_player(ctx.player_id)
+            if player is not None:
+                pm.set_power(ctx.player_id, not player.power)
+            return ["power", ""]
+        if name == "stop":
+            await pm.stop_player(ctx.player_id)
+            return ["stop", ""]
+        if name == "prev":
+            await pm.playlist_prev(ctx.player_id)
+            return ["prev", ""]
+        if name == "next":
+            await pm.playlist_next(ctx.player_id)
+            return ["next", ""]
+        return [f"button: unhandled '{args[0]}'", ""]
+    except Exception as e:  # noqa: BLE001
+        return [f"cli error: {e}", ""]
+
+
 # ---------------------------------------------------------------------------
 # Status
 # ---------------------------------------------------------------------------
