@@ -325,6 +325,9 @@ class JSONRPCAPI:
                 "current_track_id": player.current_track_id,
                 "current_title": getattr(player, "current_title", None),
                 "current_url": getattr(player, "current_url", None),
+                # Stream metadata (StreamTitle) → now playing song + artist.
+                "current_artist": getattr(player, "remote_meta", {}).get("artist", ""),
+                "remote_meta": getattr(player, "remote_meta", {}),
             }
         except Exception:
             return {"mode": "stop", "playlist_cur_index": -1}

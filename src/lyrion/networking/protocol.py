@@ -143,6 +143,7 @@ CMD_BODY = 0x07
 CMD_STMU = 0x08
 CMD_ANIC = 0x09
 CMD_GRFB = 0x0A
+CMD_META = 0x11  # ask the player to report stream metadata (StreamTitle → STMu)
 
 
 # ---------------------------------------------------------------------------
@@ -841,6 +842,12 @@ class SlimProtoClient:
                         # response headers — extract icy-metaint and send
                         # the 'cont' frame that starts the decoder.
                         self._handle_resp_frame(mac_str, payload)
+                    elif op in ("meta", "stmu"):
+                        # Squeezelite pushes the source's StreamTitle over a
+                        # 'meta' frame (id 0) — the metadata update. Parse it
+                        # so the UI shows the real song + artist without
+                        # proxying the audio. (Some builds use 'stmu'.)
+                        self._handle_stmu_frame(mac_str, payload) if op == "stmu" else self._handle_meta_frame(mac_str, payload)
                     elif op == "setd":
                         # SETD frame — id 0 carries the player's assigned name
                         if payload:
@@ -1609,6 +1616,14 @@ class SlimProtoClient:
             writer.write(frame)
             await writer.drain()
             logger.info("Sent cont metaint=%d to %s", metaint, mac)
+            # Ask the player to report the source's StreamTitle over STMu so
+            # we can show the real song + artist without proxying the audio.
+            # The 4-byte value is the metadata interval (matches icy-metaint).
+            if metaint and metaint > 0:
+                try:
+                    await self.send_meta(mac, interval=metaint)
+                except Exception as exc:
+                    logger.warning("send_meta failed for %s: %s", mac, exc)
             return True
         except (ConnectionError, OSError, RuntimeError):
             return False
@@ -1817,6 +1832,58 @@ class SlimProtoClient:
         except Exception as exc:
             logger.warning("RESP parse failed for %s: %s", mac_str, exc)
 
+    def _handle_meta_frame(self, mac_str: str, payload: bytes) -> None:
+        """Handle a 'meta' frame from the player carrying the stream title.
+
+        Squeezelite sends the source's Icecast/Shoutcast ``StreamTitle`` over
+        a ``meta`` frame (id 0) as ``StreamTitle='Artist - Title';`` (NUL
+        padded). Parse it and store artist + song on the player so the Now
+        Playing panel shows the actual title without proxying the audio.
+        """
+        self._handle_stmu_frame(mac_str, payload)
+
+    def _handle_stmu_frame(self, mac_str: str, payload: bytes) -> None:
+        """Handle an STMu (stream metadata update) frame from the player.
+
+        On a DIRECT stream Squeezelite parses the source's Icecast/Shoutcast
+        ``StreamTitle`` itself and pushes it over STMu, so the server can show
+        the actual song + artist in Now Playing without proxying the audio.
+        The payload is ``StreamTitle='Artist - Title'`` (NUL-terminated).
+        """
+        try:
+            text = payload.split(b"\x00")[0].decode("utf-8", errors="replace").strip()
+            logger.info("STMu from %s: %r", mac_str, text)
+            if not text:
+                return
+            import re as _re
+            m = _re.search(r"StreamTitle='([^']*)'", text)
+            if not m:
+                # Some builds send the bare string without the key= prefix.
+                m2 = _re.search(r"([^=]+?) - ([^-]+)$", text)
+                if m2:
+                    artist, song = m2.group(1).strip(), m2.group(2).strip()
+                else:
+                    artist, song = "", text.strip()
+            else:
+                full = m.group(1)
+                if " - " in full:
+                    artist, song = full.split(" - ", 1)
+                else:
+                    artist, song = "", full
+            from lyrion.player.manager import PlayerManager
+            player = PlayerManager().get_player(mac_str)
+            if player is None:
+                return
+            player.remote_meta = {
+                "title": song.strip(),
+                "artist": artist.strip(),
+                "streamtitle": m.group(1) if m else text.strip(),
+                "url": getattr(player, "current_url", ""),
+            }
+            player.current_title = m.group(1) if m else text.strip()
+        except Exception as exc:
+            logger.warning("STMu parse failed for %s: %s", mac_str, exc)
+
     def _handle_stat_frame(self, mac_str: str, payload: bytes) -> None:
         """Parse a STAT frame from a player (best effort, for logging/state).
 
@@ -1973,6 +2040,28 @@ class SlimProtoClient:
                 pass
         except Exception as exc:
             logger.warning("Failed to parse STAT from %s: %s", mac_str, exc)
+
+    async def send_meta(self, mac: str, interval: int = 1000) -> bool:
+        """Ask a player to report Icecast/Shoutcast stream metadata.
+
+        The original LMS sends a ``meta`` frame after a DIRECT stream so the
+        player pushes the source's ``StreamTitle`` back over STMu — letting
+        the server show the real song + artist WITHOUT proxying the audio.
+        ``interval`` is the metadata report interval in ms.
+        """
+        mac = mac.upper().replace(":", "")
+        writer = self._player_writers.get(mac)
+        if writer is None or writer.is_closing():
+            return False
+        # 4-byte BE interval (uint32)
+        payload = int(interval).to_bytes(4, "big")
+        try:
+            await self._send_frame(CMD_META, payload)
+            logger.info("Sent meta (interval=%d) to %s", interval, mac)
+            return True
+        except (ConnectionError, OSError, RuntimeError) as exc:
+            logger.warning("Failed to send meta to %s: %s", mac, exc)
+            return False
 
     # ------------------------------------------------------------------
     # End-of-track handling
