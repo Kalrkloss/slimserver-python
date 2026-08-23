@@ -154,22 +154,39 @@ async def cmd_serverstatus(
             "SELECT COUNT(DISTINCT genre) AS n FROM tracks WHERE genre != ''"
         )
         info_lines.append(f"info total genres: {int(r_gen[0]['n']) if r_gen else 0}")
+        # lastscan: the timestamp of the most recent scan (Perl parity)
+        r_scan = await _query_db(
+            "SELECT MAX(last_rescan) AS t FROM tracks"
+        )
+        info_lines.append(f"lastscan: {int(r_scan[0]['t']) if r_scan and r_scan[0]['t'] else 0}")
     except Exception:  # noqa: BLE001
         pass
 
+    # Server IP (Perl sends the server's address at top level)
+    import socket
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        server_ip = s.getsockname()[0]
+        s.close()
+    except Exception:
+        server_ip = "127.0.0.1"
+
     out = [
-        f"serverstatus version:{__version__}",
-        "serverstatus uuid:lyrion-local",
-        "serverstatus name:Lyrion",
-        "serverstatus httpport:9000",
+        f"serverstatus version:{__version__ if '__version__' in dir() else '9.2.0'}",
+        f"serverstatus uuid:{getattr(pm, 'server_uuid', 'lyrion-local')}",
+        f"serverstatus name:Lyrion",
+        f"serverstatus ip:{server_ip}",
+        f"serverstatus httpport:9000",
     ]
     out.extend(f"serverstatus {l}" for l in info_lines)
     out.append(f"serverstatus player count:{player_count}")
     out.append(f"serverstatus sn.player count:{player_count}")
+    out.append(f"serverstatus other player count:0")
     # players_loop
     for i, p in enumerate(players):
-        mac = p.mac.replace(":", "%3A") if p.mac else ""
-        name = (p.name or p.mac or "").replace(":", "%3A")
+        mac = p.mac if p.mac else ""          # raw MAC — Perl does NOT url-encode
+        name = p.name or p.mac or ""
         out.append(
             f"playerindex:{i} playerid:{mac} uuid: ip:{p.ip or '0.0.0.0'}:{p.port or 0} "
             f"name:{name} model:{p.model or 'squeezebox'} modelname:{p.model or 'squeezebox'} "
