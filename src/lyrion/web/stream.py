@@ -654,10 +654,13 @@ async def _proxy_remote(send, remote_url: str, transcode: str = "") -> None:
                 "GET", remote_url,
                 headers={
                     "User-Agent": "LyrionMusicServer/9.2.0",
-                    # Ask for Icecast metadata — the Perl LMS does the same;
-                    # the metadata bytes are stripped below, only the audio
-                    # reaches the player.
-                    "Icy-MetaData": "1",
+                    # Ask for Icecast metadata ONLY in relay mode — that
+                    # path strips it manually before forwarding. In
+                    # transcode mode the raw body goes straight into
+                    # ffmpeg: interleaved metadata bytes would corrupt
+                    # the decoder input (periodic glitches independent
+                    # of CPU load), so never request them here.
+                    **({} if transcode else {"Icy-MetaData": "1"}),
                 },
             ) as resp:
                 if resp.status_code >= 400:
