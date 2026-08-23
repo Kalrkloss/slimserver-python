@@ -37,6 +37,11 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
     from lyrion.control.request import RequestDispatcher
 
     handler = CLIHandler(RequestDispatcher())
+    # The dispatcher is created per-connection here; start() flips it to
+    # _running=True — without it every player_command (ir/display/…)
+    # answers "server shutting down".
+    if handler._dispatcher is not None:
+        await handler._dispatcher.start()
     try:
         async with handler.connect(reader, writer) as ctx:
             async for cmd, args in handler.read_commands(reader):
