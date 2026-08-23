@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#ff8800"/>
+      <stop offset="100%" stop-color="#cc5500"/>
+    </linearGradient>
+  </defs>
+  <rect width="256" height="256" rx="24" fill="url(#bg)"/>
+  <!-- Radio body -->
+  <rect x="40" y="72" width="176" height="120" rx="16" fill="#1a1a1a"/>
+  <!-- Speaker grille -->
+  <circle cx="88" cy="132" r="30" fill="none" stroke="#d0d0d0" stroke-width="4"/>
+  <circle cx="88" cy="132" r="20" fill="none" stroke="#d0d0d0" stroke-width="3"/>
+  <circle cx="88" cy="132" r="10" fill="none" stroke="#d0d0d0" stroke-width="2"/>
+  <!-- Tuning dial -->
+  <rect x="140" y="96" width="52" height="18" rx="6" fill="#ff8800"/>
+  <rect x="140" y="126" width="52" height="18" rx="6" fill="#333"/>
+  <rect x="140" y="156" width="52" height="18" rx="6" fill="#333"/>
+  <!-- Antenna -->
+  <line x1="60" y1="72" x2="96" y2="20" stroke="#d0d0d0" stroke-width="6" stroke-linecap="round"/>
+  <!-- Small blue LED -->
+  <circle cx="192" cy="200" r="8" fill="#41b6e6"/>
+  <!-- Broadcast waves -->
+  <path d="M40 44 M52 36 M64 28" stroke="#fff" stroke-width="5" stroke-linecap="round" fill="none" opacity="0.9"/>
+</svg>

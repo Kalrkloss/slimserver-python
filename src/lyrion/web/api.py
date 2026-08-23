@@ -356,6 +356,7 @@ class JSONRPCAPI:
             for i, entry in enumerate(tracks):
                 if isinstance(entry, str):
                     stream_name = getattr(player, "stream_titles", {}).get(entry, "")
+                    art = getattr(player, "stream_images", {}).get(entry, "")
                     out.append({
                         "index": i,
                         "url": entry,
@@ -363,6 +364,10 @@ class JSONRPCAPI:
                         or (player.current_title
                             if i == player.playlist_position and player.current_title
                             else "Radio Stream"),
+                        # Senderlogo: explizit hinterlegtes Bild oder Radio-Icon.
+                        # static_dir enthält bereits "html/", also ohne /html/-
+                        # Präfix im URL-Pfad (sonst doppelt -> 404).
+                        "artwork_url": art or "/images/radio.svg",
                     })
                 else:
                     out.append({
@@ -1356,6 +1361,9 @@ class JSONRPCAPI:
                             else:
                                 # 'url:<x> title:<y>' form — URL already parsed.
                                 self._set_stream_title(player, pending or "", title)
+                        elif low.startswith("image:"):
+                            # Paired logo path for the pending stream URL.
+                            self._set_stream_image(player, pending or "", str(item).split(":", 1)[1])
                         elif str(item).isdigit():
                             player.playlist.append(int(item))
                         else:
@@ -1419,6 +1427,31 @@ class JSONRPCAPI:
                 titles = {}
                 player.stream_titles = titles
             titles[url] = title
+        except Exception:
+            pass
+
+    @staticmethod
+    def _set_stream_image(player, url: str, image: str) -> None:
+        """Associate a logo/artwork path with a stream URL in the playlist.
+
+        'playlist add <url> image:<path>' stores the station logo so the Now
+        Playing panel renders it instead of the generic radio icon. The stored
+        path is normalized to a URL relative to static_dir (which already
+        contains 'html/') — an 'html/...' prefix would otherwise be doubled
+        and 404 when the path is re-composed.
+        """
+        if not url or not image:
+            return
+        try:
+            # Drop a leading 'html/' so '/html/images/x' -> '/images/x'.
+            image = str(image)
+            if image.startswith("html/"):
+                image = image[len("html/"):]
+            images = getattr(player, "stream_images", None)
+            if images is None:
+                images = {}
+                player.stream_images = images
+            images[url] = image
         except Exception:
             pass
 

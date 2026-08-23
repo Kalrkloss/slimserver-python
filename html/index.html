@@ -1886,6 +1886,7 @@ function parseFavItems(lines) {
         fav_id: String(it.id),
         title: it.name || it.title || '???',
         url: it.url || '',
+        image: it.image || '',
         type: it.type === 'folder' ? 'folder' : 'stream',
         hasitems: it.hasitems,
       });
@@ -2140,8 +2141,10 @@ async function favAddToPlaylist(id) {
   if (!fav.url) { showToast('Keine Stream-URL'); return; }
   try {
     // Favorit ist ein Stream (URL) → als Playlist-Eintrag hinzufügen (nicht Track-ID).
-    // Titel mitgeben, damit die Playlist den Streamnamen statt "Radio Stream" zeigt.
-    await api('slim.request', [appState.currentPlayer, ['playlist', 'add', fav.url, 'title:' + fav.title]]);
+    // Titel + Logo mitgeben, damit die Playlist den Streamnamen und das Senderlogo zeigt.
+    const params = ['playlist', 'add', fav.url, 'title:' + fav.title];
+    if (fav.image) params.push('image:' + fav.image);
+    await api('slim.request', [appState.currentPlayer, params]);
     showToast(`"${fav.title}" zur Playlist hinzugefügt`);
   } catch (e) { showToast('Fehler: ' + e.message); }
 }
