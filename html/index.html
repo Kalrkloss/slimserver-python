@@ -1904,12 +1904,17 @@ function parseFavItems(lines) {
   if (lines && Array.isArray(lines.loop_loop)) {
     for (const it of lines.loop_loop) {
       if (!it || !it.id) continue;
+      // Folder detection: server sends no 'type' for folders — they are
+      // identified by hasitems:1 / isaudio:0 (streams carry type:'audio').
+      const isFolder = it.type === 'folder'
+        || Number(it.hasitems) === 1
+        || (it.isaudio !== undefined && Number(it.isaudio) === 0 && !it.url);
       items.push({
         fav_id: String(it.id),
         title: it.name || it.title || '???',
         url: it.url || '',
         image: it.image || '',
-        type: it.type === 'folder' ? 'folder' : 'stream',
+        type: isFolder ? 'folder' : 'stream',
         hasitems: it.hasitems,
       });
     }
@@ -1979,7 +1984,8 @@ function parseCliPairs(lines) {
 }
 
 async function renderFavorites(folderId) {
-  appState.favFolder = folderId ? parseInt(folderId, 10) : null;
+  // folderId is the LMS hierarchical id ('0.1'), NOT a DB id.
+  appState.favFolder = folderId || null;
   const el = document.getElementById('page-content');
   el.className = 'page-scroll';
   el.innerHTML = `
@@ -2010,11 +2016,12 @@ async function refreshFavorites() {
   if (!el) return;
   const parent = appState.favFolder;
   const bc = document.getElementById('fav-breadcrumb');
-  if (bc) bc.textContent = parent ? `(Ordner #${parent})` : '(Alle)';
+  if (bc) bc.textContent = parent ? `(Ordner ${parent})` : '(Alle)';
 
   let items = [];
   try {
-    const cmd = parent ? ['favorites', 'items', String(parent)] : ['favorites', 'items'];
+    const cmd = parent ? ['favorites', 'items', `item_id:${parent}`]
+                       : ['favorites', 'items'];
     const r = await api('slim.request', ['-', cmd]);
     items = parseFavItems(r);
     appState.favItems = items;
