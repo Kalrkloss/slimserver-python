@@ -718,6 +718,7 @@ input[type="range"]::-webkit-slider-thumb {
   <span class="sb-sep">|</span>
   <span class="sb-mode" id="sb-mode">—</span>
   <span class="sb-notice" id="sb-notice" style="display:none;margin-left:8px;color:var(--warn);font-weight:600;"></span>
+  <span id="sb-scan" style="display:none;margin-left:8px;color:var(--accent);font-weight:600;">🔍 <span id="sb-scan-text"></span></span>
   <span id="sb-vol" style="margin-left:auto">
     <span>🔊</span>
     <span id="sb-volume">—</span>
@@ -932,6 +933,19 @@ async function refreshStatus() {
     if (el) {
       el.textContent = notice || '';
       el.style.display = notice ? 'inline' : 'none';
+    }
+    // Library-scan indicator: "🔍 Scan läuft — N Dateien" while scanning.
+    const scanEl = document.getElementById('sb-scan');
+    if (scanEl) {
+      const scan = (ss && typeof ss === 'object') ? ss.scan : null;
+      if (scan && scan.scanning) {
+        const done = scan.done_files || 0;
+        document.getElementById('sb-scan-text').textContent =
+          `Scan läuft — ${done} Dateien gefunden`;
+        scanEl.style.display = 'inline';
+      } else {
+        scanEl.style.display = 'none';
+      }
     }
   } catch(e) { /* ignore — notice is best-effort */ }
 

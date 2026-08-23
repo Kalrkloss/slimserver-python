@@ -104,41 +104,77 @@ class MusicImporter:
             SCAN_STATE.finish()
             return self.stats
 
+        self.stats.scanned_files = 0
+        # total is unknown until the walk finishes (streaming pipeline);
+        # start with a non-zero placeholder so progress bars work.
+        self.stats.total_files = 0
+        SCAN_STATE.start(total=1)
+
         from lyrion.database.sqlite_helper import db_session
 
-        # Collect files first (async walk)
-        files = await self._collect_files()
-        self.stats.total_files = len(files)
-        self.stats.scanned_files = 0
-        logger.info("Found %d audio files", len(files))
-        SCAN_STATE.start(total=len(files))
-
-        # Import in batches. Extract metadata BEFORE opening the DB session:
-        # the write transaction must only be open during the (fast) inserts,
-        # not during the slow mutagen extraction, or other writers (playlist
-        # save, radio add) would block for minutes ("database is locked").
+        # ── Streaming pipeline: walk → extract → import overlap ────────
+        # The directory walk (SLOW on gvfs/SMB mounts — minutes) runs as
+        # a producer thread feeding a queue; import batches consume from
+        # it WHILE the walk continues, so found tracks appear in the
+        # library incrementally instead of after the full scan.
+        import queue as _queue
+        import threading as _threading
         from lyrion.media.scanner import MediaScanner, ScanConfig
         scanner = MediaScanner(config=ScanConfig(base_path=self.config.source_path))
 
-        for batch_start in range(0, len(files), self.config.batch_size):
-            batch = files[batch_start:batch_start + self.config.batch_size]
+        file_q: _queue.Queue = _queue.Queue(maxsize=2000)
+        SENTINEL = object()
+
+        def _produce() -> None:
+            try:
+                for p in self.config.source_path.rglob("*"):
+                    if p.is_file() and p.suffix.lower().lstrip(".") in SUPPORTED_EXTENSIONS:
+                        name = p.name.lower()
+                        if name.startswith(".") or name in ("desktop.ini", "thumbs.db"):
+                            continue
+                        file_q.put(p)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Walk aborted: %s", exc)
+            finally:
+                file_q.put(SENTINEL)
+
+        walker = _threading.Thread(target=_produce, daemon=True,
+                                   name="import-walk")
+        walker.start()
+
+        batch: list[Path] = []
+        sem = asyncio.Semaphore(8)
+        total_seen = 0
+
+        async def _extract(file_path: Path) -> tuple[Path, Any] | None:
+            async with sem:
+                try:
+                    info = await scanner.scan_single_file(file_path)
+                    return (file_path, info) if info is not None else None
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("Extract failed for %s: %s", file_path, exc)
+                    self.stats.error_files += 1
+                    return None
+
+        loop = asyncio.get_running_loop()
+        walk_done = False
+        while not (walk_done and not batch):
+            if not batch:
+                # Refill the batch from the queue (non-blocking-ish).
+                while len(batch) < self.config.batch_size:
+                    item = await loop.run_in_executor(None, file_q.get)
+                    if item is SENTINEL:
+                        walk_done = True
+                        break
+                    batch.append(item)
+                    total_seen += 1
+            if not batch:
+                break
+            self.stats.total_files = max(self.stats.total_files, total_seen)
 
             # Phase 1: metadata extraction (parallel, no DB). The mutagen
-            # C calls release the GIL in worker threads, so 8 concurrent
-            # workers give a large speedup on big libraries.
+            # C calls release the GIL in worker threads.
             extracted: list[tuple[Path, Any]] = []
-            sem = asyncio.Semaphore(8)
-
-            async def _extract(file_path: Path) -> tuple[Path, Any] | None:
-                async with sem:
-                    try:
-                        info = await scanner.scan_single_file(file_path)
-                        return (file_path, info) if info is not None else None
-                    except Exception as exc:  # noqa: BLE001
-                        logger.warning("Extract failed for %s: %s", file_path, exc)
-                        self.stats.error_files += 1
-                        return None
-
             for task in asyncio.as_completed(
                     [asyncio.create_task(_extract(p)) for p in batch]):
                 self.stats.scanned_files += 1
@@ -146,18 +182,18 @@ class MusicImporter:
                 if r:
                     extracted.append(r)
                 SCAN_STATE.update(done=self.stats.scanned_files,
-                                  total=self.stats.total_files)
+                                  total=max(total_seen, 1))
+            batch = []
 
-            # Phase 2: short-lived session, inserts only. Batch lookups
-            # (existing tracks/albums/contributors + join membership) run
-            # once per batch, not once per track — the per-track queries
-            # were the bottleneck (aiosqlite thread round-trips).
+            # Phase 2: short-lived session, inserts only — the library
+            # grows incrementally while the walk continues.
             async with db_session() as session:
                 await self._import_batch(session, extracted)
                 self.stats.imported_files += len(extracted)
                 await session.commit()
             self._emit_progress()
-            logger.info("Imported %d/%d files", batch_start + len(batch), len(files))
+            logger.info("Imported %d/%d+ files", self.stats.scanned_files,
+                        total_seen)
 
         self.stats.end_time = datetime.now()
         self._emit_progress()

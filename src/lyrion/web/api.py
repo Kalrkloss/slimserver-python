@@ -647,6 +647,14 @@ class JSONRPCAPI:
                 # "ffmpeg not found - transcoding not possible".
                 "notice": _SERVER_NOTICE.get("text", ""),
             }
+            # Live library-scan progress for the status bar ("Scan läuft,
+            # N Dateien gefunden"). The SPA polls serverstatus anyway.
+            try:
+                from lyrion.media.scan_state import SCAN_STATE
+                snap = SCAN_STATE.snapshot()
+                result["scan"] = snap
+            except Exception:
+                pass
             try:
                 r = _db_query(
                     "SELECT COUNT(*) AS n, COALESCE(SUM(duration),0) AS d FROM tracks"
