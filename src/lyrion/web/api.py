@@ -808,7 +808,7 @@ class JSONRPCAPI:
 
         if cmd in ("pause", "power", "play", "stop", "mixer", "sync",
                    "unsync", "pref", "playerpref", "display", "button",
-                   "alarm", "signalstrength", "client", "mode", "name",
+                   "signalstrength", "client", "mode", "name",
                    "playlist"):
             # Invalidate the status cache: a poll right after a control
             # command must see the NEW state, not the stale cached one
@@ -895,6 +895,14 @@ class JSONRPCAPI:
         # ── search (LMS format: search <start> <count> term:<begriff>) ──
         if cmd == "search":
             return await self._json_search(args)
+
+        # ── alarms / alarm (LMS alarm-clock API, JSON for controllers) ──
+        # SqueezePlay/Material poll ['alarms'] and expect an attribute
+        # response wrapping alarm_loop of alarms for the player.
+        if cmd == "alarms":
+            return await self._json_alarms(pid, args)
+        if cmd == "alarm":
+            return await self._json_alarm(pid, args)
 
         # ── Browse commands (library) ──────────────────────────────
         if cmd in ("albums", "artists", "genres", "songs", "titles",
@@ -1186,6 +1194,68 @@ class JSONRPCAPI:
             _home_item(["favorites", "items"], "Favorites", "link", 4),
             _home_item(["browse", "radios"], "Radio", "link", 5),
         ]
+
+    @staticmethod
+    def _alarm_to_item(index: int, alarm) -> dict:
+        """Convert an Alarm to the JSON alarm_loop entry shape."""
+        return {
+            "id": index,
+            "enabled": 1 if (alarm and alarm.enabled) else 0,
+            "day": alarm.day_int() if alarm else 0,
+            "hour": int(alarm.time.split(":")[0]) if alarm else 0,
+            "minute": int(alarm.time.split(":")[1]) if alarm else 0,
+            "times": 1,
+            "fade": alarm.fade if alarm else 0,
+            "volume": alarm.volume if alarm else -1,
+            "duration": alarm.duration if alarm else 0,
+            "repeat": 1 if (alarm and alarm.repeat) else 0,
+        }
+
+    async def _json_alarms(self, pid: str | None, args: list) -> dict:
+        """['alarms'] → list all alarms for the player (LMS JSON shape)."""
+        from lyrion.alarms import AlarmManager
+
+        mac = pid if pid not in ("-", None) else ""
+        mgr = AlarmManager()
+        alarms = mgr.alarms_for(mac)
+        loop = [self._alarm_to_item(idx, alarms.get(idx)) for idx in sorted(alarms)]
+        return {
+            "count": len(loop),
+            "fade": 0,
+            "alarm_loop": loop,
+        }
+
+    async def _json_alarm(self, pid: str | None, args: list) -> dict:
+        """['alarm', '<idx>'] or ['alarm', '<idx>', 'set:<kv>']."""
+        from lyrion.alarms import AlarmManager, _alarm_from_parts, Alarm
+
+        mac = pid if pid not in ("-", None) else ""
+        mgr = AlarmManager()
+        path = str(args[0]) if args else "0"
+        # Some clients pass '<idx>' as '<idx>-' (row selection).
+        idx_str = path.split("-")[0]
+        try:
+            idx = int(idx_str)
+        except ValueError:
+            return {"error": "invalid alarm index"}
+
+        if len(args) == 1 or (len(args) >= 2 and args[1] in ("?", "query")):
+            return self._alarm_to_item(idx, mgr.get(mac, idx))
+
+        parts: dict[str, str] = {}
+        for tok in args[1:]:
+            if ":" in tok:
+                k, v = tok.split(":", 1)
+                parts[k] = v
+        current = mgr.get(mac, idx)
+        a = _alarm_from_parts(idx, parts)
+        if current:
+            for f in ("enabled", "days", "time", "volume", "fade", "duration",
+                      "repeat", "wake"):
+                if f not in parts:
+                    setattr(a, f, getattr(current, f))
+        mgr.set(mac, idx, a)
+        return self._alarm_to_item(idx, a)
 
     @staticmethod
     def _browse_response(loop: list, total: int | None = None,

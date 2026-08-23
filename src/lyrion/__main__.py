@@ -154,6 +154,15 @@ async def _run_server(
     except ImportError:
         log.debug("CLI server module not available yet")
 
+    # Alarm clock scheduler: powers on players + starts their wake source
+    # when a configured alarm fires (runs once per ~20 s).
+    try:
+        from lyrion.alarms import AlarmScheduler
+        asyncio.create_task(AlarmScheduler(polling_interval=20.0).run())
+        log.info("Alarm scheduler started (interval 20s)")
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Alarm scheduler not started: %s", exc)
+
     # Start Slimproto TCP server (port 3483 — players connect here)
     slimproto_port = int(getattr(cfg.cli_args, "slimprotoport", None)
                          or cfg.get("slimproto_port", 3483))

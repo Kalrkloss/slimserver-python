@@ -2167,11 +2167,21 @@ async def cmd_alarms(
 ) -> list[str]:
     """alarms [<start> <count>] — list alarm clocks.
 
-    LMS returns count + fade (fade-in seconds, global). We currently
-    persist no alarms, so both are 0. SqueezePlay/controllers poll this
-    to show the alarm clock page; an empty list is a valid state.
+    LMS returns count + fade (global fade-in seconds). Each configured
+    alarm is reported via an 'alarm <index>' line like SqueezePlay expects.
     """
-    return ["alarms count:0", "alarms fade:0", ""]
+    from lyrion.alarms import AlarmManager, alarm_query_string
+
+    mac = ctx.player_id or ""
+    if mac == "-":
+        mac = ""
+    mgr = AlarmManager()
+    alarms = mgr.alarms_for(mac)
+    lines = [f"alarms count:{len(alarms)}", "alarms fade:0", ""]
+    for idx in sorted(alarms):
+        lines.append(alarm_query_string(idx, alarms[idx]) + "\n")
+    lines.append("")
+    return lines
 
 
 @register_command("alarm")
@@ -2182,30 +2192,49 @@ async def cmd_alarm(
 ) -> list[str]:
     """alarm <index> [key:value ...] — query or set a single alarm.
 
-    LMS 'alarm 0 ?' returns the fields for alarm index 0 (id, enabled,
-    time, days, ...). 'alarm <index> <key>:<value>' sets a field. We
-    persist no alarms, so a known index returns a disabled 06:00 default
-    and an out-of-range index is a no-op (LMS silently ignores).
+    Query form:  'alarm <index> ?'  → returns the alarm's fields.
+    Set form:    'alarm <index> enabled:1 days:1111111 time:06:30 ...'
+    Delete form: 'alarm <index> delete'
     """
+    from lyrion.alarms import (AlarmManager, _alarm_from_parts,
+                               alarm_query_string)
+
     if not args:
         return ["alarm: ", ""]
     try:
         idx = int(args[0])
     except ValueError:
         return ["alarm: invalid index", ""]
+
+    mac = ctx.player_id or ""
+    if mac == "-":
+        mac = ""
+    mgr = AlarmManager()
+
     if len(args) == 1 or (len(args) == 2 and args[1] == "?"):
-        # Query form: report the (default/empty) alarm index fields.
-        return [
-            f"alarm index:{idx}"
-            f" enabled:0 time:06:00 days:1111111 volume:-1"
-            f" fade:-1 duration:0 repeat:0",
-            "",
-        ]
-    # Set form — consume the key:value pairs (no-op unless persisted).
-    if idx == 0:
-        # Acknowledge, but treat as a no-op unless we later persist alarms.
-        return [f"alarm index:{idx} ", ""]
-    return [f"alarm index:{idx} ", ""]
+        a = mgr.get(mac, idx)
+        return [alarm_query_string(idx, a), ""]
+
+    if len(args) >= 2 and args[1] == "delete":
+        mgr.delete(mac, idx)
+        return [alarm_query_string(idx, None), ""]
+
+    # Set form: collect key:value pairs (and tolerate a bare '0'/'1' toggle).
+    parts: dict[str, str] = {}
+    for tok in args[1:]:
+        if ":" in tok:
+            k, v = tok.split(":", 1)
+            parts[k] = v
+    current = mgr.get(mac, idx)
+    a = _alarm_from_parts(idx, parts)
+    # Preserve unspecified fields from the existing alarm.
+    if current:
+        for f in ("enabled", "days", "time", "volume", "fade", "duration",
+                  "repeat", "wake"):
+            if f not in parts:
+                setattr(a, f, getattr(current, f))
+    mgr.set(mac, idx, a)
+    return [alarm_query_string(idx, a), ""]
 
 
 # ---------------------------------------------------------------------------
