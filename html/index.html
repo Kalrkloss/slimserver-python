@@ -2019,6 +2019,7 @@ async function refreshFavorites() {
         <td>${isFolder ? 'Ordner' : 'Stream'}</td>
         <td class="row-actions">
           ${isFolder ? '' : `<button class="btn-secondary btn-sm" onclick="favPlay(${f.fav_id})">▶ Play</button>`}
+          ${isFolder ? '' : `<button class="btn-secondary btn-sm" onclick="favAddToPlaylist(${f.fav_id})">+ Playlist</button>`}
           <select onchange="favMove(${f.fav_id}, this.value)" style="padding:2px;font-size:11px">
             <option value="">Verschieben…</option>
             <option value="0">→ Root</option>
@@ -2129,6 +2130,18 @@ async function favPlay(id) {
   try {
     await api('slim.request', [appState.currentPlayer, ['favorites', 'play', String(id)]]);
     showToast('Stream startet…');
+  } catch (e) { showToast('Fehler: ' + e.message); }
+}
+
+async function favAddToPlaylist(id) {
+  if (!appState.currentPlayer) { showToast('Kein Player gewählt'); return; }
+  const fav = (appState.favItems || []).find(x => String(x.fav_id) === String(id));
+  if (!fav) { showToast('Favorit nicht gefunden'); return; }
+  if (!fav.url) { showToast('Keine Stream-URL'); return; }
+  try {
+    // Favorit ist ein Stream (URL) → als Playlist-Eintrag hinzufügen (nicht Track-ID).
+    await api('slim.request', [appState.currentPlayer, ['playlist', 'add', fav.url]]);
+    showToast(`"${fav.title}" zur Playlist hinzugefügt`);
   } catch (e) { showToast('Fehler: ' + e.message); }
 }
 
