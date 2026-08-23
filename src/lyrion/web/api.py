@@ -766,6 +766,24 @@ class JSONRPCAPI:
             player = pm.get_player(pid) if pid else None
             return {"_volume": player.volume if player else 0}
 
+        # prefset — Material Skin + controllers subscribe to the player's
+        # preference set; return the per-player prefs as {key: value}.
+        if cmd == "prefset":
+            player = pm.get_player(pid) if pid else None
+            prefs = dict(getattr(player, "playerprefs", {}) or {}) if player else {}
+            return prefs
+
+        # pref <key> [?|<value>] — server preference query/set.
+        if cmd == "pref" and args:
+            key = str(args[0])
+            if len(args) > 1 and str(args[1]) != "?":
+                from lyrion.config import get_prefs
+                await get_prefs().set(key, args[1])
+                return {f"_pref_{key}": str(args[1])}
+            from lyrion.config import get_config
+            val = get_config().get(key, "")
+            return {key: val}
+
         if cmd in ("pause", "power", "play", "stop", "mixer", "sync",
                    "unsync", "pref", "playerpref", "display", "button",
                    "alarm", "signalstrength", "client", "mode", "name",
