@@ -2293,6 +2293,7 @@ async function renderSettings(tab) {
         <button class="tab ${tab === 'server' ? 'active' : ''}" onclick="location.hash='#/settings/server'">Server</button>
         <button class="tab ${tab === 'players' ? 'active' : ''}" onclick="location.hash='#/settings/players'">Players</button>
         <button class="tab ${tab === 'plugins' ? 'active' : ''}" onclick="location.hash='#/settings/plugins'">Plugins</button>
+        <button class="tab ${tab === 'alarms' ? 'active' : ''}" onclick="location.hash='#/settings/alarms'">Alarms</button>
       </div>
       <div id="settings-content">${loadingEl()}</div>
     </div>
@@ -2301,6 +2302,7 @@ async function renderSettings(tab) {
   if (tab === 'server') await renderServerSettings();
   else if (tab === 'players') await renderPlayerSettings();
   else if (tab === 'plugins') await renderPluginsSettings();
+  else if (tab === 'alarms') await renderAlarmSettings();
 }
 
 async function renderServerSettings() {
@@ -2446,6 +2448,130 @@ async function renderPluginsSettings() {
       </div>
     </div>
   `;
+}
+
+// ── Alarm clock (Weckfunktion) ─────────────────────────────
+const DAY_NAMES = ['Mo', 'Di', 'Mi', 'Do', 'Fr', 'Sa', 'So'];
+
+async function renderAlarmSettings() {
+  const el = document.getElementById('settings-content');
+  if (!el) return;
+  // active player (prefer currentPlayer, else first connected)
+  const mac = appState.currentPlayer || (appState.players.find(p => p.connected)?.mac || '');
+  try {
+    const alarms = await api('slim.request', [mac || '-', ['alarms', '0', '16']]);
+    const loop = alarms?.alarm_loop || [];
+    el.innerHTML = `
+      <div class="settings-grid">
+        <div class="settings-card">
+          <div class="settings-card-header">Alarm Clock — ${escHtml((appState.players.find(p=>p.mac===mac)||{}).name || mac || 'No player')}</div>
+          <div class="settings-card-body">
+            <div class="empty-msg" style="margin-bottom:10px">Set wake-up alarms. Each alarm turns the player on, applies the volume and starts the wake source (radio station or track URL).</div>
+            ${loop.map((a,i) => `
+              <div class="alarm-row" id="alarm-row-${i}" style="border:1px solid var(--border);border-radius:6px;padding:10px;margin-bottom:10px">
+                <div class="info-grid" style="grid-template-columns:auto 1fr">
+                  <span class="label">Alarm ${i+1}:</span>
+                  <span>
+                    <input type="checkbox" id="alarm-enabled-${i}" ${a.enabled ? 'checked' : ''} onchange="saveAlarm(${i})" style="vertical-align:middle">
+                    <label for="alarm-enabled-${i}" style="font-size:12px">Enabled</label>
+                  </span>
+                </div>
+                <div class="info-grid" style="grid-template-columns:auto 1fr">
+                  <span class="label">Time:</span>
+                  <span>
+                    <select id="alarm-hour-${i}" onchange="saveAlarm(${i})">
+                      ${Array.from({length:24},(_,h)=>`<option value="${h}" ${h===a.hour?'selected':''}>${String(h).padStart(2,'0')}</option>`).join('')}
+                    </select>
+                      <select id="alarm-minute-${i}" onchange="saveAlarm(${i})">
+                      ${Array.from({length:12},(_,m)=>`<option value="${m*5}" ${m*5===a.minute?'selected':''}>${String(m*5).padStart(2,'0')}</option>`).join('')}
+                    </select>
+                  </span>
+                </div>
+                <div class="info-grid" style="grid-template-columns:auto 1fr">
+                  <span class="label">Days:</span>
+                  <span>
+                    ${DAY_NAMES.map((d,j)=>`<label style="font-size:12px;margin-right:6px"><input type="checkbox" data-day="${j+1}" onchange="saveAlarm(${i})" ${(a.day>>(j))&1 ? 'checked' : ''}> ${d}</label>`).join('')}
+                  </span>
+                </div>
+                <div class="info-grid" style="grid-template-columns:auto 1fr">
+                  <span class="label">Volume:</span>
+                  <select id="alarm-volume-${i}" onchange="saveAlarm(${i})">
+                    ${Array.from({length:11},(_,v)=>`<option value="${v*10}" ${v*10===a.volume?'selected':''}>${v===0?'current':(v*10)+'%'}</option>`).join('')}
+                  </select>
+                </div>
+                <div class="info-grid" style="grid-template-columns:auto 1fr">
+                  <span class="label">Wake source (URL):</span>
+                  <input id="alarm-url-${i}" type="text" value="${escHtml(alarmUrlValue(a))}" placeholder="http://… or https://…"
+                    style="font-family:monospace;font-size:12px;padding:5px;border:1px solid var(--border);border-radius:3px;width:100%;box-sizing:border-box"
+                    onchange="saveAlarm(${i})">
+                </div>
+                <div style="margin-top:8px">
+                  <button class="btn-secondary btn-sm" onclick="deleteAlarm(${i})">🗑 Delete</button>
+                </div>
+              </div>
+            `).join('')}
+            <div style="text-align:center">
+              <button class="btn-secondary" onclick="addAlarm()">➕ New Alarm</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    `;
+  } catch(e) {
+    el.innerHTML = errEl('Could not load alarms: ' + e.message);
+  }
+}
+
+function alarmUrlValue(a) {
+  // a.wake may be "url:http://…" or the url field directly; Material/SqueezePlay
+  // use the raw url. Return a clean http(s) URL for the input.
+  if (a && a.url) return a.url;
+  if (a && a.wake && a.wake !== '') return a.wake.replace(/^url:/, '').replace(/^wake:/, '');
+  return '';
+}
+
+async function saveAlarm(i) {
+  const mac = appState.currentPlayer || (appState.players.find(p => p.connected)?.mac || '');
+  const enabled = document.getElementById(`alarm-enabled-${i}`)?.checked ? 1 : 0;
+  const hour = parseInt(document.getElementById(`alarm-hour-${i}`)?.value ?? 0, 10);
+  const minute = parseInt(document.getElementById(`alarm-minute-${i}`)?.value ?? 0, 10);
+  const volume = parseInt(document.getElementById(`alarm-volume-${i}`)?.value ?? -1, 10);
+  const rawUrl = (document.getElementById(`alarm-url-${i}`)?.value || '').trim();
+  let day = 0;
+  document.querySelectorAll(`#alarm-row-${i} input[data-day]`).forEach(cb => {
+    if (cb.checked) day |= (1 << (parseInt(cb.dataset.day, 10) - 1));
+  });
+  try {
+    const args = ['alarm', String(i), `enabled:${enabled}`, `hour:${hour}`, `minute:${minute}`, `volume:${volume}`,
+                  `day:${day}`];
+    if (rawUrl) args.push(`url:${rawUrl}`);
+    await api('slim.request', [mac || '-', args]);
+    showToast('Alarm gespeichert');
+  } catch(e) { showToast('Fehler: ' + e.message); }
+}
+
+async function addAlarm() {
+  const mac = appState.currentPlayer || (appState.players.find(p => p.connected)?.mac || '');
+  try {
+    // find first free alarm index (0..15)
+    const alarms = await api('slim.request', [mac || '-', ['alarms', '0', '16']]);
+    const used = new Set((alarms?.alarm_loop || []).map(a => a.id));
+    let slot = 0;
+    while (slot < 16 && used.has(slot)) slot++;
+    if (slot >= 16) { showToast('Maximal 16 Alarme'); return; }
+    await api('slim.request', [mac || '-', ['alarm', String(slot), 'enabled:0', 'hour:7', 'minute:0', 'day:127', 'volume:-1']]);
+    renderAlarmSettings();
+    showToast(`Alarm ${slot+1} angelegt`);
+  } catch(e) { showToast('Fehler: ' + e.message); }
+}
+
+async function deleteAlarm(i) {
+  const mac = appState.currentPlayer || (appState.players.find(p => p.connected)?.mac || '');
+  try {
+    await api('slim.request', [mac || '-', ['alarm', String(i), 'delete']]);
+    renderAlarmSettings();
+    showToast('Alarm gelöscht');
+  } catch(e) { showToast('Fehler: ' + e.message); }
 }
 
 async function togglePlayerPower(mac) {

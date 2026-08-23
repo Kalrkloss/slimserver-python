@@ -1209,6 +1209,9 @@ class JSONRPCAPI:
             "volume": alarm.volume if alarm else -1,
             "duration": alarm.duration if alarm else 0,
             "repeat": 1 if (alarm and alarm.repeat) else 0,
+            "wake": (alarm.wake if alarm else "") or "",
+            "url": (alarm.wake.split(":", 1)[1] if alarm and ":" in alarm.wake
+                    else ""),
         }
 
     async def _json_alarms(self, pid: str | None, args: list) -> dict:
@@ -1253,6 +1256,17 @@ class JSONRPCAPI:
             for f in ("enabled", "days", "time", "volume", "fade", "duration",
                       "repeat", "wake"):
                 if f not in parts:
+                    # If hour/minute were given, don't clobber the time
+                    # we just built from them.
+                    if f == "time" and ("hour" in parts or "minute" in parts):
+                        continue
+                    # If an integer day-mask was given, its derived 'days'
+                    # string must not be overwritten from current.
+                    if f == "days" and "day" in parts:
+                        continue
+                    # 'url:'/'track:' build the wake value; don't clobber it.
+                    if f == "wake" and ("url" in parts or "track" in parts):
+                        continue
                     setattr(a, f, getattr(current, f))
         mgr.set(mac, idx, a)
         return self._alarm_to_item(idx, a)

@@ -267,6 +267,13 @@ def _alarm_from_parts(index: int, parts: dict[str, str]) -> Alarm:
         d = parts["days"]
         # accept '1111111' or '01xxxxx' style; keep 7 chars
         a.days = (d[:7].ljust(7, "1")) if d else "1111111"
+    if "day" in parts:
+        # integer bitmask (1=Mo .. 64=So), e.g. from JSON clients
+        try:
+            mask = int(parts["day"])
+            a.days = "".join("1" if (mask >> i) & 1 else "0" for i in range(7))
+        except ValueError:
+            pass
     if "time" in parts:
         t = parts["time"]
         if ":" in t and len(t) >= 4:
