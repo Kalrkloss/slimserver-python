@@ -1189,11 +1189,19 @@ async function togglePlay() {
     // a stale player.status that still reports the previous mode.
     updatePlayButton();
     updateStatusBar();
-    // Refresh the underlying data (queue, metadata) and keep polling so the
-    // icon stays in sync for external state changes (auto-advance, etc.).
+    // Refresh the underlying data (queue, metadata) WITHOUT re-reading
+    // isPlaying — the poll loop below reconciles the icon with the real
+    // server state (≤3s), so a right-after-command status read (which may
+    // still report the pre-command mode) never flips the icon back.
     await refreshNowPlayingData();
-    startStatusPoll();
-  } catch(e) { console.error(e); }
+  } catch(e) {
+    console.error(e);
+    // API call failed (e.g. server unreachable): the optimistic state we set
+    // above may not reflect reality. Revert isPlaying so the icon flips back,
+    // and let the next status poll reconcile with the real server state.
+    appState.isPlaying = false;
+    updatePlayButton();
+  }
   finally {
     toggleInFlight = false;
     // Re-run a queued click (real toggle, not a lost one).
