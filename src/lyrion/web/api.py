@@ -1307,15 +1307,26 @@ class JSONRPCAPI:
             sub = args[0] if args else ""
             rest = args[1:] if len(args) > 1 else []
             if sub == "add" and rest:
-                # Accept both a DB track id and a plain URL. SqueezeTray adds
-                # URLs (radio/favorites); the SPA adds track ids.
-                item = rest[0]
+                # Accept a DB track id, a 'track_id:<n>' tag (controllers),
+                # or a plain URL. SqueezeTray adds URLs (radio/favorites);
+                # the SPA + Android controllers add tagged track ids.
                 player = pm.get_player(pid)
                 if player is not None:
-                    if str(item).isdigit():
-                        player.playlist.append(int(item))
-                    else:
-                        player.playlist.append(item)
+                    for item in rest:
+                        # 'track_id:2' / 'item_id:2' -> db id; 'url:...' -> url
+                        low = str(item).lower()
+                        if low.startswith("track_id:") or low.startswith("item_id:"):
+                            tid = low.split(":", 1)[1]
+                            if tid.isdigit():
+                                player.playlist.append(int(tid))
+                        elif low.startswith("url:"):
+                            player.playlist.append(low.split(":", 1)[1])
+                        elif str(item).isdigit():
+                            player.playlist.append(int(item))
+                        else:
+                            # bare URL:
+                            player.playlist.append(item)
+                        player.last_activity = time.time()
                     player.playlist_total = len(player.playlist)
             elif sub == "index" and rest:
                 idx = rest[0]
@@ -1324,11 +1335,16 @@ class JSONRPCAPI:
                     player.playlist_position = int(idx)
                     await self._play_playlist_item(pm, player, int(idx))
             elif sub == "play":
-                # LMS-compatible 'playlist play [<index>]' (CLI/JSON path)
+                # LMS-compatible 'playlist play [<index>|track_id:<n>]'
                 player = pm.get_player(pid)
                 if player is not None:
                     if rest and str(rest[0]).isdigit():
                         idx = int(rest[0])
+                    elif rest and str(rest[0]).lower().startswith("track_id:"):
+                        # Flush a bare track id as a one-item playlist entry.
+                        tid = str(rest[0]).split(":", 1)[1]
+                        self._playlist_flush_track(pm, player, pid, tid)
+                        idx = player.playlist_position or 0
                     else:
                         idx = player.playlist_position or 0
                     player.playlist_position = idx
@@ -1374,6 +1390,19 @@ class JSONRPCAPI:
         except Exception as exc:
             logger = __import__("logging").getLogger("lyrion.web.api")
             logger.warning("_play_playlist_item failed: %s", exc)
+
+    def _playlist_flush_track(self, pm, player, pid: str, tid: str) -> None:
+        """Replace the playlist with a single track id and start it.
+
+        Handles 'playlist play track_id:<n>' where the controllers send a
+        bare tagged id (no playlist yet) — LMS play-by-track-id semantics.
+        """
+        if not tid.isdigit():
+            return
+        player.playlist = [int(tid)]
+        player.playlist_total = 1
+        player.playlist_position = 0
+        player.last_activity = time.time()
 
     async def _json_search(self, args: list[str]) -> dict:
         """LMS 'search <start> <count> term:<begriff>' — grouped results.
