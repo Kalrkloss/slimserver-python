@@ -8,6 +8,15 @@ from typing import Any, Callable, Optional
 
 logger = logging.getLogger(__name__)
 
+# Global operational notice shown in the web Status bar (e.g. a missing
+# ffmpeg). Set via set_server_notice(); read in the serverstatus response.
+_SERVER_NOTICE: dict[str, str] = {"text": ""}
+
+
+def set_server_notice(text: str) -> None:
+    """Set (or clear, with '') the global Status-bar notice."""
+    _SERVER_NOTICE["text"] = text
+
 try:
     import orjson
 
@@ -634,6 +643,9 @@ class JSONRPCAPI:
                 "info total albums": 0,
                 "info total songs": 0,
                 "info total duration": 0,
+                # Operational notice surfaced in the web Status bar, e.g.
+                # "ffmpeg not found - transcoding not possible".
+                "notice": _SERVER_NOTICE.get("text", ""),
             }
             try:
                 r = _db_query(

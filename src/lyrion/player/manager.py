@@ -12,6 +12,27 @@ from .state import PlayerState
 logger = logging.getLogger(__name__)
 
 
+# Formats a given squeeze-type player can decode natively. Mirrors the
+# Perl-LMS model→support mapping (Slim::Utils::Misc / Types.pm): SqueezeLite
+# and SqueezePlay decode the modern set; the classic Squeezebox family is
+# narrower. Used to decide whether a source must be transcoded.
+_COMMON_FORMATS = {"mp3", "flac", "aac", "ogg", "wav", "aiff", "pcm"}
+
+
+def _formats_for_model(model: str) -> set[str]:
+    """Return the set of audio extensions ``model`` plays natively."""
+    m = (model or "").lower()
+    if m.startswith("squeezelite") or m.startswith("squeezeplay"):
+        return set(_COMMON_FORMATS)
+    if m in ("squeezebox", "squeezebox2", "squeezebox3", "squeezeboxclassic"):
+        # Classic hardware: MP3, FLAC, WAV, AIFF, OGG, PCM — but no AAC/ALAC.
+        return {"mp3", "flac", "wav", "aiff", "ogg", "pcm"}
+    if m.startswith("squeezeboxradio") or m.startswith("squeezeboxtouch"):
+        return {"mp3", "flac", "aac", "wav", "aiff", "ogg", "pcm"}
+    # Unknown model: assume the modern set (never blindly force a transcode).
+    return set(_COMMON_FORMATS)
+
+
 class PlayerManager:
     """Singleton manager for all connected Squeezebox players.
 
@@ -54,6 +75,7 @@ class PlayerManager:
         firmware: str = "unknown",
         name_source: str = "device",
         can_https: bool = False,
+        supported_formats: set[str] | None = None,
     ) -> PlayerState:
         """Register a new player or update an existing one.
 
@@ -70,6 +92,10 @@ class PlayerManager:
                 client that opens multiple connections (e.g. SqueezePlay with
                 a control + compatibility session) cannot clobber the real
                 name with its device identity.
+            can_https: Whether the player can do TLS itself (HELO cap).
+            supported_formats: Audio extensions this player can decode
+                natively; used to decide whether a source must be transcoded.
+                Falsy means "assume the common set" (see _formats_for_model).
 
         Returns:
             The PlayerState for this player.
@@ -93,6 +119,10 @@ class PlayerManager:
             player.model = model or player.model
             player.firmware = firmware
             player.can_https = can_https
+            if supported_formats:
+                player.supported_formats = set(supported_formats)
+            elif not player.supported_formats:
+                player.supported_formats = _formats_for_model(player.model)
             player.connected = True
             player.update_activity()
             logger.info("Player reconnected: %s (%s) src=%s", player.name, mac, player.name_source)
@@ -107,6 +137,7 @@ class PlayerManager:
                 firmware=firmware,
                 connected=True,
                 can_https=can_https,
+                supported_formats=supported_formats or _formats_for_model(model),
             )
             self.players[mac] = player
             logger.info("Player registered: %s (%s) [%s:%d] src=%s", name, mac, ip, port, name_source)

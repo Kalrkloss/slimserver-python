@@ -80,6 +80,10 @@ class PlayerState:
     # False → https radio streams must be proxied by the server
     # (like the Perl LMS: canDirectStream honours CanHTTPS).
     can_https: bool = False
+    # Audio formats this player can decode natively (filled from the HELO
+    # 'Model' capability, like Perl LMS). Empty/falsy means "assume the
+    # common set". Used to decide whether a source must be transcoded.
+    supported_formats: set[str] = field(default_factory=set)
 
     # SlimProto STAT bookkeeping (set by the protocol handler):
     _last_stmd: Optional[float] = None        # last DECODE_COMPLETE time

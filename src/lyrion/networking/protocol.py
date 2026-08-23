@@ -780,7 +780,7 @@ class SlimProtoClient:
 
                 # Register with PlayerManager
                 try:
-                    from lyrion.player.manager import PlayerManager
+                    from lyrion.player.manager import PlayerManager, _formats_for_model
                     peer_ip = peer[0] if peer else "unknown"
                     reg_name = display_name or model
                     # A ModelName that merely repeats the device type
@@ -795,6 +795,7 @@ class SlimProtoClient:
                         mac=mac_str, name=reg_name, ip=peer_ip,
                         port=peer[1] if peer else 0, model=model, firmware="2.0.0",
                         name_source=src, can_https=can_https,
+                        supported_formats=_formats_for_model(model),
                     )
                     logger.info("Squeezelite player registered: %s (%s) model=%s src=%s", reg_name, mac_str, model, src)
                 except Exception as exc:
@@ -809,7 +810,7 @@ class SlimProtoClient:
                 # player decodes but outputs silence. The Perl LMS pushes
                 # the current volume to every newly connected player.
                 try:
-                    from lyrion.player.manager import PlayerManager
+                    from lyrion.player.manager import PlayerManager, _formats_for_model
                     pstate = PlayerManager().get_player(mac_str)
                     if pstate is not None:
                         await self.send_volume_to_player(mac_str, pstate.volume)
@@ -864,7 +865,7 @@ class SlimProtoClient:
                                 if new_name:
                                     logger.info("Player %s sends name via SETD: %r", mac_str, new_name)
                                     try:
-                                        from lyrion.player.manager import PlayerManager
+                                        from lyrion.player.manager import PlayerManager, _formats_for_model
                                         PlayerManager().rename_player(mac_str, new_name)
                                     except Exception as exc:
                                         logger.warning("SETD rename failed for %s: %s", mac_str, exc)
@@ -960,7 +961,7 @@ class SlimProtoClient:
             player_ip = peer[0] if peer else "unknown"
             player_port = peer[1] if peer else 0
             try:
-                from lyrion.player.manager import PlayerManager
+                from lyrion.player.manager import PlayerManager, _formats_for_model
                 PlayerManager().register_player(
                     mac=mac_formatted,
                     name=model_name,
@@ -968,6 +969,7 @@ class SlimProtoClient:
                     port=player_port,
                     model=model_name,
                     firmware=hello.revision.strip(),
+                    supported_formats=_formats_for_model(model_name),
                 )
                 logger.info("Player registered via SlimProto: %s (%s)", mac_formatted, player_ip)
             except Exception as exc:
@@ -1026,7 +1028,7 @@ class SlimProtoClient:
                         self._player_connections.pop(key, None)
                         if self._player_writers.get(key) is writer:
                             self._player_writers.pop(key, None)
-                        from lyrion.player.manager import PlayerManager
+                        from lyrion.player.manager import PlayerManager, _formats_for_model
                         if keep_registered:
                             # DSCO end-of-stream: the player reconnects
                             # immediately. Mark offline but KEEP the state
@@ -1111,6 +1113,24 @@ class SlimProtoClient:
         if "wav" in m or "pcm" in m or "aiff" in m or "aif" in m:
             return "p"
         return "m"  # mp3 and everything else
+
+    @staticmethod
+    def _codec_to_extension(codec: str) -> str:
+        """Map a slimproto codec char back to a file extension."""
+        return {
+            "f": "flac", "o": "ogg", "a": "aac", "p": "wav", "m": "mp3",
+        }.get(codec, "mp3")
+
+    @staticmethod
+    def _player_can_decode(player, codec: str) -> bool:
+        """True if ``player`` natively decodes a source of the given codec
+        char (''/no supported_formats ⇒ assume the common set)."""
+        if player is None:
+            return True
+        formats = getattr(player, "supported_formats", None)
+        if not formats:
+            return True  # unknown model: assume transcode is unnecessary
+        return SlimProtoClient._codec_to_extension(codec) in formats
 
     @staticmethod
     def _build_stream_frame(
@@ -1248,12 +1268,56 @@ class SlimProtoClient:
             logger.warning("Could not load track %d for codec: %s", track_id, exc)
 
         codec = self._codec_char(mime)
+        pcm_params = None  # (sample_size, rate, chan, endian) ASCII codes
+        transcode_requested = False
+
+        # ── Format fallback: if the player cannot decode this codec, run an
+        # ffmpeg transcode to raw PCM (strm codec 'p') instead of streaming
+        # the source. If ffmpeg is missing, fall back to the direct stream
+        # (the LMS must keep working) and surface a Status-bar notice.
+        try:
+            from lyrion.player.manager import PlayerManager
+            player = PlayerManager().get_player(mac)
+            if player is not None and not SlimProtoClient._player_can_decode(player, codec):
+                from lyrion.web.stream import ffmpeg_available, ffprobe_audio_info, _set_server_notice
+                if not ffmpeg_available():
+                    _set_server_notice("ffmpeg not found - transcoding not possible")
+                    logger.warning(
+                        "track %d codec %s not decodable by %s and no ffmpeg; "
+                        "serving source directly", track_id, codec, mac,
+                    )
+                else:
+                    info = (ffprobe_audio_info(track_path)
+                            if track_path is not None and track_path.is_file() else None)
+                    if info is not None:
+                        from lyrion.web.stream import pcm_params_for_strm
+                        pcm_params = pcm_params_for_strm({
+                            "bits": info["bits"], "rate": info["rate"],
+                            "channels": info["channels"], "bigendian": False,
+                        })
+                        codec = "p"
+                        transcode_requested = True
+                        logger.info(
+                            "track %d codec %s not natively decodable by %s — "
+                            "transcoding to PCM via ffmpeg (%d/%d/%d)",
+                            track_id, codec, mac, info["bits"], info["rate"],
+                            info["channels"],
+                        )
+                    else:
+                        logger.warning(
+                            "track %d codec %s not decodable, ffprobe failed; "
+                            "serving source directly", track_id, codec,
+                        )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Format-fallback decision failed for track %d: %s", track_id, exc)
 
         # For raw-PCM codecs the strm frame must carry the explicit format
         # (squeezelite pcm_open reads it straight from the frame); parse the
-        # WAV/AIFF header server-side like the Perl LMS.
-        pcm_params = None
-        if codec == "p" and track_path is not None and track_path.is_file():
+        # WAV/AIFF header server-side like the Perl LMS. This only applies
+        # to a native WAV/AIFF source — when we already set pcm_params via
+        # ffprobe for the format-fallback transcode, keep those.
+        if codec == "p" and not transcode_requested \
+                and track_path is not None and track_path.is_file():
             from lyrion.web.stream import parse_pcm_header, pcm_params_for_strm
             info = parse_pcm_header(track_path)
             if info is not None:
@@ -1275,10 +1339,18 @@ class SlimProtoClient:
         # exactly "GET /stream.mp3?player=<MAC> HTTP/1.0\r\n\r\n" — no track
         # id in the URL, no Host header. The /stream endpoint resolves the
         # current track from the player's playlist via the player= param.
-        request = (
-            f"GET /stream.mp3?player={mac} HTTP/1.0\r\n"
-            f"\r\n"
-        ).encode("ascii")
+        if transcode_requested:
+            # Format fallback: ask the /stream endpoint to run ffmpeg and
+            # emit raw PCM instead of the source file.
+            request = (
+                f"GET /stream.mp3?player={mac}&transcode=1 HTTP/1.0\r\n"
+                f"\r\n"
+            ).encode("ascii")
+        else:
+            request = (
+                f"GET /stream.mp3?player={mac} HTTP/1.0\r\n"
+                f"\r\n"
+            ).encode("ascii")
 
         # Normal LMS proxy stream: autostart=1.  The player starts after
         # HTTP headers; it must not wait for a cont frame.
@@ -1585,7 +1657,7 @@ class SlimProtoClient:
                 # The source never answered (dead/unreachable station) —
                 # don't leave the UI showing "playing" with no audio.
                 try:
-                    from lyrion.player.manager import PlayerManager
+                    from lyrion.player.manager import PlayerManager, _formats_for_model
                     player = PlayerManager().get_player(mac)
                     if player is not None:
                         player.mode = "stop"
@@ -1932,7 +2004,7 @@ class SlimProtoClient:
                                 candidate = raw_name.decode("latin-1").strip()
                             if candidate and candidate.isprintable() and len(candidate) < 64:
                                 logger.info("STAT setd from %s: name=%r (payload %d bytes)", mac_str, candidate, len(payload))
-                                from lyrion.player.manager import PlayerManager
+                                from lyrion.player.manager import PlayerManager, _formats_for_model
                                 PlayerManager().rename_player(mac_str, candidate)
                                 break
                 except Exception as exc:

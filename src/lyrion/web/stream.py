@@ -152,6 +152,101 @@ def _track_path_from_url(url: str) -> Path | None:
     return p if p.exists() else None
 
 
+# ── ffmpeg availability + PCM transcode (format fallback) ────────────────
+_FFMPEG_CACHE: dict[str, bool] = {"checked": False, "available": False}
+
+def _set_server_notice(text: str) -> None:
+    """Thin wrapper so this module can surface a Status-bar notice without
+    importing the API module at import time (avoids a circular import)."""
+    try:
+        from lyrion.web.api import set_server_notice as _s
+        _s(text)
+    except Exception:
+        pass
+
+
+def ffmpeg_available() -> bool:
+    """Return True if ffmpeg is on PATH (cached across calls)."""
+    if _FFMPEG_CACHE["checked"]:
+        return _FFMPEG_CACHE["available"]
+    import shutil
+    _FFMPEG_CACHE["available"] = shutil.which("ffmpeg") is not None
+    _FFMPEG_CACHE["checked"] = True
+    return _FFMPEG_CACHE["available"]
+
+
+def ffprobe_audio_info(path: Path) -> dict | None:
+    """Return {'codec','bits','rate','channels'} via ffprobe, or None."""
+    import asyncio
+    import subprocess
+    try:
+        proc = subprocess.run(
+            ["ffprobe", "-v", "error",
+             "-show_entries", "stream=codec_name,sample_rate,channels,bits_per_raw_sample",
+             "-of", "csv=p=0", str(path)],
+            capture_output=True, text=True, timeout=15,
+        )
+        line = (proc.stdout or "").strip().splitlines()
+        if not line:
+            return None
+        c, rate, ch, bits = (line[0].split(",") + ["", "", ""])[:4]
+        return {
+            "codec": c.strip(),
+            "rate": int(rate) if rate.isdigit() else 44100,
+            "channels": int(ch) if ch.isdigit() else 2,
+            "bits": int(bits) if bits.isdigit() else 16,
+        }
+    except Exception:
+        return None
+
+
+async def _transcode_to_pcm_pipe(send, path: Path, source_mime: str) -> None:
+    """Stream ``path`` through ffmpeg as raw little-endian PCM (s16le).
+
+    Used as the format-fallback when a player cannot decode the source
+    codec natively (e.g. FLAC/ALAC/OGG on a classic Squeezebox). Emits the
+    ASGI response directly: http.response.start + chunked body.
+
+    The source's own sample rate / channel count / bit depth are read by
+    ffprobe so the emitted PCM matches the strm-frame params the server
+    already advertised to the player (no resampling).
+    """
+    import asyncio
+    info = ffprobe_audio_info(path) or {}
+    rate = int(info.get("rate") or 44100)
+    channels = int(info.get("channels") or 2)
+    bits = int(info.get("bits") or 16)
+    rate_arg = str(rate)
+    if bits == 24:
+        codec_arg, fmt = "pcm_s24le", "s24le"
+    else:
+        codec_arg, fmt = "pcm_s16le", "s16le"
+    cmd = [
+        "ffmpeg", "-v", "error", "-i", str(path),
+        "-acodec", codec_arg, "-ac", str(channels), "-ar", rate_arg,
+        "-f", fmt, "pipe:1",
+    ]
+    headers = [
+        (b"content-type", b"audio/L16"),
+        (b"cache-control", b"no-cache"),
+    ]
+    await send({"type": "http.response.start", "status": 200, "headers": headers})
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+        )
+        assert proc.stdout is not None
+        while True:
+            chunk = await proc.stdout.read(64 * 1024)
+            if not chunk:
+                break
+            await send({"type": "http.response.body", "body": chunk, "more_body": True})
+        await proc.wait()
+    except Exception as exc:
+        logger.warning("ffmpeg transcode failed for %s: %s", path.name, exc)
+    await send({"type": "http.response.body", "body": b"", "more_body": False})
+
+
 async def _load_track(track_id: int):
     """Load a Track row by id, return (path, mime) or (None, None)."""
     from sqlalchemy import select
@@ -275,6 +370,18 @@ async def stream_track(scope: dict, receive, send) -> None:
 
     if not mime:
         mime = _EXT_MIME.get(path.suffix.lower(), "audio/mpeg")
+
+    # ── Format fallback: if the request asked for transcoding (strm frame
+    # set codec 'p' + &transcode=1) and ffmpeg is present, emit raw PCM via
+    # ffmpeg instead of the source file. If ffmpeg is missing the request
+    # should never have set transcode=1, but guard anyway: surface a
+    # Status-bar notice and serve the source directly (LMS must keep going).
+    if query.get("transcode", [None])[0]:
+        if ffmpeg_available():
+            await _transcode_to_pcm_pipe(send, path, mime)
+            return
+        _set_server_notice("ffmpeg not found - transcoding not possible")
+        logger.warning("transcode requested for %s but no ffmpeg; serving source", path.name)
 
     # PCM (wav/aiff) is served as HEADERLESS raw samples: the strm frame
     # carries the parsed format and squeezelite's pcm decoder expects the

@@ -717,6 +717,7 @@ input[type="range"]::-webkit-slider-thumb {
   <span id="sb-track">—</span>
   <span class="sb-sep">|</span>
   <span class="sb-mode" id="sb-mode">—</span>
+  <span class="sb-notice" id="sb-notice" style="display:none;margin-left:8px;color:var(--warn);font-weight:600;"></span>
   <span id="sb-vol" style="margin-left:auto">
     <span>🔊</span>
     <span id="sb-volume">—</span>
@@ -921,6 +922,18 @@ async function refreshPlayers() {
 }
 
 async function refreshStatus() {
+  // Status-bar notice always reflects the server (e.g. missing ffmpeg),
+  // independent of any selected player.
+  try {
+    const ss = await api('slim.request', ['-', ['serverstatus', '0', '1']]);
+    const notice = (ss && typeof ss === 'object') ? (ss.notice || '') : '';
+    const el = document.getElementById('sb-notice');
+    if (el) {
+      el.textContent = notice || '';
+      el.style.display = notice ? 'inline' : 'none';
+    }
+  } catch(e) { /* ignore — notice is best-effort */ }
+
   if (!appState.currentPlayer) {
     appState.isPlaying = false;
     appState.currentTrackIndex = -1;
