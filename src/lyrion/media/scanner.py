@@ -397,6 +397,22 @@ class MediaScanner:
          duration, bitrate, sample_rate, channels) = (
             await asyncio.to_thread(self._extract_tags, file_path))
 
+        # Metadata heuristics: fill gaps from folder structure and the
+        # filename (tags always win). Many files carry only partial tags
+        # or none at all — the goal is no track without artist/album.
+        try:
+            from lyrion.media.heuristics import apply_heuristics
+            guessed = apply_heuristics(
+                file_path=file_path,
+                library_root=str(self.config.base_path),
+                title=title, artist=artist, album=album,
+                genre=genre, year=year, track=track,
+            )
+            title, artist, album = guessed.title, guessed.artist, guessed.album
+            genre, year, track = guessed.genre, guessed.year, guessed.track
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Heuristics failed for %s: %s", file_path, exc)
+
         # Look for cover artwork
         artwork_path = None
         if self.config.generate_artwork:
