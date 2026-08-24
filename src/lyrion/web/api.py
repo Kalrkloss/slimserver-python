@@ -1223,14 +1223,18 @@ class JSONRPCAPI:
             }
 
         return [
-            _home_item(["artists"], "Artists", "artist", 0, {"menu": "albums"}),
-            _home_item(["albums"], "Albums", "album", 1, {"menu": "tracks"}),
-            _home_item(["titles"], "Songs", "song", 2, {"menu": "songinfo"}),
-            _home_item(["genres"], "Genres", "genre", 3, {"menu": "artists"}),
+            # 'type' MUST be a SlimBrowseItemType the controllers know
+            # (text/audio/playlist/outline/link/...). SqueezeClient parses
+            # it as a strict enum — 'artist'/'album'/'song'/'genre' crash
+            # the app on connect. 'outline' = folder-ish entry.
+            _home_item(["artists"], "Artists", "outline", 0, {"menu": "albums"}),
+            _home_item(["albums"], "Albums", "outline", 1, {"menu": "tracks"}),
+            _home_item(["titles"], "Songs", "outline", 2, {"menu": "songinfo"}),
+            _home_item(["genres"], "Genres", "outline", 3, {"menu": "artists"}),
             # Favorites: the app sends 'favorites items' — the menu list
             # with the DB ids the controllers parse as numbers.
-            _home_item(["favorites", "items"], "Favorites", "link", 4),
-            _home_item(["browse", "radios"], "Radio", "link", 5),
+            _home_item(["favorites", "items"], "Favorites", "outline", 4),
+            _home_item(["browse", "radios"], "Radio", "outline", 5),
         ]
 
     @staticmethod
