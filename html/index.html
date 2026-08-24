@@ -1530,6 +1530,14 @@ async function renderBrowse(type) {
           <button class="tab ${t === appState.browseType ? 'active' : ''}" onclick="location.hash='#/browse/${t}'">${browseTitle(t)}</button>
         `).join('')}
       </div>
+      <div style="display:flex;gap:8px;margin:10px 0;align-items:center">
+        <input id="browse-search" type="text" placeholder="Filter (Titel/Name)…"
+               value="${escHtml(appState.browseSearch || '')}"
+               style="flex:0 1 280px;padding:6px;border:1px solid var(--border);border-radius:3px"
+               onkeydown="if(event.key==='Enter'){appState.browseSearch=this.value;appState.browsePage=0;loadBrowseData();}">
+        <button class="btn-secondary" onclick="appState.browseSearch=document.getElementById('browse-search').value;appState.browsePage=0;loadBrowseData()">🔍 Filtern</button>
+        ${appState.browseSearch ? `<button class="btn-secondary" onclick="appState.browseSearch='';document.getElementById('browse-search').value='';appState.browsePage=0;loadBrowseData()">✕ Zurücksetzen</button>` : ''}
+      </div>
       <div id="browse-content">${loadingEl()}</div>
       <div class="pagination" id="browse-pagination"></div>
     </div>
@@ -1598,22 +1606,30 @@ async function loadBrowseData() {
 
     switch (appState.browseType) {
       case 'artists': {
-        const { items, total: t } = fromResponse(await req(['artists', start, perPage, 'tags:']));
+        const cmd = ['artists', start, perPage, 'tags:'];
+        if (appState.browseSearch) cmd.push(`search:${appState.browseSearch}`);
+        const { items, total: t } = fromResponse(await req(cmd));
         data = items; total = t || (data.length >= perPage ? start + perPage + 1 : start + data.length);
         break;
       }
       case 'albums': {
-        const { items, total: t } = fromResponse(await req(['albums', start, perPage, 'tags:']));
+        const cmd = ['albums', start, perPage, 'tags:'];
+        if (appState.browseSearch) cmd.push(`search:${appState.browseSearch}`);
+        const { items, total: t } = fromResponse(await req(cmd));
         data = items; total = t || (data.length >= perPage ? start + perPage + 1 : start + data.length);
         break;
       }
       case 'songs': {
-        const { items, total: t } = fromResponse(await req(['songs', start, perPage, 'tags:']));
+        const cmd = ['songs', start, perPage, 'tags:'];
+        if (appState.browseSearch) cmd.push(`search:${appState.browseSearch}`);
+        const { items, total: t } = fromResponse(await req(cmd));
         data = items; total = t || (data.length >= perPage ? start + perPage + 1 : start + data.length);
         break;
       }
       case 'genres': {
-        const { items, total: t } = fromResponse(await req(['genres', start, perPage, 'tags:']));
+        const cmd = ['genres', start, perPage, 'tags:'];
+        if (appState.browseSearch) cmd.push(`search:${appState.browseSearch}`);
+        const { items, total: t } = fromResponse(await req(cmd));
         data = items; total = t || (data.length >= perPage ? start + perPage + 1 : start + data.length);
         break;
       }
@@ -1768,19 +1784,58 @@ function browsePage(p) {
 }
 
 function browseArtists(artist) {
-  showToast(`Browsing artist: ${artist}`);
+  // Filter the Songs tab by artist name (search filter).
+  location.hash = '#/browse/songs';
+  setTimeout(() => {
+    appState.browseSearch = artist;
+    const s = document.getElementById('browse-search');
+    if (s) s.value = artist;
+    appState.browsePage = 0;
+    loadBrowseData();
+  }, 60);
 }
 
 function browseAlbum(album) {
-  showToast(`Browsing album: ${album}`);
+  // Open the album's track list: Songs tab filtered by album name.
+  location.hash = '#/browse/songs';
+  setTimeout(() => {
+    appState.browseSearch = album;
+    const s = document.getElementById('browse-search');
+    if (s) s.value = album;
+    appState.browsePage = 0;
+    loadBrowseData();
+  }, 60);
 }
 
 function browseGenre(genre) {
-  showToast(`Browsing genre: ${genre}`);
+  // Filter the Songs tab by genre name.
+  location.hash = '#/browse/songs';
+  setTimeout(() => {
+    appState.browseSearch = genre;
+    const s = document.getElementById('browse-search');
+    if (s) s.value = genre;
+    appState.browsePage = 0;
+    loadBrowseData();
+  }, 60);
 }
 
-function addAlbumToPlaylist(album) {
-  showToast(`Album "${album}" added to playlist`);
+async function addAlbumToPlaylist(album) {
+  if (!appState.currentPlayer) { showToast('No player selected'); return; }
+  try {
+    // Resolve the album's tracks via the songs filter, then append them all.
+    const r = await api('slim.request', ['-', ['songs', 0, 500, `search:${album}`]]);
+    const items = (r && (r.titles_loop || r.item_loop || r.loop_loop)) || [];
+    const ids = items.map(t => String(t.id)).filter(Boolean);
+    if (!ids.length) { showToast(`Keine Tracks für "${album}" gefunden`); return; }
+    for (const id of ids) {
+      await api('slim.request', [appState.currentPlayer, ['playlist', 'add', id]]);
+    }
+    showToast(`Album "${album}" (${ids.length} Tracks) zur Playlist hinzugefügt`);
+    if (typeof refreshStatus === 'function') refreshStatus();
+    if (typeof refreshPlaylistContent === 'function') refreshPlaylistContent();
+  } catch (e) {
+    showToast('Fehler: ' + e.message);
+  }
 }
 
 async function addSongToQueue(index) {
