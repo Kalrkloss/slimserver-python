@@ -1,4 +1,4 @@
-"""Player state structures for Lyrion Music Server."""
+"""Player state structures for Pyrion Music Server."""
 from __future__ import annotations
 
 import time

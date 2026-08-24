@@ -1,5 +1,5 @@
 """
-Jive / SqueezePlay protocol handler for Lyrion Music Server.
+Jive / SqueezePlay protocol handler for Pyrion Music Server.
 
 Handles the ZIP-based (Zeroconf Interactive Protocol) requests from
 SqueezePlay/Jive UI clients. Uses XML/JSON-RPC style request/response

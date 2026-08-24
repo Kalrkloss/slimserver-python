@@ -1,4 +1,4 @@
-"""Album / release type classification for Lyrion Music Server."""
+"""Album / release type classification for Pyrion Music Server."""
 from __future__ import annotations
 
 from enum import Enum, auto

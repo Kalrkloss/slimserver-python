@@ -1,5 +1,5 @@
 """
-Async timer management for Lyrion Music Server.
+Async timer management for Pyrion Music Server.
 
 Ported from Slim::Utils::Timers. Provides a robust async timer scheduler
 that supports one-shot and periodic timers with accurate timing.

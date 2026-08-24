@@ -1,7 +1,7 @@
 """
-Lyrion Music Server - Python port of Logitech Media Server / Squeezebox Server.
+Pyrion Music Server - Python port of Logitech Media Server / Squeezebox Server.
 
-This is the core Python package for Lyrion Music Server, providing streaming
+This is the core Python package for Pyrion Music Server, providing streaming
 audio server capabilities for Squeezebox and compatible players.
 """
 

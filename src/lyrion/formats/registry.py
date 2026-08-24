@@ -1,4 +1,4 @@
-"""Format registry for Lyrion Music Server."""
+"""Format registry for Pyrion Music Server."""
 from __future__ import annotations
 
 import subprocess

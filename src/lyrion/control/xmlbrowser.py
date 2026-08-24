@@ -1,5 +1,5 @@
 """
-XML Browser for Lyrion Music Server.
+XML Browser for Pyrion Music Server.
 
 Generates XML responses for the classic LMS/SqueezeCenter web UI.
 Handles browse requests and returns XML-formatted menus and lists.

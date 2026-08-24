@@ -1,4 +1,4 @@
-"""Web interface for Lyrion Music Server."""
+"""Web interface for Pyrion Music Server."""
 from .server import WebServer
 from .api import JSONRPCAPI, WebAPIHandler
 

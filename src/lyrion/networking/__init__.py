@@ -1,4 +1,4 @@
-"""Networking layer for Lyrion Music Server."""
+"""Networking layer for Pyrion Music Server."""
 from .protocol import SlimProtoClient, SLIMPROTO_PORT
 from .discovery import DiscoveryService, DISCOVERY_PORT
 from .http_client import HTTPClient

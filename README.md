@@ -1,9 +1,9 @@
-# Lyrion Music Server — Python Port
+# Pyrion Music Server — Python Port
 
 A LMS-compatible streaming audio server for Squeezebox and compatible
 players (Squeezelite, SqueezePlay, SqueezeESP32, ...), implemented in
 Python 3. This project re-implements the SlimProto / JSON-RPC / CLI
-protocol surface of the original (Perl) Lyrion Music Server.
+protocol surface of the original (Perl) Pyrion Music Server.
 
 > **Status: WORK IN PROGRESS — playback verified.** Player discovery,
 > registration, control, the web UI **and audio playback** work. MP3

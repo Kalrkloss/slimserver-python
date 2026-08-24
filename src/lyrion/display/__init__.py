@@ -1,4 +1,4 @@
-"""Display rendering for Lyrion Music Server."""
+"""Display rendering for Pyrion Music Server."""
 from .renderer import DisplayRenderer
 from .screens import NowPlayingScreen, MenuScreen, VolumeScreen, ScreensaverScreen
 

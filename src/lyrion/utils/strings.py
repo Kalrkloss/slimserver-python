@@ -1,5 +1,5 @@
 """
-Internationalization (i18n) strings for Lyrion Music Server.
+Internationalization (i18n) strings for Pyrion Music Server.
 
 Provides string lookup with variable substitution, matching the format
 used by LMS strings.txt files (Perl-style gettext-like format).
@@ -16,7 +16,7 @@ from collections import defaultdict
 # ---------------------------------------------------------------------------
 # LMS strings.txt format parser
 # Lyrion uses a key=value format with English as default language:
-#   PLUGIN_NAME             Lyrion Music Server
+#   PLUGIN_NAME             Pyrion Music Server
 #   BROWSE_ALBUMS           Browse Albums
 #   PLAY_TIME               Play time: %1 seconds
 # ---------------------------------------------------------------------------

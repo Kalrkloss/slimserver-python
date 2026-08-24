@@ -1,4 +1,4 @@
-These are HTML 'skins' for Lyrion Music Server.
+These are HTML 'skins' for Pyrion Music Server.
 
 They are written using Template Toolkit - https://www.tt2.org/
 
@@ -6,11 +6,11 @@ They are written using Template Toolkit - https://www.tt2.org/
 
 Classic:
 	Owner: The Lyrion Community.
-	Description: This is the previous Official skin for Lyrion Music Server
+	Description: This is the previous Official skin for Pyrion Music Server
 
 Default:
 	Owner: The Lyrion Community.
-	Description: This is the Official skin for Lyrion Music Server
+	Description: This is the Official skin for Pyrion Music Server
 
 EN:
 	Owner: The Lyrion Community.

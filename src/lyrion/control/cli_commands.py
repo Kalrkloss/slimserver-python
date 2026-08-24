@@ -1,5 +1,5 @@
 """
-Built-in CLI command implementations for Lyrion Music Server.
+Built-in CLI command implementations for Pyrion Music Server.
 
 These are registered via the @register_command decorator in cli.py.
 """
@@ -73,7 +73,7 @@ async def cmd_version(
     args: list[str],
 ) -> list[str]:
     """version — return server version string."""
-    return ["9.2.0 Lyrion Music Server"]
+    return ["9.2.0 Pyrion Music Server"]
 
 
 @register_command("can", "capabilities")

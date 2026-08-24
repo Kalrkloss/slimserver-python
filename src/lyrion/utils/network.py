@@ -1,5 +1,5 @@
 """
-Network utilities for Lyrion Music Server.
+Network utilities for Pyrion Music Server.
 
 Ported from Slim::Utils::Network. Provides network address resolution,
 interface discovery, HTTP client helpers, and port management.
@@ -248,7 +248,7 @@ async def get_http_client(
                     follow_redirects=True,
                     headers={
                         "User-Agent": user_agent
-                        or "LyrionMusicServer/9.2.0",
+                        or "PyrionMusicServer/9.2.0",
                     },
                 )
     return _http_client

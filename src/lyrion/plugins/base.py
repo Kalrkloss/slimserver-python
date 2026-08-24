@@ -1,4 +1,4 @@
-"""Base plugin classes for Lyrion Music Server."""
+"""Base plugin classes for Pyrion Music Server."""
 from __future__ import annotations
 
 import logging

@@ -1,4 +1,4 @@
-"""Artwork extraction, discovery, resizing, and caching for Lyrion Music Server."""
+"""Artwork extraction, discovery, resizing, and caching for Pyrion Music Server."""
 from __future__ import annotations
 
 import asyncio

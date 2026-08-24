@@ -1,4 +1,4 @@
-"""JSON-RPC API for Lyrion Music Server."""
+"""JSON-RPC API for Pyrion Music Server."""
 from __future__ import annotations
 
 import json
@@ -643,10 +643,10 @@ class JSONRPCAPI:
                     import uuid as _uuid
                     server_uuid = str(_uuid.uuid4())
                     await prefs._prefs.set("server_uuid", server_uuid)
-                server_name = str(prefs.get("server_name", "") or "Lyrion")
+                server_name = str(prefs.get("server_name", "") or "Pyrion")
             except Exception:
                 server_uuid = "lyrion-server-0001"
-                server_name = "Lyrion"
+                server_name = "Pyrion"
             result = {
                 "version": __version__,
                 "uuid": server_uuid,

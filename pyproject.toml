@@ -1,7 +1,7 @@
 [project]
 name = "lyrion"
 version = "9.2.0"
-description = "Lyrion Music Server - streaming audio server for Squeezebox players"
+description = "Pyrion Music Server - streaming audio server for Squeezebox players"
 requires-python = ">=3.11"
 dependencies = [
     "anyio>=4.0",

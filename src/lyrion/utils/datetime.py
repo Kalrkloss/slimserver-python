@@ -1,5 +1,5 @@
 """
-DateTime utilities for Lyrion Music Server.
+DateTime utilities for Pyrion Music Server.
 
 Ported from Slim::Utils::DateTime. Provides formatting, parsing,
 and localization helpers for timestamps, durations, and date displays.

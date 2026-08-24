@@ -1,5 +1,5 @@
 """
-Logging framework for Lyrion Music Server.
+Logging framework for Pyrion Music Server.
 
 Ported from Slim::Utils::Log. Provides:
 - Multiple log levels (debug, info, warning, error, critical)

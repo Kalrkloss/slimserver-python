@@ -1,4 +1,4 @@
-"""HTTP server for Lyrion Music Server web UI."""
+"""HTTP server for Pyrion Music Server web UI."""
 from __future__ import annotations
 
 import asyncio
@@ -141,7 +141,7 @@ class WebServer:
 
     async def _handle_status(self) -> tuple[int, list[tuple[str, str]], bytes]:
         """Return plain-text server/player status."""
-        lines = ["Lyrion Music Server\n", "version: 9.2.0\n"]
+        lines = ["Pyrion Music Server\n", "version: 9.2.0\n"]
 
         # Import here to avoid circular
         try:

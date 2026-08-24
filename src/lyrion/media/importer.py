@@ -1,5 +1,5 @@
 """
-Music import module for Lyrion Music Server.
+Music import module for Pyrion Music Server.
 
 Scans the configured music directory, extracts metadata with the media
 scanner (mutagen) and writes tracks/albums/contributors into the SQLAlchemy

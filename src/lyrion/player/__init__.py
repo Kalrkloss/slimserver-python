@@ -1,4 +1,4 @@
-"""Player state management for Lyrion Music Server."""
+"""Player state management for Pyrion Music Server."""
 from .manager import PlayerManager
 from .state import PlayerState, PlaybackStatus
 

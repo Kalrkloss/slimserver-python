@@ -1,5 +1,5 @@
 """
-CLI command handler for Lyrion Music Server.
+CLI command handler for Pyrion Music Server.
 
 Implements the Logitech Media Server CLI protocol over TCP port 9090.
 Commands are space-separated with optional arguments. Responses are

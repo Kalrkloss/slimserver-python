@@ -1,5 +1,5 @@
 """
-In-memory cache utilities for Lyrion Music Server.
+In-memory cache utilities for Pyrion Music Server.
 
 Ported from Slim::Utils::Cache. Provides a fast in-memory cache with TTL,
 size limits, and async support.

@@ -1,4 +1,4 @@
-"""Plugin system for Lyrion Music Server."""
+"""Plugin system for Pyrion Music Server."""
 from .manager import PluginManager
 from .base import Plugin, PluginMetadata
 

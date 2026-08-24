@@ -1,4 +1,4 @@
-"""Player manager for Lyrion Music Server."""
+"""Player manager for Pyrion Music Server."""
 from __future__ import annotations
 
 import logging

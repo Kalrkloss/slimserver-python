@@ -1,5 +1,5 @@
 """
-SQLAlchemy ORM models for the Lyrion Music Server database schema.
+SQLAlchemy ORM models for the Pyrion Music Server database schema.
 
 This schema is ported from the Perl LMS file Slim/Schema.pm, which defines
 ~3000 lines of SQLite CREATE TABLE statements. The Python models use

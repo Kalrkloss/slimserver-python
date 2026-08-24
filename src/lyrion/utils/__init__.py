@@ -1,5 +1,5 @@
 """
-Lyrion Music Server utility modules.
+Pyrion Music Server utility modules.
 
 Provides: logging, preferences, OS detection, i18n strings,
 timers, validators, network, datetime, firmware, and cache utilities.

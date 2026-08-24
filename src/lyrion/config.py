@@ -1,5 +1,5 @@
 """
-Configuration file parser and preference management for Lyrion Music Server.
+Configuration file parser and preference management for Pyrion Music Server.
 
 Handles .conf INI-like config files (the same format used by LMS) with sections
 and key=value pairs. Also manages CLI overrides and SQLite-backed preference persistence.
@@ -469,7 +469,7 @@ class LyrionConfig:
         """Parse CLI arguments and apply them as overrides."""
         parser = argparse.ArgumentParser(
             prog="lyrion",
-            description="Lyrion Music Server",
+            description="Pyrion Music Server",
         )
         parser.add_argument(
             "--noweb",

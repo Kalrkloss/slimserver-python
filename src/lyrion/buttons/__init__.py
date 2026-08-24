@@ -1,4 +1,4 @@
-"""IR/RF button handling for Lyrion Music Server."""
+"""IR/RF button handling for Pyrion Music Server."""
 from typing import Callable, Optional
 
 # Button code → action mapping for different player types

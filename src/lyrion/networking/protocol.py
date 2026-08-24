@@ -1418,7 +1418,7 @@ class SlimProtoClient:
         all timeouts (60 s+); parallel it is just one timeout.
         """
         import httpx
-        headers = {"User-Agent": "LyrionMusicServer/9.2.0"}
+        headers = {"User-Agent": "PyrionMusicServer/9.2.0"}
         timeout = httpx.Timeout(connect=2.0, read=2.0, write=2.0, pool=2.0)
         async with httpx.AsyncClient(timeout=timeout,
                                      follow_redirects=True) as client:
@@ -1466,7 +1466,7 @@ class SlimProtoClient:
 
         result = url
         try:
-            headers = {"User-Agent": "LyrionMusicServer/9.2.0"}
+            headers = {"User-Agent": "PyrionMusicServer/9.2.0"}
             timeout = httpx.Timeout(connect=8.0, read=8.0, write=8.0, pool=8.0)
             async with httpx.AsyncClient(timeout=timeout,
                                          follow_redirects=True) as client:
@@ -1617,7 +1617,7 @@ class SlimProtoClient:
             f"GET {path} HTTP/1.0\r\n"
             f"Accept: */*\r\n"
             f"Cache-Control: no-cache\r\n"
-            f"User-Agent: LyrionMusicServer/9.2.0\r\n"
+            f"User-Agent: PyrionMusicServer/9.2.0\r\n"
             f"Icy-MetaData: 1\r\n"
             f"Connection: close\r\n"
             f"Host: {host_header}\r\n"

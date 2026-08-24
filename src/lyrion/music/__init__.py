@@ -1,5 +1,5 @@
 """
-Music library modules for Lyrion Music Server.
+Music library modules for Pyrion Music Server.
 
 Handles: library management, album art, metadata.
 """

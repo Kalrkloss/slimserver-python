@@ -1,4 +1,4 @@
-"""Display screens for Lyrion Music Server."""
+"""Display screens for Pyrion Music Server."""
 from __future__ import annotations
 
 import logging
@@ -251,7 +251,7 @@ class ScreensaverScreen(Screen):
                 renderer.draw_rect(x, y, bw - 2, h, color=0x4208, filled=True)
         else:
             # Scrolling marquee
-            text = context.get("marquee_text", "Lyrion Music Server")
+            text = context.get("marquee_text", "Pyrion Music Server")
             elapsed = int(time.time() - self._start_time) % 60
             offset = elapsed * 4
             renderer.draw_text(text, renderer.width - offset, renderer.height // 2 - 4, color=_White)

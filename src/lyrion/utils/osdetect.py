@@ -1,5 +1,5 @@
 """
-OS detection utilities for Lyrion Music Server.
+OS detection utilities for Pyrion Music Server.
 
 Provides accurate OS family detection mirroring Slim::Utils::OSDetect.
 """

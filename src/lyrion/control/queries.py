@@ -1,5 +1,5 @@
 """
-Query handler for Lyrion Music Server CLI.
+Query handler for Pyrion Music Server CLI.
 
 Handles query-style CLI commands (often preceded by '?') that return
 library data in a structured, line-oriented format.

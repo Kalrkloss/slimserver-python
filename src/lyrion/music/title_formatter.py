@@ -1,4 +1,4 @@
-"""Title formatter for Lyrion Music Server.
+"""Title formatter for Pyrion Music Server.
 
 Mirrors Slim::Music::TitleFormatter — formats track titles using
 arbitrary pattern strings with placeholders.

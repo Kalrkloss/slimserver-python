@@ -1,5 +1,5 @@
 """
-Request dispatcher for Lyrion Music Server.
+Request dispatcher for Pyrion Music Server.
 
 Unified request handling pipeline from all sources:
 CLI, HTTP (JSON/SqueezeOS), and Slimproto.

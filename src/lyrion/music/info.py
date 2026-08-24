@@ -1,4 +1,4 @@
-"""Track, artist, and album metadata models for Lyrion Music Server."""
+"""Track, artist, and album metadata models for Pyrion Music Server."""
 from __future__ import annotations
 
 import logging

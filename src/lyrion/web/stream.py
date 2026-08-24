@@ -1,5 +1,5 @@
 """
-HTTP audio streaming endpoint for Lyrion Music Server.
+HTTP audio streaming endpoint for Pyrion Music Server.
 
 Squeezelite/Squeezebox players fetch track audio from the server over
 HTTP: the slimproto `strm` frame points the player at
@@ -653,7 +653,7 @@ async def _proxy_remote(send, remote_url: str, transcode: str = "") -> None:
             async with client.stream(
                 "GET", remote_url,
                 headers={
-                    "User-Agent": "LyrionMusicServer/9.2.0",
+                    "User-Agent": "PyrionMusicServer/9.2.0",
                     # Ask for Icecast metadata ONLY in relay mode — that
                     # path strips it manually before forwarding. In
                     # transcode mode the raw body goes straight into

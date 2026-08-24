@@ -1,5 +1,5 @@
 """
-Input validation utilities for Lyrion Music Server.
+Input validation utilities for Pyrion Music Server.
 
 Ported from Slim::Utils::Validate. Provides validators for common
 data types and patterns used throughout the LMS codebase.

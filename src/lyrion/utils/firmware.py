@@ -1,5 +1,5 @@
 """
-Firmware versioning utilities for Lyrion Music Server.
+Firmware versioning utilities for Pyrion Music Server.
 
 Handles Squeezebox player firmware version comparisons and compatibility.
 Firmware versions follow the LMS major.minor.patch.build format.

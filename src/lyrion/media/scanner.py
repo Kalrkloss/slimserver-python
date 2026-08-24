@@ -1,5 +1,5 @@
 """
-Media folder scanner for Lyrion Music Server.
+Media folder scanner for Pyrion Music Server.
 Modified to scan /mnt/media2/Musik instead of current source paths.
 """
 from __future__ import annotations

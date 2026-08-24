@@ -1,5 +1,5 @@
 """
-Lyrion Music Server bootstrap and module initialization.
+Pyrion Music Server bootstrap and module initialization.
 
 This module handles:
 - sys.path setup (including vendor lib/ directories)

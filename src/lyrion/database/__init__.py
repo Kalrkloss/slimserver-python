@@ -1,5 +1,5 @@
 """
-Lyrion Music Server database module.
+Pyrion Music Server database module.
 
 Provides SQLite-backed persistence using SQLAlchemy ORM and aiosqlite.
 The database schema is ported from Slim/Schema.pm.

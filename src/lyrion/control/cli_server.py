@@ -1,5 +1,5 @@
 """
-LMS-compatible CLI server for Lyrion Music Server.
+LMS-compatible CLI server for Pyrion Music Server.
 
 Telnet/text-mode CLI on port 9090 compatible with the Logitech Media
 Server CLI specification (see PROTOCOL.md, chapter 4).

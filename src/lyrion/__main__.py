@@ -1,5 +1,5 @@
 """
-Lyrion Music Server entry point.
+Pyrion Music Server entry point.
 
 Usage:
     python -m lyrion [--noweb] [--localfile FILE] [--loglevel LEVEL] ...
@@ -89,7 +89,7 @@ async def _run_server(
     log_level: str,
 ) -> None:
     """
-    Run the Lyrion Music Server.
+    Run the Pyrion Music Server.
 
     This coroutine:
     1. Initializes the config system
@@ -121,7 +121,7 @@ async def _run_server(
     log = get_logger("lyrion")
 
     log.info("=" * 60)
-    log.info("Lyrion Music Server v%s (build %s)", __version__, __build_date__)
+    log.info("Pyrion Music Server v%s (build %s)", __version__, __build_date__)
     log.info("Python %s", sys.version)
     log.info("Server data directory: %s", cfg.serverdata_dir)
     log.info("Prefs directory: %s", cfg.prefs_dir)
@@ -358,7 +358,7 @@ async def _broadcast_server_presence(log: logging.Logger, slimproto_port: int, h
         while True:
             try:
                 msg = _json.dumps({
-                    "name": "Lyrion Music Server",
+                    "name": "Pyrion Music Server",
                     "version": "9.2.0",
                     "host": server_ip,
                     "port": http_port,
@@ -422,7 +422,7 @@ def _daemonize() -> bool:
 
 def main(argv: list[str] | None = None) -> int | NoReturn:
     """
-    Main entry point for Lyrion Music Server.
+    Main entry point for Pyrion Music Server.
 
     Parses CLI arguments, sets up the event loop, and runs the server.
     """
@@ -432,7 +432,7 @@ def main(argv: list[str] | None = None) -> int | NoReturn:
 
     parser = argparse.ArgumentParser(
         prog="lyrion",
-        description="Lyrion Music Server",
+        description="Pyrion Music Server",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:

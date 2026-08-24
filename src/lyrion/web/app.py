@@ -1,5 +1,5 @@
 """
-ASGI/anyio web application for Lyrion Music Server.
+ASGI/anyio web application for Pyrion Music Server.
 
 Uses uvicorn as the HTTP server library, wrapped in anyio for consistency
 with the project's async/await model.
@@ -347,7 +347,7 @@ def create_config(
 
 
 class WebServer:
-    """ASGI-based web server for Lyrion Music Server.
+    """ASGI-based web server for Pyrion Music Server.
 
     Wraps uvicorn and runs it as an anyio task.
     """

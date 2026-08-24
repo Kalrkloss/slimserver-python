@@ -1,5 +1,5 @@
 """
-Preferences system for Lyrion Music Server.
+Preferences system for Pyrion Music Server.
 
 Ported from Slim::Utils::Prefs. Provides SQLite-backed preference storage
 with categories, defaults, validation, and change callbacks.

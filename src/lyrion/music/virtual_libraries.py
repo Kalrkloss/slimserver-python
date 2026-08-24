@@ -1,4 +1,4 @@
-"""Virtual Libraries for Lyrion Music Server."""
+"""Virtual Libraries for Pyrion Music Server."""
 from __future__ import annotations
 
 import logging

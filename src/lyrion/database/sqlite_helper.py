@@ -1,5 +1,5 @@
 """
-SQLite connection management for Lyrion Music Server.
+SQLite connection management for Pyrion Music Server.
 
 Provides:
 - Async connection pool using aiosqlite

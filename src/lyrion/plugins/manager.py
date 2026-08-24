@@ -1,4 +1,4 @@
-"""Plugin manager for Lyrion Music Server."""
+"""Plugin manager for Pyrion Music Server."""
 from __future__ import annotations
 
 import importlib
