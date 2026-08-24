@@ -1133,11 +1133,15 @@ class JSONRPCAPI:
             "player_name": player.name or player.mac,
             # SqueezeClient's PlayerStatusResponse requires this
             "player_connected": 1,
-            "playlist shuffle": int(getattr(player, "shuffle", 0) or 0),
-            "playlist repeat": int(getattr(player, "repeat", 0) or 0),
+            # SqueezeClient parses these as STRING enums ("0"/"1"/"2",
+            # PlayerStatus.ShuffleState/RepeatState @SerialName) — an int
+            # breaks kotlinx serialization → app crash on connect.
+            "playlist shuffle": str(int(getattr(player, "shuffle", 0) or 0)),
+            "playlist repeat": str(int(getattr(player, "repeat", 0) or 0)),
             "mixer volume": player.volume or 50,
             "playlist_tracks": len(playlist_ids),
-            "playlist_cur_index": str(cur),
+            # Int (no default in PlayerStatusResponse) — a string crashes.
+            "playlist_cur_index": int(cur) if str(cur).isdigit() else 0,
             "time": elapsed,
             "rate": 1 if player.mode == "play" else 0,
             # Perl parity: 'playlist mode' mirrors the repeat state
@@ -1151,6 +1155,11 @@ class JSONRPCAPI:
             "playlist_timestamp": time.time(),
             "playlist_loop": loop,
         }
+        # SqueezeClient's PlayerStatusResponse declares 'count: Int' and
+        # 'offset: String?' WITHOUT defaults — a missing count crashes the
+        # app on connect. Perl parity: count = number of items returned.
+        result["count"] = len(loop)
+        result["offset"] = "0"
         # Player IP:port (Perl sends 'ip:port' of the control connection).
         try:
             result["player_ip"] = f"{player.ip}:{getattr(player, 'port', 0) or 0}"
