@@ -159,6 +159,77 @@ async def _handle_cometd(cometd: CometdManager, path: str, receive, send) -> Non
     await send({"type": "http.response.body", "body": response})
 
 
+_MIME_BY_EXT = {
+    ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
+    ".webp": "image/webp", ".gif": "image/gif",
+}
+
+
+async def _serve_album_cover(album_id: int, send) -> None:
+    """Serve the cover image stored in Album.artwork for /music/<id>/cover.
+
+    Reads the image file in a thread (SMB reads block) and streams it with
+    long-lived cache headers — covers never change for an album id. Falls
+    back to 404 when the album has no artwork or the file vanished.
+    """
+    import asyncio as _asyncio
+
+    try:
+        loop = _asyncio.get_running_loop()
+        data, mime = await loop.run_in_executor(None, _load_sync_factory(album_id))
+    except Exception:
+        data, mime = None, None
+    if not data:
+        await send({
+            "type": "http.response.start",
+            "status": 404,
+            "headers": [(b"Content-Type", b"text/plain")],
+        })
+        await send({"type": "http.response.body", "body": b"no artwork"})
+        return
+    await send({
+        "type": "http.response.start",
+        "status": 200,
+        "headers": [
+            (b"Content-Type", (mime or "image/jpeg").encode()),
+            (b"Cache-Control", b"max-age=86400"),
+        ],
+    })
+    await send({"type": "http.response.body", "body": data})
+
+
+def _load_sync_factory(album_id: int):
+    """Return a zero-arg callable that loads the cover synchronously.
+
+    Runs inside the executor: creates its own event loop for the async
+    DB session (aiosqlite needs one) and returns (data, mime).
+    """
+    def _run():
+        import asyncio as _aio
+
+        async def _q():
+            from lyrion.database.sqlite_helper import db_session
+            from lyrion.database.schema import Album
+            from sqlalchemy import select
+            from pathlib import Path as _Path
+
+            async with db_session() as session:
+                album = (
+                    await session.execute(
+                        select(Album).where(Album.id == album_id))
+                ).scalar_one_or_none()
+                if album is None or not album.artwork:
+                    return None, None
+                p = _Path(album.artwork)
+                if not p.is_file():
+                    return None, None
+                mime = _MIME_BY_EXT.get(p.suffix.lower(), "image/jpeg")
+                return p.read_bytes(), mime
+
+        return _aio.run(_q())
+    return _run
+
+
 def create_app(
     host: str = "0.0.0.0",
     port: int = 9000,
@@ -188,6 +259,16 @@ def create_app(
             from .stream import stream_track
             await stream_track(scope, receive, send)
             return
+
+        # Album cover art (LMS convention): /music/<album_id>/cover.jpg.
+        # Players/controllers request this URL to display album artwork.
+        if path.startswith("/music/") and method == "GET":
+            import re as _re
+
+            m = _re.match(r"^/music/(\d+)/cover\.(jpg|png)$", path)
+            if m:
+                await _serve_album_cover(int(m.group(1)), send)
+                return
 
         # Cometd (Jive controllers + Material Skin). libcometd sends the
         # action as a path suffix (/cometd/handshake, /cometd/connect,

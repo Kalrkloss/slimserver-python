@@ -401,15 +401,27 @@ class MusicImporter:
 
         album = album_by_key.get(key)
         if album is None:
+            # Cover artwork: scanner found cover.jpg/png/… in the track's
+            # folder — store the path so the API can serve it to players.
+            artwork = getattr(info, "artwork_path", None)
             album = Album(
                 titlesort=_sort_string(album_name),
                 title=album_name,
                 year=year or None,
                 compilation=1 if compilation else 0,
+                artwork=str(artwork) if artwork else None,
+                artwork_front=str(artwork) if artwork else None,
             )
             session.add(album)
             await session.flush()
             album_by_key[key] = album
+        elif not album.artwork:
+            # Album existed without artwork (e.g. imported before this
+            # column was filled) — backfill from this track's folder.
+            artwork = getattr(info, "artwork_path", None)
+            if artwork:
+                album.artwork = str(artwork)
+                album.artwork_front = str(artwork)
         if (track.id, album.id) not in ta_set:
             await session.execute(
                 tracks_albums.insert().values(track=track.id, album=album.id))

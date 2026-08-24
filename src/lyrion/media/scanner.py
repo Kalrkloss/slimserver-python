@@ -447,6 +447,18 @@ class MediaScanner:
             if artwork_path.exists() and artwork_path.is_file():
                 logger.debug("Found artwork: %s", artwork_path)
                 return artwork_path
+        # Fallback: any image whose name contains 'cover'/'folder'/'front'/
+        # 'albumart' (e.g. '00-artist-album-cover.jpg' release layouts).
+        try:
+            for entry in folder.iterdir():
+                if not entry.is_file():
+                    continue
+                n = entry.name.lower()
+                if n.endswith((".jpg", ".jpeg", ".png", ".webp", ".gif")) and any(
+                        k in n for k in ("cover", "folder", "front", "albumart")):
+                    return entry
+        except OSError:
+            pass
         return None
 
     async def _calculate_file_hash(self, file_path: Path) -> str:

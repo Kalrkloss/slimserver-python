@@ -353,6 +353,7 @@ class JSONRPCAPI:
             # Track titles from the DB (one query for all local tracks)
             track_ids = [e for e in tracks if not isinstance(e, str)]
             titles: dict[int, str] = {}
+            art_by_track: dict[int, str] = {}
             if track_ids:
                 try:
                     from sqlalchemy import select
@@ -365,6 +366,25 @@ class JSONRPCAPI:
                         titles = {tid: t for tid, t in result.all()}
                 except Exception:
                     titles = {}
+                # Album artwork per track (one bulk query) — the player
+                # shows the cover in Now Playing and the playlist.
+                try:
+                    from sqlalchemy import select as _sel
+                    from lyrion.database.schema import Album, tracks_albums
+                    from lyrion.database.sqlite_helper import db_session
+                    async with db_session() as session:
+                        rows = (await session.execute(
+                            _sel(tracks_albums.c.track,
+                                 tracks_albums.c.album,
+                                 Album.artwork)
+                            .join(Album, Album.id == tracks_albums.c.album)
+                            .where(tracks_albums.c.track.in_(track_ids))
+                        )).all()
+                        for tid, album_id, art in rows:
+                            if art:
+                                art_by_track[tid] = f"/music/{album_id}/cover.jpg"
+                except Exception:
+                    art_by_track = {}
             for i, entry in enumerate(tracks):
                 if isinstance(entry, str):
                     stream_name = getattr(player, "stream_titles", {}).get(entry, "")
@@ -386,6 +406,7 @@ class JSONRPCAPI:
                         "index": i,
                         "track_id": entry,
                         "title": titles.get(entry, f"Track {entry}"),
+                        "artwork_url": art_by_track.get(entry, ""),
                     })
             return out
         except Exception:
@@ -1335,7 +1356,8 @@ class JSONRPCAPI:
                 artists.setdefault(r["track"], {})["artist"] = r["artist"]
             albums: dict[int, dict] = {}
             for r in db.execute(
-                f"""SELECT ta.track, a.id AS album_id, a.title AS album
+                f"""SELECT ta.track, a.id AS album_id, a.title AS album,
+                           a.artwork AS album_artwork
                     FROM tracks_albums ta
                     JOIN albums a ON a.id = ta.album
                     WHERE ta.track IN ({placeholders})""",
@@ -1343,6 +1365,9 @@ class JSONRPCAPI:
             ):
                 albums.setdefault(r["track"], {})["album_id"] = r["album_id"]
                 albums.setdefault(r["track"], {})["album"] = r["album"]
+                if r["album_artwork"]:
+                    albums.setdefault(r["track"], {})[
+                        "artwork_url"] = f"/music/{r['album_id']}/cover.jpg"
             for row in rows:
                 tid = row["id"]
                 info: dict = {
@@ -1848,7 +1873,7 @@ class JSONRPCAPI:
                 if filters.get("artist_id"):
                     joins += " JOIN tracks_contributors tc ON tc.track = t.id AND tc.role = 1"
                 rows = db.execute(
-                    "SELECT DISTINCT al.id, al.title, al.year FROM albums al"
+                    "SELECT DISTINCT al.id, al.title, al.year, al.artwork FROM albums al"
                     + joins + where +
                     " ORDER BY al.title LIMIT ? OFFSET ?",
                     params + (count, start)).fetchall()
@@ -1875,6 +1900,10 @@ class JSONRPCAPI:
                         "play": {"player": 0, "cmd": ["playlist", "play"],
                                  "params": {"album_id": r["id"]}},
                     }
+                    if r["artwork"]:
+                        item["coverid"] = r["id"]
+                        item["coverart"] = 1
+                        item["artwork_url"] = f"/music/{r['id']}/cover.jpg"
                     loop.append(item)
                 total = db.execute(
                     "SELECT COUNT(DISTINCT al.id) FROM albums al" + joins + where,
@@ -1888,7 +1917,11 @@ class JSONRPCAPI:
                 if filters.get("artist_id"):
                     joins += " JOIN tracks_contributors tc ON tc.track = t.id AND tc.role = 1"
                 rows = db.execute(
-                    "SELECT DISTINCT t.id, t.title, t.url, t.duration FROM tracks t"
+                    "SELECT DISTINCT t.id, t.title, t.url, t.duration, "
+                    "al.id AS album_id, al.artwork AS album_artwork "
+                    "FROM tracks t"
+                    " LEFT JOIN tracks_albums ta ON ta.track = t.id"
+                    " LEFT JOIN albums al ON al.id = ta.album"
                     + joins + where +
                     " ORDER BY t.title LIMIT ? OFFSET ?",
                     params + (count, start)).fetchall()
@@ -1898,7 +1931,7 @@ class JSONRPCAPI:
                 loop = []
                 for r in rows:
                     info = enrich.get(r["id"], {})
-                    loop.append({
+                    entry = {
                         "id": r["id"], "title": r["title"] or "", "url": r["url"] or "",
                         "duration": r["duration"] or 0,
                         "artist": info.get("artist", ""),
@@ -1910,7 +1943,12 @@ class JSONRPCAPI:
                             "play": {"player": 0, "cmd": ["playlist", "play"],
                                      "params": {"track_id": r["id"]}},
                         },
-                    })
+                    }
+                    if r["album_artwork"]:
+                        entry["coverid"] = r["album_id"]
+                        entry["coverart"] = 1
+                        entry["artwork_url"] = f"/music/{r['album_id']}/cover.jpg"
+                    loop.append(entry)
                 total = db.execute(
                     "SELECT COUNT(DISTINCT t.id) FROM tracks t" + joins + where,
                     params).fetchone()[0]
