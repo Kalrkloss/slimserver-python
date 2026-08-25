@@ -1166,6 +1166,32 @@ class JSONRPCAPI:
             "playlist_timestamp": time.time(),
             "playlist_loop": loop,
         }
+        # Jive/SqueezePlay Now Playing reads the current_* fields (not
+        # 'title'): a radio stream shows its StreamTitle, a local track its
+        # title/artist/album. SqueezePlay otherwise shows a blank line.
+        np_title = cur_info.get("title", "")
+        np_artist = cur_info.get("artist", "")
+        np_album = cur_info.get("album", "")
+        result["current_title"] = np_title
+        result["current_artist"] = np_artist
+        result["current_album"] = np_album
+        result["current_url"] = getattr(player, "current_url", "") or ""
+        # Squeezer/SqueezePlay also read the bare 'track'/'artist'/'album'
+        # (and often a 'track' key for the now-playing line). For a radio
+        # stream, give the stream name as track and parse "Artist - Title"
+        # from the StreamTitle so at least the track line is never blank.
+        result["track"] = np_title
+        if not np_artist and np_title and " - " in np_title:
+            head, _, tail = np_title.partition(" - ")
+            if tail:
+                result["artist"] = head.strip()
+                result["track"] = tail.strip()
+                result["current_artist"] = head.strip()
+                result["current_title"] = tail.strip()
+        if not result.get("artist"):
+            result.setdefault("artist", np_artist)
+        if not result.get("album"):
+            result.setdefault("album", np_album)
         # SqueezeClient's PlayerStatusResponse declares 'count: Int' and
         # 'offset: String?' WITHOUT defaults — a missing count crashes the
         # app on connect. Perl parity: count = number of items returned.
@@ -1180,10 +1206,16 @@ class JSONRPCAPI:
         # status; our SPA/SqueezeTray read them). Kept out of the strict
         # parity path — apps that compare key sets see Perl shape.
         if not tags or True:  # cheap: keep for local UI consumers
-            result["artist"] = cur_info.get("artist", "")
-            result["title"] = cur_info.get("title", "")
-            result["album"] = cur_info.get("album", "")
-            result["duration"] = cur_info.get("duration", 0) or 0
+            result.setdefault("artist", cur_info.get("artist", ""))
+            result.setdefault("title", cur_info.get("title", ""))
+            result.setdefault("album", cur_info.get("album", ""))
+            # Only report a duration when known. For a live radio stream the
+            # duration is unknown — leaving it out makes SqueezeClient take
+            # the disabled-slider branch (a 0 here would make valueTo=0.1 vs
+            # a growing play-position and crash the seek slider).
+            dur = float(cur_info.get("duration", 0) or 0)
+            if dur > 0:
+                result["duration"] = dur
             result["item_loop"] = loop
         result |= sync_fields
         if remote_meta:
@@ -1899,28 +1931,145 @@ class JSONRPCAPI:
         """browselibrary items <start> <count> mode:<albums|artists|genres|
         years|bmf|search> — the My-Music children navigation.
 
-        SqueezePlay/SqueezeClient open My Music through this command (the
-        home items point at it). Map the mode onto the library browse and
-        return a controller-safe response.
+        SqueezePlay/SqueezeClient open My Music through this command. The
+        response must be the OpenSqueeze library shape (count + loop_loop,
+        items with a string id, name, type playlist/audio/folder, image,
+        isaudio, hasitems) — the same shape the favorites list uses that the
+        controllers render and navigate. Each item also carries the go/play
+        actions so clients that drive navigation from actions work too.
         """
         nums = [int(s) for s in args if str(s).isdigit()]
         start = nums[0] if nums else 0
         count = nums[1] if len(nums) > 1 else 512
         mode = next((str(a)[5:] for a in args if str(a).startswith("mode:")),
                     "albums")
-        mode_map = {
-            "albums": "albums", "artists": "artists", "genres": "genres",
-            "bmf": "musicfolder", "songs": "titles", "search": "search",
-            "years": "years",
-        }
-        target = mode_map.get(mode, "albums")
-        if target == "years":
-            return await self._json_years(start, count)
-        if target == "search":
-            # 'search' is a text-input mode; open an empty list (the app
-            # shows a search box). No crash.
-            return self._browse_response([])
-        return await self._json_browse(target, [str(start), str(count)])
+        search = next((str(a)[7:] for a in args if str(a).startswith("search:")),
+                      "")
+        try:
+            rows, total, plural, kind = await self._library_rows(
+                mode, start, count, search)
+        except Exception:  # noqa: BLE001
+            return {"count": 0, "loop_loop": []}
+        loop = []
+        for r in rows:
+            if kind == "albums":
+                ident, name, image = str(r["id"]), r["title"] or "", \
+                    (f"/music/{r['id']}/cover.jpg" if r.get("artwork") else "")
+                go = ["titles"]
+                go_params = {"album_id": r["id"]}
+                play_params = {"album_id": r["id"]}
+                icon = image or "html/images/albums.png"
+            elif kind == "artists":
+                ident, name = str(r["id"]), r["name"] or ""
+                go = ["albums"]
+                go_params = {"artist_id": r["id"]}
+                play_params = {"artist_id": r["id"]}
+                icon = "html/images/artists.png"
+            elif kind == "genres":
+                ident, name = str(r["id"]), r["genre"] or ""
+                go = ["albums"]
+                go_params = {"genre": name}
+                play_params = {"genre": name}
+                icon = "html/images/genres.png"
+            elif kind == "years":
+                ident, name = str(r["year"]), str(r["year"])
+                go = ["albums"]
+                go_params = {"year": r["year"]}
+                play_params = {"year": r["year"]}
+                icon = "html/images/years.png"
+            elif kind == "folder":
+                ident, name = str(r["id"]), r["name"]
+                go = ["browselibrary", "items"]
+                go_params = {"mode": "bmf", "search": str(r["id"])}
+                play_params = {}
+                icon = "html/images/musicfolder.png"
+            else:
+                continue
+            item = {
+                "id": ident,
+                "name": name,
+                "text": name,
+                "title": name,
+                "type": "playlist" if kind != "folder" else "folder",
+                "image": icon,
+                "isaudio": 1,
+                "hasitems": 1,
+            }
+            item["actions"] = {
+                "go": {"player": 0, "cmd": go, "params": go_params},
+                "play": {"player": 0, "cmd": ["playlist", "play"],
+                         "params": play_params},
+            }
+            loop.append(item)
+        return {"count": total, "loop_loop": loop,
+                "item_loop": loop, plural: loop}
+
+    async def _library_rows(self, mode: str, start: int, count: int,
+                            search: str = ""):
+        """Return (rows, total, plural, kind) for a browselibrary mode."""
+        def q(sql, *p):
+            return _db_query(sql, p)
+
+        def total_of(sql, *p):
+            rows = _db_query(sql, p)
+            # _db_query returns list[dict]; grab the first row's first value.
+            return list(rows[0].values())[0] if rows else 0
+
+        if mode == "albums":
+            rows = q("SELECT DISTINCT al.id, al.title, al.artwork FROM albums al "
+                     "ORDER BY al.title LIMIT ? OFFSET ?", count, start)
+            total = total_of("SELECT COUNT(DISTINCT al.id) FROM albums al")
+            return rows, total, "albums_loop", "albums"
+        if mode == "artists":
+            rows = q("SELECT DISTINCT c.id, c.name FROM contributors c "
+                     "JOIN tracks_contributors tc ON tc.contributor = c.id "
+                     "AND tc.role = 1 ORDER BY c.name LIMIT ? OFFSET ?",
+                     count, start)
+            total = total_of("SELECT COUNT(DISTINCT c.id) FROM contributors c "
+                             "JOIN tracks_contributors tc ON tc.contributor = c.id "
+                             "AND tc.role = 1")
+            return rows, total, "artists_loop", "artists"
+        if mode == "genres":
+            rows = q("SELECT DISTINCT genre AS genre FROM tracks "
+                     "WHERE genre != '' ORDER BY genre COLLATE NOCASE "
+                     "LIMIT ? OFFSET ?", count, start)
+            total = total_of("SELECT COUNT(DISTINCT genre) FROM tracks "
+                             "WHERE genre != ''")
+            return rows, total, "genres_loop", "genres"
+        if mode == "years":
+            rows = q("SELECT DISTINCT year FROM tracks WHERE year > 0 "
+                     "ORDER BY year DESC LIMIT ? OFFSET ?", count, start)
+            total = total_of("SELECT COUNT(DISTINCT year) FROM tracks "
+                             "WHERE year > 0")
+            return rows, total, "years_loop", "years"
+        if mode in ("bmf", "musicfolder"):
+            # folder browse: build the tree from the track URLs
+            if search:
+                where = " AND url LIKE ?"
+                like = search.rstrip("/") + "/%"
+                rows = q("SELECT DISTINCT url FROM tracks "
+                         "WHERE url LIKE 'file://%'" + where +
+                         " ORDER BY url LIMIT ? OFFSET ?", like, count, start)
+            else:
+                rows = q("SELECT DISTINCT url FROM tracks "
+                         "WHERE url LIKE 'file://%' "
+                         "ORDER BY url LIMIT ? OFFSET ?", count, start)
+            names = []
+            for r in rows:
+                path = r["url"][len("file://"):].lstrip("/")
+                if search:
+                    rel = path[len(search.rstrip("/")) + 1:]
+                    names.append(rel.split("/", 1)[0])
+                else:
+                    parts = path.split("/")
+                    names.append(parts[0] if len(parts) >= 2 else path)
+            names = list(dict.fromkeys(n for n in names if n))
+            loop_rows = [{"id": search.rstrip("/") + "/" + n if search
+                          else "file:///" + n, "name": n}
+                         for n in names]
+            return loop_rows, len(names), "musicfolder_loop", "folder"
+        # fallback: albums
+        return await self._library_rows("albums", start, count)
 
     async def _json_years(self, start: int, count: int) -> dict:
         """years — a distinct release-year list (My Music → Jahrgang)."""
