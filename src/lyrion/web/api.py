@@ -937,7 +937,13 @@ class JSONRPCAPI:
         if cmd in ("albums", "artists", "genres", "songs", "titles",
                    "musicfolder", "playlists", "radios", "songinfo",
                    "info", "contributors", "browse"):
+            if cmd == "radios":
+                return await self._json_radios(cmd, args)
             return await self._json_browse(cmd, args)
+
+        # ── radiosearch (controller Radio search; LMS 'radiosearch') ──
+        if cmd == "radiosearch":
+            return await self._json_radiosearch(cmd, args)
 
         # ── displaystatus (Squeezer subscribes with a request) ──────
         # Squeezer's parseDisplayStatus does getDataAsMap() — an
@@ -1325,7 +1331,33 @@ class JSONRPCAPI:
         JSON-RPC clients 'loop_loop' and the controllers read the
         category-specific name ('artists_loop' etc., LMS reference);
         deliver all (identical). count = the total number of matches
-        (not the page length)."""
+        (not the page length).
+
+        Each item is normalized so the Android controllers (SqueezeClient /
+        Squeezer) can render it: they read 'text' for the display title and
+        'type' for the row kind. The raw LMS fields (album/artist/title/name)
+        are kept for the Real-LMS reference shape; unknown keys are ignored
+        by the kotlinx deserializers, so adding text/type/icon is safe."""
+        for it in loop:
+            if not isinstance(it, dict):
+                continue
+            # Display title: controllers read 'text'; fall back to the
+            # LMS-native display field used by this item type.
+            text = it.get("text") or it.get("title") or it.get("album") \
+                or it.get("artist") or it.get("name") or ""
+            it.setdefault("text", text)
+            it.setdefault("title", text)
+            # Row type: 'outline' (folder-ish) is a valid SlimBrowseItemType
+            # understood by every controller. Never leave it as a raw
+            # artist/album/song/genre/radio value the enum can't decode.
+            if it.get("type") in (None, "artist", "album", "song", "genre",
+                                  "radio", "track", "folder"):
+                it["type"] = "outline"
+            it.setdefault("hasitems", 1)
+            # Artwork hint if the item carries a cover already.
+            if it.get("coverid") and not it.get("icon"):
+                it["icon"] = f"/music/{it['coverid']}/cover.jpg"
+                it["icon-id"] = it["coverid"]
         resp: dict = {"count": len(loop) if total is None else total,
                       "loop_loop": loop, "item_loop": loop}
         if plural:
@@ -1753,6 +1785,109 @@ class JSONRPCAPI:
                              "track_id": r["id"]} for r in tracks],
         }
 
+    async def _radio_stations_loop(self) -> list[dict]:
+        """Build the item_loop for the Radio directory. Falls back to the
+        remote-URL favorites (the user's radio/streams) when the Radio
+        Manager has no persisted stations, so the list is never empty."""
+        try:
+            from lyrion.music.radio import get_radio_manager
+            stations = await get_radio_manager().list_stations()
+            if stations:
+                return [
+                    {
+                        "id": str(s.id),
+                        "name": s.name,
+                        "text": s.name,
+                        "url": s.url,
+                        "type": "audio",
+                        "hasitems": 0,
+                        "actions": {
+                            "play": {"player": 0, "cmd": ["playlist", "play"],
+                                     "params": {"item_id": str(s.id)}},
+                            "do": {"player": 0, "cmd": ["playlist", "play"],
+                                   "params": {"item_id": str(s.id)}},
+                        },
+                    }
+                    for s in stations
+                ]
+        except Exception:  # noqa: BLE001
+            pass
+        # Fallback: favorites that point at a remote stream (a URL).
+        try:
+            from lyrion.music.favorites import get_favorites_manager
+            fm = get_favorites_manager()
+            loop = await self._fav_items_loop(fm, None, "0", False)
+            out = []
+            for it in loop:
+                url = it.get("url") or ""
+                if not str(url).startswith(("http://", "https://", "mms://", "rtp://")):
+                    continue
+                name = it.get("text") or it.get("name") or "Radio"
+                out.append({
+                    "id": str(it.get("id", "")),
+                    "name": name,
+                    "text": name,
+                    "url": url,
+                    "type": "audio",
+                    "hasitems": 0,
+                    "actions": {
+                        "play": {"player": 0, "cmd": ["playlist", "play"],
+                                 "params": {"item_id": str(it.get("id", ""))}},
+                        "do": {"player": 0, "cmd": ["playlist", "play"],
+                               "params": {"item_id": str(it.get("id", ""))}},
+                    },
+                })
+            return out
+        except Exception:  # noqa: BLE001
+            return []
+
+    async def _json_radios(self, cmd: str, args: list[str]) -> dict:
+        """radios [start count] — the Radio directory as a browse list.
+
+        The controllers open it from the home-menu 'Radio' item
+        (actions.go = ['browse','radios'] or the bare 'radios' query)."""
+        loop = await self._radio_stations_loop()
+        return self._browse_response(loop)
+
+    async def _json_radiosearch(self, cmd: str, args: list[str]) -> dict:
+        """radiosearch <start> <count> term:<text> — search radio stations.
+
+        Uses the Radio Browser API when reachable; on any failure returns a
+        valid empty list so the controller shows 'no stations' instead of a
+        crash (the controller expects count + item_loop)."""
+        nums = [int(s) for s in args if str(s).isdigit()]
+        start = nums[0] if nums else 0
+        count = nums[1] if len(nums) > 1 else 20
+        term = next((str(a)[5:] for a in args if str(a).startswith("term:")), "")
+        if not term:
+            return self._browse_response([])
+        try:
+            from lyrion.music.radio import get_radio_manager
+            stations = await get_radio_manager().directory.search(
+                name=term, limit=count, offset=start)
+            items = []
+            for s in stations:
+                name = s.name or "Unknown"
+                items.append({
+                    "id": str(s.id) if s.id is not None else str(s.url),
+                    "name": name,
+                    "text": name,
+                    "url": s.url,
+                    "type": "audio",
+                    "hasitems": 0,
+                    "actions": {
+                        "play": {"player": 0, "cmd": ["playlist", "play"],
+                                 "params": {"item_id": str(s.id) if s.id is not None
+                                            else str(s.url)}},
+                        "do": {"player": 0, "cmd": ["playlist", "play"],
+                               "params": {"item_id": str(s.id) if s.id is not None
+                                          else str(s.url)}},
+                    },
+                })
+            return self._browse_response(items)
+        except Exception:  # noqa: BLE001
+            return self._browse_response([])
+
     async def _json_browse(self, cmd: str, args: list[str]) -> dict:
         """Browse library tables (albums/artists/songs/genres) as JSON."""
         # browse <target> [<start> <count>] — the home menu items carry
@@ -1772,30 +1907,8 @@ class JSONRPCAPI:
                 except Exception:
                     return self._browse_response([])
             if target == "radios":
-                try:
-                    from lyrion.music.radio import get_radio_manager
-                    stations = await get_radio_manager().list_stations()
-                    loop = [
-                        {
-                            "id": str(s.id),
-                            "name": s.name,
-                            "text": s.name,
-                            "url": s.url,
-                            "type": "radio",
-                            "hasitems": 0,
-                            # Jive actions: play/do plays the station.
-                            "actions": {
-                                "play": {"player": 0, "cmd": ["playlist", "play"],
-                                         "params": {"item_id": str(s.id)}},
-                                "do": {"player": 0, "cmd": ["playlist", "play"],
-                                       "params": {"item_id": str(s.id)}},
-                            },
-                        }
-                        for s in stations
-                    ]
-                    return self._browse_response(loop)
-                except Exception:
-                    return self._browse_response([])
+                loop = await self._radio_stations_loop()
+                return self._browse_response(loop)
             return self._browse_response([])
 
         start = int(args[0]) if args and str(args[0]).isdigit() else 0
