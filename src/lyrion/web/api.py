@@ -1063,7 +1063,16 @@ class JSONRPCAPI:
             # firstItem.get("trackType").asText() — a missing field is a
             # NULL NPE crash).
             item["title"] = title
+            item["text"] = title          # SqueezePlay _extractTrackInfo fallback
             item["trackType"] = "local" if isinstance(tid, int) else "remote"
+            # SqueezePlay now-playing reads _track.track/.artist/.album —
+            # provide them for LOCAL tracks (a remote stream intentionally
+            # omits `track` so SqueezePlay falls back to text + current_title).
+            if isinstance(tid, int):
+                item["track"] = title
+                item["artist"] = info.get("artist", "")
+                item["album"] = info.get("album", "")
+                item["duration"] = duration
             for code, field in TAG_FIELDS.items():
                 if not tag_ok(code):
                     continue
@@ -1144,6 +1153,9 @@ class JSONRPCAPI:
             "player_name": player.name or player.mac,
             # SqueezeClient's PlayerStatusResponse requires this
             "player_connected": 1,
+            # SqueezePlay reads playerStatus.remote == 1 to append the live
+            # current_title for a radio stream.
+            "remote": 1 if isinstance(cur_tid, str) else 0,
             # SqueezeClient parses these as STRING enums ("0"/"1"/"2",
             # PlayerStatus.ShuffleState/RepeatState @SerialName) — an int
             # breaks kotlinx serialization → app crash on connect.
