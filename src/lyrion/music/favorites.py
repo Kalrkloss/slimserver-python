@@ -122,7 +122,19 @@ class FavoritesManager:
             items = await self.list_items(parent)
             if idx < 0 or idx >= len(items):
                 return None
-            parent = int(items[idx]["id"])
+            # list_items returns the hierarchical string as 'id' (e.g. "0.2")
+            # and the real DB id as 'dbid'. Use 'dbid' so hierarchical paths
+            # resolve to the actual Favorite row (playing a favorite by
+            # item_id otherwise falls back to a stale/default stream).
+            item = items[idx]
+            real_id = item.get("dbid")
+            if real_id is not None:
+                parent = int(real_id)
+                continue
+            try:
+                parent = int(item["id"])
+            except (ValueError, TypeError, KeyError):
+                return None
         return parent
 
     async def get(self, fav_id: int) -> Optional[dict[str, Any]]:
