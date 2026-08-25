@@ -1228,7 +1228,7 @@ class JSONRPCAPI:
             # position). Using the position keeps valueTo >= value for
             # SqueezeClient while still giving SqueezePlay a duration.
             dur = float(cur_info.get("duration", 0) or 0)
-            pos = float(getattr(player, "time", 0) or 0)
+            pos = float(elapsed or 0)
             if dur <= 0 and pos > 0:
                 dur = pos
             if dur <= 0:
