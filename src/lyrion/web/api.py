@@ -1221,13 +1221,19 @@ class JSONRPCAPI:
             result.setdefault("artist", cur_info.get("artist", ""))
             result.setdefault("title", cur_info.get("title", ""))
             result.setdefault("album", cur_info.get("album", ""))
-            # Only report a duration when known. For a live radio stream the
-            # duration is unknown — leaving it out makes SqueezeClient take
-            # the disabled-slider branch (a 0 here would make valueTo=0.1 vs
-            # a growing play-position and crash the seek slider).
+            # Report a duration for a live stream as a non-zero value: leaving
+            # it out (null) makes SqueezePlay's status processing choke and
+            # prevents the Now-Playing window from opening, while a 0 makes
+            # SqueezeClient's seek-slider crash (valueTo=0.1 vs growing
+            # position). Using the position keeps valueTo >= value for
+            # SqueezeClient while still giving SqueezePlay a duration.
             dur = float(cur_info.get("duration", 0) or 0)
-            if dur > 0:
-                result["duration"] = dur
+            pos = float(getattr(player, "time", 0) or 0)
+            if dur <= 0 and pos > 0:
+                dur = pos
+            if dur <= 0:
+                dur = 1.0
+            result["duration"] = dur
             result["item_loop"] = loop
         result |= sync_fields
         if remote_meta:
