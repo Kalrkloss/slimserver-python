@@ -1747,7 +1747,15 @@ async def cmd_playlist_play(
                 return [f"playlist play {idx}", ""] if ok else ["cli error: could not play", ""]
             track_id = idx
         elif positional:
-            track_id = int(positional[0])
+            first = str(positional[0])
+            # Bare stream URL (SqueezePlay sends playlist play <url> for a
+            # favorite whose url it uses directly, no item_id) — play it.
+            if "://" in first:
+                url = first
+                ok = await pm.play_url(ctx.player_id, url, "")
+                return [f"playlist play {url}", ""] if ok \
+                    else ["cli error: could not play stream", ""]
+            track_id = int(first)
         else:
             return ["playlist play <trackId> — missing id", ""]
         pm.playlist_add(ctx.player_id, track_id)

@@ -1615,12 +1615,33 @@ class JSONRPCAPI:
                     player.playlist_position = int(idx)
                     await self._play_playlist_item(pm, player, int(idx))
             elif sub == "play":
-                # LMS-compatible 'playlist play [<index>|track_id:<n>]'
+                # LMS-compatible 'playlist play [<index>|track_id:<n>|item_id:<n>|<url>]'
                 player = pm.get_player(pid)
                 if player is not None:
-                    if rest and str(rest[0]).isdigit():
+                    idx = player.playlist_position or 0
+                    first = str(rest[0]).lower() if rest else ""
+                    if first.startswith("item_id:"):
+                        # Favorite by hierarchical id (SqueezePlay/Squeezer).
+                        # route through the favorite manager so the CORRECT
+                        # stream plays (resolve_path uses dbid), not the
+                        # current playlist index.
+                        try:
+                            from lyrion.music.favorites import get_favorites_manager
+                            from lyrion.control.cli_commands import _fav_resolve_id
+                            fm = get_favorites_manager()
+                            fav_id = await _fav_resolve_id(fm, str(rest[0]).split(":", 1)[1])
+                            if fav_id is not None:
+                                await fm.play(pid, fav_id)
+                                return
+                        except Exception:
+                            pass
+                    elif "://" in str(rest[0]) if rest else False:
+                        # Bare stream URL
+                        await pm.play_url(pid, str(rest[0]), "")
+                        return
+                    elif rest and str(rest[0]).isdigit():
                         idx = int(rest[0])
-                    elif rest and str(rest[0]).lower().startswith("track_id:"):
+                    elif rest and first.startswith("track_id:"):
                         # Flush a bare track id as a one-item playlist entry.
                         tid = str(rest[0]).split(":", 1)[1]
                         self._playlist_flush_track(pm, player, pid, tid)
