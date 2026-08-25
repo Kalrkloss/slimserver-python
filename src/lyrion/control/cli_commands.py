@@ -61,12 +61,47 @@ async def cmd_exit(
     return []  # empty list signals connection close
 
 
+@register_command("ping")
+async def cmd_ping(
+    handler: CLIHandler,
+    ctx: CLIContext,
+    args: list[str],
+) -> list[str]:
+    """ping — connection liveness (SqueezePlay/controllers poll it)."""
+    return ["ping"]
+
+
+@register_command("client")
+async def cmd_client(
+    handler: CLIHandler,
+    ctx: CLIContext,
+    args: list[str],
+) -> list[str]:
+    """client <mac> <model> <name> [..] — register a controlling client.
+
+    SqueezePlay logs in through this: it sends its client identity and the
+    server acknowledges. Until it is recognised the controller can't reach
+    the menus. We just acknowledge (the discovery + websocket paths carry
+    the real data)."""
+    return ["client: ok"]
+
+
+@register_command("listen")
+async def cmd_listen(
+    handler: CLIHandler,
+    ctx: CLIContext,
+    args: list[str],
+) -> list[str]:
+    """listen <on|off> — subscribe/unsubscribe a client to server events."""
+    return ["listen: ok"]
+
+
 # ---------------------------------------------------------------------------
 # Server info
 # ---------------------------------------------------------------------------
 
 
-@register_command("version")
+@register_command("version", "ver")
 async def cmd_version(
     handler: CLIHandler,
     ctx: CLIContext,
