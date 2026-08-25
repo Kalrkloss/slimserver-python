@@ -945,6 +945,11 @@ class JSONRPCAPI:
         if cmd == "radiosearch":
             return await self._json_radiosearch(cmd, args)
 
+        # ── browselibrary (SqueezePlay My-Music children; LMS 'browselibrary
+        #    items <start> <count> mode:<albums|artists|genres|years|bmf|search>') ──
+        if cmd == "browselibrary":
+            return await self._json_browselibrary(cmd, args)
+
         # ── displaystatus (Squeezer subscribes with a request) ──────
         # Squeezer's parseDisplayStatus does getDataAsMap() — an
         # 'unknown command' list response crashes it. Empty map is fine.
@@ -1188,59 +1193,60 @@ class JSONRPCAPI:
         return result
 
     def _home_menu(self) -> list[dict]:
-        """The root browse menu (Home) shared by menu/menustatus/status.
+        """The root browse menu (Home), matching the real LMS item shape
+        that SqueezePlay/SqueezeClient/Squeezer reliably render.
 
-        Jive/SlimBrowse format (lyrion.org/reference/slimbrowse): the
-        actions.go is a JSON command {player, cmd, params} where cmd is
-        the LMS query name (artists/albums/titles/...) and params.menu
-        declares the next browse level. The Android controllers execute
-        exactly this command when the item is tapped — 'browse://' cmd
-        strings were never understood, so no sub-menu ever opened.
+        The controllers recognise the canonical item ids (myMusic, favorites,
+        radios, myMusicMusicFolder...), the node values (home/myMusic) and
+        the browselibrary navigation command. Items with isANode become
+        expandable nodes; the myMusic children are emitted in the SAME
+        item_loop and nested under the myMusic node by the controller.
         """
-
-        def _home_item(cmd: list[str], name: str, typ: str, weight: int = 0,
-                       params: dict | None = None) -> dict:
+        def _go(cmd: list[str], params: dict | None = None) -> dict:
             go: dict = {"player": 0, "cmd": cmd}
             if params:
                 go["params"] = params
-            return {
-                "id": f"browse://{cmd[0]}",
-                "name": name,
-                "text": name,  # OpenSqueeze shows getText()
-                "node": cmd[0],  # SqueezeClient HomeMenuItemResponse
-                "parent": "home",  # Jive home root
-                "type": typ,
-                "hasitems": 1,
+            return {"go": go, "do": go}
+
+        def _my_item(iid: str, name: str, node: str, weight: int,
+                     mode: str, icon: str = "") -> dict:
+            """A My Music child that browses the library by mode."""
+            it = {
+                "id": iid,
+                "text": name,
+                "node": node,
                 "weight": weight,
-                # Squeezer reads 'icon' (or 'icon-id') — 'image' is ignored
-                "icon": f"html/images/{cmd[0]}.png",
-                # Jive navigation: go/do action is the LMS command that
-                # opens the next browse level (with the menu: param).
-                "actions": {"go": go, "do": go},
-                "browse": {"id": cmd[0], "name": name, "type": typ},
-                # Jive window hints — the menu push opens/refreshes a
-                # text list window with the item's title.
-                "nextWindow": "refresh",
-                "window": {
-                    "windowStyle": "text_list",
-                    "title": name,
-                    "hasMore": 1,
-                },
+                "actions": _go(["browselibrary", "items"],
+                               {"menu": 1, "mode": mode}),
             }
+            if icon:
+                it["icon"] = icon
+            return it
+
+        my_children = [
+            _my_item("myMusicArtistsAllArtists", "Alle Interpreten", "myMusic",
+                     11, "artists", "html/images/artists.png"),
+            _my_item("myMusicAlbums", "Alben", "myMusic", 20,
+                     "albums", "html/images/albums.png"),
+            _my_item("myMusicGenres", "Stilrichtung", "myMusic", 30,
+                     "genres", "html/images/genres.png"),
+            _my_item("myMusicYears", "Jahrgang", "myMusic", 40, "years"),
+            _my_item("myMusicMusicFolder", "Musikordner", "myMusic", 70,
+                     "bmf", "html/images/musicfolder.png"),
+            _my_item("myMusicSearch", "Suchen", "myMusic", 90, "search"),
+        ]
 
         return [
-            # 'type' MUST be a SlimBrowseItemType the controllers know
-            # (text/audio/playlist/outline/link/...). SqueezeClient parses
-            # it as a strict enum — 'artist'/'album'/'song'/'genre' crash
-            # the app on connect. 'outline' = folder-ish entry.
-            _home_item(["artists"], "Artists", "outline", 0, {"menu": "albums"}),
-            _home_item(["albums"], "Albums", "outline", 1, {"menu": "tracks"}),
-            _home_item(["titles"], "Songs", "outline", 2, {"menu": "songinfo"}),
-            _home_item(["genres"], "Genres", "outline", 3, {"menu": "artists"}),
-            # Favorites: the app sends 'favorites items' — the menu list
-            # with the DB ids the controllers parse as numbers.
-            _home_item(["favorites", "items"], "Favorites", "outline", 4),
-            _home_item(["browse", "radios"], "Radio", "outline", 5),
+            # My Music node — SqueezePlay expands it into the myMusic
+            # children (which share this item_loop, node=myMusic).
+            {"id": "myMusic", "text": "Eigene Musik", "node": "home",
+             "isANode": 1, "weight": 11, "hasitems": 1},
+            {"id": "favorites", "text": "Favoriten", "node": "home",
+             "weight": 100, "actions": _go(["favorites", "items"],
+                                           {"menu": "favorites"})},
+            {"id": "radios", "text": "Radio", "node": "home", "weight": 20,
+             "actions": _go(["radios"], {"menu": "radio"})},
+            *my_children,
         ]
 
     @staticmethod
@@ -1886,6 +1892,53 @@ class JSONRPCAPI:
                     },
                 })
             return self._browse_response(items)
+        except Exception:  # noqa: BLE001
+            return self._browse_response([])
+
+    async def _json_browselibrary(self, cmd: str, args: list[str]) -> dict:
+        """browselibrary items <start> <count> mode:<albums|artists|genres|
+        years|bmf|search> — the My-Music children navigation.
+
+        SqueezePlay/SqueezeClient open My Music through this command (the
+        home items point at it). Map the mode onto the library browse and
+        return a controller-safe response.
+        """
+        nums = [int(s) for s in args if str(s).isdigit()]
+        start = nums[0] if nums else 0
+        count = nums[1] if len(nums) > 1 else 512
+        mode = next((str(a)[5:] for a in args if str(a).startswith("mode:")),
+                    "albums")
+        mode_map = {
+            "albums": "albums", "artists": "artists", "genres": "genres",
+            "bmf": "musicfolder", "songs": "titles", "search": "search",
+            "years": "years",
+        }
+        target = mode_map.get(mode, "albums")
+        if target == "years":
+            return await self._json_years(start, count)
+        if target == "search":
+            # 'search' is a text-input mode; open an empty list (the app
+            # shows a search box). No crash.
+            return self._browse_response([])
+        return await self._json_browse(target, [str(start), str(count)])
+
+    async def _json_years(self, start: int, count: int) -> dict:
+        """years — a distinct release-year list (My Music → Jahrgang)."""
+        try:
+            rows = _db_query(
+                "SELECT DISTINCT year FROM tracks WHERE year > 0 "
+                "ORDER BY year DESC LIMIT ? OFFSET ?",
+                (count, start))
+            loop = [{"id": str(r["year"]), "text": str(r["year"]),
+                     "name": str(r["year"]), "type": "outline",
+                     "actions": {"go": {"player": 0, "cmd": ["albums"],
+                                        "params": {"year": r["year"]}},
+                                 "do": {"player": 0, "cmd": ["albums"],
+                                        "params": {"year": r["year"]}}}}
+                    for r in rows]
+            total = _db_query("SELECT COUNT(DISTINCT year) FROM tracks "
+                              "WHERE year > 0")[0][0] if rows else 0
+            return self._browse_response(loop, total, "years_loop")
         except Exception:  # noqa: BLE001
             return self._browse_response([])
 
