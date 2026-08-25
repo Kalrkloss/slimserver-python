@@ -1359,6 +1359,7 @@ class JSONRPCAPI:
                 it["icon"] = f"/music/{it['coverid']}/cover.jpg"
                 it["icon-id"] = it["coverid"]
         resp: dict = {"count": len(loop) if total is None else total,
+                      "offset": 0,
                       "loop_loop": loop, "item_loop": loop}
         if plural:
             resp[plural] = loop
