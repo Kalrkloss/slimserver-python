@@ -1047,8 +1047,11 @@ class JSONRPCAPI:
         _elapsed = float(getattr(player, "elapsed", 0) or 0)
         _cur_title = getattr(player, "current_title", "") or ""
         _cur_artist = ""
+        _cur_track = _cur_title
         if isinstance(_cur_tid, str) and " - " in _cur_title:
-            _cur_artist = _cur_title.split(" - ", 1)[0].strip()
+            _artist, _track = _cur_title.split(" - ", 1)
+            _cur_artist = _artist.strip()
+            _cur_track = _track.strip()
 
         for i, tid in enumerate(playlist_ids):
             if isinstance(tid, int):
@@ -1089,6 +1092,7 @@ class JSONRPCAPI:
                 # has artist/duration/url to render (Perl's playlist item is
                 # rich: artist/title/artwork_url/duration/url/remote).
                 item["url"] = str(tid)
+                item["track"] = _cur_track or item.get("title", "")
                 item["artist"] = _cur_artist or ""
                 item["album"] = ""
                 item["duration"] = _elapsed
