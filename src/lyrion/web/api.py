@@ -1160,15 +1160,11 @@ class JSONRPCAPI:
             if _stream_img.startswith("html/"):
                 _stream_img = _stream_img[len("html/"):]
             remote_meta = {
-                "id": -abs(hash(cur_url)),
                 "title": cur_info.get("title", ""),
                 "artist": cur_info.get("artist", ""),
                 "album": cur_info.get("album", ""),
                 "duration": cur_info.get("duration", 0) or 0,
                 "url": cur_url,
-                "remote": 1,
-                "coverart": 0,
-                "artwork_url": _stream_img or "/html/images/favorites.png",
             }
 
         menu_block = None
@@ -1213,7 +1209,7 @@ class JSONRPCAPI:
             "digital_volume_control": 1,
             "use_volume_control": 1,
             "signalstrength": 0,
-            "seq_no": str(getattr(player, "_seq_no", 0) or 0),
+            "seq_no": int(getattr(player, "_seq_no", 0) or 0),
             "playlist_timestamp": time.time(),
             "playlist_loop": loop,
         }
