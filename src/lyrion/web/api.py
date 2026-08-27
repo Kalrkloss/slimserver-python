@@ -1039,6 +1039,17 @@ class JSONRPCAPI:
         def tag_ok(code: str) -> bool:  # noqa: N802
             return (not tags) or code in tags
 
+        # Pre-compute values for enriching the CURRENT playlist item (SqueezePlay
+        # Now-Playing renders from it). Computed here (before the loop) because
+        # cur_info/elapsed are derived later in this function.
+        _cur = player.playlist_position or 0
+        _cur_tid = playlist_ids[_cur] if 0 <= _cur < len(playlist_ids) else None
+        _elapsed = float(getattr(player, "elapsed", 0) or 0)
+        _cur_title = getattr(player, "current_title", "") or ""
+        _cur_artist = ""
+        if isinstance(_cur_tid, str) and " - " in _cur_title:
+            _cur_artist = _cur_title.split(" - ", 1)[0].strip()
+
         for i, tid in enumerate(playlist_ids):
             if isinstance(tid, int):
                 info = track_rows.get(tid, {})
@@ -1073,6 +1084,14 @@ class JSONRPCAPI:
                 item["artist"] = info.get("artist", "")
                 item["album"] = info.get("album", "")
                 item["duration"] = duration
+            elif i == player.playlist_position:
+                # Enrich the CURRENT stream item so SqueezePlay's Now-Playing
+                # has artist/duration/url to render (Perl's playlist item is
+                # rich: artist/title/artwork_url/duration/url/remote).
+                item["url"] = str(tid)
+                item["artist"] = _cur_artist or ""
+                item["album"] = ""
+                item["duration"] = _elapsed
             for code, field in TAG_FIELDS.items():
                 if not tag_ok(code):
                     continue
