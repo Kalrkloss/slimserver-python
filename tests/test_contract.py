@@ -171,6 +171,16 @@ def test_cli_client(server_up):
     assert out.startswith("client: ok"), f"CLI 'client' must register, got {out!r}"
 
 
+def test_cli_playerstatus(server_up):
+    """SqueezePlay's SlimPlayer runs 'playerstatus <mac> - 1' via the CLI.
+    Returning 'player not found' (because the '-' placeholder overwrote the
+    player id) means the status never arrives, playlistSize stays 0 and the
+    Now-Playing window never opens. Regression test for that."""
+    out = cli("02:11:22:33:44:55 playerstatus - 1")
+    assert "player not found" not in out, f"playerstatus must resolve the player, got {out!r}"
+    assert "player_name" in out, f"playerstatus must return a status, got {out!r}"
+
+
 def test_cli_players(server_up):
     out = cli("players 0 5")
     assert "playerid" in out or "player" in out.lower(), f"CLI 'players' must return the player list: {out!r}"

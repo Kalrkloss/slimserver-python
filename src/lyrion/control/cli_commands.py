@@ -699,7 +699,13 @@ async def cmd_playerstatus(
     args: list[str],
 ) -> list[str]:
     """playerstatus [<playerId>] — full player status (same as status)."""
-    if args:
+    # The CLI dispatch already set ctx.player_id from the leading token
+    # ('<mac> playerstatus ...'). args[0] is usually '-' (the "any/current
+    # player" placeholder) — overwriting the id with it makes the lookup
+    # fail with 'player not found', which is exactly what SqueezePlay's
+    # SlimPlayer sees, so playlistSize never updates and the Now-Playing
+    # window never opens. Only take a real id from args.
+    if args and args[0] not in ("-", ""):
         ctx.player_id = args[0]
     return await cmd_status(handler, ctx, [])
 
