@@ -2570,7 +2570,15 @@ class WebAPIHandler:
             # Material Skin (Jive controller UI) SPA entry
             path = "/material/index.html"
 
-        file_path = self._static_dir / path.lstrip("/")
+        rel = path.lstrip("/")
+        # static_dir already contains "html/" (set in __main__.py to
+        # <base>/html). A URL path like /html/images/x.png therefore must
+        # have its leading "html/" stripped, else the prefix is DOUBLED
+        # and every image 404s (<base>/html/html/images/x.png).
+        if rel.startswith("html/"):
+            rel = rel[len("html/"):]
+
+        file_path = self._static_dir / rel
         # Security: prevent directory traversal
         if not str(file_path).startswith(str(self._static_dir.resolve())):
             return 403, {}, b"Forbidden"
