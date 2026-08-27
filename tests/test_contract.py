@@ -184,3 +184,21 @@ def test_cli_playerstatus(server_up):
 def test_cli_players(server_up):
     out = cli("players 0 5")
     assert "playerid" in out or "player" in out.lower(), f"CLI 'players' must return the player list: {out!r}"
+
+
+# ----------------------------------------------------------------------
+# "Eigene Musik" — album drill returns tracks (titles ... album_id:<id>)
+# ----------------------------------------------------------------------
+def test_album_drill_returns_tracks(server_up):
+    """Drilling into an album (SqueezePlay 'Eigene Musik' -> album) must list
+    its tracks. A duplicated tracks_albums alias in the titles query previously
+    made the drill return count 0 — no tracks appeared."""
+    alb = lms(TEST_PLAYER, ["albums", "0", "1"])
+    lo = alb.get("loop_loop") or alb.get("albums_loop") or []
+    assert lo, "albums browse must return at least one album"
+    aid = lo[0].get("id")
+
+    res = lms(TEST_PLAYER, ["titles", "0", "3", f"album_id:{aid}"])
+    loop = res.get("titles_loop") or res.get("loop_loop") or res.get("item_loop") or []
+    assert res.get("count", 0) > 0, f"album drill (album_id={aid}) must return tracks, count={res.get('count')!r}"
+    assert loop and loop[0].get("title"), f"track item must have a title: {loop[0] if loop else None!r}"

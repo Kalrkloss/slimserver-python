@@ -2311,12 +2311,21 @@ class JSONRPCAPI:
                     params).fetchone()[0]
                 plural = "albums_loop"
             elif cmd == "songs" or cmd == "titles":
-                where, params = _conds("t.title")
+                # tracks_albums ta is joined in the base query below — do
+                # NOT add a second JOIN tracks_albums ta here (alias clash,
+                # which made the album drill return count 0 / no tracks).
+                _w: list[str] = []
+                _p: list = []
+                if filters.get("search"):
+                    _w.append("t.title LIKE ?"); _p.append(f"%{filters['search']}%")
                 joins = ""
-                if filters.get("album_id"):
-                    joins += " JOIN tracks_albums ta ON ta.track = t.id"
-                if filters.get("artist_id"):
+                if filters.get("artist_id") and str(filters["artist_id"]).isdigit():
                     joins += " JOIN tracks_contributors tc ON tc.track = t.id AND tc.role = 1"
+                    _w.append("tc.contributor = ?"); _p.append(int(filters["artist_id"]))
+                if filters.get("album_id") and str(filters["album_id"]).isdigit():
+                    _w.append("ta.album = ?"); _p.append(int(filters["album_id"]))
+                where = (" WHERE " + " AND ".join(_w)) if _w else ""
+                params = tuple(_p)
                 rows = db.execute(
                     "SELECT DISTINCT t.id, t.title, t.url, t.duration, "
                     "al.id AS album_id, al.artwork AS album_artwork "
@@ -2337,6 +2346,7 @@ class JSONRPCAPI:
                         "duration": r["duration"] or 0,
                         "artist": info.get("artist", ""),
                         "album": info.get("album", ""),
+                        "genre": info.get("genre", ""),
                         # Jive actions: go opens songinfo, play plays the track.
                         "actions": {
                             "go": {"player": 0, "cmd": ["songinfo"],
@@ -2351,7 +2361,9 @@ class JSONRPCAPI:
                         entry["artwork_url"] = f"/music/{r['album_id']}/cover.jpg"
                     loop.append(entry)
                 total = db.execute(
-                    "SELECT COUNT(DISTINCT t.id) FROM tracks t" + joins + where,
+                    "SELECT COUNT(DISTINCT t.id) FROM tracks t"
+                    " LEFT JOIN tracks_albums ta ON ta.track = t.id"
+                    + joins + where,
                     params).fetchone()[0]
                 plural = "titles_loop"
             elif cmd == "genres":
