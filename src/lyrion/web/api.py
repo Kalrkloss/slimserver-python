@@ -1096,6 +1096,12 @@ class JSONRPCAPI:
                 item["artist"] = _cur_artist or ""
                 item["album"] = ""
                 item["duration"] = _elapsed
+                # Artwork so the Now-Playing shows a placeholder for
+                # cover-less streams (Perl provides artwork_url). Prefer a
+                # stored station logo, else the heart placeholder.
+                _simg = getattr(player, "stream_images", {}).get(str(tid), "") or ""
+                item["artwork_url"] = _simg or "/html/images/favorites.png"
+                item["coverart"] = 1
             for code, field in TAG_FIELDS.items():
                 if not tag_ok(code):
                     continue
@@ -1154,15 +1160,15 @@ class JSONRPCAPI:
             if _stream_img.startswith("html/"):
                 _stream_img = _stream_img[len("html/"):]
             remote_meta = {
-                "id": str(-abs(hash(cur_url))),
+                "id": -abs(hash(cur_url)),
                 "title": cur_info.get("title", ""),
                 "artist": cur_info.get("artist", ""),
                 "album": cur_info.get("album", ""),
                 "duration": cur_info.get("duration", 0) or 0,
                 "url": cur_url,
                 "remote": 1,
-                "coverart": "0",
-                "artwork_url": _stream_img or "html/images/favorites.png",
+                "coverart": 0,
+                "artwork_url": _stream_img or "/html/images/favorites.png",
             }
 
         menu_block = None
