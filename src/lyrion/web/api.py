@@ -1147,12 +1147,22 @@ class JSONRPCAPI:
         remote_meta = {}
         cur_url = getattr(player, "current_url", None)
         if cur_url and not isinstance(playlist_ids[cur] if cur < len(playlist_ids) else None, int):
+            # Station logo if one is stored (playlist add image:<path>),
+            # else a default placeholder (Perl uses html/images/favorites.png
+            # — the "heart" SqueezePlay draws for cover-less streams).
+            _stream_img = getattr(player, "stream_images", {}).get(cur_url, "") or ""
+            if _stream_img.startswith("html/"):
+                _stream_img = _stream_img[len("html/"):]
             remote_meta = {
+                "id": str(-abs(hash(cur_url))),
                 "title": cur_info.get("title", ""),
                 "artist": cur_info.get("artist", ""),
                 "album": cur_info.get("album", ""),
                 "duration": cur_info.get("duration", 0) or 0,
                 "url": cur_url,
+                "remote": 1,
+                "coverart": "0",
+                "artwork_url": _stream_img or "html/images/favorites.png",
             }
 
         menu_block = None
