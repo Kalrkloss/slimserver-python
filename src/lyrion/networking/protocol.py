@@ -679,33 +679,30 @@ class SlimProtoClient:
             # + bytes_received_H (u32 BE) + bytes_received_L (u32 BE) + lang (2B)
             # + capabilities text (remaining bytes up to `length`)
             if first_byte[0] == 0x48:  # 'H' = "HELO" opcode
-                # Read: "ELO" (3B) + length (4B) + deviceid+revision (2B) + mac (6B)
-                # + uuid (16B) + wlan (2B) + brH (4B) + brL (4B) + lang (2B)
-                # = 3 + 4 + 2 + 6 + 16 + 2 + 4 + 4 + 2 = 43 bytes of fixed header remaining
-                fixed_header = await reader.readexactly(43)
-                # Verify "ELO" prefix
-                if fixed_header[0:3] != b"ELO":
-                    logger.warning("Bad HELO header from %s: expected ELO, got %s", peer, fixed_header[0:3].hex())
+                # Read "ELO" (3B) + length (4B BE). The declared length is the
+                # body size (Perl Slimproto: 36 bytes with uuid, 20 without;
+                # anything beyond that is the capabilities text).
+                prefix = await reader.readexactly(7)  # "ELO" + length
+                if prefix[0:3] != b"ELO":
+                    logger.warning("Bad HELO header from %s: expected ELO, got %s", peer, prefix[0:3].hex())
                     writer.close()
                     return
-                length_be = int.from_bytes(fixed_header[3:7], "big")  # 4-byte big-endian length
-                # Parse remaining fixed fields
-                offset = 7  # after opcode+length (=4+4=8) minus the 'H' we already read (=1) → 7
-                deviceid = fixed_header[offset]; offset += 1
-                revision = fixed_header[offset]; offset += 1
-                mac_raw = fixed_header[offset:offset + 6]; offset += 6
-                uuid_raw = fixed_header[offset:offset + 16]; offset += 16
-                wlan = int.from_bytes(fixed_header[offset:offset + 2], "big"); offset += 2
-                br_h = int.from_bytes(fixed_header[offset:offset + 4], "big"); offset += 4
-                br_l = int.from_bytes(fixed_header[offset:offset + 4], "big"); offset += 4
-                lang_raw = fixed_header[offset:offset + 2].decode("ascii", errors="replace"); offset += 2
-                # Capabilities = remaining bytes: length - header_size
-                header_size = 44  # 4(opcode)+4(length)+1(dev)+1(rev)+6(mac)+16(uuid)+2(wlan)+4(brH)+4(brL)+2(lang)
-                cap_bytes_len = length_be - (header_size - 4 - 4)  # length includes opcode+length fields
-                # Fix: length in squeezelite includes the whole packet size MINUS 8 (opcode+length)
-                # Actually: "length" = sizeof(packet) - 8 (from squeezelite source)
-                # So: cap_len = length - (header_size - 8) = length - 36
-                cap_bytes_len = length_be - (header_size - 8)
+                length_be = int.from_bytes(prefix[3:7], "big")  # 4-byte big-endian length
+                # Older firmware (no uuid) sends a 20-byte body; newer sends 36.
+                has_uuid = length_be >= 36
+                fixed_len = 36 if has_uuid else 20
+                fixed = await reader.readexactly(fixed_len)
+                offset = 0
+                deviceid = fixed[offset]; offset += 1
+                revision = fixed[offset]; offset += 1
+                mac_raw = fixed[offset:offset + 6]; offset += 6
+                uuid_raw = fixed[offset:offset + 16] if has_uuid else b""; offset += 16 if has_uuid else 0
+                wlan = int.from_bytes(fixed[offset:offset + 2], "big"); offset += 2
+                br_h = int.from_bytes(fixed[offset:offset + 4], "big"); offset += 4
+                br_l = int.from_bytes(fixed[offset:offset + 4], "big"); offset += 4
+                lang_raw = fixed[offset:offset + 2].decode("ascii", errors="replace"); offset += 2
+                # Capabilities = remaining bytes beyond the fixed body.
+                cap_bytes_len = length_be - fixed_len
                 cap_text = ""
                 if cap_bytes_len > 0 and cap_bytes_len < 65536:  # sanity check
                     cap_text = (await reader.readexactly(cap_bytes_len)).decode("ascii", errors="replace")
@@ -1151,27 +1148,36 @@ class SlimProtoClient:
     # Streaming control (server -> player)
     # ------------------------------------------------------------------
 
+    #: Exact MIME → slimproto codec char (Perl Slim/Player/Squeezebox.pm).
+    #: Substring matching is NOT used — e.g. "audio/x-wavpack" contains "wav"
+    #: but is not raw PCM, and WMA/ALAC/Opus are not MP3.
+    _CODEC_BY_MIME = {
+        "audio/mpeg": "m", "audio/mp3": "m", "audio/x-mp3": "m",
+        "audio/flac": "f", "audio/x-flac": "f",
+        "audio/aac": "a", "audio/aacp": "a", "audio/mp4": "a",
+        "audio/x-m4a": "a", "audio/m4a": "a", "audio/mp4a-latm": "a",
+        "audio/ogg": "o", "application/ogg": "o", "audio/vorbis": "o",
+        "audio/opus": "u",
+        "audio/wav": "p", "audio/x-wav": "p", "audio/wave": "p",
+        "audio/aiff": "p", "audio/x-aiff": "p", "audio/aif": "p",
+        "audio/x-ms-wma": "w", "audio/wma": "w",
+        "audio/x-alac": "l", "audio/alac": "l",
+    }
+
     @staticmethod
     def _codec_char(mime: str | None) -> str:
         """Map a MIME type to the slimproto codec character."""
         if not mime:
             return "m"
-        m = mime.lower()
-        if "flac" in m:
-            return "f"
-        if "ogg" in m or "opus" in m or "vorbis" in m:
-            return "o"
-        if "aac" in m or "mp4" in m or "m4a" in m:
-            return "a"
-        if "wav" in m or "pcm" in m or "aiff" in m or "aif" in m:
-            return "p"
-        return "m"  # mp3 and everything else
+        m = mime.lower().split(";")[0].strip()
+        return SlimProtoClient._CODEC_BY_MIME.get(m, "m")
 
     @staticmethod
     def _codec_to_extension(codec: str) -> str:
         """Map a slimproto codec char back to a file extension."""
         return {
             "f": "flac", "o": "ogg", "a": "aac", "p": "wav", "m": "mp3",
+            "w": "wma", "u": "opus", "l": "alac",
         }.get(codec, "mp3")
 
     @staticmethod
