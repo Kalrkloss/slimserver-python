@@ -2328,8 +2328,13 @@ class JSONRPCAPI:
                 if filters.get("artist_id") or filters.get("genre"):
                     joins += " JOIN tracks_albums ta ON ta.album = al.id" \
                              " JOIN tracks t ON t.id = ta.track"
-                if filters.get("artist_id"):
+                if filters.get("artist_id") and str(filters["artist_id"]).isdigit():
                     joins += " JOIN tracks_contributors tc ON tc.track = t.id AND tc.role = 1"
+                    # The JOIN alone is not enough — add the actual
+                    # contributor predicate, else every artist's albums leak.
+                    cond = "tc.contributor = ?"
+                    where = ((" WHERE " + cond) if not where else where + " AND " + cond)
+                    params = params + (int(filters["artist_id"]),)
                 rows = db.execute(
                     "SELECT DISTINCT al.id, al.title, al.year, al.artwork FROM albums al"
                     + joins + where +
