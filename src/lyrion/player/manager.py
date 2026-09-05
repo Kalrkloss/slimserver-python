@@ -725,7 +725,8 @@ class PlayerManager:
                 player.mode = "pause"
                 player.last_activity = time.time()
             return ok
-        # resume — restart the current item
+        # resume — restart the current item, then restore the position
+        saved = float(getattr(player, "elapsed", 0) or 0)
         is_stream = self._current_is_stream(player)
         if is_stream:
             url = getattr(player, "current_url", None) or ""
@@ -743,6 +744,10 @@ class PlayerManager:
         if ok:
             player.mode = "play"
             player.last_activity = time.time()
+            # Restore the pre-pause position for local tracks (live streams
+            # cannot be seeked and restart from the beginning).
+            if saved > 0 and not is_stream:
+                await self.seek_to(player_id, int(saved))
         return ok
 
     # ------------------------------------------------------------------
@@ -847,12 +852,12 @@ class PlayerManager:
         return ok
 
     async def seek_to(self, player_id: str, seconds: int) -> bool:
-        """Seek within the current stream (SlimProto strm 'a' skip-ahead).
+        """Seek within the current stream.
 
-        Sends a skip-ahead command for <seconds> * sample_rate jiffies —
-        squeezelite discards the next N decoded samples, which equals a
-        forward seek. Backwards seeks restart the current stream first
-        (the real LMS re-streams the track too).
+        A forward seek is a SlimProto ``strm 'a'`` skip-ahead (the replay-gain
+        field carries the interval in milliseconds). A backwards or
+        out-of-range seek restarts the current item instead (the real LMS
+        re-streams the track too).
         """
         player = self.get_player(player_id)
         if player is None:
@@ -861,27 +866,6 @@ class PlayerManager:
         if handler is None:
             return False
 
-        async def _send_skip(mac_clean: str, secs: int, rate: int = 44100) -> bool:
-            mac = mac_clean.upper().replace(":", "")
-            writer = handler._player_writers.get(mac)
-            if writer is None or writer.is_closing():
-                return False
-            samples = int(max(0, secs)) * rate
-            payload = b"".join([
-                b"strm", b"a",
-                struct.pack(">I", samples),      # jiffies to skip
-                struct.pack(">I", 0),            # reserved (data offset hi)
-                struct.pack(">I", 0),            # reserved
-            ])
-            frame = struct.pack(">H", len(payload)) + payload
-            try:
-                writer.write(frame)
-                await writer.drain()
-                logger.info("Sent strm 'a' (skip-ahead %ds) to %s", secs, mac)
-                return True
-            except (ConnectionError, OSError, RuntimeError):
-                return False
-
         if seconds <= getattr(player, "elapsed", 0) or seconds > 100000:
             # Backwards / out-of-range: restart the current item instead.
             pos = player.playlist_position or 0
@@ -889,11 +873,12 @@ class PlayerManager:
             if 0 <= pos < len(items):
                 item = items[pos]
                 if isinstance(item, int):
-                    await self.play_track(player_id, item)
-                    return True
+                    return await self.play_track(player_id, item)
                 return await self.play_url(player_id, str(item))
-            return await _send_skip(player.mac, max(0, seconds))
-        return await _send_skip(player.mac, seconds - int(getattr(player, "elapsed", 0) or 0))
+            return False
+        return await handler.send_skip_to_player(
+            player.mac, seconds - int(getattr(player, "elapsed", 0) or 0)
+        )
 
     async def playlist_next(self, player_id: str) -> bool:
         """Skip to the next track in the playlist (wraps to start)."""

@@ -1823,6 +1823,34 @@ class SlimProtoClient:
         except (ConnectionError, OSError, RuntimeError):
             return False
 
+    async def send_skip_to_player(self, mac: str, seconds: int) -> bool:
+        """Send a 'strm' skip-ahead command ('a').
+
+        Perl (Slim/Player/Squeezebox.pm stream('a')) sets the replay-gain
+        field to ``int(interval * 1000)`` — the skip interval in
+        MILLISECONDS. Squeezelite discards the next N ms of decoded audio,
+        which equals a forward seek.
+        """
+        mac = mac.upper().replace(":", "")
+        writer = self._player_writers.get(mac)
+        if writer is None or writer.is_closing():
+            return False
+        payload = b"".join([
+            b"strm", b"a", b"0", b"?", b"0", b"0", b"0", b"l",
+            bytes(7),
+            struct.pack(">I", max(0, int(seconds) * 1000)),  # replay_gain = ms
+            struct.pack(">H", 0),
+            struct.pack(">I", 0),
+        ])
+        frame = struct.pack(">H", len(payload)) + payload
+        try:
+            writer.write(frame)
+            await writer.drain()
+            logger.info("Sent strm 'a' (skip-ahead %ds) to %s", seconds, mac)
+            return True
+        except (ConnectionError, OSError, RuntimeError):
+            return False
+
     async def send_volume_to_player(self, mac: str, volume: int) -> bool:
         """Send an 'audg' volume frame to a player.
 
