@@ -221,6 +221,10 @@ class Album(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     titlesort: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
     title: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+    # Primary artist's sort key — part of the album identity so two different
+    # artists' same-title albums do NOT merge (Perl Slim/Schema.pm keys albums
+    # by title + contributor).
+    albumartist_sort: Mapped[str | None] = mapped_column(String(255), nullable=True)
     disccount: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     disc: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     year: Mapped[int | None] = mapped_column(Integer, nullable=True)
@@ -257,7 +261,7 @@ class Album(Base):
     )
 
     __table_args__ = (
-        UniqueConstraint("titlesort", "year", name="uq_album_titlesort_year"),
+        UniqueConstraint("titlesort", "albumartist_sort", name="uq_album_titlesort_artist"),
         Index("idx_album_year", "year"),
         Index("idx_album_musicbrainz", "musicbrainz_id"),
         Index("idx_album_compilation", "compilation"),

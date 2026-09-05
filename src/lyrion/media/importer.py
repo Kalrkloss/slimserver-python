@@ -281,21 +281,25 @@ class MusicImporter:
                 ac_set.add((r[0], r[1]))
 
         # Existing albums/contributors for the batch keys.
+        # Album identity = (title sort, artist sort) — NOT year (different
+        # track years must not split a compilation) and NOT title alone
+        # (different artists' same-title albums must not merge).
         album_keys = set()
         artist_names: set[str] = set()
         for _, info in extracted:
             album_name = getattr(info, "album", None) or "Unknown Album"
-            year = getattr(info, "year", 0) or 0
-            album_keys.add((_sort_string(album_name), year or None))
             artist = getattr(info, "artist", None) or "Unknown Artist"
+            compilation = bool(getattr(info, "compilation", False))
+            artist_key = "various artists" if compilation else _sort_string(artist)
+            album_keys.add((_sort_string(album_name), artist_key))
             if artist and artist != "Unknown Artist":
                 artist_names.add(artist.strip().lower())
         album_by_key: dict[tuple, Album] = {
-            (a.titlesort, a.year): a for a in (
+            (a.titlesort, a.albumartist_sort): a for a in (
                 await session.execute(
                     select(Album).where(
                         Album.titlesort.in_([k[0] for k in album_keys])))).scalars()
-            if (a.titlesort, a.year) in album_keys}
+            if (a.titlesort, a.albumartist_sort) in album_keys}
         contrib_by_name: dict[str, Contributor] = {
             c.namespell: c for c in (
                 await session.execute(
@@ -392,7 +396,8 @@ class MusicImporter:
         album_name = info.album or "Unknown Album" if hasattr(info, "album") else "Unknown Album"
         year = getattr(info, "year", 0) or 0
         compilation = bool(getattr(info, "compilation", False))
-        key = (_sort_string(album_name), year or None)
+        artist_key = "various artists" if compilation else _sort_string(artist)
+        key = (_sort_string(album_name), artist_key)
 
         album = album_by_key.get(key)
         if album is None:
@@ -402,6 +407,7 @@ class MusicImporter:
             album = Album(
                 titlesort=_sort_string(album_name),
                 title=album_name,
+                albumartist_sort=artist_key,
                 year=year or None,
                 compilation=1 if compilation else 0,
                 artwork=str(artwork) if artwork else None,
@@ -417,6 +423,12 @@ class MusicImporter:
             if artwork:
                 album.artwork = str(artwork)
                 album.artwork_front = str(artwork)
+        # Retag cleanup: drop a stale album link (track re-tagged to a
+        # different album) — otherwise the old album keeps listing the track.
+        await session.execute(
+            tracks_albums.delete().where(
+                (tracks_albums.c.track == track.id)
+                & (tracks_albums.c.album != album.id)))
         if (track.id, album.id) not in ta_set:
             await session.execute(
                 tracks_albums.insert().values(track=track.id, album=album.id))
@@ -433,6 +445,12 @@ class MusicImporter:
                 session.add(contrib)
                 await session.flush()
                 contrib_by_name[artist.strip().lower()] = contrib
+            # Retag cleanup: drop stale artist links for this track.
+            await session.execute(
+                tracks_contributors.delete().where(
+                    (tracks_contributors.c.track == track.id)
+                    & (tracks_contributors.c.contributor != contrib.id)
+                    & (tracks_contributors.c.role == 1)))
             if (track.id, contrib.id) not in tc_set:
                 await session.execute(
                     tracks_contributors.insert().values(
