@@ -350,6 +350,11 @@ class EventMessage:
 # SlimProtoClient
 # ---------------------------------------------------------------------------
 
+#: A disconnected player is forgotten (removed from the registry) after this
+#: many seconds unless it reconnects first (Perl Slimproto.pm
+#: ``$forget_disconnected_time = 300``).
+FORGET_DISCONNECTED_TIME = 300
+
 
 class SlimProtoClient:
     """Async slimproto client — connects a player (or emulated player) to LMS.
@@ -405,6 +410,10 @@ class SlimProtoClient:
         # player disconnected while the other is alive (that broke
         # stop/play: "Cannot send command to disconnected player").
         self._player_connections: dict[str, int] = {}
+
+        # Forget tasks for disconnected players (Perl forget_disconnected_client):
+        # MAC-key -> task that unregisters the player after the grace period.
+        self._forget_tasks: dict[str, asyncio.Task] = {}
 
         # Server-side fields (populated after HELO)
         self._server_buffer_size: int = 0
@@ -798,6 +807,9 @@ class SlimProtoClient:
                         name_source=src, can_https=can_https,
                         supported_formats=_formats_for_model(model),
                     )
+                    # Reconnect: cancel any pending forget-disconnected timer
+                    # so the player's state (playlist/volume/position) survives.
+                    self._cancel_forget(mac_str)
                     logger.info("Squeezelite player registered: %s (%s) model=%s src=%s", reg_name, mac_str, model, src)
                 except Exception as exc:
                     logger.warning("Squeezelite register failed: %s", exc)
@@ -1038,9 +1050,16 @@ class SlimProtoClient:
                             if p is not None:
                                 p.connected = False
                         else:
-                            PlayerManager().unregister_player(mac_clean)
-                            logger.info("Player unregistered: %s", mac_clean)
-                            # Wake /slim/serverstatus Cometd subscribers
+                            # Perl forget_disconnected_client semantics: keep the
+                            # player's state (playlist/volume/position) across the
+                            # disconnect, mark it offline, and forget it after the
+                            # grace period unless it reconnects first.
+                            p = PlayerManager().get_player(mac_clean)
+                            if p is not None:
+                                p.connected = False
+                            self._schedule_forget(mac_clean)
+                            logger.info("Player disconnected (forget in %ds): %s",
+                                        FORGET_DISCONNECTED_TIME, mac_clean)
                             _notify_cometd_server_status()
                     else:
                         self._player_connections[key] = count
@@ -1049,6 +1068,39 @@ class SlimProtoClient:
             writer.close()
             await writer.wait_closed()
             logger.info("Player disconnected: %s", peer)
+
+    def _schedule_forget(self, mac_clean: str) -> None:
+        """Schedule unregistration of a disconnected player after the grace
+        period (Perl ``forget_disconnected_client``). Cancelled on reconnect.
+        """
+        key = mac_clean.replace(":", "").upper()
+
+        async def _forget() -> None:
+            await asyncio.sleep(FORGET_DISCONNECTED_TIME)
+            self._forget_tasks.pop(key, None)
+            try:
+                from lyrion.player.manager import PlayerManager
+                p = PlayerManager().get_player(mac_clean)
+                # Only forget players that are still offline — a player that
+                # reconnected between scheduling and firing must survive.
+                if p is not None and not p.connected:
+                    PlayerManager().unregister_player(mac_clean)
+                    logger.info("Forgot disconnected player: %s", mac_clean)
+                    _notify_cometd_server_status()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("forget disconnected player failed: %s", exc)
+
+        existing = self._forget_tasks.pop(key, None)
+        if existing is not None:
+            existing.cancel()
+        self._forget_tasks[key] = asyncio.create_task(_forget())
+
+    def _cancel_forget(self, mac_clean: str) -> None:
+        """Cancel a pending forget task (called when a player reconnects)."""
+        key = mac_clean.replace(":", "").upper()
+        task = self._forget_tasks.pop(key, None)
+        if task is not None:
+            task.cancel()
 
     async def _read_single_frame_from_reader(
         self,
