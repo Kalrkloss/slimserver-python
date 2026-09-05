@@ -2156,7 +2156,10 @@ class JSONRPCAPI:
                              "AND tc.role = 1")
             return rows, total, "artists_loop", "artists"
         if mode == "genres":
-            rows = q("SELECT DISTINCT genre AS genre FROM tracks "
+            # The genres table is not populated by the importer — use the
+            # track genre text, and expose it as a string id so the renderer
+            # (which reads r["id"]) never hits a KeyError.
+            rows = q("SELECT DISTINCT genre AS genre, genre AS id FROM tracks "
                      "WHERE genre != '' ORDER BY genre COLLATE NOCASE "
                      "LIMIT ? OFFSET ?", count, start)
             total = total_of("SELECT COUNT(DISTINCT genre) FROM tracks "
