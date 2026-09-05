@@ -9,12 +9,21 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Optional
 
 from sqlalchemy import select
+
+from lyrion.database.schema import (
+    Album,
+    Contributor,
+    Track,
+    albums_contributors,
+    tracks_albums,
+    tracks_contributors,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -231,12 +240,6 @@ class MusicImporter:
     async def _import_batch(self, session, extracted: list[tuple[Path, Any]]) -> None:
         """Import one batch with batch-level lookups (once per batch,
         not per track)."""
-        from sqlalchemy import select
-        from lyrion.database.schema import (
-            Album, Contributor, Track, albums_contributors,
-            tracks_albums, tracks_contributors,
-        )
-
         # Existing tracks for the batch URLs.
         urls = [_file_url(p) for p, _ in extracted]
         track_by_url: dict[str, Track] = {t.url: t for t in (
@@ -314,8 +317,6 @@ class MusicImporter:
         track_by_url: dict[str, Track],
     ) -> None:
         """Upsert one track (no joins — those run in _import_links)."""
-        from lyrion.database.schema import Track
-
         url = _file_url(file_path)
         title = (info.title or file_path.stem) if hasattr(info, "title") else file_path.stem
         mtime = getattr(info, "last_modified", None)
@@ -385,12 +386,6 @@ class MusicImporter:
         ta_set: set, tc_set: set, ac_set: set,
     ) -> None:
         """Album + contributor links for a track (Core inserts only)."""
-        from lyrion.database.schema import (
-            Album, Contributor, albums_contributors,
-            tracks_albums, tracks_contributors,
-        )
-        from sqlalchemy import select
-
         url = _file_url(file_path)
         track = track_by_url[url]
         artist = (info.artist or "Unknown Artist") if hasattr(info, "artist") else "Unknown Artist"
