@@ -1592,16 +1592,20 @@ class JSONRPCAPI:
             else:
                 send("stop")
         elif cmd == "mixer":
-            val = str(args[-1]) if args else ""
-            if val.isdigit():
-                player = pm.get_player(pid)
-                if player is not None:
-                    player.volume = int(val)
-                    # audg frame — text CLI does not exist on the
-                    # SlimProto channel.
-                    await pm.set_volume(pid, int(val))
-                else:
-                    send(f"mixer volume {val}")
+            # Only 'mixer volume <n>' touches the volume. bass/treble/pitch/
+            # muting are separate mixer controls and must NOT be routed to
+            # volume (Perl registers them independently in Slim/Control/Request.pm).
+            if args and str(args[0]).lower() == "volume" and len(args) > 1:
+                val = str(args[1])
+                if val.isdigit():
+                    player = pm.get_player(pid)
+                    if player is not None:
+                        player.volume = int(val)
+                        # audg frame — text CLI does not exist on the
+                        # SlimProto channel.
+                        await pm.set_volume(pid, int(val))
+                    else:
+                        send(f"mixer volume {val}")
         elif cmd == "playlist":
             sub = args[0] if args else ""
             rest = args[1:] if len(args) > 1 else []
@@ -1656,9 +1660,40 @@ class JSONRPCAPI:
                     player.playlist_position = int(idx)
                     await self._play_playlist_item(pm, player, int(idx))
             elif sub == "play":
-                # LMS-compatible 'playlist play [<index>|track_id:<n>|item_id:<n>|<url>]'
+                # LMS-compatible 'playlist play [<index>|track_id:<n>|item_id:<n>|album_id:<n>|artist_id:<n>|<url>]'
                 player = pm.get_player(pid)
                 if player is not None:
+                    tagged = {}
+                    for a in rest:
+                        s = str(a)
+                        if ":" in s:
+                            k, _, v = s.partition(":")
+                            tagged[k] = v
+                    if "album_id" in tagged or "artist_id" in tagged:
+                        # Expand to all tracks of the album/artist (one query).
+                        try:
+                            import sqlite3
+                            db = sqlite3.connect(f"file:{_library_db_path()}?mode=ro", uri=True)
+                            if "album_id" in tagged:
+                                rows = db.execute(
+                                    "SELECT t.id FROM tracks t JOIN tracks_albums ta ON ta.track = t.id "
+                                    "WHERE ta.album = ? ORDER BY t.tracknum, t.title",
+                                    (int(tagged["album_id"]),)).fetchall()
+                            else:
+                                rows = db.execute(
+                                    "SELECT t.id FROM tracks t JOIN tracks_contributors tc ON tc.track = t.id "
+                                    "WHERE tc.contributor = ? AND tc.role = 1 ORDER BY t.title",
+                                    (int(tagged["artist_id"]),)).fetchall()
+                            db.close()
+                            ids = [r[0] for r in rows]
+                            if ids:
+                                player.playlist = list(ids)
+                                player.playlist_total = len(ids)
+                                player.playlist_position = 0
+                                await self._play_playlist_item(pm, player, 0)
+                                return
+                        except Exception:
+                            pass
                     idx = player.playlist_position or 0
                     first = str(rest[0]).lower() if rest else ""
                     if first.startswith("item_id:"):
@@ -1702,6 +1737,20 @@ class JSONRPCAPI:
                 if player is not None:
                     player.playlist = []
                     player.playlist_total = 0
+            elif sub == "shuffle":
+                player = pm.get_player(pid)
+                if player is not None and rest:
+                    try:
+                        player.shuffle = max(0, min(2, int(str(rest[0]))))
+                    except ValueError:
+                        pass
+            elif sub == "repeat":
+                player = pm.get_player(pid)
+                if player is not None and rest:
+                    try:
+                        player.repeat = max(0, min(2, int(str(rest[0]))))
+                    except ValueError:
+                        pass
         else:
             send(f"{cmd} {' '.join(args)}")
 
