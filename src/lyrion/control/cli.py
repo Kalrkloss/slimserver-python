@@ -206,6 +206,20 @@ class CLIHandler:
         """Set the CLI authentication password (empty/None = no auth)."""
         self._auth_password = password
 
+    def check_password(self, password: str) -> bool:
+        """Return True if ``password`` grants CLI access.
+
+        With no server password configured (``_auth_password`` empty/None)
+        authentication is disabled and every password is accepted. Otherwise
+        the supplied password must match the configured one (constant-time
+        comparison to avoid timing side channels).
+        """
+        import hmac
+
+        if not self._auth_password:
+            return True
+        return hmac.compare_digest(str(password), self._auth_password)
+
     def set_dispatcher(self, dispatcher: "RequestDispatcher") -> None:
         """Set the request dispatcher."""
         self._dispatcher = dispatcher

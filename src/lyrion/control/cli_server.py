@@ -37,6 +37,14 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
     from lyrion.control.request import RequestDispatcher
 
     handler = CLIHandler(RequestDispatcher())
+    # Enable CLI authentication when a server password is configured.
+    try:
+        from lyrion.config import get_config
+        pw = get_config().get("password", "") or ""
+        if pw:
+            handler.set_auth_password(str(pw))
+    except Exception:  # noqa: BLE001
+        pass
     # The dispatcher is created per-connection here; start() flips it to
     # _running=True — without it every player_command (ir/display/…)
     # answers "server shutting down".

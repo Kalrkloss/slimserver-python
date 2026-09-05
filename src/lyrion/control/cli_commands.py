@@ -42,8 +42,7 @@ async def cmd_login(
         return ["login: "]
 
     password = args[0]
-    auth_ok = True  # TODO: compare against server settings
-    if auth_ok:
+    if handler.check_password(password):
         ctx.authenticated = True
         return ["login: 1"]
     else:
