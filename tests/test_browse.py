@@ -31,6 +31,30 @@ def _db(tmp_path):
     return str(db)
 
 
+def test_browselibrary_search_returns_matching_tracks(tmp_path, monkeypatch):
+    db = tmp_path / "lyrion.db"
+    con = sqlite3.connect(db)
+    con.executescript(
+        """
+        CREATE TABLE tracks (id INTEGER PRIMARY KEY, title TEXT);
+        INSERT INTO tracks (id, title) VALUES (1, 'Sunset Orion'), (2, 'Other Song');
+        """
+    )
+    con.commit()
+    con.close()
+    monkeypatch.setattr(api_mod, "_library_db_path", lambda: str(db))
+
+    async def run():
+        api = JSONRPCAPI()
+        return await api._json_browselibrary(
+            "browselibrary", ["items", "0", "10", "mode:search", "search:Sunset"])
+
+    result = asyncio.run(run())
+    loop = result.get("loop_loop") or []
+    assert len(loop) == 1, f"search must return only matches, got {loop}"
+    assert loop[0]["name"] == "Sunset Orion"
+
+
 def test_browselibrary_genres_returns_items(tmp_path, monkeypatch):
     db_path = _db(tmp_path)
     monkeypatch.setattr(api_mod, "_library_db_path", lambda: db_path)

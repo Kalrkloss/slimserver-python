@@ -2103,6 +2103,12 @@ class JSONRPCAPI:
                 go_params = {"year": r["year"]}
                 play_params = {"year": r["year"]}
                 icon = "html/images/years.png"
+            elif kind == "search":
+                ident, name = str(r["id"]), r.get("name") or ""
+                go = ["songinfo"]
+                go_params = {"track_id": r["id"]}
+                play_params = {"track_id": r["id"]}
+                icon = "html/images/search.png"
             elif kind == "folder":
                 ident, name = str(r["id"]), r["name"]
                 go = ["browselibrary", "items"]
@@ -2185,9 +2191,17 @@ class JSONRPCAPI:
                          "ORDER BY url LIMIT ? OFFSET ?", count, start)
             names = []
             for r in rows:
-                path = r["url"][len("file://"):].lstrip("/")
+                url = r["url"]
+                path = (url[len("file://"):].lstrip("/")
+                        if url.startswith("file://") else url.lstrip("/"))
                 if search:
-                    rel = path[len(search.rstrip("/")) + 1:]
+                    # Normalize search to the same form as path (no file://
+                    # prefix) — slicing by the original URI's length produced
+                    # garbage child names.
+                    s = search
+                    if s.startswith("file://"):
+                        s = s[len("file://"):].lstrip("/")
+                    rel = path[len(s.rstrip("/")) + 1:]
                     names.append(rel.split("/", 1)[0])
                 else:
                     parts = path.split("/")
@@ -2197,6 +2211,20 @@ class JSONRPCAPI:
                           else "file:///" + n, "name": n}
                          for n in names]
             return loop_rows, len(names), "musicfolder_loop", "folder"
+        if mode == "search":
+            # My Music → Suchen: search track titles (falling back to an
+            # empty list instead of dumping every album).
+            if not search:
+                return [], 0, "search_loop", "search"
+            like = f"%{search}%"
+            rows = q("SELECT DISTINCT t.id, t.title FROM tracks t "
+                     "WHERE t.title LIKE ? ORDER BY t.title COLLATE NOCASE "
+                     "LIMIT ? OFFSET ?", like, count, start)
+            total = total_of(
+                "SELECT COUNT(DISTINCT t.id) FROM tracks t WHERE t.title LIKE ?",
+                like)
+            rows = [{"id": r["id"], "name": r["title"] or ""} for r in rows]
+            return rows, total, "search_loop", "search"
         # fallback: albums
         return await self._library_rows("albums", start, count)
 

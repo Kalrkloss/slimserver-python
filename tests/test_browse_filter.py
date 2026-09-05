@@ -34,6 +34,32 @@ def _db(tmp_path):
     return str(db)
 
 
+def test_browselibrary_bmf_returns_child_folder_names(tmp_path, monkeypatch):
+    db = tmp_path / "lyrion.db"
+    con = sqlite3.connect(db)
+    con.executescript(
+        """
+        CREATE TABLE tracks (id INTEGER PRIMARY KEY, url TEXT);
+        INSERT INTO tracks (id, url) VALUES
+            (1, 'file:///music/Rock/a.mp3'), (2, 'file:///music/Jazz/b.mp3');
+        """
+    )
+    con.commit()
+    con.close()
+    monkeypatch.setattr(api_mod, "_library_db_path", lambda: str(db))
+
+    async def run():
+        api = JSONRPCAPI()
+        return await api._json_browselibrary(
+            "browselibrary", ["items", "0", "10", "mode:bmf",
+                              "search:file:///music"])
+
+    result = asyncio.run(run())
+    loop = result.get("loop_loop") or []
+    names = {it.get("name") for it in loop}
+    assert names == {"Rock", "Jazz"}, f"bmf child names wrong: {names}"
+
+
 def test_albums_artist_id_filters(tmp_path, monkeypatch):
     monkeypatch.setattr(api_mod, "_library_db_path", lambda: _db(tmp_path))
 
