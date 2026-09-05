@@ -159,7 +159,11 @@ class CometdManager:
                         player_id, "null", "00:00:00:00:00:00", ""):
                     continue
                 try:
-                    result = await self._dispatch([player_id, ["playerstatus", "-", "1"]])
+                    # Re-dispatch the ORIGINAL stored request (pagination/
+                    # menu/tags preserved) instead of a fixed short one.
+                    data = client.subscriptions.get(sub) or {}
+                    request = data.get("request") or [player_id, ["playerstatus", "-", "1"]]
+                    result = await self._dispatch(request)
                     self.push(client.client_id, {
                         "channel": sub,
                         "data": result,
@@ -326,7 +330,11 @@ class CometdManager:
             elif channel in ("/meta/unsubscribe", "/slim/unsubscribe"):
                 client = self.get(cid)
                 data = msg.get("data", {})
-                subscription = data.get("unsubscribe", "")
+                # Accept data.unsubscribe, data.subscription, or the TOP-LEVEL
+                # 'subscription' field (libcometd/Android send it top-level,
+                # like /meta/subscribe).
+                subscription = (data.get("unsubscribe") or data.get("subscription")
+                                or msg.get("subscription") or "")
                 if client is not None and subscription:
                     client.subscriptions.pop(subscription, None)
                 reply.update({"successful": client is not None})
