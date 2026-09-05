@@ -35,7 +35,7 @@ _EXT_MIME = {
     ".wv": "audio/x-wavpack",
 }
 
-_RANGE_RE = re.compile(r"bytes=(\d*)-(\d*)")
+_RANGE_RE = re.compile(r"^bytes=(\d+)-(\d*)$")
 
 
 def parse_pcm_header(path: Path) -> dict | None:
@@ -406,21 +406,32 @@ async def stream_track(scope: dict, receive, send) -> None:
     end = file_size - 1
     status = 200
 
-    m = _RANGE_RE.search(range_header)
+    m = _RANGE_RE.match(range_header)
     if m:
-        status = 206
-        if m.group(1):
-            start = max(int(m.group(1)), data_start)
-        if m.group(2):
-            end = min(int(m.group(2)), file_size - 1)
-        if start >= file_size:
+        # Single range "bytes=first[-last]" — Perl HTTP.pm supports no
+        # suffix form ("bytes=-N") and rejects inverted ranges (400).
+        first = int(m.group(1))
+        last = int(m.group(2)) if m.group(2) else file_size - 1
+        if first > file_size:
+            # invalid (past end of file) → 416
             await _send_simple(
                 send, 416,
-                f"Requested range not satisfiable: {start}-{end}",
+                f"Requested range not satisfiable: {first}-{last}",
                 "text/plain",
                 extra={"Content-Range": f"bytes */{file_size}"},
             )
             return
+        if last < first:
+            # invalid (first > last) → 400, like Perl
+            await _send_simple(send, 400, "Invalid range", "text/plain")
+            return
+        if last >= file_size:
+            last = file_size - 1
+        start = max(first, data_start)
+        end = last
+        status = 206
+    # else: unsupported range (suffix/multi-range/garbage) is ignored and the
+    # whole file is served as a 200 — exactly like the Perl LMS.
 
     length = end - start + 1
     response_headers = [
