@@ -2186,38 +2186,6 @@ class SlimProtoClient:
             return False
 
     # ------------------------------------------------------------------
-    # End-of-track handling
-    # ------------------------------------------------------------------
-
-
-async def _advance_after_track(pm, mac_str: str) -> None:
-    """Advance the playlist when the player reports track end (STAT STMd).
-
-    LMS behaviour: after the last track the player stops; otherwise the
-    next playlist item gets a new strm frame. Do NOT wrap around (LMS
-    default has repeat off).
-
-    A remote (radio) stream NEVER ends — an underrun there is just a
-    buffer hiccup, not track end. Never advance/stop on it.
-    """
-    try:
-        player = pm.get_player(mac_str)
-        if player is None or not player.playlist:
-            return
-        if getattr(player, "remote", 0):
-            logger.info("Underrun on remote stream %s — not a track end, "
-                        "keeping playback", mac_str)
-            return
-        if player.playlist_position < len(player.playlist) - 1:
-            logger.info("Track finished on %s — advancing playlist", mac_str)
-            await pm.playlist_next(mac_str)
-        else:
-            logger.info("Last track finished on %s — stopping", mac_str)
-            await pm.stop_player(mac_str)
-    except Exception as exc:
-        logger.warning("advance after track failed for %s: %s", mac_str, exc)
-
-    # ------------------------------------------------------------------
     # Convenience helpers
     # ------------------------------------------------------------------
 
@@ -2254,3 +2222,35 @@ async def _advance_after_track(pm, mac_str: str) -> None:
     async def send_anic(self, image_data: bytes) -> None:
         """Send ANIC (album art / now-playing image)."""
         await self._send_frame(CMD_ANIC, image_data)
+
+    # ------------------------------------------------------------------
+    # End-of-track handling
+    # ------------------------------------------------------------------
+
+
+async def _advance_after_track(pm, mac_str: str) -> None:
+    """Advance the playlist when the player reports track end (STAT STMd).
+
+    LMS behaviour: after the last track the player stops; otherwise the
+    next playlist item gets a new strm frame. Do NOT wrap around (LMS
+    default has repeat off).
+
+    A remote (radio) stream NEVER ends — an underrun there is just a
+    buffer hiccup, not track end. Never advance/stop on it.
+    """
+    try:
+        player = pm.get_player(mac_str)
+        if player is None or not player.playlist:
+            return
+        if getattr(player, "remote", 0):
+            logger.info("Underrun on remote stream %s — not a track end, "
+                        "keeping playback", mac_str)
+            return
+        if player.playlist_position < len(player.playlist) - 1:
+            logger.info("Track finished on %s — advancing playlist", mac_str)
+            await pm.playlist_next(mac_str)
+        else:
+            logger.info("Last track finished on %s — stopping", mac_str)
+            await pm.stop_player(mac_str)
+    except Exception as exc:
+        logger.warning("advance after track failed for %s: %s", mac_str, exc)
