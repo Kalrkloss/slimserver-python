@@ -1772,6 +1772,9 @@ class JSONRPCAPI:
             player.playlist_position = idx
             if isinstance(item, int):
                 player.current_track_id = item
+                player.remote = 0  # local track
+            else:
+                player.remote = 1  # live stream: never "track end"
             pm.set_mode(player.mac, "play")
             ok = True
             if isinstance(item, int):
