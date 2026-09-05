@@ -1,6 +1,7 @@
 """Player manager for Pyrion Music Server."""
 from __future__ import annotations
 
+import asyncio
 import logging
 import struct
 import time
@@ -387,7 +388,16 @@ class PlayerManager:
             return
         player.power = on
         player.update_activity()
-        self.send_command(mac, "power" if on else "power!")
+        if not on:
+            # Power off = stop playback (SlimProto strm 'q') + standby. The
+            # stop-frame send is async; schedule it on the running loop (all
+            # callers are async: JSON-RPC/CLI/alarm wake).
+            player.mode = "stop"
+            try:
+                loop = asyncio.get_running_loop()
+                loop.create_task(self.stop_player(mac))
+            except RuntimeError:
+                pass  # no running loop — state-only fallback
         logger.debug("Player %s power: %s", mac, "on" if on else "off")
 
     async def set_volume(self, mac: str, volume: int) -> bool:
