@@ -225,15 +225,17 @@ async def _run_server(
             # see no updates while a player is idle and reconnect).
             asyncio.create_task(cometd_mgr.keepalive_loop())
 
-            # Installed (site-packages) checkouts: src/lyrion lives under
-            # site-packages, so parent.parent.parent is the venv root — fall
-            # back to the repository checkout layout when html/ is missing.
+            # html/ lives at the repo root for editable/checkout installs
+            # (src/lyrion -> root) and INSIDE the package for wheel installs
+            # (hatchling force-include "html" -> "lyrion/html").
             import lyrion as _lyrion_pkg
             _pkg_dir = Path(_lyrion_pkg.__file__).resolve().parent
-            base_dir = _pkg_dir.parent.parent  # .../src/lyrion -> repo root
-            if not (base_dir / "html").is_dir():
-                base_dir = Path.cwd()
-            static_dir = str(base_dir / "html")
+            html_dir = _pkg_dir / "html"          # wheel install
+            if not html_dir.is_dir():
+                html_dir = _pkg_dir.parent.parent / "html"  # checkout layout
+            if not html_dir.is_dir():
+                html_dir = Path.cwd() / "html"    # last resort
+            static_dir = str(html_dir)
             config_uvicorn = create_config(
                 host="0.0.0.0",
                 port=http_port,
