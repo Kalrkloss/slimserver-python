@@ -20,6 +20,63 @@ from .cometd import LONG_POLL_TIMEOUT, CometdManager
 logger = logging.getLogger(__name__)
 
 
+def _authorize(scope: dict, authorize: bool, username: str, password: str) -> bool:
+    """Return True if the request is authorized.
+
+    When ``authorize`` is False (the default), every request passes.
+    Otherwise the request must carry a Basic-Auth header matching
+    ``username``/``password`` (constant-time comparison). Mirrors the
+    Perl LMS ``Slim::Web::HTTP`` ``authorize``/``checkAuthorization`` path.
+    """
+    import base64
+    import hmac
+
+    if not authorize:
+        return True
+    headers = {k.decode("latin1").lower(): v.decode("latin1")
+               for k, v in scope.get("headers", [])}
+    auth = headers.get("authorization", "")
+    if not auth.startswith("Basic "):
+        return False
+    try:
+        decoded = base64.b64decode(auth[6:].strip()).decode("utf-8")
+    except Exception:
+        return False
+    user, _, pwd = decoded.partition(":")
+    return hmac.compare_digest(user, username) and hmac.compare_digest(pwd, password)
+
+
+def _auth_config() -> tuple[bool, str, str]:
+    """Read (authorize, username, password) from the active config.
+
+    Defensive boolean coercion: the preference store may return the raw
+    string ``"0"``/``"1"`` for a bool pref, and ``"0"`` is truthy.
+    """
+    try:
+        from lyrion.config import get_config
+        cfg = get_config()
+        raw = str(cfg.get("authorize", 0) or 0)
+        authorize = raw.lower() in ("1", "true", "yes", "on")
+        username = str(cfg.get("username", "") or "")
+        password = str(cfg.get("password", "") or "")
+        return authorize, username, password
+    except Exception:
+        return False, "", ""
+
+
+async def _respond_401(send) -> None:
+    await send({
+        "type": "http.response.start",
+        "status": 401,
+        "headers": [
+            (b"content-type", b"text/plain"),
+            (b"content-length", b"12"),
+            (b"www-authenticate", b'Basic realm="Pyrion Music Server"'),
+        ],
+    })
+    await send({"type": "http.response.body", "body": b"Unauthorized"})
+
+
 async def _handle_streaming_connect(
     cometd: CometdManager,
     cid: str,
@@ -253,6 +310,12 @@ def create_app(
         """ASGI application entry point."""
         method = scope.get("method", "GET")
         path = scope.get("path", "/")
+
+        # Authorization gate (Perl 'authorize' pref → Basic-auth required).
+        authorize, username, password = _auth_config()
+        if not _authorize(scope, authorize, username, password):
+            await _respond_401(send)
+            return
 
         # Audio streaming gets a dedicated path (needs chunked body sends).
         if path.startswith("/stream") and method == "GET":
