@@ -283,14 +283,31 @@ class CLIHandler:
         as line end, reply after every line) — NOT blank-line terminated.
         Each non-empty line is a complete command.
         """
+        buf = b""
         while True:
-            line_bytes = await reader.readline()
-            if not line_bytes:
+            chunk = await reader.read(4096)
+            if not chunk:
                 break  # EOF
-            line_bytes = line_bytes.rstrip(b"\r\n\x00")
-            if not line_bytes:
-                continue  # blank line: separator only, no command
-            request = line_bytes.decode("utf-8", errors="replace")
+            buf += chunk
+            while True:
+                term = min(
+                    (i for i in (buf.find(b"\n"), buf.find(b"\r"),
+                                 buf.find(b"\x00")) if i != -1),
+                    default=-1,
+                )
+                if term == -1:
+                    break
+                line = buf[:term]
+                buf = buf[term + 1:]
+                line = line.strip()
+                if not line:
+                    continue
+                request = line.decode("utf-8", errors="replace")
+                cmd_name, args = self._parse_request(request)
+                yield cmd_name, args
+        # Leftover bytes at EOF without a trailing terminator.
+        if buf.strip():
+            request = buf.decode("utf-8", errors="replace")
             cmd_name, args = self._parse_request(request)
             yield cmd_name, args
 
@@ -299,13 +316,15 @@ class CLIHandler:
 
         LMS CLI parameters are percent-escaped (URL style, e.g.
         'The%20Clash' → 'The Clash'); the command name itself is not.
+        The first token is also decoded so a percent-escaped player MAC
+        (e.g. 'aa%3Abb…') binds the player correctly.
         """
         from urllib.parse import unquote
 
         parts = shlex.split(request)
         if not parts:
             return "", []
-        return parts[0].lower(), [unquote(p) for p in parts[1:]]
+        return unquote(parts[0]).lower(), [unquote(p) for p in parts[1:]]
 
     # -----------------------------------------------------------------------
     # Command dispatch
