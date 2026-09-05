@@ -2602,9 +2602,12 @@ class WebAPIHandler:
         if rel.startswith("html/"):
             rel = rel[len("html/"):]
 
-        file_path = self._static_dir / rel
-        # Security: prevent directory traversal
-        if not str(file_path).startswith(str(self._static_dir.resolve())):
+        # Resolve the real path and enforce it stays inside the static root.
+        # A naive string-prefix check on the unresolved path is bypassable
+        # (e.g. "html/../secret.txt" literally starts with "html/").
+        base = self._static_dir.resolve()
+        file_path = (self._static_dir / rel).resolve()
+        if not file_path.is_relative_to(base):
             return 403, {}, b"Forbidden"
 
         if not file_path.is_file():

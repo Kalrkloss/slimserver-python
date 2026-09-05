@@ -3,7 +3,7 @@
   "kind": "python-module",
   "bootstrap": ["pip install -e .[dev]"],
   "build": [],
-  "test": ["python3 -m compileall -q src/", "LMS_TEST_SPAWN=1 python3 -m pytest -m contract -q"],
+  "test": ["python3 -m compileall -q src/", "LMS_TEST_SPAWN=1 python3 -m pytest -q"],
   "start": null,
   "port": null,
   "readinessPath": null
