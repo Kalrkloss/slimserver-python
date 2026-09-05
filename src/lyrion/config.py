@@ -120,7 +120,7 @@ class PreferenceStore:
     validation, and change-tracking.
     """
 
-    __slots__ = ("_db_path", "_db", "_cache", "_cli_overrides", "_loaded")
+    __slots__ = ("_db_path", "_db", "_cache", "_meta_cache", "_cli_overrides", "_loaded")
 
     _instance: PreferenceStore | None = None
 
@@ -131,6 +131,8 @@ class PreferenceStore:
         self._db_path: Path = Path(db_path) if db_path else Path.home() / ".lyrion" / "prefs.db"
         self._db: aiosqlite.Connection | None = None
         self._cache: dict[str, str] = {}
+        # prefmeta rows (name -> row) for synchronous type coercion.
+        self._meta_cache: dict[str, dict] = {}
         self._cli_overrides: dict[str, Any] = {}
         self._loaded = False
 
@@ -178,6 +180,16 @@ class PreferenceStore:
         async with self._db.execute("SELECT name, value FROM prefhash") as cur:
             rows = await cur.fetchall()
         self._cache = {row["name"]: row["value"] for row in rows}
+        # Cache prefmeta (types/defaults) too, so the sync get() can coerce
+        # int/bool prefs without an async fetch.
+        async with self._db.execute(
+                "SELECT name, default_value, type FROM prefmeta") as cur2:
+            meta_rows = await cur2.fetchall()
+        self._meta_cache = {
+            r["name"]: {"name": r["name"], "default_value": r["default_value"],
+                        "type": r["type"]}
+            for r in meta_rows
+        }
 
     async def _save(self, name: str, value: str) -> None:
         """Persist a single preference to the database."""
@@ -230,27 +242,15 @@ class PreferenceStore:
         type_name = meta_row["type"] if meta_row else "string"
         return self._coerce_type(value_str, type_name, default)
 
-    def _get_meta_sync(self, name: str) -> aiosqlite.Row | None:
-        """Synchronously fetch preference metadata (runs in executor)."""
-        # This is called from sync get(); run in thread to avoid blocking
-        import asyncio
+    def _get_meta_sync(self, name: str) -> dict | None:
+        """Return the cached prefmeta row for ``name`` (for type coercion).
 
-        try:
-            loop = asyncio.get_running_loop()
-
-            async def _fetch() -> aiosqlite.Row | None:
-                if self._db is None:
-                    return None
-                async with self._db.execute(
-                    "SELECT * FROM prefmeta WHERE name = ?", (name,)
-                ) as cur:
-                    return await cur.fetchone()
-
-            future = loop.create_task(_fetch())
-                # We'll check this in a sync context below - avoid deadlock
-            return None  # fallback; will be refined
-        except Exception:
-            return None
+        The meta rows are loaded into ``_meta_cache`` at init, so the sync
+        ``get()`` never needs an async fetch (the old implementation created
+        a task it never awaited and always returned None → every pref came
+        back as a string).
+        """
+        return self._meta_cache.get(name)
 
     @staticmethod
     def _coerce_type(value: str, type_name: str, default: Any) -> Any:
@@ -311,6 +311,10 @@ class PreferenceStore:
         # If not in cache, load default
         if name not in self._cache and default is not None:
             self._cache[name] = default_str
+        # Keep the in-memory meta cache in sync so sync get() sees the type.
+        self._meta_cache[name] = {
+            "name": name, "default_value": default_str, "type": type_name,
+        }
 
     async def all_by_category(self, category: str) -> dict[str, Any]:
         """Return all preferences in a given category."""
