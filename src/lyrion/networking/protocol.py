@@ -2191,24 +2191,31 @@ class SlimProtoClient:
                     elif event == "STMs":
                         # TRACK_STARTED — a new track started playing
                         player.mode = "play"
+                        player.pause_requested = False
                         player._track_started_at = time.time()
                     elif event == "STMf":
                         # FLUSH/STOP ack — the player stopped; mark stop
                         # only if the server didn't already (natural end
-                        # vs. user stop).
+                        # vs. user stop / pause-stop).
                         if player.mode not in ("pause",):
                             player.mode = "stop"
+                            player.pause_requested = False
+                        else:
+                            player.pause_requested = False  # pause-ack
                     elif event == "STMp":
                         # PAUSE ack
                         player.mode = "pause"
+                        player.pause_requested = False
                     elif event == "STMr":
                         # RESUME ack
                         player.mode = "play"
+                        player.pause_requested = False
                     elif event == "STMn":
                         # DECODE_ERROR — the player could not decode the
                         # stream; log and fall back to stop.
                         logger.warning("STAT STMn (decode error) from %s", mac_str)
                         player.mode = "stop"
+                        player.pause_requested = False
                     elif event in ("STMo", "STMu"):
                         # OUTPUT_UNDERRUN (STMo legacy / STMu current) —
                         # harmless mid-stream, BUT when the decoder has
@@ -2222,12 +2229,22 @@ class SlimProtoClient:
                             asyncio.create_task(_advance_after_track(pm, mac_str))
                     elif event == "pause":
                         player.mode = "pause"
+                        player.pause_requested = False
                     elif event == "stop":
-                        player.mode = "stop"
+                        # A pause is implemented as strm 'q' (firmware does
+                        # not honour strm 'p') — the resulting STAT stop is
+                        # the pause-ack and must keep mode="pause".
+                        if player.pause_requested:
+                            player.pause_requested = False
+                            player.mode = "pause"
+                        else:
+                            player.mode = "stop"
                     elif event == "play":
                         player.mode = "play"
+                        player.pause_requested = False
                     elif event == "load":
                         player.mode = "loading"
+                        player.pause_requested = False
                     player.last_activity = __import__("time").time()
                     # Wake CLI subscribers so they push the fresh status.
                     try:

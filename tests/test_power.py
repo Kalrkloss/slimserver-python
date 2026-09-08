@@ -18,6 +18,9 @@ class _FakeHandler:
         self.stopped.append(mac)
         return True
 
+    async def send_remote_stream(self, mac, url, codec):
+        return True
+
 
 def _fresh_pm():
     pm = object.__new__(PlayerManager)
@@ -61,3 +64,39 @@ def test_power_off_sends_stop_frame():
 
     stopped = asyncio.run(run())
     assert stopped == ["02:11:22:33:44:55"]
+
+
+def test_pause_sets_intent_that_stop_ack_must_not_overwrite():
+    """Pause = strm 'q' (firmware workaround); the player's STAT stop-ack
+    must keep mode 'pause' (protocol.py consumes pause_requested)."""
+
+    async def run():
+        pm = _fresh_pm()
+        p = _player(pm)
+        p.mode = "play"
+        p.current_url = "http://radio.example/x"
+        p.remote = 1
+        ok = await pm.pause_player(p.mac, True)
+        return ok, p.mode, p.pause_requested
+
+    ok, mode, flagged = asyncio.run(run())
+    assert ok
+    assert mode == "pause"
+    assert flagged is True, "STAT stop-ack needs the intent to keep 'pause'"
+
+
+def test_resume_clears_pause_intent():
+    async def run():
+        pm = _fresh_pm()
+        p = _player(pm)
+        p.mode = "pause"
+        p.pause_requested = True
+        p.current_url = "http://radio.example/x"
+        p.current_track_id = None
+        p.remote = 1
+        ok = await pm.pause_player(p.mac, False)
+        return ok, p.pause_requested
+
+    ok, flagged = asyncio.run(run())
+    assert ok
+    assert flagged is False

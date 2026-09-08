@@ -393,6 +393,7 @@ class PlayerManager:
             # stop-frame send is async; schedule it on the running loop (all
             # callers are async: JSON-RPC/CLI/alarm wake).
             player.mode = "stop"
+            player.pause_requested = False  # real stop supersedes a pause
             try:
                 loop = asyncio.get_running_loop()
                 loop.create_task(self.stop_player(mac))
@@ -591,6 +592,8 @@ class PlayerManager:
         if handler is None:
             logger.warning("play_track: no protocol handler wired")
             return False
+        # A fresh play supersedes any pending pause state.
+        player.pause_requested = False
         # The HTTP proxy endpoint resolves a request without ?id= through the
         # player's playlist, exactly like LMS. Populate state before sending:
         # Squeezelite can connect immediately after receiving the strm frame.
@@ -648,6 +651,8 @@ class PlayerManager:
         if handler is None:
             logger.warning("play_url: no protocol handler wired")
             return False
+        # A fresh play supersedes any pending pause state.
+        player.pause_requested = False
         # Set the URL before sending strm: the player may open the HTTP
         # connection before this coroutine gets another scheduling point.
         old_playlist = player.playlist
@@ -686,6 +691,8 @@ class PlayerManager:
         handler = self._protocol_handler
         if handler is None:
             return False
+        # An explicit stop ends any pending pause.
+        player.pause_requested = False
         ok = await handler.send_stop_to_player(player.mac)
         if ok:
             player.mode = "stop"
@@ -723,9 +730,13 @@ class PlayerManager:
             ok = await handler.send_stop_to_player(player.mac)
             if ok:
                 player.mode = "pause"
+                # The player answers the stop with a STAT stop event that
+                # must NOT overwrite the pause state (see protocol.py).
+                player.pause_requested = True
                 player.last_activity = time.time()
             return ok
         # resume — restart the current item, then restore the position
+        player.pause_requested = False
         saved = float(getattr(player, "elapsed", 0) or 0)
         is_stream = self._current_is_stream(player)
         if is_stream:

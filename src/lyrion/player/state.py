@@ -34,6 +34,9 @@ class PlayerState:
     power: bool = False
     volume: int = 50
     mode: Literal["stop", "play", "pause", "loading"] = "stop"
+    # True between a pause command (strm 'q' stop-workaround) and the
+    # player's STAT stop-ack: the ack must NOT flip mode back to "stop".
+    pause_requested: bool = False
     current_track_id: Optional[int] = None
     # P6-1: fields used by the status handlers were set via setattr —
     # declare them so tooling/linters see them and typos fail early.
