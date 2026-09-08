@@ -34,11 +34,24 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class ImportConfig:
-    """Configuration for music import."""
+    """Configuration for music import.
+
+    ``mode`` mirrors the LMS rescan modes (Slim/Control/Commands.pm
+    rescanCommand): the default "full" scan reconciles deletions (tracks
+    whose files vanished are removed together with orphaned albums/
+    contributors); any other mode is an additive refresh that never
+    deletes.
+    """
 
     source_path: Path = Path("/mnt/media/Musik")
     batch_size: int = 100
     overwrite_existing: bool = False
+    mode: str = "full"
+
+    @property
+    def delete_missing(self) -> bool:
+        """Only a full rescan may remove tracks that are gone from disk."""
+        return self.mode in ("", "normal", "full")
 
 
 @dataclass
@@ -51,6 +64,7 @@ class ImportStats:
     skipped_files: int = 0
     error_files: int = 0
     scanned_files: int = 0
+    deleted_files: int = 0
     start_time: Optional[datetime] = None
     end_time: Optional[datetime] = None
 
@@ -133,15 +147,27 @@ class MusicImporter:
 
         file_q: _queue.Queue = _queue.Queue(maxsize=2000)
         SENTINEL = object()
+        # URLs of every file the walk discovers — used by the deletion
+        # reconciliation after a FULL scan (additive scans skip this).
+        found_urls: set[str] | None = (set() if self.config.delete_missing
+                                       else None)
+        # Set by the consumer when abortscan arrived; the producer polls it
+        # so a long gvfs walk stops quickly instead of draining fully.
+        abort_ev = _threading.Event()
 
         def _produce() -> None:
             try:
                 for p in self.config.source_path.rglob("*"):
+                    if abort_ev.is_set():
+                        logger.info("Scan walk aborted — stopping walker")
+                        break
                     if p.is_file() and p.suffix.lower().lstrip(".") in SUPPORTED_EXTENSIONS:
                         name = p.name.lower()
                         if name.startswith(".") or name in ("desktop.ini", "thumbs.db"):
                             continue
                         file_q.put(p)
+                        if found_urls is not None:
+                            found_urls.add(_file_url(p))
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Walk aborted: %s", exc)
             finally:
@@ -154,6 +180,7 @@ class MusicImporter:
         batch: list[Path] = []
         sem = asyncio.Semaphore(8)
         total_seen = 0
+        aborted = False
 
         async def _extract(file_path: Path) -> tuple[Path, Any] | None:
             async with sem:
@@ -181,6 +208,17 @@ class MusicImporter:
                 break
             self.stats.total_files = max(self.stats.total_files, total_seen)
 
+            # Abort (abortscan): stop importing, discard the pending batch,
+            # keep draining the queue until the walker's SENTINEL so the
+            # producer thread never blocks on a full queue.
+            if SCAN_STATE.abort_requested:
+                aborted = True
+                abort_ev.set()
+                logger.info("Scan aborted — discarding %d queued file(s)",
+                            len(batch))
+                batch = []
+                continue
+
             # Phase 1: metadata extraction (parallel, no DB). The mutagen
             # C calls release the GIL in worker threads.
             extracted: list[tuple[Path, Any]] = []
@@ -204,16 +242,96 @@ class MusicImporter:
             logger.info("Imported %d/%d+ files", self.stats.scanned_files,
                         total_seen)
 
+        walker.join(timeout=10)
         self.stats.end_time = datetime.now()
+
+        # Deletion reconciliation: a full scan removes tracks whose files
+        # are no longer on disk (plus orphaned albums/contributors). Never
+        # run on an aborted scan, and never when the walk found nothing
+        # (a wrong/empty musicdir must not wipe the library).
+        if not aborted and found_urls is not None and found_urls:
+            self.stats.deleted_files = await self._reconcile_deletions(
+                found_urls)
+
         self._emit_progress()
         SCAN_STATE.finish()
         logger.info(
-            "Import complete: %d imported, %d errors, %d total "
+            "Import complete: %d imported, %d deleted, %d errors, %d total "
             "(took %.1fs)",
-            self.stats.imported_files, self.stats.error_files, self.stats.total_files,
+            self.stats.imported_files, self.stats.deleted_files,
+            self.stats.error_files, self.stats.total_files,
             (self.stats.end_time - self.stats.start_time).total_seconds(),
         )
         return self.stats
+
+    async def _reconcile_deletions(self, found_urls: set[str]) -> int:
+        """Remove tracks whose files disappeared since the last full scan.
+
+        Only tracks outside the freshly-walked URL set are deleted; join
+        rows cascade (FK ON), orphaned albums/contributors/genres without
+        any remaining track are removed too (Perl full-rescan semantics).
+        Returns the number of deleted tracks.
+        """
+        from lyrion.database.sqlite_helper import db_session
+        from sqlalchemy import text
+
+        if not found_urls:
+            logger.warning("Full scan found no files — refusing deletion "
+                           "reconciliation")
+            return 0
+
+        async with db_session() as session:
+            rows = await session.execute(text("SELECT url FROM tracks"))
+            db_urls = {row[0] for row in rows}
+            missing = sorted(db_urls - found_urls)
+            if not missing:
+                return 0
+            # Chunked deletes stay under SQLite's per-statement variable
+            # limit even for 50k+ track libraries.
+            for i in range(0, len(missing), 900):
+                chunk = missing[i:i + 900]
+                binds = ", ".join(f":p{n}" for n in range(len(chunk)))
+                await session.execute(
+                    text(f"DELETE FROM tracks WHERE url IN ({binds})"),
+                    {f"p{n}": url for n, url in enumerate(chunk)})
+            # Explicit join-row + orphan cleanup — required both when the
+            # FK pragma is off (tests, legacy connections) and to drop
+            # albums/contributors/genres that no track references anymore
+            # (the FK cascades only reach the join tables).
+            await session.execute(text(
+                "DELETE FROM tracks_albums WHERE track NOT IN "
+                "(SELECT id FROM tracks)"))
+            await session.execute(text(
+                "DELETE FROM tracks_albums WHERE album NOT IN "
+                "(SELECT id FROM albums)"))
+            await session.execute(text(
+                "DELETE FROM tracks_contributors WHERE track NOT IN "
+                "(SELECT id FROM tracks)"))
+            await session.execute(text(
+                "DELETE FROM tracks_contributors WHERE contributor NOT IN "
+                "(SELECT id FROM contributors)"))
+            await session.execute(text(
+                "DELETE FROM tracks_genres WHERE track NOT IN "
+                "(SELECT id FROM tracks)"))
+            await session.execute(text(
+                "DELETE FROM albums_contributors WHERE album NOT IN "
+                "(SELECT id FROM albums)"))
+            await session.execute(text(
+                "DELETE FROM albums_contributors WHERE contributor NOT IN "
+                "(SELECT id FROM contributors)"))
+            await session.execute(text(
+                "DELETE FROM albums WHERE id NOT IN "
+                "(SELECT DISTINCT album FROM tracks_albums)"))
+            await session.execute(text(
+                "DELETE FROM contributors WHERE id NOT IN "
+                "(SELECT DISTINCT contributor FROM tracks_contributors)"))
+            await session.execute(text(
+                "DELETE FROM genres WHERE id NOT IN "
+                "(SELECT DISTINCT genre FROM tracks_genres)"))
+            await session.commit()
+            logger.info("Deletion reconciliation removed %d track(s)",
+                        len(missing))
+            return len(missing)
 
     # -- file collection ----------------------------------------------------
 

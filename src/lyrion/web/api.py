@@ -128,6 +128,7 @@ class JSONRPCAPI:
         self.register("playlist.prev", self._playlist_prev)
         self.register("slim.request", self._slim_request)
         self.register("rescan", self._rescan)
+        self.register("abortscan", self._abortscan)
 
     def register(self, name: str, method: Callable) -> None:
         """Register a method.
@@ -978,10 +979,18 @@ class JSONRPCAPI:
         except Exception as e:
             return {"error": str(e)}
 
-    async def _rescan(self, mode: str = "normal") -> Any:
-        """Direct rescan — triggers MusicImporter in background."""
+    async def _rescan(self, mode: str = "full") -> Any:
+        """Direct rescan — triggers MusicImporter in background.
+
+        ``mode`` mirrors the LMS rescan modes (Commands.pm rescanCommand):
+        the default full rescan reconciles deletions; other modes are
+        additive refreshes that never delete.
+        """
         import asyncio as _asyncio
         from pathlib import Path as _Path
+
+        mode = (str(mode) or "full").strip().lower() or "full"
+
         async def _do():
             from lyrion.config import get_config
             from lyrion.media.importer import MusicImporter, ImportConfig
@@ -993,11 +1002,19 @@ class JSONRPCAPI:
                     "Preference 'musicdir' is empty — falling back to %s "
                     "(set it via serverpref)", fallback)
                 musicdir = str(fallback)
-            importer = MusicImporter(ImportConfig(source_path=_Path(musicdir)))
+            importer = MusicImporter(ImportConfig(source_path=_Path(musicdir),
+                                                  mode=mode))
             stats = await importer.import_music()
             return stats
+
         _asyncio.create_task(_do())
         return {"status": "rescan started", "mode": mode}
+
+    async def _abortscan(self) -> Any:
+        """Direct abortscan — stops the running library scan (Perl parity)."""
+        from lyrion.media.scan_state import SCAN_STATE
+        SCAN_STATE.request_abort()
+        return {"status": "abort requested"}
 
     # ─────────────────────────────────────────────────────────────
     # slim.request JSON helpers

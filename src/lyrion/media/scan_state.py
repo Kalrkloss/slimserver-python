@@ -23,6 +23,7 @@ class ScanState:
             self.progress: int = 0  # 0..100
             self.total_files: int = 0
             self.done_files: int = 0
+            self._abort = False
 
     def start(self, total: int = 0) -> None:
         with self._lock:
@@ -30,6 +31,19 @@ class ScanState:
             self.progress = 0
             self.total_files = max(0, int(total))
             self.done_files = 0
+            # Abort is per-scan: a fresh scan starts with a clean flag
+            # (Perl Slim::Music::Import->abortScan semantics).
+            self._abort = False
+
+    def request_abort(self) -> None:
+        """Ask the running scan to stop (abortscan)."""
+        with self._lock:
+            self._abort = True
+
+    @property
+    def abort_requested(self) -> bool:
+        with self._lock:
+            return self._abort
 
     def update(self, done: int, total: int | None = None) -> None:
         with self._lock:

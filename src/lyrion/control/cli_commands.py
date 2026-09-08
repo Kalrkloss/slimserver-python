@@ -650,7 +650,12 @@ async def cmd_abortscan(
     ctx: CLIContext,
     args: list[str],
 ) -> list[str]:
-    """abortscan — cancel a running rescan (best effort)."""
+    """abortscan — cancel a running rescan (Perl Slim::Music::Import->abortScan)."""
+    try:
+        from lyrion.media.scan_state import SCAN_STATE
+        SCAN_STATE.request_abort()
+    except Exception:  # noqa: BLE001
+        pass
     return ["abortscan: ok", ""]
 
 
@@ -2012,8 +2017,14 @@ async def cmd_rescan(
     ctx: CLIContext,
     args: list[str],
 ) -> list[str]:
-    """rescan [once] — trigger a media library rescan in the background."""
-    mode = args[0] if args else "normal"
+    """rescan [<mode>] — trigger a media library rescan in the background.
+
+    <mode> mirrors the LMS rescan modes: default "full" (reconciles
+    deletions), "playlists" etc. are additive refreshes.
+    """
+    mode = (args[0] if args and args[0] else "full").strip().lower()
+    if mode in ("1", "once"):
+        mode = "full"
     try:
         import asyncio
 
@@ -2032,7 +2043,8 @@ async def cmd_rescan(
                         "Preference 'musicdir' is empty — falling back to %s "
                         "(set it via serverpref)", fallback)
                     musicdir = str(fallback)
-                imp = MusicImporter(ImportConfig(source_path=_Path(musicdir)))
+                imp = MusicImporter(ImportConfig(source_path=_Path(musicdir),
+                                                 mode=mode))
                 await imp.import_music()
             except Exception as exc:  # noqa: BLE001
                 import logging

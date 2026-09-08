@@ -93,6 +93,17 @@ async def init_db(
         poolclass=AsyncAdaptedQueuePool,
     )
 
+    # PRAGMA foreign_keys is per-connection — the pragma run in
+    # _create_schema applies only to that throwaway connection. Without it
+    # on every pooled connection the schema's ondelete CASCADE/SET NULL
+    # never fire and orphaned join rows/albums accumulate after track
+    # deletes (e.g. rescan deletion reconciliation).
+    @event.listens_for(_db_engine.sync_engine, "connect")
+    def _set_sqlite_pragma(dbapi_connection, connection_record):  # noqa: ARG001
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA foreign_keys = ON")
+        cursor.close()
+
     _session_factory = async_sessionmaker(
         _db_engine,
         class_=AsyncSession,
