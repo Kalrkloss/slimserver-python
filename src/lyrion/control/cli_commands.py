@@ -2035,7 +2035,6 @@ async def cmd_rescan(
                 import logging as _logging
                 from pathlib import Path as _Path
                 from lyrion.config import get_config
-                from lyrion.media.importer import ImportConfig, MusicImporter
                 musicdir = get_config().get("musicdir", "") or ""
                 if not str(musicdir).strip():
                     fallback = _Path.home() / "Music"
