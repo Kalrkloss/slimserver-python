@@ -114,9 +114,50 @@ async def init_db(
 
     # Create schema
     await _create_schema(_db_engine)
+    # Additive migration for DBs created before a schema change: new
+    # columns/indexes are never added to existing tables by create_all.
+    await migrate_legacy_db(_db_engine)
 
     logger.info("Database initialized at %s", db_path)
     return _db_engine
+
+
+async def migrate_legacy_db(engine: AsyncEngine) -> list[str]:
+    """Apply additive migrations to DBs from older server versions.
+
+    create_all only creates MISSING tables — columns added to the schema
+    later never appear on existing DBs. Each migration is idempotent and
+    guarded by a PRAGMA table_info check.
+
+    2026-09 (album identity = title + album artist): add the nullable
+    ``albums.albumartist_sort`` column. The unique index is intentionally
+    NOT recreated here — legacy rows have no artist key, backfilling one
+    would either violate uniqueness (same-title albums split by year) or
+    mislabel artists; one full rescan under the new importer converges
+    (old rows lose their tracks via retag, orphan cleanup removes them).
+
+    Returns the list of applied migration names.
+    """
+    applied: list[str] = []
+
+    def _ensure_albums_artist_sort(sync_conn) -> bool:
+        cols = [r[1] for r in
+                sync_conn.exec_driver_sql("PRAGMA table_info(albums)")]
+        if "albumartist_sort" not in cols:
+            sync_conn.exec_driver_sql(
+                "ALTER TABLE albums ADD COLUMN albumartist_sort VARCHAR(255)")
+            return True
+        return False
+
+    try:
+        async with engine.begin() as conn:
+            changed = await conn.run_sync(_ensure_albums_artist_sort)
+        if changed:
+            applied.append("albums.albumartist_sort")
+            logger.info("Migration: added albums.albumartist_sort")
+    except Exception as exc:  # noqa: BLE001 - fresh DBs already have it
+        logger.debug("Migration albums.albumartist_sort skipped: %s", exc)
+    return applied
 
 
 async def _create_schema(engine: AsyncEngine) -> None:
