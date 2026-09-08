@@ -2704,9 +2704,15 @@ async def cmd_playlists(
         return out
     if sub == "new" and len(args) >= 2:
         name = " ".join(args[1:])
+        if name.startswith("name:"):
+            name = name[5:]
+        if not name.strip():
+            return ["playlists new: error: empty name", ""]
+        # remote/disabled are NOT NULL without DB defaults — omitting them
+        # raised IntegrityError on every 'playlists new'.
         await _write_db(
-            "INSERT INTO playlists (playlist, name, changed, pl_type) "
-            "VALUES (?, ?, datetime('now'), 0)",
+            "INSERT INTO playlists (playlist, name, changed, pl_type, "
+            "remote, disabled) VALUES (?, ?, datetime('now'), 0, 0, 0)",
             (name, name),
         )
         row = await _query_db(

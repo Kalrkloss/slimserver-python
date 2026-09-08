@@ -934,9 +934,13 @@ class JSONRPCAPI:
         if cmd == "alarm":
             return await self._json_alarm(pid, args)
 
+        # ── Saved playlists (Perl playlistsQuery / Commands.pm parity) ──
+        if cmd == "playlists":
+            return await self._json_playlists(pid, args)
+
         # ── Browse commands (library) ──────────────────────────────
         if cmd in ("albums", "artists", "genres", "songs", "titles",
-                   "musicfolder", "playlists", "radios", "songinfo",
+                   "musicfolder", "radios", "songinfo",
                    "info", "contributors", "browse"):
             if cmd == "radios":
                 return await self._json_radios(cmd, args)
@@ -1521,6 +1525,127 @@ class JSONRPCAPI:
                     setattr(a, f, getattr(current, f))
         mgr.set(mac, idx, a)
         return self._alarm_to_item(idx, a)
+
+    # ─────────────────────────────────────────────────────────────
+    # Saved playlists (Perl: playlistsQuery → 'playlists_loop' with
+    # id + playlist, playlists tracks → 'playlist_tracks_loop')
+    # ─────────────────────────────────────────────────────────────
+
+    async def _json_playlists(self, pid: str | None, args: list) -> dict:
+        """['playlists', <start>, <count>, 'tags:…'] and the subcommands
+        'new' / 'rename' / 'delete' / 'tracks' (Slim/Control/Commands.pm
+        playlistsNew/Rename/DeleteCommand + playlistsQuery parity)."""
+        if args and str(args[0]).lower() in ("new", "rename", "delete",
+                                             "tracks"):
+            sub = str(args[0]).lower()
+            if sub == "tracks" and len(args) >= 2 and str(args[1]).isdigit():
+                return await self._json_playlist_tracks(int(args[1]))
+            return await self._json_playlist_mutation(sub, args[1:])
+
+        nums = [int(s) for s in args if str(s).isdigit()]
+        start = nums[0] if nums else 0
+        count = nums[1] if len(nums) > 1 else 10
+        tags = next((str(a)[5:] for a in args if str(a).startswith("tags:")), "")
+        import sqlite3
+        db = sqlite3.connect(f"file:{_library_db_path()}?mode=ro", uri=True)
+        db.row_factory = sqlite3.Row
+        try:
+            rows = db.execute(
+                "SELECT id, playlist, name, remote FROM playlists "
+                "ORDER BY name COLLATE NOCASE LIMIT ? OFFSET ?",
+                (count, start)).fetchall()
+            total = db.execute(
+                "SELECT COUNT(*) AS n FROM playlists").fetchone()["n"]
+        finally:
+            db.close()
+        loop = []
+        for r in rows:
+            item = {"id": int(r["id"]),
+                    "playlist": (r["name"] or r["playlist"] or "")}
+            if "x" in tags:
+                item["remote"] = int(r["remote"] or 0)
+            loop.append(item)
+        return {"count": int(total or 0), "playlists_loop": loop}
+
+    async def _json_playlist_tracks(self, pid: int) -> dict:
+        """['playlists', 'tracks', <id>] → playlist_tracks_loop."""
+        import sqlite3
+        db = sqlite3.connect(f"file:{_library_db_path()}?mode=ro", uri=True)
+        db.row_factory = sqlite3.Row
+        try:
+            rows = db.execute(
+                "SELECT pi.position, pi.track, pi.url, pi.title, "
+                "t.title AS ttitle, t.duration AS tduration "
+                "FROM playlist_items pi "
+                "LEFT JOIN tracks t ON t.id = pi.track "
+                "WHERE pi.playlist = ? ORDER BY pi.position",
+                (pid,)).fetchall()
+        finally:
+            db.close()
+        loop = []
+        for r in rows:
+            title = r["title"] or r["ttitle"]
+            item: dict = {}
+            if r["track"] is not None:
+                item["id"] = int(r["track"])
+            else:
+                item["id"] = r["url"] or ""
+            if title:
+                item["title"] = title
+            if r["url"]:
+                item["url"] = r["url"]
+            if r["tduration"]:
+                item["duration"] = int(r["tduration"] or 0)
+            loop.append(item)
+        return {"count": len(loop), "playlist_tracks_loop": loop}
+
+    async def _json_playlist_mutation(self, sub: str, toks: list) -> dict:
+        """new/rename/delete on saved playlists (Perl Commands.pm)."""
+        parts: dict[str, str] = {}
+        for tok in toks:
+            if ":" in tok:
+                k, v = tok.split(":", 1)
+                parts[k] = v
+        import sqlite3
+        db = sqlite3.connect(_library_db_path(), timeout=30)
+        try:
+            if sub == "new":
+                name = parts.get("name", "").strip()
+                if not name:
+                    return {"error": "playlists new needs name:<title>"}
+                try:
+                    cur = db.execute(
+                        "INSERT INTO playlists (playlist, name, changed, "
+                        "pl_type, remote, disabled) "
+                        "VALUES (?, ?, datetime('now'), 0, 0, 0)",
+                        (name, name))
+                    db.commit()
+                    return {"playlist_id": int(cur.lastrowid)}
+                except sqlite3.IntegrityError:
+                    db.rollback()
+                    return {"error": "playlist already exists"}
+            if sub == "delete":
+                pid = int(parts.get("id", "-1").split("-")[0])
+                if pid < 0:
+                    return {"error": "playlists delete needs id:<n>"}
+                db.execute("DELETE FROM playlist_items WHERE playlist = ?",
+                           (pid,))
+                db.execute("DELETE FROM playlists WHERE id = ?", (pid,))
+                db.commit()
+                return {"deleted": pid}
+            if sub == "rename":
+                pid = int(parts.get("id", "-1").split("-")[0])
+                name = parts.get("name", "").strip()
+                if pid < 0 or not name:
+                    return {"error": "playlists rename needs id:<n> name:<x>"}
+                db.execute(
+                    "UPDATE playlists SET name = ?, playlist = ? WHERE id = ?",
+                    (name, name, pid))
+                db.commit()
+                return {"renamed": pid, "name": name}
+            return {"error": f"unknown playlists subcommand {sub}"}
+        finally:
+            db.close()
 
     @staticmethod
     def _browse_response(loop: list, total: int | None = None,
