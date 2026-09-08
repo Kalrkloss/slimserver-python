@@ -63,6 +63,48 @@ def _db_query(sql: str, params: tuple = ()) -> list[dict]:
         con.close()
 
 
+def _genre_id_to_text(genre_id) -> str:
+    """Resolve a browselibrary genre_id (index into the DISTINCT track-genre
+    list, stable order) to the genre text — the genres table is empty."""
+    try:
+        if str(genre_id).isdigit():
+            rows = _db_query("SELECT DISTINCT genre FROM tracks "
+                             "WHERE genre != '' ORDER BY genre COLLATE "
+                             "NOCASE LIMIT 1 OFFSET ?", (int(genre_id),))
+            return rows[0]["genre"] if rows else ""
+    except Exception:  # noqa: BLE001
+        pass
+    return ""
+
+
+def _expand_track_ids(tagged: dict) -> list[int]:
+    """Resolve album_id/artist_id/year/genre_id filter tokens to the full
+    ordered track-id list (SqueezePlay 'playlistcontrol' + playlist play/add
+    expansion, Perl playlist control parity)."""
+    where: list[str] = []
+    params: list = []
+    if tagged.get("album_id"):
+        where.append("t.id IN (SELECT track FROM tracks_albums WHERE album = ?)")
+        params.append(int(tagged["album_id"]))
+    elif tagged.get("artist_id"):
+        where.append("t.id IN (SELECT track FROM tracks_contributors "
+                     "WHERE contributor = ? AND role = 1)")
+        params.append(int(tagged["artist_id"]))
+    if tagged.get("year"):
+        where.append("t.year = ?")
+        params.append(int(tagged["year"]))
+    if tagged.get("genre_id"):
+        genre_text = _genre_id_to_text(tagged["genre_id"])
+        if genre_text:
+            where.append("t.genre = ?")
+            params.append(genre_text)
+    if not where:
+        return []
+    sql = ("SELECT t.id FROM tracks t WHERE " + " AND ".join(where)
+           + " ORDER BY t.tracknum, t.title")
+    return [int(r["id"]) for r in _db_query(sql, tuple(params))]
+
+
 class JSONRPCError(Exception):
     """JSON-RPC error exception."""
 
@@ -839,7 +881,7 @@ class JSONRPCAPI:
         if cmd in ("pause", "power", "play", "stop", "mixer", "sync",
                    "unsync", "pref", "playerpref", "display", "button",
                    "signalstrength", "client", "mode", "name",
-                   "playlist"):
+                   "playlist", "playlistcontrol"):
             # Invalidate the status cache: a poll right after a control
             # command must see the NEW state, not the stale cached one
             # (Squeezer otherwise shows 'playing' until the TTL expires).
@@ -1843,19 +1885,44 @@ class JSONRPCAPI:
                         await pm.set_volume(pid, int(val))
                     else:
                         send(f"mixer volume {val}")
+        elif cmd == "playlistcontrol":
+            # SqueezePlay's My-Music play/add (base.actions → cmd
+            # playlistcontrol cmd:load|add + the item's commonParams ids).
+            # Route onto the playlist command with the same filter tokens.
+            tokens = [str(a) for a in args]
+            op = next((t.split(":", 1)[1] for t in tokens
+                       if t.startswith("cmd:")), "load")
+            sub = "play" if op == "load" else "add"
+            rest = [t for t in tokens
+                    if not t.startswith(("cmd:", "menu:", "useContextMenu"))]
+            await self._json_control(pm, pid, "playlist", [sub] + rest)
         elif cmd == "playlist":
             sub = args[0] if args else ""
             rest = args[1:] if len(args) > 1 else []
             if sub == "add" and rest:
                 # Accept a DB track id, a 'track_id:<n>' tag (controllers),
-                # or a plain URL. SqueezeTray adds URLs (radio/favorites);
-                # the SPA + Android controllers add tagged track ids.
-                # A stream URL may carry a display title (station name) via a
-                # paired 'title:<name>' so the playlist shows it instead of
-                # 'Radio Stream':
-                #   playlist add <url> title:<name>
+                # a plain URL, or album/artist/year/genre filters (SqueezePlay
+                # playlistcontrol add) that expand to every matching track.
                 player = pm.get_player(pid)
                 if player is not None:
+                    tagged = {}
+                    for _a in rest:
+                        _s = str(_a)
+                        if ":" in _s:
+                            _k, _, _v = _s.partition(":")
+                            tagged[_k] = _v
+                    if any(k in tagged for k in
+                           ("album_id", "artist_id", "year", "genre_id")):
+                        try:
+                            _ids = _expand_track_ids(tagged)
+                            for _tid in _ids:
+                                if _tid not in player.playlist:
+                                    player.playlist.append(_tid)
+                            player.playlist_total = len(player.playlist)
+                            player.last_activity = time.time()
+                            return
+                        except Exception:  # noqa: BLE001
+                            pass
                     pending = ""
                     for item in rest:
                         low = str(item).lower()
@@ -1906,23 +1973,11 @@ class JSONRPCAPI:
                         if ":" in s:
                             k, _, v = s.partition(":")
                             tagged[k] = v
-                    if "album_id" in tagged or "artist_id" in tagged:
-                        # Expand to all tracks of the album/artist (one query).
+                    if "album_id" in tagged or "artist_id" in tagged \
+                            or "year" in tagged or "genre_id" in tagged:
+                        # Expand to all matching tracks (one query).
                         try:
-                            import sqlite3
-                            db = sqlite3.connect(f"file:{_library_db_path()}?mode=ro", uri=True)
-                            if "album_id" in tagged:
-                                rows = db.execute(
-                                    "SELECT t.id FROM tracks t JOIN tracks_albums ta ON ta.track = t.id "
-                                    "WHERE ta.album = ? ORDER BY t.tracknum, t.title",
-                                    (int(tagged["album_id"]),)).fetchall()
-                            else:
-                                rows = db.execute(
-                                    "SELECT t.id FROM tracks t JOIN tracks_contributors tc ON tc.track = t.id "
-                                    "WHERE tc.contributor = ? AND tc.role = 1 ORDER BY t.title",
-                                    (int(tagged["artist_id"]),)).fetchall()
-                            db.close()
-                            ids = [r[0] for r in rows]
+                            ids = _expand_track_ids(tagged)
                             if ids:
                                 player.playlist = list(ids)
                                 player.playlist_total = len(ids)
@@ -2308,11 +2363,36 @@ class JSONRPCAPI:
                     "albums")
         search = next((str(a)[7:] for a in args if str(a).startswith("search:")),
                       "")
+        # Drill-down ids SqueezePlay merges from the parent item's
+        # commonParams (album_id:45, artist_id:…, year:…, genre_id:…).
+        filters: dict = {}
+        for a in args:
+            s = str(a)
+            for key in ("album_id", "artist_id", "genre_id", "year"):
+                if s.startswith(f"{key}:") and s[len(key) + 1:].strip():
+                    filters[key] = s[len(key) + 1:].strip()
         try:
             rows, total, plural, kind = await self._library_rows(
-                mode, start, count, search)
+                mode, start, count, search, filters or None)
         except Exception:  # noqa: BLE001
             return {"count": 0, "loop_loop": []}
+
+        # menu:1 → SqueezePlay/Jive MENU window (Perl BrowseLibrary shape:
+        # window.style + base.actions + text/type/commonParams items), NOT
+        # the OpenSqueeze loop_loop. SqueezePlay's My-Music renders these
+        # and drills via base.actions.go + each item's commonParams — a
+        # numeric 'window' or a missing base made the list crash / taps
+        # navigate nowhere ("Alben leer, keine Lieder").
+        if any(str(a) == "menu:1" for a in args):
+            menu = self._browselibrary_menu_items(kind, rows, mode, search)
+            return {
+                "base": {"actions": self._browselibrary_menu_actions(kind)},
+                "count": int(total or len(menu)),
+                "offset": start,
+                "window": {"windowStyle": "icon_list"},
+                "item_loop": menu,
+            }
+
         loop = []
         for r in rows:
             if kind == "albums":
@@ -2373,9 +2453,116 @@ class JSONRPCAPI:
         return {"count": total, "loop_loop": loop,
                 "item_loop": loop, plural: loop}
 
+    @staticmethod
+    def _browselibrary_menu_items(kind: str, rows: list, mode: str,
+                                  search: str = "") -> list:
+        """Build the SqueezePlay/Jive MENU shape for browselibrary items
+        (request token menu:1) — Perl Slim::Menu::BrowseLibrary parity:
+        text/type/commonParams instead of the OpenSqueeze loop_loop shape.
+        SqueezePlay drills into an entry through commonParams.<id>, so a
+        missing menu shape makes taps navigate nowhere ("no songs")."""
+        out: list[dict] = []
+        ids = []
+        for r in rows:
+            if kind == "albums" and r.get("id") is not None:
+                ids.append(r["id"])
+        artist_line: dict = {}
+        if kind == "albums" and ids:
+            try:
+                import sqlite3
+                db = sqlite3.connect(
+                    f"file:{_library_db_path()}?mode=ro", uri=True)
+                db.row_factory = sqlite3.Row
+                marks = ",".join("?" * len(ids))
+                art = db.execute(
+                    "SELECT ta.album AS aid, COUNT(DISTINCT c.id) AS n, "
+                    "MIN(c.name) AS name FROM tracks_albums ta "
+                    "JOIN tracks_contributors tc ON tc.track = ta.track "
+                    "AND tc.role = 1 JOIN contributors c ON c.id = tc.contributor "
+                    f"WHERE ta.album IN ({marks}) "
+                    "GROUP BY ta.album", ids).fetchall()
+                for row in art:
+                    if row["n"] == 1:
+                        artist_line[row["aid"]] = row["name"] or ""
+                    elif row["n"] > 1:
+                        artist_line[row["aid"]] = "Diverse Interpreten"
+                db.close()
+            except Exception:  # noqa: BLE001
+                pass
+        for r in rows:
+            item: dict = {"type": "playlist"}
+            if kind == "albums":
+                title = r["title"] or ""
+                artist = artist_line.get(r["id"], "")
+                item["text"] = f"{title}\n{artist}" if artist else title
+                item["commonParams"] = {"album_id": str(r["id"])}
+                if r.get("artwork"):
+                    item["icon"] = f"/music/{r['id']}/cover.jpg"
+            elif kind == "artists":
+                item["text"] = r["name"] or ""
+                item["commonParams"] = {"artist_id": str(r["id"])}
+                item["icon"] = "html/images/artists.png"
+            elif kind == "genres":
+                item["text"] = r["genre"] or ""
+                item["commonParams"] = {"genre_id": str(r["id"])}
+            elif kind == "years":
+                item["text"] = str(r["year"])
+                item["commonParams"] = {"year": int(r["year"])}
+            elif kind == "tracks":
+                # Album/artist drill target: one row per song.
+                item["type"] = "audio"
+                item["text"] = r["title"] or ""
+                item["commonParams"] = {"track_id": int(r["id"])}
+            elif kind == "folder":
+                item["text"] = r["name"] or ""
+                ident = str(r["id"])
+                item["commonParams"] = {"url": ident}
+                item["icon"] = "html/images/musicfolder.png"
+            else:
+                continue
+            out.append(item)
+        return out
+
+    @staticmethod
+    def _browselibrary_menu_actions(kind: str) -> dict:
+        """Perl base.actions for a browselibrary menu window — SqueezePlay
+        uses 'go' to drill (album→mode:tracks, artist→mode:albums, …) and
+        'play'/'add' to load the commonParams item into the playlist."""
+        go_mode = {"albums": "tracks", "artists": "albums",
+                   "genres": "albums", "years": "albums",
+                   "folder": "bmf", "tracks": "tracks"}.get(kind, "albums")
+        go_params: dict = {"mode": go_mode, "menu": 1}
+        if kind == "artists":
+            go_params["menu_mode"] = "artists"
+        actions: dict = {
+            "go": {"player": 0, "cmd": ["browselibrary", "items"],
+                   "itemsParams": "commonParams", "params": go_params},
+            "play": {"player": 0, "cmd": ["playlistcontrol"],
+                     "itemsParams": "commonParams",
+                     "params": {"cmd": "load", "menu": 1},
+                     "nextWindow": "nowPlaying"},
+            "add": {"player": 0, "cmd": ["playlistcontrol"],
+                    "itemsParams": "commonParams",
+                    "params": {"cmd": "add", "menu": 1}},
+        }
+        if kind == "folder":
+            actions["go"] = {"player": 0, "cmd": ["browselibrary", "items"],
+                             "itemsParams": "commonParams",
+                             "params": {"mode": "bmf", "menu": 1}}
+        return actions
+
     async def _library_rows(self, mode: str, start: int, count: int,
-                            search: str = ""):
-        """Return (rows, total, plural, kind) for a browselibrary mode."""
+                            search: str = "", filters: dict | None = None):
+        """Return (rows, total, plural, kind) for a browselibrary mode.
+
+        ``filters`` carries the drill-down ids SqueezePlay merges from the
+        item's commonParams (album_id/artist_id/year/genre_id/…)."""
+        filters = filters or {}
+        f_artist = filters.get("artist_id")
+        f_album = filters.get("album_id")
+        f_genre = filters.get("genre_id")
+        f_year = filters.get("year")
+
         def q(sql, *p):
             return _db_query(sql, p)
 
@@ -2384,10 +2571,77 @@ class JSONRPCAPI:
             # _db_query returns list[dict]; grab the first row's first value.
             return list(rows[0].values())[0] if rows else 0
 
+        if mode == "tracks" or mode in ("songs", "titles"):
+            # Album/artist/year drill → the track list (Perl mode:tracks).
+            where, params = [], []
+            if f_album:
+                where.append("t.id IN (SELECT track FROM tracks_albums "
+                             "WHERE album = ?)")
+                params.append(f_album)
+            if f_artist:
+                where.append("t.id IN (SELECT track FROM tracks_contributors "
+                             "WHERE contributor = ? AND role = 1)")
+                params.append(f_artist)
+            if f_year:
+                where.append("t.year = ?")
+                params.append(f_year)
+            if f_genre:
+                genre_text = ""
+                if str(f_genre).isdigit():
+                    g = _db_query("SELECT DISTINCT genre FROM tracks "
+                                  "WHERE genre != '' ORDER BY genre COLLATE "
+                                  "NOCASE LIMIT 1 OFFSET ?", (int(f_genre),))
+                    genre_text = g[0]["genre"] if g else ""
+                if genre_text:
+                    where.append("t.genre = ?")
+                    params.append(genre_text)
+            if search:
+                where.append("t.title LIKE ?")
+                params.append(f"%{search}%")
+            where_sql = (" WHERE " + " AND ".join(where)) if where else ""
+            order = (" ORDER BY t.tracknum" if f_album
+                     else " ORDER BY t.title COLLATE NOCASE")
+            rows = q("SELECT DISTINCT t.id, t.title, t.year FROM tracks t"
+                     + where_sql + order + " LIMIT ? OFFSET ?",
+                     *(params + [count, start]))
+            total = total_of(
+                "SELECT COUNT(DISTINCT t.id) FROM tracks t" + where_sql,
+                *params)
+            return rows, total, "tracks_loop", "tracks"
         if mode == "albums":
-            rows = q("SELECT DISTINCT al.id, al.title, al.artwork FROM albums al "
-                     "ORDER BY al.title LIMIT ? OFFSET ?", count, start)
-            total = total_of("SELECT COUNT(DISTINCT al.id) FROM albums al")
+            where, params = [], []
+            if f_artist:
+                where.append("al.id IN (SELECT album FROM tracks_albums "
+                             "WHERE track IN (SELECT track FROM "
+                             "tracks_contributors WHERE contributor = ? "
+                             "AND role = 1))")
+                params.append(f_artist)
+            if f_year:
+                where.append("al.year = ?")
+                params.append(f_year)
+            if f_genre:
+                genre_text = ""
+                if str(f_genre).isdigit():
+                    g = _db_query("SELECT DISTINCT genre FROM tracks "
+                                  "WHERE genre != '' ORDER BY genre COLLATE "
+                                  "NOCASE LIMIT 1 OFFSET ?", (int(f_genre),))
+                    genre_text = g[0]["genre"] if g else ""
+                if genre_text:
+                    where.append("al.id IN (SELECT album FROM tracks_albums "
+                                 "WHERE track IN (SELECT id FROM tracks "
+                                 "WHERE genre = ?))")
+                    params.append(genre_text)
+            if search:
+                where.append("al.title LIKE ?")
+                params.append(f"%{search}%")
+            where_sql = (" WHERE " + " AND ".join(where)) if where else ""
+            rows = q("SELECT DISTINCT al.id, al.title, al.artwork "
+                     "FROM albums al" + where_sql +
+                     " ORDER BY al.title LIMIT ? OFFSET ?",
+                     *(params + [count, start]))
+            total = total_of(
+                "SELECT COUNT(DISTINCT al.id) FROM albums al" + where_sql,
+                *params)
             return rows, total, "albums_loop", "albums"
         if mode == "artists":
             rows = q("SELECT DISTINCT c.id, c.name FROM contributors c "

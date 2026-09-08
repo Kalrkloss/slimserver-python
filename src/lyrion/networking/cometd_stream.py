@@ -243,12 +243,14 @@ async def _handle_connection(manager, reader: asyncio.StreamReader,
                     break
                 else:
                     # no connect: reply with acks AND any queued events.
-                    # Jive clients (SqueezeCtrl) expect request results
-                    # in the POST reply; SqueezeClient reads publish
-                    # responses via body.string() (checks only
-                    # messages[0].successful) and receives the events
-                    # via the OPEN STREAM — so peek (don't clear) the
-                    # queue so the push_task delivers them too.
+                    # The result of a slim/request / a subscription's
+                    # initial payload is delivered EXACTLY ONCE, in this
+                    # reply (Perl semantics — Jive registers a one-time
+                    # notify for request ids and logs every duplicate as
+                    # "event we aren't subscribed to"; duplicates also
+                    # made Jive treat its subscriptions as unacknowledged
+                    # and keep them pending, so it never re-registered
+                    # serverstatus/playerstatus after a reconnect).
                     events = []
                     for m in messages:
                         if not isinstance(m, dict):
@@ -259,7 +261,8 @@ async def _handle_connection(manager, reader: asyncio.StreamReader,
                             if resp.startswith("/"):
                                 cid2 = resp.split("/")[1]
                         if cid2:
-                            events.extend(await manager.peek_events(cid2))
+                            events.extend(
+                                await manager.wait_for_events(cid2, timeout=0))
                     payload = json.dumps(replies + events).encode("utf-8")
                     writer.write(b"HTTP/1.1 200 OK\r\n"
                                  b"Content-Type: application/json\r\n"
