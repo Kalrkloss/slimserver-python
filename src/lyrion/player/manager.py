@@ -619,6 +619,10 @@ class PlayerManager:
             player.current_track_id = track_id
             player.remote = 0  # local track: never a "live stream" flag
             player.elapsed = 0.0
+            # A local track must not inherit the radio's StreamTitle/meta
+            # (else now-playing shows the old station name over the track).
+            player.current_title = ""
+            player.remote_meta = {}
             # Track duration for status 'duration'/'time' queries — the
             # real LMS serves it from the DB as soon as the track loads.
             try:

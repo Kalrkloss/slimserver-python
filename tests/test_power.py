@@ -21,6 +21,9 @@ class _FakeHandler:
     async def send_remote_stream(self, mac, url, codec):
         return True
 
+    async def send_strm_to_player(self, mac, track_id):
+        return True
+
 
 def _fresh_pm():
     pm = object.__new__(PlayerManager)
@@ -100,3 +103,21 @@ def test_resume_clears_pause_intent():
     ok, flagged = asyncio.run(run())
     assert ok
     assert flagged is False
+
+
+def test_play_track_clears_stale_stream_metadata():
+    """A local track must not inherit the radio's StreamTitle/meta."""
+    async def run():
+        pm = _fresh_pm()
+        p = _player(pm)
+        p.remote = 1
+        p.current_title = "Alte Station - irgendein Titel"
+        p.remote_meta = {"title": "irgendein Titel", "artist": "Alte Station"}
+        ok = await pm.play_track(p.mac, 42)
+        return ok, p
+
+    ok, p = asyncio.run(run())
+    assert ok
+    assert p.remote == 0
+    assert p.current_title == "", "radio StreamTitle must be cleared"
+    assert p.remote_meta == {}, "radio meta must be cleared"

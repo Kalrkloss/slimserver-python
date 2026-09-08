@@ -1162,7 +1162,12 @@ class JSONRPCAPI:
             except Exception:
                 title = url_str
             cur_info = {"title": title, "url": url_str}
-        if getattr(player, "current_title", ""):
+        # Only a remote stream's StreamTitle may override the now-playing
+        # line — a local track's title comes from the DB row (a stale radio
+        # StreamTitle must not linger over local tracks).
+        if (getattr(player, "current_title", "")
+                and cur < len(playlist_ids)
+                and not isinstance(playlist_ids[cur], int)):
             cur_info["title"] = player.current_title
 
         elapsed = getattr(player, "elapsed", 0) or 0
