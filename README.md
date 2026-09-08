@@ -6,10 +6,13 @@ Python 3. This project re-implements the SlimProto / JSON-RPC / CLI
 protocol surface of the original (Perl) Pyrion Music Server.
 
 > **Status: WORK IN PROGRESS — playback verified.** Player discovery,
-> registration, control, the web UI **and audio playback** work. MP3
+> registration, control, the web UI **and audio playback** work. MP3/FLAC
 > library tracks and radio streams (HTTP + HTTPS) play end-to-end on
-> Squeezelite (verified via ALSA-loopback capture). **FLAC decodes but
-> stays silent** — see [What does not work](#what-does-not-work).
+> Squeezelite (verified via ALSA-loopback capture). A parity-closure
+> program against the original Perl LMS ran through 2026-09 (security,
+> playback state, dispatch/browse, library integrity, alarms/playlists,
+> prefs/HTTP-range) — see [docs/protocol-gaps.md](docs/protocol-gaps.md)
+> for the current remaining-work list.
 
 ---
 
@@ -17,27 +20,30 @@ protocol surface of the original (Perl) Pyrion Music Server.
 
 | Area | Status |
 |------|--------|
-| SlimProto server (TCP 3483) | ✅ Player registration (HELO/SETD), name handling, keepalive, audg volume sync on connect |
+| SlimProto server (TCP 3483) | ✅ Player registration (HELO 20/36-byte + SETD), name handling, keepalive, audg volume sync on connect, disconnect grace (`forget_disconnected_client`, 300 s) |
 | Discovery service (UDP 3483) | ✅ Broadcast beacons, HELO-ACK |
-| JSON-RPC API (HTTP 9000) | ✅ `server.*`, `player.*`, `playlist.*` methods, `slim.request` passthrough |
-| CLI (TCP 9090) | ✅ Status, browse (artists/albums/songs/radio), playlist control |
-| Web UI | ✅ Single-file SPA (`html/index.html`, hash routing, LMS-style skin, no external deps) |
-| Library scanner | ✅ SQLite DB (`~/.lyrion/Lyrion/Prefs/lyrion.db`), 50k+ tracks, genres, artists, albums |
-| Player control | ✅ power/volume (audg frame), play/pause/stop/next/prev (strm frames), playlist management, favorites |
-| **Audio playback (MP3)** | ✅ **End-to-end verified on Squeezelite v2.0.0** (strm → HTTP `/stream.mp3` → decode → output; capture peak 0.5 FS) |
-| **Radio / favorites** | ✅ **Direct streaming** like the real LMS: strm frame points at the source, player connects directly, server sends `cont` with metaint (RESP round-trip); proxy fallback |
-| Auto-next / end-of-track | ✅ Playlist advance on player STAT `STMd` (decoder complete); last track → stop |
+| JSON-RPC API (HTTP 9000) | ✅ `server.*`, `player.*`, `playlist.*` methods, `slim.request` passthrough (playlist album_id/artist_id expansion, mixer, shuffle/repeat) |
+| Web auth | ✅ Optional Basic-auth gate on the `authorize` pref; CLI `login` validates the configured `password` (2026-09) |
+| CLI (TCP 9090) | ✅ Status, browse (artists/albums/songs/radio), playlist control, CR/NUL-terminated wire + percent-decoded player ids |
+| CometD | ✅ subscribe/unsubscribe semantics, status notify replays the stored request (pagination/menu/tags preserved) |
+| Web UI | ✅ Single-file SPA (`html/index.html`, hash routing, LMS-style skin, no external deps) + bundled Material skin under `/material` |
+| Library scanner | ✅ SQLite DB (`~/.lyrion/Lyrion/Prefs/lyrion.db`), 50k+ tracks, streaming incremental walk, album identity (title+artist), metadata heuristics |
+| Rescan | ✅ Full/additive scan modes, `abortscan`, deletion reconciliation on full rescan (Perl parity, 2026-09) |
+| Player control | ✅ power (strm stop), volume (audg), play/pause/stop/next/prev, skip-ahead seek (`strm 'a'` 24-byte frame), resume-restores-position, playlist management, favorites, alarms (per player, `fr:`/`track:`/`url:` wake sources) |
+| **Audio playback** | ✅ **MP3 + FLAC end-to-end on Squeezelite v2.0.0** (direct streaming; proxy/transcode only when the player cannot decode the source format) |
+| **Radio / favorites** | ✅ **Direct streaming** like the real LMS (strm → source, server `cont` with metaint, RESP round-trip); AAC/HE-AAC streams transcode-proxy to MP3; HTTPS radio plays |
+| Auto-next / end-of-track | ✅ Playlist advance on player STAT `STMd`; last track → stop; local-track starts clear the radio flag |
 | Test tone | ✅ `/stream.mp3?testtone=1` (440 Hz, 5 s WAV) |
 
 ## What does not work
 
 | Area | Status |
 |------|--------|
-| **FLAC playback** | ❌ **Not solved.** Decoder opens (`codec open: 'f'`), HTTP 200, output starts (`track_start`, `start buffer frames`) — but the captured audio stays silent. MP3 and radio work. |
-| Transcoding | ❌ Not implemented (no flac→mp3, no format conversion) |
-| Squeezebox hardware display | ❌ No display/title line support |
-| HTTPS | ❌ HTTP only (server side; remote HTTPS radio is proxied) |
-| IR / remote control | ❌ Not implemented |
+| Squeezebox hardware display | ❌ No classic-SB display/title-line support (SqueezePlay/SPA/controllers work) |
+| IR / hardware remote control | ❌ Not implemented (Squeezelite IRC/keys not served) |
+| Server-side HTTPS listener | ❌ Listening socket is HTTP; remote HTTPS streams play fine (player-side TLS or transcode proxy) |
+| Playlist **file** import (`.m3u` on disk) | ❌ DB-saved playlists are fully supported (CLI + JSON); scanning playlist *files* from the media dir is not implemented |
+| Sync (multi-player group playback) | ⏳ Group bookkeeping exists; real synchronized fan-out is the last known parity gap (deferred to the end of the 2026-09 plan) |
 
 ## Architecture
 

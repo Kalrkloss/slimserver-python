@@ -7,6 +7,26 @@ Schweregrad: 🔴 kritisch · 🟠 mittel · 🟡 gering.
 
 Stand der Analyse: 2026-08-13, Code-Basis Commit `ac346b8`.
 
+> **Aktualisierung 2026-09-08 — Paritäts-Programm weitgehend abgeschlossen.**
+> Die strukturierte Gap-Analyse gegen das Perl-LMS (public/9.2) liegt im
+> Arbeitsplan `.hermes/plans/2026-09-05_174302-close-lms-parity-gaps.md`;
+> bis 2026-09-08 sind daraus umgesetzt und einzeln committet (93 pytest
+> passed, 4 legitime Skips bei leerer Bibliothek):
+> Security (Static-Path-Traversal, CLI-Login, Web-Basic-Auth), Wiedergabe
+> (send_cli-Methoden, Power-Off, Pause/Resume+Seek, Remote-Flag, Reconnect
+> 300 s, Codec/HELO), Dispatch (JSON-Playlist/Mixer, browselibrary inkl.
+> artist_id-Filter/mode:search/mode:bmf, CLI-Draht CR/NUL, CometD),
+> Bibliothek (Album-Identität Titel+Künstler statt Jahr, Retag-Cleanup,
+> Rescan-Modi + `abortscan` + Löschabgleich), Alarme (add/update/delete,
+> `fr:`-Hierarchie-Wake), Playlists (JSON `playlists_loop` + NOT-NULL-Fix),
+> Prefs-Typen, HTTP-Range-Parsing.
+>
+> **Restarbeiten (Stand 2026-09-08):** Sync-Fan-Out (2.5, ans Ende
+> zurückgestellt); CLI `listen` registriert keine echten Subscriptions;
+> Playlist-Datei-Import (`.m3u`); der unten stehende 2026-08-13-Stand ist
+> für die geschlossenen Punkte historisch. Verlässlicher Restarbeitsnachweis
+> ist der Plan oben, nicht diese Datei.
+
 > **Aktualisierung 2026-08-23 (Commit `a5441a203`):** Mehrere CLI-Gaps aus
 > diesem Dokument wurden inzwischen geschlossen:
 > - `serverstatus` (3.6): `players_loop`, roher `playerid` (kein %3A),
