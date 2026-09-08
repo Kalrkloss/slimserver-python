@@ -216,13 +216,26 @@ class AlarmScheduler:
             PlayerManager(), "players") else []
 
     async def _favorite_url(self, fav_id: str) -> str | None:
-        """Resolve a favorite id to its URL (for a 'fr:' wake source)."""
+        """Resolve a favorite id to its URL (for a 'fr:' wake source).
+
+        Accepts a plain DB id ('5') and an LMS hierarchical id ('0.2.1' —
+        favorites nested in folders) via FavoritesManager.resolve_path.
+        """
         try:
             from lyrion.music.favorites import get_favorites_manager
 
-            fav = await get_favorites_manager().get(int(fav_id))
-            if fav:
-                return fav.get("url") or fav.get("type")
+            mgr = get_favorites_manager()
+            fav = str(fav_id).strip()
+            if not fav.isdigit():
+                # Hierarchical id ('0.x…') → DB id; None if not found.
+                resolved = await mgr.resolve_path(fav)
+                if resolved is None:
+                    logger.info("alarm: favorite path %r not found", fav_id)
+                    return None
+                fav = str(resolved)
+            favorite = await mgr.get(int(fav))
+            if favorite:
+                return favorite.get("url") or favorite.get("type")
         except Exception as exc:  # pragma: no cover
             logger.warning("alarm: cannot resolve favorite %s: %s", fav_id, exc)
         return None
@@ -295,13 +308,39 @@ def _alarm_from_parts(index: int, parts: dict[str, str]) -> Alarm:
         except ValueError:
             pass
     if "time" in parts:
-        t = parts["time"]
+        t = parts["time"].strip()
         if ":" in t and len(t) >= 4:
             a.time = t.zfill(5)
+        elif t.isdigit() and len(t) in (3, 4):
+            # Perl CLI/JSON form: time:HHMM (or HMM) digits only
+            a.time = f"{int(t[:-2]):02d}:{t[-2:]}"
     if "hour" in parts or "minute" in parts:
         hh = int(parts.get("hour", a.time.split(":")[0]))
         mm = int(parts.get("minute", a.time.split(":")[1]))
         a.time = f"{hh:02d}:{mm:02d}"
+    if "dow" in parts:
+        # Perl dow list: 0=Monday .. 6=Sunday (day-mask bit 0 = Monday)
+        try:
+            vals = [int(x) for x in parts["dow"].split(",") if x.strip() != ""]
+            days = ["0"] * 7
+            for v in vals:
+                if 0 <= v <= 6:
+                    days[v] = "1"
+            a.days = "".join(days)
+        except ValueError:
+            pass
+    if "dowAdd" in parts or "dowDel" in parts:
+        try:
+            days = list(a.days.ljust(7, "0")[:7])
+            for x in parts.get("dowAdd", "").split(","):
+                if x.strip().isdigit() and 0 <= int(x) <= 6:
+                    days[int(x)] = "1"
+            for x in parts.get("dowDel", "").split(","):
+                if x.strip().isdigit() and 0 <= int(x) <= 6:
+                    days[int(x)] = "0"
+            a.days = "".join(days)
+        except ValueError:
+            pass
     if "volume" in parts:
         try:
             a.volume = int(parts["volume"])
@@ -320,13 +359,18 @@ def _alarm_from_parts(index: int, parts: dict[str, str]) -> Alarm:
     if "repeat" in parts:
         a.repeat = parts["repeat"] not in ("0", "false", "")
     # wake source — 'url:'/track:' wrap with their prefix; a 'wake:' value
-    # already carries it (don't double-prefix).
+    # already carries it (don't double-prefix). url:0 clears the wake
+    # (Perl: '0' as url means "current playlist"/no source — Jive sends it
+    # when the user clears the wake source).
     for w in ("url", "track"):
         if w in parts and parts[w]:
-            a.wake = f"{w}:{parts[w]}"
+            a.wake = "" if parts[w] == "0" else f"{w}:{parts[w]}"
     if "wake" in parts and parts["wake"]:
-        a.wake = parts["wake"] if parts["wake"].startswith(("url:", "track:", "fr:")) \
-            else f"url:{parts['wake']}"
+        if parts["wake"] == "0":
+            a.wake = ""
+        else:
+            a.wake = parts["wake"] if parts["wake"].startswith(("url:", "track:", "fr:")) \
+                else f"url:{parts['wake']}"
     return a
 
 

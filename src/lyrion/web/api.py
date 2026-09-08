@@ -1390,14 +1390,28 @@ class JSONRPCAPI:
         }
 
     async def _json_alarm(self, pid: str | None, args: list) -> dict:
-        """['alarm', '<idx>'] or ['alarm', '<idx>', 'set:<kv>']."""
+        """['alarm', '<idx>'] / ['alarm', '<idx>', '<k:v>…'] / Perl cmds.
+
+        Perl alarmCommand forms (Commands.pm:55, used by Material):
+          ['alarm', 'add',    'time:HHMM', 'dow:0,2', 'url:<stream>']
+          ['alarm', 'update', 'id:<idx>',  'k:v'…]
+          ['alarm', 'delete', 'id:<idx>']
+          ['alarm', 'enableall' | 'disableall']
+        plus the index form (own SPA/SqueezePlay) incl. a bare 'delete'.
+        """
         from lyrion.alarms import AlarmManager, _alarm_from_parts, Alarm
 
         mac = pid if pid not in ("-", None) else ""
         mgr = AlarmManager()
-        path = str(args[0]) if args else "0"
+        first = str(args[0]) if args else ""
+
+        if first in ("add", "update", "delete", "enableall", "disableall",
+                     "defaultvolume"):
+            return await self._alarm_command(mac, first, args[1:])
+
+        # ── index form ────────────────────────────────────────────────
         # Some clients pass '<idx>' as '<idx>-' (row selection).
-        idx_str = path.split("-")[0]
+        idx_str = first.split("-")[0]
         try:
             idx = int(idx_str)
         except ValueError:
@@ -1405,6 +1419,11 @@ class JSONRPCAPI:
 
         if len(args) == 1 or (len(args) >= 2 and args[1] in ("?", "query")):
             return self._alarm_to_item(idx, mgr.get(mac, idx))
+
+        # Own web UI delete: ['alarm', '<idx>', 'delete']
+        if args[1] in ("delete", "delete:1", "del"):
+            mgr.delete(mac, idx)
+            return {"deleted": idx, "id": idx}
 
         parts: dict[str, str] = {}
         for tok in args[1:]:
@@ -1423,9 +1442,80 @@ class JSONRPCAPI:
                         continue
                     # If an integer day-mask was given, its derived 'days'
                     # string must not be overwritten from current.
-                    if f == "days" and "day" in parts:
+                    if f == "days" and ("day" in parts or "dow" in parts
+                                        or "dowAdd" in parts or "dowDel" in parts):
                         continue
                     # 'url:'/'track:' build the wake value; don't clobber it.
+                    if f == "wake" and ("url" in parts or "track" in parts):
+                        continue
+                    setattr(a, f, getattr(current, f))
+        mgr.set(mac, idx, a)
+        return self._alarm_to_item(idx, a)
+
+    async def _alarm_command(self, mac: str, cmd: str, toks: list) -> dict:
+        """Perl alarmCommand: add/update/delete/enableall/disableall."""
+        from lyrion.alarms import AlarmManager, _alarm_from_parts
+
+        mgr = AlarmManager()
+        parts: dict[str, str] = {}
+        for tok in toks:
+            if ":" in tok:
+                k, v = tok.split(":", 1)
+                parts[k] = v
+
+        if cmd == "delete":
+            raw = parts.get("id")
+            if raw is None:
+                return {"error": "alarm delete needs id:<index>"}
+            try:
+                idx = int(str(raw).split("-")[0])
+            except ValueError:
+                return {"error": "invalid alarm index"}
+            mgr.delete(mac, idx)
+            return {"deleted": idx, "id": idx}
+
+        if cmd == "enableall":
+            for i in list(mgr.alarms_for(mac)):
+                a = mgr.get(mac, i)
+                if a:
+                    a.enabled = True
+                    mgr.set(mac, i, a)
+            return {"count": len(mgr.alarms_for(mac))}
+
+        if cmd == "disableall":
+            for i in list(mgr.alarms_for(mac)):
+                a = mgr.get(mac, i)
+                if a:
+                    a.enabled = False
+                    mgr.set(mac, i, a)
+            return {"count": len(mgr.alarms_for(mac))}
+
+        if cmd == "add":
+            existing = mgr.alarms_for(mac)
+            idx = max(existing) + 1 if existing else 0
+            a = _alarm_from_parts(idx, parts)
+            mgr.set(mac, idx, a)
+            return self._alarm_to_item(idx, a)
+
+        # update — Perl requires id:<idx>; merge like the index set-form.
+        raw = parts.get("id")
+        if raw is None:
+            return {"error": "alarm update needs id:<index>"}
+        try:
+            idx = int(str(raw).split("-")[0])
+        except ValueError:
+            return {"error": "invalid alarm index"}
+        current = mgr.get(mac, idx)
+        a = _alarm_from_parts(idx, parts)
+        if current:
+            for f in ("enabled", "days", "time", "volume", "fade", "duration",
+                      "repeat", "wake"):
+                if f not in parts:
+                    if f == "time" and ("hour" in parts or "minute" in parts):
+                        continue
+                    if f == "days" and ("day" in parts or "dow" in parts
+                                        or "dowAdd" in parts or "dowDel" in parts):
+                        continue
                     if f == "wake" and ("url" in parts or "track" in parts):
                         continue
                     setattr(a, f, getattr(current, f))
