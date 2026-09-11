@@ -67,28 +67,42 @@ HELO response (server → player):
           "TUNE" — initial server URL (e.g. http://my.squeeze.center:9000)
           "wrnm" — ?
 
-STAT payload (player → server, sent periodically):
-    0-3   crlf_ref (u32)
-    4-7   wallclock (u32 seconds)
-    8-11  stream buffers (u32)
-    12-15  decoded buffers (u32)
-    16-19  output buffers (u32)
-    20-23  CPU (0..100)
-    24-27  dac (0..100)
-    28-31  jive (u32)
-    32-35  flags
-    36-39  server timestamp (u32)
-    40-43  elapsed (u32 ms)
-    44-47  current output sample rate (u32)
-    48-51  current output bit depth (u32)
-    52-55  decoder (u32)
-    56-59  player IP (u32, network order)
-    60-63  wifi mode / strength
-    64-67  wifi error rate
-    68-71  wifi noise floor
-    72-73  power state (u16: 0=on, 1=off)
-    74     player type (ascii)
-    75-    model name / uuid etc.
+STAT payload (player → server, sent periodically, big-endian):
+
+    0-3    event              (4 ASCII chars)
+    4      num_crlf           (u8)
+    5      mas_initialized    (u8, 'm'/'p')
+    6      mas_mode           (u8)
+    7-10   buffer_size        (u32, rptr / decodeSize)
+    11-14  buffer_fullness    (u32, wptr / decodeFull)
+    15-18  bytes_received_H   (u32)
+    19-22  bytes_received_L   (u32)
+    23-24  signal_strength    (u16, 0xffff = "unknown")
+    25-28  jiffies            (u32, ms since player boot)
+    29-32  output_buffer_size (u32)
+    33-36  output_buffer_fullness (u32)
+    37-40  elapsed_seconds    (u32)
+    41-42  voltage            (u16)
+    43-46  elapsed_milliseconds (u32)
+    47-50  server_timestamp   (u32)
+    51-52  error_code         (u16, only present on 53/57-byte frames)
+
+    Field order/sizes are the Perl `unpack('a4CCCNNNNnNNNNnNNn')`
+    (Slim/Networking/Slimproto.pm:768, `_stat_handler`) and match
+    SqueezePlay's own STAT packer byte for byte
+    (~/opt/squeezeplay/share/jive/jive/net/SlimProto.lua:167-195).
+
+    Frame length variants seen on the wire:
+      51 bytes  SqueezePlay / jive (no trailing error_code)
+      53 bytes  current firmware (Slimproto.pm:772 "future firmware")
+      57 bytes  older firmware: same 53 fields + 4 trailing junk bytes
+                (Slimproto.pm:772-777 zeroes error_code for those)
+
+    `event` is normally an STM* code, but SqueezePlay acks *every* frame
+    it has no subscription for with sendStatus(opcode)
+    (SlimProto.lua:555-558), so `vers`, `setd`, `audg`, `cont`, `strm`, …
+    show up as STAT events too. Those acks carry decode/output sizes but
+    elapsed=0 while idle.
 """
 from __future__ import annotations
 
@@ -98,7 +112,7 @@ import re
 import struct
 from collections.abc import Coroutine
 from dataclasses import dataclass, field
-from enum import IntEnum, IntFlag
+from enum import IntFlag
 from typing import Any, Callable
 from urllib.parse import urlparse
 import time
@@ -1272,6 +1286,45 @@ class SlimProtoClient:
         ])
         return struct.pack(">H", len(payload)) + payload
 
+    @staticmethod
+    def _build_strm_control_frame(command: str, replay_gain: int = 0) -> bytes:
+        """Build the Perl ``stream($command)`` 24-byte body (no request).
+
+        Perl ``Slim/Player/Squeezebox.pm:1096-1116``:
+        ``pack 'aaaaaaaCCCaCCCNnN', ($command, 0, 'm','?','?','?','?',
+        0,0,0, TRANSITION_NONE, $flags, 0, 0, $replayGain, 0, 0)``.
+        ``pack('a', 0)`` stringifies the number 0, so autostart and
+        transitionType are the ASCII char ``'0'``. Verified byte for byte
+        against perl:
+
+            stream(p) -> 70 30 6d 3f 3f 3f 3f 00 00 00 30 00 00 00
+                         00 00 00 00 00 00 00 00 00 00
+
+        Used for 'f' flush, 'q' stop, 'p' pause, 'u' unpause, 'a' skip.
+        (Perl: Squeezebox2.pm:1104-1126 resume/pauseForInterval/skipAhead.)
+        """
+        c = command.encode("ascii")
+        if len(c) != 1:
+            raise ValueError(f"invalid strm command: {command!r}")
+        payload = b"".join([
+            b"strm",
+            c,                          # command
+            b"0",                       # autostart (pack('a', 0) -> "0")
+            b"m",                       # format byte
+            b"?", b"?", b"?", b"?",     # pcm size/rate/chan/endian
+            bytes([0]),                 # bufferThreshold
+            bytes([0]),                 # spdif
+            bytes([0]),                 # transitionDuration
+            b"0",                       # transitionType TRANSITION_NONE
+            bytes([0]),                 # flags
+            bytes([0]),                 # outputThreshold
+            bytes([0]),                 # slaves
+            struct.pack(">I", max(0, int(replay_gain)) & 0xFFFFFFFF),
+            struct.pack(">H", 0),       # server_port
+            struct.pack(">I", 0),       # server_ip
+        ])
+        return struct.pack(">H", len(payload)) + payload
+
     async def send_flush_to_player(self, mac: str) -> bool:
         """Send a 'strm' flush command ('f') to a player.
 
@@ -1287,14 +1340,7 @@ class SlimProtoClient:
         writer = self._player_writers.get(mac)
         if writer is None or writer.is_closing():
             return False
-        payload = b"".join([
-            b"strm", b"f", b"0", b"?", b"0", b"0", b"0", b"l",
-            bytes(7),                       # threshold..slaves
-            struct.pack(">I", 0),           # replay_gain
-            struct.pack(">H", 0),           # server_port
-            struct.pack(">I", 0),           # server_ip
-        ])
-        frame = struct.pack(">H", len(payload)) + payload
+        frame = self._build_strm_control_frame("f")
         try:
             writer.write(frame)
             await writer.drain()
@@ -1327,6 +1373,31 @@ class SlimProtoClient:
         if writer is None or writer.is_closing():
             logger.warning("No active connection for player %s", mac)
             return False
+
+        # ── Idempotency guard (LIVE-02) ──
+        # Perl's controller ignores a redundant _Stream for the song that is
+        # already playing: a repeat `playlistcontrol cmd:load <current track>`
+        # does NOT flush and restart the stream. Our handle used to send
+        # `strm 'f'` + `strm 's'` on every repeat, and SqueezePlay answers
+        # every `cmd:load` with a fresh load — the resulting
+        # flush/connect/underrun loop tore the buffers down before any audio
+        # could play (see .hermes/gap-analysis/06 LIVE-02: 6 strm frames in
+        # 8 s, out_fullness flipping 0 <-> 3525496, elapsed frozen).
+        try:
+            from lyrion.player.manager import PlayerManager
+            _existing = PlayerManager().get_player(mac)
+            if (
+                _existing is not None
+                and _existing.mode == "play"
+                and _existing.current_track_id == track_id
+            ):
+                logger.info(
+                    "strm for %s track=%d already playing — skipping re-stream",
+                    mac, track_id,
+                )
+                return True
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("strm idempotency check failed for %s: %s", mac, exc)
 
         # Load track metadata for codec
         mime = None
@@ -1757,7 +1828,7 @@ class SlimProtoClient:
                 # The source never answered (dead/unreachable station) —
                 # don't leave the UI showing "playing" with no audio.
                 try:
-                    from lyrion.player.manager import PlayerManager, _formats_for_model
+                    from lyrion.player.manager import PlayerManager
                     player = PlayerManager().get_player(mac)
                     if player is not None:
                         player.mode = "stop"
@@ -1806,18 +1877,8 @@ class SlimProtoClient:
         writer = self._player_writers.get(mac)
         if writer is None or writer.is_closing():
             return False
-        # strm command 'q' = flush/stop. Fields after endianness:
-        # threshold(1) spdif(1) transition_period(1) transition_type(1)
-        # flags(1) output_threshold(1) slaves(1) = 7 bytes, then
-        # replay_gain(4 BE) server_port(2 BE) server_ip(4 BE)
-        payload = b"".join([
-            b"strm", b"q", b"0", b"?", b"0", b"0", b"0", b"l",
-            bytes(7),                 # threshold..slaves
-            struct.pack(">I", 0),     # replay_gain
-            struct.pack(">H", 0),     # server_port
-            struct.pack(">I", 0),     # server_ip
-        ])
-        frame = struct.pack(">H", len(payload)) + payload
+        # strm command 'q' = flush/stop (Perl Squeezebox.pm:1096-1116 layout).
+        frame = self._build_strm_control_frame("q")
         try:
             writer.write(frame)
             await writer.drain()
@@ -1839,14 +1900,8 @@ class SlimProtoClient:
         writer = self._player_writers.get(mac)
         if writer is None or writer.is_closing():
             return False
-        payload = b"".join([
-            b"strm", b"p", b"0", b"?", b"0", b"0", b"0", b"l",
-            bytes(7),
-            struct.pack(">I", pause_ms),  # replay_gain = pause interval ms
-            struct.pack(">H", 0),
-            struct.pack(">I", 0),
-        ])
-        frame = struct.pack(">H", len(payload)) + payload
+        # replay_gain = pause interval in ms (0 = pause indefinitely).
+        frame = self._build_strm_control_frame("p", pause_ms)
         try:
             writer.write(frame)
             await writer.drain()
@@ -1865,14 +1920,8 @@ class SlimProtoClient:
         writer = self._player_writers.get(mac)
         if writer is None or writer.is_closing():
             return False
-        payload = b"".join([
-            b"strm", b"u", b"0", b"?", b"0", b"0", b"0", b"l",
-            bytes(7),
-            struct.pack(">I", 0),  # replay_gain = unpause jiffies (0 = now)
-            struct.pack(">H", 0),
-            struct.pack(">I", 0),
-        ])
-        frame = struct.pack(">H", len(payload)) + payload
+        # replay_gain = unpause jiffies (0 = now).
+        frame = self._build_strm_control_frame("u", 0)
         try:
             writer.write(frame)
             await writer.drain()
@@ -1893,14 +1942,8 @@ class SlimProtoClient:
         writer = self._player_writers.get(mac)
         if writer is None or writer.is_closing():
             return False
-        payload = b"".join([
-            b"strm", b"a", b"0", b"?", b"0", b"0", b"0", b"l",
-            bytes(7),
-            struct.pack(">I", max(0, int(seconds) * 1000)),  # replay_gain = ms
-            struct.pack(">H", 0),
-            struct.pack(">I", 0),
-        ])
-        frame = struct.pack(">H", len(payload)) + payload
+        # replay_gain = skip interval in ms (Perl stream('a')).
+        frame = self._build_strm_control_frame("a", int(seconds) * 1000)
         try:
             writer.write(frame)
             await writer.drain()
@@ -2084,34 +2127,97 @@ class SlimProtoClient:
         except Exception as exc:
             logger.warning("STMu parse failed for %s: %s", mac_str, exc)
 
-    def _handle_stat_frame(self, mac_str: str, payload: bytes) -> None:
-        """Parse a STAT frame from a player (best effort, for logging/state).
+    # STAT field offsets — Perl `unpack('a4CCCNNNNnNNNNnNNn')`
+    # (Slim/Networking/Slimproto.pm:768) == SqueezePlay SlimProto.lua:167-195.
+    # (offset, size, name) in big-endian byte order.
+    _STAT_FIELDS: tuple[tuple[int, int, str], ...] = (
+        (4, 1, "num_crlf"),
+        (5, 1, "mas_initialized"),
+        (6, 1, "mas_mode"),
+        (7, 4, "buffer_size"),
+        (11, 4, "buffer_fullness"),
+        (15, 4, "bytes_received_h"),
+        (19, 4, "bytes_received_l"),
+        (23, 2, "signal_strength"),
+        (25, 4, "jiffies"),
+        (29, 4, "output_buffer_size"),
+        (33, 4, "output_buffer_fullness"),
+        (37, 4, "elapsed_seconds"),
+        (41, 2, "voltage"),
+        (43, 4, "elapsed_milliseconds"),
+        (47, 4, "server_timestamp"),
+        (51, 2, "error_code"),
+    )
 
-        STAT packet layout (from squeezelite slimproto.h / LMS _stat_handler):
-            event(4) num_crlf(1) mas_initialized(1) mas_mode(1)
-            stream_buffer_size(4) stream_buffer_fullness(4)
-            bytes_received_H(4) bytes_received_L(4) signal_strength(2)
-            jiffies(4) output_buffer_size(4) output_buffer_fullness(4)
-            elapsed_seconds(4) voltage(2) elapsed_milliseconds(4)
-            server_timestamp(4) error_code(2)
+    @staticmethod
+    def parse_stat_payload(payload: bytes) -> dict:
+        """Unpack a STAT payload exactly like Perl's ``_stat_handler``.
+
+        Returns every field of the Perl unpack plus a few derived ones:
+
+        ``event`` (str), ``num_crlf``, ``mas_initialized``, ``mas_mode``,
+        ``buffer_size`` (Perl ``rptr``/decodeSize), ``buffer_fullness``
+        (``wptr``/decodeFull), ``fullness`` (=buffer_fullness),
+        ``bytes_received_h/l``, ``bytes_received``, ``signal_strength``,
+        ``jiffies``, ``output_buffer_size``, ``output_buffer_fullness``,
+        ``elapsed_seconds``, ``voltage``, ``elapsed_milliseconds``,
+        ``server_timestamp``, ``error_code``, ``length``.
+
+        Truncated/unknown-shape payloads never raise: fields that lie
+        beyond the frame are reported as 0 (Perl gets ``undef`` there and
+        forces ``error_code = 0`` for any length other than 53/57,
+        Slimproto.pm:770-777).
+        """
+        n = len(payload)
+        out: dict = {
+            "event": payload[0:4].decode("ascii", errors="replace").strip("\x00"),
+            "length": n,
+        }
+        for off, size, name in SlimProtoClient._STAT_FIELDS:
+            out[name] = int.from_bytes(payload[off:off + size], "big") if n >= off + size else 0
+        # 51-byte SqueezePlay/jive frames have no trailing error_code;
+        # 53/57-byte frames do. Anything else is an older firmware whose
+        # error_code Perl deliberately ignores.
+        if n not in (53, 57):
+            out["error_code"] = 0
+        out["bytes_received"] = out["bytes_received_h"] * 2**32 + out["bytes_received_l"]
+        # Perl aliases: bufferSize <- buffer_size, fullness <- buffer_fullness.
+        out["fullness"] = out["buffer_fullness"]
+        # Seconds of playback. Perl prefers elapsed_milliseconds
+        # (Slimproto.pm:811-814 logs `elapsed_milliseconds / 1000`); some
+        # firmware only fills the whole-second field.
+        if out["elapsed_milliseconds"]:
+            out["elapsed_seconds_precise"] = out["elapsed_milliseconds"] / 1000.0
+        else:
+            out["elapsed_seconds_precise"] = float(out["elapsed_seconds"])
+        return out
+
+    def _handle_stat_frame(self, mac_str: str, payload: bytes) -> None:
+        """Parse a STAT frame from a player and drive the UI state machine.
+
+        Layout documented in the module docstring (and enforced by
+        ``parse_stat_payload``): Perl ``unpack('a4CCCNNNNnNNNNnNNn')``
+        (Slimproto.pm:768). Live frames from the SqueezePlay on this
+        network are 51 bytes (no error_code), squeezelite sends 53.
         """
         try:
-            if len(payload) >= 4:
-                event = payload[0:4].decode("ascii", errors="replace").strip("\x00")
-            else:
-                event = "?"
-            # Squeezelite/SqueezePlayer pack the statstruct_t WITHOUT
-            # C padding (53 bytes). Verified against live frames:
-            # output_buffer_size(4) at 29:33 == 0x0035d540 (3.5MB), so
-            # jiffies is at 25:29 and elapsed_seconds at 37:41.
-            jiffies = int.from_bytes(payload[25:29], "big") if len(payload) >= 29 else 0
-            elapsed = int.from_bytes(payload[37:41], "big") if len(payload) >= 41 else 0
-            # output buffer fullness (33:37) — counts DOWN as the audio
+            stat = self.parse_stat_payload(payload)
+            event = stat["event"]
+            jiffies = stat["jiffies"]
+            # output buffer fullness (offset 33) — counts DOWN as the audio
             # drains. End-of-track = STMt while the output buffer has
             # fully drained after the decoder ran dry (STMd).
-            out_fullness = int.from_bytes(payload[33:37], "big") if len(payload) >= 37 else 0
-            logger.debug("STAT from %s: event=%s jiffies=%d elapsed=%ds out_fullness=%d hex=%s",
-                         mac_str, event, jiffies, elapsed, out_fullness, payload[:60].hex())
+            out_fullness = stat["output_buffer_fullness"]
+            logger.debug(
+                "STAT from %s: event=%s jiffies=%d elapsed=%ss (ms=%d) "
+                "out_fullness=%d/%d fullness=%d signal=%d bytes=%d "
+                "srv_ts=%d err=%d len=%d hex=%s",
+                mac_str, event, jiffies,
+                stat["elapsed_seconds_precise"], stat["elapsed_milliseconds"],
+                out_fullness, stat["output_buffer_size"],
+                stat["fullness"], stat["signal_strength"],
+                stat["bytes_received"], stat["server_timestamp"],
+                stat["error_code"], stat["length"], payload[:60].hex())
 
             # event "setd" carries the player-assigned name (squeezelite/IPAD style)
             if event == "setd":
@@ -2132,7 +2238,7 @@ class SlimProtoClient:
                                 candidate = raw_name.decode("latin-1").strip()
                             if candidate and candidate.isprintable() and len(candidate) < 64:
                                 logger.info("STAT setd from %s: name=%r (payload %d bytes)", mac_str, candidate, len(payload))
-                                from lyrion.player.manager import PlayerManager, _formats_for_model
+                                from lyrion.player.manager import PlayerManager
                                 PlayerManager().rename_player(mac_str, candidate)
                                 break
                 except Exception as exc:
@@ -2144,10 +2250,23 @@ class SlimProtoClient:
                 pm = PlayerManager()
                 player = pm.get_player(mac_str)
                 if player is not None:
-                    # Track playback position (STAT elapsed_seconds, sent
-                    # with every STMt) — used for status 'time'.
-                    if elapsed and elapsed < 3600 * 24:  # sanity: < 24h
-                        player.elapsed = elapsed
+                    # Persist the full STAT field set (PROT-15). The status
+                    # 'time' uses elapsed; prefer the ms field as Perl does
+                    # (`elapsed_milliseconds / 1000`, Slimproto.pm:811-814).
+                    try:
+                        player.elapsed = stat["elapsed_seconds_precise"]
+                    except Exception:
+                        pass
+                    # signalstrength was hard-coded 0 in the status before;
+                    # keep the raw STAT value (0xffff = "unknown").
+                    if stat["signal_strength"] not in (0, 0xFFFF):
+                        player.signal_strength = stat["signal_strength"] & 0xFF
+                    # Keep the whole decoded struct for diagnostics/sync
+                    # (Perl keeps it in %status and exposes
+                    # getPlayPointData -> jiffies/elapsed_ms/elapsed_s).
+                    # setattr keeps this file self-contained (state.py is
+                    # owned elsewhere); declare it on PlayerState later.
+                    setattr(player, "_stat", stat)
                     if event == "STMt":
                         # TIMING heartbeat: only sent while the output is
                         # RUNNING. If the UI state says otherwise (e.g. the
