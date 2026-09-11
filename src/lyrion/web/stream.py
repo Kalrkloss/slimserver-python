@@ -8,8 +8,11 @@ the actual file bytes with range support (needed for resume/seek).
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
+import time
+from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
@@ -177,7 +180,6 @@ def ffmpeg_available() -> bool:
 
 def ffprobe_audio_info(path: Path) -> dict | None:
     """Return {'codec','bits','rate','channels'} via ffprobe, or None."""
-    import asyncio
     import subprocess
     try:
         proc = subprocess.run(
@@ -263,6 +265,187 @@ async def _load_track(track_id: int):
         path = _track_path_from_url(track.url) if track.url else None
         mime = track.content_type
         return path, mime
+
+
+# ── Flow control / stream-switch abort (LIVE-08) ─────────────────────────
+#
+# Perl parcel (public/9.2 @ d1d0a683d):
+#
+# * ``Slim/Web/HTTP.pm:2152-2439`` (``sendStreamingResponse``) writes at
+#   most ``MAXCHUNKSIZE`` = 32768 bytes (line 61) per select() callback and
+#   is only invoked when the socket is writable (``addWrite(...)``, line
+#   2143); a partial write / EWOULDBLOCK requeues the unsent remainder
+#   (2387-2405). Python's ``await send(...)`` supplies the same TCP
+#   backpressure, but the kernel/uvicorn buffers swallow a whole 11 MB
+#   track in 0.40 s — the player then sits on a full buffer and never opens
+#   a new ``GET /stream.mp3`` on a track switch. So the pace becomes
+#   explicit: a short burst (fast start), then ~1x realtime.
+# * ``Slim/Web/HTTP.pm:2136`` + ``2185-2199``: every streaming socket is
+#   registered as ``$client->streamingsocket``; the callback closes any
+#   socket that is no longer the client's current one → the old stream dies
+#   the moment the player switches. ``Slim/Player/Squeezebox.pm:206-216``
+#   ``stop`` sets ``streamingsocket(undef)`` ("HTTP.pm will close the socket
+#   on the next select"); ``Squeezebox2.pm:398-403`` ``play`` calls
+#   ``closeStream()`` (Bug 15477: "always use a new stream").
+#
+# ``cont`` is NOT part of this: the only occurrence in the whole Perl tree
+# is ``Slim/Player/Squeezebox2.pm:724`` — a SERVER→player frame carrying the
+# Icecast metaint for direct streams. There is no client→server ``cont``
+# handler, so an incoming ``cont`` is logged only and must not be wired as
+# "send more" (flow control is socket-level).
+
+DEFAULT_BITRATE_BPS = 128_000   # conservative fallback (bits/s)
+BURST_SECONDS = 3.0             # audio buffered up front before throttling
+PACED_CHUNK_SIZE = 16 * 1024    # ≤ Perl MAXCHUNKSIZE (32768)
+CANCEL_POLL_SECONDS = 0.25      # max delay before a cancel is noticed
+
+
+@dataclass
+class ActiveStream:
+    """A running ``/stream.mp3`` response, keyed by player MAC."""
+    mac: str
+    cancel_event: asyncio.Event = field(default_factory=asyncio.Event)
+
+
+_active_streams: dict[str, ActiveStream] = {}
+
+
+def _normalize_mac(mac: str) -> str:
+    """Registry key: uppercase, no colons, no URL escaping."""
+    return mac.upper().replace("%3A", "").replace(":", "")
+
+
+def register_active_stream(mac: str) -> ActiveStream:
+    """Register the handler's response as the player's current stream.
+
+    Replaces (and cancels) any previous stream for the same player — the
+    Perl LMS does the same by making the newest socket
+    ``$client->streamingsocket`` and closing the older one.
+    """
+    key = _normalize_mac(mac)
+    handle = ActiveStream(mac=key)
+    previous = _active_streams.get(key)
+    if previous is not None:
+        previous.cancel_event.set()
+    _active_streams[key] = handle
+    return handle
+
+
+def unregister_active_stream(handle: ActiveStream) -> None:
+    """Drop a finished handler's entry — but never a newer one's."""
+    if _active_streams.get(handle.mac) is handle:
+        del _active_streams[handle.mac]
+
+
+def cancel_active_stream(mac: str) -> bool:
+    """Abort the player's running stream response.
+
+    Called from the slimproto side (``send_strm_to_player`` /
+    ``send_remote_stream``) BEFORE the new strm frame goes out, so the
+    player can immediately reconnect: the old response stops writing and
+    the connection is closed. Returns True if a stream was running.
+    """
+    handle = _active_streams.get(_normalize_mac(mac))
+    if handle is None:
+        return False
+    handle.cancel_event.set()
+    return True
+
+
+def _now() -> float:
+    """Monotonic clock — a module hook so tests can fake time."""
+    return time.monotonic()
+
+
+async def _sleep(delay: float) -> None:
+    """Sleep hook (tests replace this to keep pacing deterministic)."""
+    await asyncio.sleep(delay)
+
+
+class StreamPacer:
+    """Rate limiter for ``/stream.mp3``: burst, then ~1x realtime."""
+
+    def __init__(self, bytes_per_sec: int, burst_bytes: int) -> None:
+        self.bytes_per_sec = max(1, int(bytes_per_sec))
+        self.burst_bytes = max(0, int(burst_bytes))
+        self._start = 0.0
+        self._sent = 0
+
+    @classmethod
+    def from_bitrate(cls, bitrate_bps: int | None,
+                     burst_seconds: float = BURST_SECONDS) -> StreamPacer:
+        bps = int(bitrate_bps) if bitrate_bps and bitrate_bps > 0 \
+            else DEFAULT_BITRATE_BPS
+        per_sec = max(1, bps // 8)
+        return cls(per_sec, int(per_sec * max(0.0, burst_seconds)))
+
+    def start(self) -> None:
+        self._start = _now()
+        self._sent = 0
+
+    def schedule(self, sent_bytes: int) -> float:
+        """Delay to wait after this write so the stream stays ≤ realtime
+        (once the burst is exhausted). 0.0 inside the burst."""
+        self._sent += max(0, int(sent_bytes))
+        if self._sent <= self.burst_bytes:
+            return 0.0
+        target = (self._sent - self.burst_bytes) / self.bytes_per_sec
+        delay = target - (_now() - self._start)
+        return delay if delay > 0 else 0.0
+
+
+async def _sleep_or_cancel(handle: ActiveStream | None, delay: float) -> bool:
+    """Sleep ``delay`` seconds, waking early (returns True) if the stream
+    was cancelled by a track switch. Sliced so a cancel is noticed within
+    CANCEL_POLL_SECONDS instead of after a whole multi-second delay."""
+    remaining = delay
+    while remaining > 0:
+        if handle is not None and handle.cancel_event.is_set():
+            return True
+        step = remaining if remaining < CANCEL_POLL_SECONDS else CANCEL_POLL_SECONDS
+        await _sleep(step)
+        remaining -= step
+    return handle is not None and handle.cancel_event.is_set()
+
+
+_MIN_BITRATE_BPS = 16_000        # sanity clamp (16 kbit/s)
+_MAX_BITRATE_BPS = 3_072_000     # sanity clamp (3 Mbit/s)
+
+
+async def _stream_bitrate_bps(track_id: int, file_bytes: int | None = None
+                              ) -> int | None:
+    """Average bitrate of the track in bits/s, or None when unknown.
+
+    ``tracks.bitrate`` already holds **bits/s** (verified against the live
+    DB: 320000 for a 320 kbit/s MP3, 1411200 for raw PCM — not kbit/s).
+    When the duration is known the rate is derived from the number of bytes
+    we are about to serve (exact for VBR, and it can never starve the
+    player by pacing below the real rate).
+    """
+    bitrate = duration = None
+    try:
+        from sqlalchemy import select
+
+        from lyrion.database.schema import Track
+        from lyrion.database.sqlite_helper import db_session
+
+        async with db_session() as session:
+            row = (await session.execute(
+                select(Track.bitrate, Track.duration).where(Track.id == track_id)
+            )).one_or_none()
+        if row is not None:
+            bitrate, duration = row
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("bitrate lookup failed for track %d: %s", track_id, exc)
+        return None
+
+    if duration and duration > 0.5 and file_bytes:
+        estimated = int(file_bytes * 8 / float(duration))
+        if _MIN_BITRATE_BPS <= estimated <= _MAX_BITRATE_BPS:
+            return estimated
+    if bitrate and bitrate > 0:
+        return max(_MIN_BITRATE_BPS, min(int(bitrate), _MAX_BITRATE_BPS))
+    return None
 
 
 async def _revert_player_mode(mac: str) -> None:
@@ -451,6 +634,29 @@ async def stream_track(scope: dict, receive, send) -> None:
         "headers": response_headers,
     })
 
+    # ── Flow control + switch-abort (LIVE-08) ───────────────────────────
+    # Only a full-body response (200) to a known player is paced and
+    # registered. Range/seek responses (206) keep the previous behaviour
+    # byte for byte and are never cancelled.
+    handle: ActiveStream | None = None
+    pacer: StreamPacer | None = None
+    if status == 200 and player_mac:
+        handle = register_active_stream(player_mac)
+        if pcm_info is not None:
+            # raw PCM has no DB bitrate — the header gives the exact rate
+            bitrate = pcm_info["rate"] * pcm_info["channels"] * pcm_info["bits"]
+        else:
+            bitrate = await _stream_bitrate_bps(track_id, length)
+        pacer = StreamPacer.from_bitrate(bitrate)
+        pacer.start()
+        logger.info(
+            "Stream %s: pacing %d bit/s (burst %.1fs, %d B)",
+            handle.mac, pacer.bytes_per_sec * 8,
+            pacer.burst_bytes / pacer.bytes_per_sec, pacer.burst_bytes,
+        )
+
+    chunk_size = PACED_CHUNK_SIZE if pacer is not None else CHUNK_SIZE
+
     # Stream the file in chunks (async via to_thread — no aiofiles needed)
     import asyncio as _asyncio
 
@@ -460,17 +666,34 @@ async def stream_track(scope: dict, receive, send) -> None:
             if start > 0:
                 f.seek(start)
             while remaining > 0:
-                chunk = await _asyncio.to_thread(f.read, min(CHUNK_SIZE, remaining))
+                if handle is not None and handle.cancel_event.is_set():
+                    logger.info(
+                        "Stream %s cancelled (track switch) — closing response",
+                        handle.mac,
+                    )
+                    break
+                chunk = await _asyncio.to_thread(f.read, min(chunk_size, remaining))
                 if not chunk:
                     break
                 remaining -= len(chunk)
                 await send({"type": "http.response.body", "body": chunk,
                             "more_body": remaining > 0})
+                if pacer is not None and handle is not None:
+                    delay = pacer.schedule(len(chunk))
+                    if delay > 0 and await _sleep_or_cancel(handle, delay):
+                        logger.info(
+                            "Stream %s cancelled during pacing — closing response",
+                            handle.mac,
+                        )
+                        break
     except (ConnectionError, BrokenPipeError, asyncio.CancelledError):
         # Player disconnected (stop/next) — this is normal.
         pass
     except Exception as exc:  # noqa: BLE001
         logger.warning("Stream error for track %d: %s", track_id, exc)
+    finally:
+        if handle is not None:
+            unregister_active_stream(handle)
     # NOTE: no auto-next here. Advancing the playlist on HTTP-send
     # completion is WRONG: the server can push the whole file into the
     # player's buffer long before it finished playing, which restarts the
@@ -737,4 +960,3 @@ async def _proxy_remote(send, remote_url: str, transcode: str = "") -> None:
                        remote_url[:80], exc)
 
 
-import asyncio  # noqa: E402  (used in stream_track exception handling)

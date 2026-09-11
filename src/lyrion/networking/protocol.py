@@ -1369,6 +1369,28 @@ class SlimProtoClient:
         except Exception:
             pass
 
+    @staticmethod
+    def cancel_active_stream(mac: str) -> bool:
+        """Abort the player's running ``/stream.mp3`` response.
+
+        Perl LMS parity: the newest streaming socket becomes
+        ``$client->streamingsocket`` and ``sendStreamingResponse`` closes any
+        socket that is no longer the client's current one
+        (Slim/Web/HTTP.pm:2136 + 2185-2199); ``stop``/``play`` disassociate it
+        outright (Squeezebox.pm:206-216, Squeezebox2.pm:398-403). The Python
+        handler is paced, so without this an old stream keeps writing for
+        minutes after the switch.
+        """
+        try:
+            from lyrion.web.stream import cancel_active_stream
+            cancelled = cancel_active_stream(mac)
+            if cancelled:
+                logger.info("Cancelled active /stream.mp3 response for %s", mac)
+            return cancelled
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("cancel_active_stream failed for %s: %s", mac, exc)
+            return False
+
     async def send_strm_to_player(self, mac: str, track_id: int) -> bool:
         """Send a 'strm' (stream) frame to a player so it fetches the track
         over HTTP from this server's /stream.mp3 endpoint.
@@ -1526,6 +1548,10 @@ class SlimProtoClient:
         )
         # Flush old stream buffers first (Perl LMS behaviour) so the
         # switch is immediate instead of playing out the old buffer.
+        # Then (or rather: before) the new frame goes out, the previous
+        # /stream.mp3 response for this player is aborted so it cannot keep
+        # filling the player's buffers (LIVE-08).
+        self.cancel_active_stream(mac)
         await self._flush_if_playing(mac)
         try:
             writer.write(frame)
@@ -1683,6 +1709,10 @@ class SlimProtoClient:
 
         # Flush old stream buffers first (Perl LMS behaviour) so the
         # switch is immediate instead of playing out the old buffer.
+        # The player's previous /stream.mp3 response is aborted first
+        # (LIVE-08) — every branch below (proxy, https fallback, direct)
+        # must not race an old paced stream still filling the buffers.
+        self.cancel_active_stream(mac)
         await self._flush_if_playing(mac)
 
         # Resolve redirects / M3U/PLS playlists server-side (Squeezelite
