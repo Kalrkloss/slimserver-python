@@ -2193,20 +2193,37 @@ class JSONRPCAPI:
             else:
                 send(f"power {val}")
         elif cmd == "pause":
-            val = str(args[0]) if args else "0"
             player = pm.get_player(pid)
-            if player is not None:
-                if val == "1":
-                    # Real frame to the player (strm 'p'), not just state
-                    await pm.pause_player(pid, True)
-                elif val == "0":
-                    # Resume: power on + (re)send strm for the current track
-                    player.power = True
-                    player.mode = "play"
-                    pm.set_mode(pid, "play")
-                    await self._play_playlist_item(pm, player, player.playlist_position or 0)
+            if player is None:
+                send(f"pause {args[0]}" if args else "pause")
             else:
-                send(f"pause {val}")
+                # Perl parity (Slim/Control/Commands.pm:731-753):
+                #   explicit value -> truthy = 'pause', falsy = 'play'
+                #   no value       -> toggle ('play' from pause/stop, else 'pause')
+                #   'play' while paused becomes 'resume' (position kept),
+                #   'play' while stopped starts the current playlist item.
+                curmode = player.mode or "stop"
+                if args:
+                    raw = str(args[0])
+                    try:
+                        want = "pause" if float(raw) != 0 else "play"
+                    except ValueError:
+                        want = "pause" if raw else "play"
+                else:
+                    want = "play" if curmode in ("pause", "stop") else "pause"
+                if want == "pause":
+                    # only from 'play' (Perl: pause cannot pause a stopped player)
+                    if curmode == "play":
+                        await pm.pause_player(pid, True)
+                else:
+                    if curmode == "pause":
+                        await pm.pause_player(pid, False)   # Perl's 'resume'
+                    elif curmode == "stop":
+                        player.power = True
+                        pm.set_mode(pid, "play")
+                        await self._play_playlist_item(
+                            pm, player, player.playlist_position or 0
+                        )
         elif cmd == "play":
             player = pm.get_player(pid)
             if player is not None:
