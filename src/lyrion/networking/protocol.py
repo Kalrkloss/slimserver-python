@@ -2258,9 +2258,13 @@ class SlimProtoClient:
                         from lyrion.web.cometd import get_manager
                         _mgr = get_manager()
                         if _mgr is not None:
+                            logger.debug("STAT %s → notify_player_status (%d cometd clients)",
+                                         mac_str, len(getattr(_mgr, "_clients", {})))
                             asyncio.create_task(_mgr.notify_player_status(player.mac))
-                    except Exception:
-                        pass
+                        else:
+                            logger.debug("STAT %s → no cometd manager", mac_str)
+                    except Exception as exc:
+                        logger.debug("notify_player_status dispatch failed: %s", exc)
             except Exception:
                 pass
         except Exception as exc:
