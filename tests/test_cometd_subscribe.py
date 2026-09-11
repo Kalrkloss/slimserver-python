@@ -324,3 +324,122 @@ def test_serverstatus_subscription_is_request_driven_and_defaults_to_jive():
     assert request_driven == [["", ["serverstatus", "0", "50", "subscribe:60"]]]
     assert len(events) == 1
     assert default_calls == [["", ["serverstatus", "0", "50", "subscribe:60"]]]
+
+
+# ---------------------------------------------------------------------------
+# R0.5 P3 fixes — delivery per matched channel, no phantom client from a
+# cid-less response path, and Perl's error acks for malformed subscriptions.
+# ---------------------------------------------------------------------------
+
+
+def test_two_exact_status_subs_of_same_player_both_delivered():
+    """Perl delivers one event per matched channel (Manager::deliver_events),
+    so two distinct EXACT status subscriptions of the same player — two
+    response channels, two stored requests — must yield TWO events. Only a
+    glob that resolves to an already-matched channel is collapsed
+    (review P3-1: 708 collapsed them to one)."""
+    async def run():
+        mgr, rec = _manager()
+        cid = await _handshake(mgr)
+        first = f"/{cid}/slim/playerstatus/{PLAYER}"
+        second = f"/slim/playerstatus/{PLAYER}"
+        await mgr.handle_messages([{
+            "channel": "/slim/subscribe", "clientId": cid, "id": 2,
+            "data": {"request": [PLAYER, JIVE_STATUS_CMD], "response": first},
+        }])
+        await mgr.handle_messages([{
+            "channel": "/slim/subscribe", "clientId": cid, "id": 3,
+            "data": {"request": [PLAYER, JIVE_STATUS_CMD], "response": second},
+        }])
+        await mgr.wait_for_events(cid, timeout=0)  # drain both seed pushes
+        await mgr.wait_for_events(cid, timeout=0)
+        rec.calls.clear()
+        await mgr.notify_player_status(PLAYER)
+        return first, second, rec.calls, await mgr.wait_for_events(cid, timeout=0)
+
+    first, second, calls, events = _run(run())
+    assert sorted(e["channel"] for e in events) == sorted([first, second]), events
+    assert len(calls) == 2, calls
+
+
+def test_two_exact_status_subs_same_channel_delivered_once():
+    """Two subscriptions that resolve to the SAME concrete channel are one
+    delivery (dedupe per channel), not two."""
+    async def run():
+        mgr, rec = _manager()
+        cid = await _handshake(mgr)
+        channel = f"/{cid}/slim/playerstatus/{PLAYER}"
+        for msgid in (2, 3):
+            await mgr.handle_messages([{
+                "channel": "/slim/subscribe", "clientId": cid, "id": msgid,
+                "data": {"request": [PLAYER, JIVE_STATUS_CMD],
+                         "response": channel},
+            }])
+        await mgr.wait_for_events(cid, timeout=0)
+        rec.calls.clear()
+        await mgr.notify_player_status(PLAYER)
+        return channel, await mgr.wait_for_events(cid, timeout=0)
+
+    channel, events = _run(run())
+    assert len(events) == 1, events
+    assert events[0]["channel"] == channel
+
+
+def test_cidless_response_channel_creates_no_phantom_client():
+    """A /slim/subscribe whose response channel has no clientId segment
+    (``/slim/serverstatus``) must not mint a phantom client named after the
+    namespace root (review P3-2: a client ``slim`` swallowed the events)."""
+    async def run():
+        mgr, rec = _manager()
+        cid = await _handshake(mgr)
+        ack = (await mgr.handle_messages([{
+            "channel": "/slim/subscribe", "id": 2,
+            "data": {"request": [PLAYER, JIVE_STATUS_CMD],
+                     "response": "/slim/serverstatus"},
+        }]))[0]
+        return cid, ack, sorted(mgr._clients), rec.calls
+
+    cid, ack, clients, calls = _run(run())
+    assert clients == [cid], clients
+    assert ack["successful"] is False
+    assert ack["error"]
+    assert calls == []
+
+
+def test_slim_subscribe_without_response_is_an_error_ack():
+    """Perl answers a /slim/subscribe without data.response with
+    successful:false + 'response data key not found' (Cometd.pm:486-492);
+    the old code acked success while registering nothing (review P3-3)."""
+    async def run():
+        mgr, rec = _manager()
+        cid = await _handshake(mgr)
+        ack = (await mgr.handle_messages([{
+            "channel": "/slim/subscribe", "clientId": cid, "id": 2,
+            "data": {"request": [PLAYER, JIVE_STATUS_CMD]},
+        }]))[0]
+        return ack, mgr.get(cid).subscriptions, rec.calls
+
+    ack, subs, calls = _run(run())
+    assert ack["successful"] is False
+    assert ack["error"] == "response data key not found"
+    assert subs == {}
+    assert calls == []
+
+
+def test_slim_subscribe_without_request_is_an_error_ack():
+    """Perl: /slim/subscribe without data.request -> 'request data key not
+    found' (Cometd.pm:479-485), successful:false."""
+    async def run():
+        mgr, rec = _manager()
+        cid = await _handshake(mgr)
+        ack = (await mgr.handle_messages([{
+            "channel": "/slim/subscribe", "clientId": cid, "id": 2,
+            "data": {"response": f"/{cid}/slim/playerstatus/{PLAYER}"},
+        }]))[0]
+        return ack, mgr.get(cid).subscriptions, rec.calls
+
+    ack, subs, calls = _run(run())
+    assert ack["successful"] is False
+    assert ack["error"] == "request data key not found"
+    assert subs == {}
+    assert calls == []

@@ -21,6 +21,8 @@ import asyncio
 import json
 import logging
 
+from lyrion.web.cometd import _client_id_from_channel
+
 
 logger = logging.getLogger(__name__)
 
@@ -137,6 +139,14 @@ def _dechunk(data: bytes) -> bytes:
 
 async def _handle_connection(manager, reader: asyncio.StreamReader,
                              writer: asyncio.StreamWriter, web_port: int) -> None:
+    # Every client this socket touches. Perl removes them via
+    # webCloseHandler -> disconnectClient; this server has no close callback,
+    # so the connection owns them and drops them in its ``finally`` — also a
+    # handshake-only client and one created by a non-connect POST that never
+    # opens a /meta/connect. ``owner`` is the connection's identity so a
+    # reconnected client is only removed by its newest connection.
+    owner = object()
+    conn_cids: set[str] = set()
     try:
         while True:
             request = await _read_http_request(reader)
@@ -166,6 +176,24 @@ async def _handle_connection(manager, reader: asyncio.StreamReader,
                         logger.debug("Cometd PAYLOAD %s: %s", _ch, _data)
 
                 replies = await manager.handle_messages(messages)
+                # Remember every client this socket touched: handshake ids
+                # arrive in the replies, explicit ones in the messages, and
+                # Orange Squeeze's cid-less /slim/* in their response channel.
+                # The connection drops them all when it closes.
+                for m in messages:
+                    if not isinstance(m, dict):
+                        continue
+                    c = m.get("clientId", "")
+                    if not c:
+                        c = _client_id_from_channel(
+                            (m.get("data") or {}).get("response", ""))
+                    if c:
+                        conn_cids.add(c)
+                for r in replies:
+                    if isinstance(r, dict) and r.get("clientId"):
+                        conn_cids.add(r["clientId"])
+                for c in conn_cids:
+                    manager.register_connection(c, owner)
                 connect_msgs = [m for m in messages if isinstance(m, dict)
                                 and m.get("channel") == "/meta/connect"]
 
@@ -194,18 +222,14 @@ async def _handle_connection(manager, reader: asyncio.StreamReader,
                     chunk = json.dumps(first).encode("utf-8")
                     writer.write(f"{len(chunk):x}\r\n".encode() + chunk + b"\r\n")
                     await writer.drain()
-                    # Keep the stream open and push events, while the
-                    # loop continues reading the pipelined requests.
+                    # The stream stays open: mark the client as actively
+                    # connected so the idle reaper (Perl LONG_POLLING_AUTOKILL)
+                    # never drops a silently streaming client. The push task
+                    # dies with the connection (cancelled in the finally
+                    # below); the request loop keeps running.
+                    manager.connection_open(cid)
                     push_task = asyncio.create_task(
                         _push_events(manager, cid, writer))
-                    try:
-                        # continue the request loop (this function loops
-                        # back to read the next POST)
-                        pass
-                    finally:
-                        pass
-                    # The request loop keeps running; the push task must
-                    # survive until the connection closes.
                     stream_cid = cid
                     try:
                         while True:
@@ -240,7 +264,11 @@ async def _handle_connection(manager, reader: asyncio.StreamReader,
                                     # ack is the only one; result events flow
                                     # via push_task (exactly once).
                                     nc = nconnect[0]
-                                    stream_cid = nc.get("clientId", stream_cid)
+                                    new_cid = nc.get("clientId", stream_cid)
+                                    if new_cid and new_cid != stream_cid:
+                                        manager.connection_closed(stream_cid)
+                                        manager.connection_open(new_cid)
+                                        stream_cid = new_cid
                                     payload = list(nreplies) + [{
                                         "channel": "/meta/connect",
                                         "successful": True,
@@ -271,14 +299,18 @@ async def _handle_connection(manager, reader: asyncio.StreamReader,
                             await push_task
                         except (asyncio.CancelledError, Exception):
                             pass
-                        # The connection is gone (client closed it, app was
-                        # killed, or the body was truncated) — no
-                        # /meta/disconnect ever arrives. Drop the client here:
-                        # otherwise it stays in the manager forever and the
-                        # notify_* / keepalive loops keep filling an event
-                        # queue nobody reads. Perl does the same from
-                        # webCloseHandler -> disconnectClient.
-                        manager.remove(stream_cid)
+                        manager.connection_closed(stream_cid)
+                        # The streaming connection is gone: client closed it,
+                        # app was killed, or the body was truncated — no
+                        # /meta/disconnect ever arrives. Drop the client here
+                        # (only if this connection still owns it) — otherwise
+                        # it stays in the manager forever and the notify_* /
+                        # keepalive loops keep filling a queue nobody reads.
+                        # Perl does the same from webCloseHandler ->
+                        # disconnectClient. Handshake-only / non-connect
+                        # clients are dropped by the outer finally below and,
+                        # on the ASGI path, by the manager's idle reaper.
+                        manager.remove_if_owner(stream_cid, owner)
                     break
                 else:
                     # no connect: reply with acks AND any queued events.
@@ -297,8 +329,7 @@ async def _handle_connection(manager, reader: asyncio.StreamReader,
                         cid2 = m.get("clientId", "")
                         if not cid2:
                             resp = (m.get("data") or {}).get("response", "")
-                            if resp.startswith("/"):
-                                cid2 = resp.split("/")[1]
+                            cid2 = _client_id_from_channel(resp)
                         if cid2:
                             events.extend(
                                 await manager.wait_for_events(cid2, timeout=0))
@@ -318,6 +349,13 @@ async def _handle_connection(manager, reader: asyncio.StreamReader,
             asyncio.IncompleteReadError, EOFError):
         pass
     finally:
+        # The socket is gone: drop every client this connection owned —
+        # including a handshake-only client that never issued /meta/connect
+        # and one created by a non-connect POST (review repros H/I). Only the
+        # client's current connection may remove it, so a reconnect that
+        # already claimed the id is left alone (Perl webCloseHandler).
+        for cid in conn_cids:
+            manager.remove_if_owner(cid, owner)
         # Always release the socket — also for a truncated body / aborted
         # connection, which used to escape the handler (IncompleteReadError
         # is neither a ConnectionError nor an OSError) and leak the

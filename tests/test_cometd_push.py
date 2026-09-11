@@ -22,7 +22,12 @@ import asyncio
 import json
 
 from lyrion.networking.cometd_stream import start_cometd_server
-from lyrion.web.cometd import MAX_QUEUED_EVENTS, CometdManager, _channel_matches
+from lyrion.web.cometd import (
+    LONG_POLLING_AUTOKILL,
+    MAX_QUEUED_EVENTS,
+    CometdManager,
+    _channel_matches,
+)
 
 
 class _StubRPC:
@@ -602,3 +607,251 @@ def test_non_connect_post_on_stream_is_answered_as_a_chunk():
     assert b"HTTP/1.1" not in raw, raw
     payload = json.loads(raw)
     assert any(m.get("channel") == "/slim/request" for m in payload), payload
+
+
+# ---------------------------------------------------------------------------
+# R0.5 fixes — client cleanup on ALL paths (handshake-only, non-connect, ASGI,
+# disconnect) + Perl's LONG_POLLING_AUTOKILL idle reaper (review P2-1, repros
+# H/I) and the documented connect-ack position deviation (review P3-4).
+# ---------------------------------------------------------------------------
+
+
+def _fake_clock(start: float = 1000.0):
+    """Returns (now_list, clock) — a mutable clock for idle-timeout tests."""
+    now = [start]
+    return now, (lambda: now[0])
+
+
+async def _read_clen_reply(reader) -> bytes:
+    """Read one Content-Length framed /cometd reply."""
+    head = await _read_headers(reader)
+    clen = 0
+    for line in head.split(b"\r\n"):
+        if line.lower().startswith(b"content-length:"):
+            clen = int(line.split(b":", 1)[1].strip())
+    return await asyncio.wait_for(reader.readexactly(clen), timeout=5)
+
+
+def test_handshake_only_client_is_reaped_after_idle_timeout():
+    """A client that handshakes but never /meta/connect is dropped once it
+    exceeds Perl's LONG_POLLING_AUTOKILL window (review P2-1, repro H)."""
+    now, clock = _fake_clock()
+
+    async def run():
+        mgr = CometdManager(_StubRPC(), clock=clock)
+        hs = await mgr.handle_messages([{"channel": "/meta/handshake", "id": 1}])
+        cid = hs[0]["clientId"]
+        assert mgr.get(cid) is not None
+        # one second short of the window: still alive
+        now[0] += LONG_POLLING_AUTOKILL - 1
+        assert mgr.kill_idle_clients() == []
+        assert mgr.get(cid) is not None
+        now[0] += 2
+        return cid, mgr.kill_idle_clients(), mgr.get(cid)
+
+    cid, reaped, client = _run(run())
+    assert reaped == [cid], "handshake-only client must be reaped"
+    assert client is None
+
+
+def test_idle_reaper_spares_client_with_open_streaming_connection():
+    """A silent but open streaming connection must never be reaped."""
+    now, clock = _fake_clock()
+
+    async def run():
+        mgr = CometdManager(_StubRPC(), clock=clock)
+        hs = await mgr.handle_messages([{"channel": "/meta/handshake", "id": 1}])
+        cid = hs[0]["clientId"]
+        mgr.connection_open(cid)
+        now[0] += 10 * LONG_POLLING_AUTOKILL
+        spared = mgr.kill_idle_clients()
+        mgr.connection_closed(cid)
+        now[0] += LONG_POLLING_AUTOKILL + 1
+        reaped = mgr.kill_idle_clients()
+        return cid, spared, reaped, mgr.get(cid)
+
+    cid, spared, reaped, client = _run(run())
+    assert spared == []
+    assert reaped == [cid]
+    assert client is None
+
+
+def test_native_handshake_only_then_close_removes_client():
+    """handshake then abrupt close (no /meta/connect) must not leak the
+    client in the manager (review repro H)."""
+    async def run():
+        mgr = CometdManager(_StubRPC())
+        server = await start_cometd_server(mgr, "127.0.0.1", 0)
+        try:
+            port = server.sockets[0].getsockname()[1]
+            reader, writer = await asyncio.open_connection("127.0.0.1", port)
+            writer.write(_post_bytes([{"channel": "/meta/handshake", "id": 1}]))
+            await writer.drain()
+            hs = json.loads(await _read_clen_reply(reader))
+            cid = hs[0]["clientId"]
+            assert mgr.get(cid) is not None
+            writer.close()  # abrupt: never sends /meta/disconnect nor connect
+            try:
+                await writer.wait_closed()
+            except Exception:  # noqa: BLE001
+                pass
+            for _ in range(60):
+                if mgr.get(cid) is None:
+                    break
+                await asyncio.sleep(0.05)
+            return cid, mgr.get(cid)
+        finally:
+            server.close()
+            await server.wait_closed()
+
+    _cid, client = _run(run())
+    assert client is None, "handshake-only client must be dropped on close"
+
+
+def test_native_non_connect_post_close_stops_keepalive_work():
+    """A non-connect POST (long-poll style) creates/keeps a client; closing
+    the socket without /meta/disconnect must drop it, and the subscribe:N
+    keep-alive must stop dispatching for it (review repro I)."""
+    async def run():
+        rpc = _StubRPC()
+        mgr = CometdManager(rpc)
+        server = await start_cometd_server(mgr, "127.0.0.1", 0)
+        try:
+            port = server.sockets[0].getsockname()[1]
+            reader, writer = await asyncio.open_connection("127.0.0.1", port)
+            writer.write(_post_bytes([{"channel": "/meta/handshake", "id": 1}]))
+            await writer.drain()
+            cid = json.loads(await _read_clen_reply(reader))[0]["clientId"]
+
+            # non-connect POST with a 1s keep-alive subscription
+            writer.write(_post_bytes([{
+                "channel": "/slim/subscribe", "id": 2,
+                "data": {
+                    "request": [cid, ["status", "-", 1, "subscribe:1"]],
+                    "response": f"/{cid}/slim/playerstatus/{cid}",
+                },
+            }]))
+            await writer.drain()
+            await _read_clen_reply(reader)
+            assert mgr.get(cid) is not None
+            assert f"/{cid}/slim/playerstatus/{cid}" in mgr.get(cid).subscriptions
+
+            keepalive = asyncio.create_task(mgr.keepalive_loop())
+            writer.close()  # abrupt: no /meta/disconnect
+            try:
+                await writer.wait_closed()
+            except Exception:  # noqa: BLE001
+                pass
+            for _ in range(60):
+                if mgr.get(cid) is None:
+                    break
+                await asyncio.sleep(0.05)
+            rpc.calls.clear()
+            await asyncio.sleep(2.3)  # > 2 keep-alive intervals
+            keepalive.cancel()
+            try:
+                await keepalive
+            except asyncio.CancelledError:
+                pass
+            return cid, mgr.get(cid), rpc.calls
+        finally:
+            server.close()
+            await server.wait_closed()
+
+    _cid, client, calls = _run(run())
+    assert client is None, "non-connect client must be dropped on close"
+    assert calls == [], f"keep-alive must not dispatch for a dead client: {calls}"
+
+
+def test_asgi_streaming_connect_removes_client_on_abort():
+    """ASGI streaming /meta/connect: a failed send (client gone) must drop
+    the client — the ASGI path never sees /meta/disconnect (review P2-1d)."""
+    async def run():
+        from lyrion.web.app import _handle_cometd
+
+        mgr = CometdManager(_StubRPC())
+        hs = await mgr.handle_messages([{"channel": "/meta/handshake", "id": 1}])
+        cid = hs[0]["clientId"]
+        body = json.dumps([{"channel": "/meta/connect", "clientId": cid,
+                            "id": 2, "connectionType": "streaming"}]).encode()
+        sent = []
+
+        async def receive():
+            if not sent:
+                sent.append(1)
+                return {"type": "http.request", "body": body,
+                        "more_body": False}
+            return {"type": "http.disconnect"}
+
+        async def send(message):  # client vanished before the response
+            raise RuntimeError("client gone")
+
+        await _handle_cometd(mgr, "/cometd", receive, send)
+        return cid, mgr.get(cid)
+
+    _cid, client = _run(run())
+    assert client is None, "aborted ASGI stream must drop the client"
+
+
+def test_asgi_long_poll_removes_client_on_aborted_response():
+    """ASGI long-poll /meta/connect: a failed response send drops the
+    client (silent-success leak, review P2-1d)."""
+    async def run():
+        from lyrion.web.app import _handle_cometd
+
+        mgr = CometdManager(_StubRPC())
+        hs = await mgr.handle_messages([{"channel": "/meta/handshake", "id": 1}])
+        cid = hs[0]["clientId"]
+        mgr.push(cid, {"channel": f"/{cid}/slim/x", "data": {}, "id": 0})
+        body = json.dumps([{"channel": "/meta/connect", "clientId": cid,
+                            "id": 2}]).encode()
+        sent = []
+
+        async def receive():
+            if not sent:
+                sent.append(1)
+                return {"type": "http.request", "body": body,
+                        "more_body": False}
+            return {"type": "http.disconnect"}
+
+        async def send(message):
+            raise RuntimeError("client gone")
+
+        await _handle_cometd(mgr, "/cometd", receive, send)
+        return cid, mgr.get(cid)
+
+    _cid, client = _run(run())
+    assert client is None, "aborted long-poll must drop the client"
+
+
+def test_connect_ack_position_is_documented_perl_deviation():
+    """Perl forces the /meta/(re)connect reply to be the FIRST event of the
+    response (Cometd.pm:279-292, ``first_event``). Python keeps it after the
+    batch acks. That is a deliberate, documented deviation: the
+    Android/libcometd clients could not be exercised in this test suite, so
+    the shipped order is pinned here instead of being changed silently
+    (review P3-4). Flip this test and both transports together when a device
+    can verify the reordering."""
+    async def run():
+        mgr = CometdManager(_StubRPC())
+        server = await start_cometd_server(mgr, "127.0.0.1", 0)
+        try:
+            reader, writer, cid = await _open_stream(server)
+            try:
+                await _read_chunk(reader)  # first chunk: connect ack only
+                writer.write(_post_bytes([
+                    {"channel": "/meta/subscribe", "clientId": cid, "id": 3,
+                     "subscription": f"/{cid}/**"},
+                    {"channel": "/meta/connect", "clientId": cid, "id": 4},
+                ]))
+                await writer.drain()
+                return json.loads(await _read_chunk(reader))
+            finally:
+                writer.close()
+        finally:
+            server.close()
+            await server.wait_closed()
+
+    follow = _run(run())
+    assert [m["channel"] for m in follow] == ["/meta/subscribe", "/meta/connect"]
+    assert follow[0]["channel"] != "/meta/connect"

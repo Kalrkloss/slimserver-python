@@ -6,16 +6,13 @@ with the project's async/await model.
 """
 from __future__ import annotations
 
-import asyncio
-import json
 import logging
-import time
 from typing import Callable, Optional
 
 import uvicorn
 
 from .api import JSONRPCAPI, WebAPIHandler
-from .cometd import LONG_POLL_TIMEOUT, CometdManager
+from .cometd import LONG_POLL_TIMEOUT, CometdManager, _client_id_from_channel
 
 logger = logging.getLogger(__name__)
 
@@ -88,7 +85,10 @@ async def _handle_streaming_connect(
     events), then hold the response open and push events as chunks.
 
     SqueezeClient expects the connect + subscribe acks within 5 seconds
-    and then reads the body as a stream of JSON arrays.
+    and then reads the body as a stream of JSON arrays. The ASGI transport
+    never sees a /meta/disconnect, so when the client vanishes (a send
+    raises, or the request task is cancelled) the client is removed here —
+    the same cleanup Perl does from webCloseHandler -> disconnectClient.
     """
     import json as _json
 
@@ -99,25 +99,33 @@ async def _handle_streaming_connect(
         "id": msg.get("id", ""),
         "advice": {"reconnect": "retry", "interval": 0, "timeout": 25},
     }
+    # Perl puts the (re)connect reply FIRST in the response (Cometd.pm:279-292,
+    # "first_event"). We keep the shipped order — batch acks, then the connect
+    # ack — because the Android/libcometd clients could not be exercised in
+    # this suite; the deviation is documented, not silently changed (P3-4).
     first = list(replies) + [connect_ack]
     events = await cometd.wait_for_events(cid, timeout=0)
     first.extend(events)
 
-    await send({
-        "type": "http.response.start",
-        "status": 200,
-        "headers": [(b"Content-Type", b"application/json"),
-                    (b"Cache-Control", b"no-cache")],
-    })
-    await send({"type": "http.response.body",
-                "body": _json.dumps(first).encode("utf-8"), "more_body": True})
-
-    # Keep the stream open and push event batches as they arrive. The
-    # uvicorn path (port 9000) serves clients that connect directly to
-    # :9000 (Squeezer manual address) — closing after 0.6 s broke their
-    # connection. Orange Squeeze (pipelined POSTs over one socket) is
-    # served by the native server on 9080.
+    owner = object()
+    cometd.register_connection(cid, owner)
+    cometd.connection_open(cid)
     try:
+        await send({
+            "type": "http.response.start",
+            "status": 200,
+            "headers": [(b"Content-Type", b"application/json"),
+                        (b"Cache-Control", b"no-cache")],
+        })
+        await send({"type": "http.response.body",
+                    "body": _json.dumps(first).encode("utf-8"),
+                    "more_body": True})
+
+        # Keep the stream open and push event batches as they arrive. The
+        # uvicorn path (port 9000) serves clients that connect directly to
+        # :9000 (Squeezer manual address) — closing after 0.6 s broke their
+        # connection. Orange Squeeze (pipelined POSTs over one socket) is
+        # served by the native server on 9080.
         while True:
             # A vanished client (meta/disconnect) makes wait_for_events
             # return [] immediately — without the existence check the
@@ -132,11 +140,14 @@ async def _handle_streaming_connect(
                         "more_body": True})
     except Exception:
         pass
-    try:
-        await send({"type": "http.response.body", "body": b"",
-                    "more_body": False})
-    except Exception:
-        pass
+    finally:
+        cometd.connection_closed(cid)
+        cometd.remove_if_owner(cid, owner)
+        try:
+            await send({"type": "http.response.body", "body": b"",
+                        "more_body": False})
+        except Exception:
+            pass
 
 
 async def _handle_cometd(cometd: CometdManager, path: str, receive, send) -> None:
@@ -144,6 +155,11 @@ async def _handle_cometd(cometd: CometdManager, path: str, receive, send) -> Non
 
     Replies to handshake/subscribe/request immediately; /meta/connect
     long-polls (held open until events arrive or the timeout expires).
+    Streaming /meta/connect keeps the response open until the client is gone
+    and drops it (cometd_stream.py does the same on its socket). The
+    handshake-only, non-connect and dead long-polling clients the ASGI path
+    never sees close for are reaped by CometdManager's idle autokill
+    (Perl LONG_POLLING_AUTOKILL).
     """
     import json as _json
 
@@ -164,56 +180,83 @@ async def _handle_cometd(cometd: CometdManager, path: str, receive, send) -> Non
         logger.info("Cometd body not JSON (%s): %.160s", exc, body.decode("utf-8", errors="replace"))
         messages = []
 
+    # Every client this POST concerns; dropped if the response cannot be
+    # delivered (client aborted) — the ASGI path gets no other close signal.
+    cids: set[str] = set()
+    for m in messages:
+        if isinstance(m, dict) and m.get("clientId"):
+            cids.add(m["clientId"])
+
     replies: list[dict] = []
     try:
         replies = await cometd.handle_messages(messages)
     except Exception as exc:  # noqa: BLE001
         logger.warning("Cometd handle_messages failed: %s", exc)
+    for r in replies:
+        if isinstance(r, dict) and r.get("clientId"):
+            cids.add(r["clientId"])
 
     connect_msgs = [m for m in messages if isinstance(m, dict)
                     and m.get("channel") == "/meta/connect"]
 
-    if connect_msgs:
-        # /meta/connect: streaming clients (SqueezeClient, Material) need
-        # the reply IMMEDIATELY (5s timeout) and then a held-open stream
-        # that pushes events as chunks.
-        for msg in connect_msgs:
-            cid = msg.get("clientId", "")
-            if msg.get("connectionType") == "streaming":
-                await _handle_streaming_connect(cometd, cid, msg, replies, send)
-                return
-            # long-polling: hold until events arrive or timeout
-            events = await cometd.wait_for_events(cid)
-            replies.append({
-                "channel": "/meta/connect",
-                "successful": True,
-                "clientId": cid,
-                "id": msg.get("id", ""),
-                "advice": {"reconnect": "retry", "interval": 0,
-                           "timeout": LONG_POLL_TIMEOUT},
-            })
-            replies.extend(events)
-    else:
-        # No connect in this batch: deliver events pushed by
-        # subscribe/request immediately (Jive expects the response in
-        # the same reply batch when the request was sent standalone).
-        for msg in messages:
-            if not isinstance(msg, dict):
-                continue
-            cid = msg.get("clientId", "")
-            if not cid:
-                continue
-            events = await cometd.wait_for_events(cid, timeout=0)
-            replies.extend(events)
+    try:
+        if connect_msgs:
+            # /meta/connect: streaming clients (SqueezeClient, Material) need
+            # the reply IMMEDIATELY (5s timeout) and then a held-open stream
+            # that pushes events as chunks.
+            for msg in connect_msgs:
+                cid = msg.get("clientId", "")
+                if msg.get("connectionType") == "streaming":
+                    await _handle_streaming_connect(cometd, cid, msg, replies, send)
+                    return
+                # long-polling: hold until events arrive or timeout
+                events = await cometd.wait_for_events(cid)
+                replies.append({
+                    "channel": "/meta/connect",
+                    "successful": True,
+                    "clientId": cid,
+                    "id": msg.get("id", ""),
+                    "advice": {"reconnect": "retry", "interval": 0,
+                               "timeout": LONG_POLL_TIMEOUT},
+                })
+                replies.extend(events)
+                # A completed poll restarts Perl's autokill window.
+                cometd.touch(cid)
+        else:
+            # No connect in this batch: deliver events pushed by
+            # subscribe/request immediately (Jive expects the response in
+            # the same reply batch when the request was sent standalone).
+            for msg in messages:
+                if not isinstance(msg, dict):
+                    continue
+                cid = msg.get("clientId", "")
+                if not cid:
+                    # Orange Squeeze's /slim/* carry no clientId — the id is
+                    # the first segment of the response channel (P3-2 rule).
+                    cid = _client_id_from_channel(
+                        (msg.get("data") or {}).get("response", ""))
+                if not cid:
+                    continue
+                events = await cometd.wait_for_events(cid, timeout=0)
+                replies.extend(events)
 
-    response = _json.dumps(replies).encode("utf-8")
-    await send({
-        "type": "http.response.start",
-        "status": 200,
-        "headers": [(b"Content-Type", b"application/json"),
-                    (b"Cache-Control", b"no-cache")],
-    })
-    await send({"type": "http.response.body", "body": response})
+        response = _json.dumps(replies).encode("utf-8")
+        await send({
+            "type": "http.response.start",
+            "status": 200,
+            "headers": [(b"Content-Type", b"application/json"),
+                        (b"Cache-Control", b"no-cache")],
+        })
+        await send({"type": "http.response.body", "body": response})
+    except Exception as exc:  # noqa: BLE001
+        # The response could not be written — the client is gone. Drop the
+        # clients this POST created/used so notify_* / keepalive_loop stop
+        # queueing for them. (Streaming connects clean up in their own
+        # finally.)
+        logger.info("Cometd response aborted (%s) — dropping client(s) %s",
+                    exc, sorted(cids))
+        for cid in cids:
+            cometd.remove(cid)
 
 
 _MIME_BY_EXT = {

@@ -16,6 +16,12 @@ Events are pushed on the subscribed channel (e.g. /slim/serverstatus)
 or the per-client response channel. The request payloads are exactly
 slim.request params (player + command array) and are dispatched through
 the JSON-RPC handler.
+
+Client lifecycle: a client is removed on /meta/disconnect, when the
+transport connection that owned it closes (cometd_stream.py, and the ASGI
+streaming handler in web/app.py), or when it goes idle past
+LONG_POLLING_AUTOKILL — Perl's disconnect timer, which catches the
+handshake-only and non-connecting clients no close handler can see.
 """
 from __future__ import annotations
 
@@ -31,6 +37,14 @@ logger = logging.getLogger(__name__)
 
 LONG_POLL_TIMEOUT = 25  # seconds a /meta/connect request is held open
 
+# Perl Slim::Web::Cometd LONG_POLLING_AUTOKILL (Cometd.pm:49, 693): after a
+# long-polling response is sent, a timer is armed for this many seconds and
+# fires disconnectClient if no new poll arrives. It covers exactly the clients
+# Perl's webCloseHandler cannot see — a handshake-only client, a long-polling
+# client with no active connection, or one that dies without ever sending
+# /meta/disconnect. Python implements it as an idle sweep instead of a timer.
+LONG_POLLING_AUTOKILL = 180.0
+
 # Upper bound for one client's pending-event queue. Perl has no explicit cap
 # (it relies on LONG_POLLING_AUTOKILL / webCloseHandler to drop dead clients);
 # this is a Python-side safety net so a stalled or half-dead client cannot grow
@@ -45,6 +59,18 @@ class CometdClient:
     subscriptions: dict[str, dict] = field(default_factory=dict)
     events: list[dict] = field(default_factory=list)
     notify: asyncio.Event = field(default_factory=asyncio.Event)
+    # Wall-clock of the client's last message / connection activity. Used by
+    # the idle reaper (Perl LONG_POLLING_AUTOKILL -> disconnectClient).
+    last_seen: float = 0.0
+    # Number of OPEN transports (streaming connections). A streaming
+    # connection is legitimately silent between events, so the idle reaper
+    # must never touch a client while this is > 0.
+    connections: int = 0
+    # The transport connection that currently owns this client. Only the
+    # newest connection may remove the client (Perl webCloseHandler checks
+    # ``$conn->[HTTP_CLIENT] == $httpClient`` before disconnectClient), so a
+    # stale connection closing cannot kill a reconnected client.
+    owner: object | None = None
 
 
 # Module-level manager singleton — lets the slimproto layer wake
@@ -100,6 +126,34 @@ def _channel_matches(pattern: str, channel: str) -> bool:
         head = pattern[:-1]  # '/foo/'
         return channel.startswith(head) and len(channel) > len(head)
     return False
+
+
+# Channel roots that are namespaces, never clientIds. A /slim/subscribe
+# without a clientId derives the id from its response channel's first segment
+# (Orange Squeeze sends none); without this guard a response channel like
+# ``/slim/serverstatus`` minted a phantom client called ``slim`` that then
+# received every serverstatus event (review P3-2).
+_RESERVED_CHANNEL_ROOTS = frozenset({"slim", "meta", "cometd"})
+
+
+def _client_id_from_channel(channel) -> str:
+    """ClientId embedded as the first segment of a response channel.
+
+    Perl expects ``$response =~ m{/([0-9a-f]{8})/}`` (Cometd.pm:427), but
+    Python hands out non-hex ids too (``lyrion-N``, ``1<uuid>``) and a real
+    jive/Android client reuses whatever the handshake returned, so any
+    non-empty, non-glob, non-namespace first segment is accepted. Returns
+    "" when there is no usable segment.
+    """
+    if not isinstance(channel, str) or not channel.startswith("/"):
+        return ""
+    parts = channel.split("/")
+    if len(parts) < 2:
+        return ""
+    segment = parts[1]
+    if not segment or _is_glob(segment) or segment in _RESERVED_CHANNEL_ROOTS:
+        return ""
+    return segment
 
 
 # ---------------------------------------------------------------------------
@@ -218,10 +272,14 @@ class CometdManager:
     /meta/... channels over /cometd (long-polling or streaming).
     """
 
-    def __init__(self, jsonrpc) -> None:
+    def __init__(self, jsonrpc, clock=None) -> None:
         self._jsonrpc = jsonrpc
         self._clients: dict[str, CometdClient] = {}
         self._counter = itertools.count(1)
+        # Injectable wall clock so the idle reaper (LONG_POLLING_AUTOKILL) can
+        # be tested without sleeping; production uses time.time.
+        self._clock = clock or time.time
+        self._autokill_task: asyncio.Task | None = None
         _set_manager(self)
 
     # ------------------------------------------------------------------
@@ -240,7 +298,9 @@ class CometdManager:
         else:
             client_id = f"lyrion-{next(self._counter)}"
         client = CometdClient(client_id=client_id)
+        client.last_seen = self._clock()
         self._clients[client_id] = client
+        self.ensure_autokill()
         return client
 
     def get_or_create(self, client_id: str) -> CometdClient:
@@ -254,7 +314,11 @@ class CometdManager:
         client = self._clients.get(client_id)
         if client is None:
             client = CometdClient(client_id=client_id)
+            client.last_seen = self._clock()
             self._clients[client_id] = client
+            self.ensure_autokill()
+        else:
+            client.last_seen = self._clock()
         return client
 
     def get(self, client_id: str) -> CometdClient | None:
@@ -262,6 +326,94 @@ class CometdManager:
 
     def remove(self, client_id: str) -> None:
         self._clients.pop(client_id, None)
+
+    def touch(self, client_id: str) -> None:
+        """Mark client activity (Perl kills the autokill timer on connect)."""
+        client = self._clients.get(client_id)
+        if client is not None:
+            client.last_seen = self._clock()
+
+    def register_connection(self, client_id: str, owner: object) -> None:
+        """Make ``owner`` the client's current (newest) transport connection.
+
+        Mirrors Perl Manager::register_connection — a reconnect overwrites the
+        stored connection. Combined with remove_if_owner this keeps a stale
+        connection's close from removing a client that already reconnected.
+        """
+        client = self._clients.get(client_id)
+        if client is None:
+            return
+        client.owner = owner
+        client.last_seen = self._clock()
+
+    def remove_if_owner(self, client_id: str, owner: object) -> bool:
+        """Remove the client only while ``owner`` is its current connection."""
+        client = self._clients.get(client_id)
+        if client is None or client.owner is not owner:
+            return False
+        self.remove(client_id)
+        return True
+
+    def connection_open(self, client_id: str) -> None:
+        """Record an open transport so the idle reaper spares the client.
+
+        A streaming connection stays open indefinitely and is silent between
+        events, so it must not count as idleness.
+        """
+        client = self._clients.get(client_id)
+        if client is None:
+            return
+        client.connections += 1
+        client.last_seen = self._clock()
+
+    def connection_closed(self, client_id: str) -> None:
+        client = self._clients.get(client_id)
+        if client is None:
+            return
+        client.connections = max(0, client.connections - 1)
+        client.last_seen = self._clock()
+
+    def kill_idle_clients(self, timeout: float | None = None) -> list[str]:
+        """Drop clients idle longer than ``timeout`` and return their ids.
+
+        This is Perl's LONG_POLLING_AUTOKILL -> disconnectClient: a client
+        that stops polling, never connects after a handshake, or dies without
+        /meta/disconnect is removed so notify_* / keepalive_loop stop doing
+        work for it. Clients with an open transport are never reaped.
+        """
+        limit = LONG_POLLING_AUTOKILL if timeout is None else timeout
+        now = self._clock()
+        reaped: list[str] = []
+        for client_id, client in list(self._clients.items()):
+            if client.connections:
+                continue
+            if now - client.last_seen >= limit:
+                self.remove(client_id)
+                reaped.append(client_id)
+                logger.info("Cometd idle autokill -> client %s", client_id)
+        return reaped
+
+    async def autokill_loop(self, interval: float = 5.0,
+                            timeout: float | None = None) -> None:
+        """Periodically reap idle clients (Perl's autokill timer)."""
+        while True:
+            await asyncio.sleep(interval)
+            self.kill_idle_clients(timeout)
+
+    def ensure_autokill(self) -> None:
+        """Start the idle reaper once, lazily, when the first client appears.
+
+        The manager is shared between uvicorn and the native stream server, so
+        starting the task here keeps it single while both transports benefit.
+        No-op outside a running event loop.
+        """
+        if self._autokill_task is not None and not self._autokill_task.done():
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._autokill_task = loop.create_task(self.autokill_loop())
 
     def _matched_targets(self, client: CometdClient,
                          base_channels: list[str],
@@ -278,10 +430,8 @@ class CometdManager:
         preserved.
 
         The second element tells the caller whether the entry came from an
-        exact channel or from a glob; ``_pick_target`` uses if to collapse
-        several matches for ONE client into a single delivery (a client
-        holding both a cid-less exact channel and ``/<cid>/**`` would
-        otherwise get the same event twice).
+        exact channel or from a glob; ``_pick_targets`` uses it to drop a glob
+        that only duplicates an exact subscription for the same event.
         """
         matched: dict[str, tuple[dict, bool]] = {}
         for sub, data in list(client.subscriptions.items()):
@@ -295,26 +445,37 @@ class CometdManager:
         return matched
 
     @staticmethod
-    def _pick_target(targets: dict[str, tuple[dict, bool]],
-                     base_channels: list[str]) -> tuple[str, dict] | None:
-        """Reduce one client's channel matches to a SINGLE delivery.
+    def _pick_targets(targets: dict[str, tuple[dict, bool]],
+                      base_channels: list[str]) -> list[tuple[str, dict]]:
+        """Reduce one client's channel matches to its list of deliveries.
 
-        Perl delivers an event once per *matched channel*; the Python
-        server synthesises the concrete channel, so a client that holds a
-        cid-less exact channel *and* a catch-all glob matches two
-        channels for one event. Jive treats the second copy as "event we
-        aren't subscribed to", so exactly-once is enforced per client:
-        an exact subscription wins over a glob (it is the channel the
-        client explicitly named and it keeps the stored request), ties
-        keep the most specific base channel.
+        Perl delivers an event once per *matched channel*
+        (Manager::deliver_events iterates the channel buckets), so a client
+        holding two distinct EXACT status subscriptions — two response
+        channels, two stored requests — gets one event per channel
+        (Cometd.pm:840-870). ``targets`` is already keyed by the concrete
+        channel, so distinct channels are distinct deliveries.
+
+        A Bayeux *glob* is only a catch-all: when the client also holds an
+        exact channel for the same event it adds nothing and is dropped (the
+        channel the client explicitly named wins and keeps its stored
+        request). A glob-only client keeps its single, most specific delivery.
+        That keeps jive's ``/<cid>/**`` from duplicating a targeted
+        ``/<cid>/slim/...`` push without collapsing two genuine exact
+        subscriptions into one (review P3-1).
         """
-        for exact in (True, False):
-            for channel in list(base_channels) + [c for c in targets
-                                                   if c not in base_channels]:
-                entry = targets.get(channel)
-                if entry is not None and entry[1] is exact:
-                    return channel, entry[0]
-        return None
+        exact: list[str] = []
+        globs: list[str] = []
+        for channel in list(base_channels) + [c for c in targets
+                                              if c not in base_channels]:
+            entry = targets.get(channel)
+            if entry is None:
+                continue
+            (exact if entry[1] else globs).append(channel)
+        # Exact subscriptions deliver on every channel they named; a glob is a
+        # catch-all with no request of its own, so it stays a single delivery.
+        chosen = exact or globs[:1]
+        return [(c, targets[c][0]) for c in chosen]
 
     def push(self, client_id: str, event: dict) -> None:
         client = self._clients.get(client_id)
@@ -343,8 +504,10 @@ class CometdManager:
         its result pushed; only a subscription without a request falls back
         to the jive serverstatus request.
 
-        Exactly once per CLIENT: a client holding both a targeted channel
-        and ``/<cid>/**`` gets a single event (see _pick_target).
+        Exactly once per matched channel: a client holding a targeted channel
+        *and* a redundant ``/<cid>/**`` glob gets a single event on the
+        targeted channel (see _pick_targets); two distinct exact
+        subscriptions each get their own event.
         """
         for client in list(self._clients.values()):
             base = [f"/{client.client_id}/slim/serverstatus",
@@ -361,20 +524,17 @@ class CometdManager:
                     targets.setdefault(channel,
                                        (data if isinstance(data, dict) else {},
                                         sub == channel))
-            picked = self._pick_target(targets, base)
-            if picked is None:
-                continue
-            channel, data = picked
-            try:
-                request = _stored_request(data) or ["", list(JIVE_SERVERSTATUS_REQUEST)]
-                result = await self._dispatch(request)
-                self.push(client.client_id, {
-                    "channel": channel,
-                    "data": result,
-                    "id": 0,
-                })
-            except Exception:  # noqa: BLE001
-                pass
+            for channel, data in self._pick_targets(targets, base):
+                try:
+                    request = _stored_request(data) or ["", list(JIVE_SERVERSTATUS_REQUEST)]
+                    result = await self._dispatch(request)
+                    self.push(client.client_id, {
+                        "channel": channel,
+                        "data": result,
+                        "id": 0,
+                    })
+                except Exception:  # noqa: BLE001
+                    pass
 
     async def notify_player_status(self, player_id: str) -> None:
         """Push a fresh player status to status/playerstatus subscribers.
@@ -391,8 +551,9 @@ class CometdManager:
         catch-all) falls back to the jive default request, which is what
         makes the Now-Playing title update (LIVE-01).
 
-        Exactly once per CLIENT: a client holding both a cid-less exact
-        channel and ``/<cid>/**`` gets a single event (see _pick_target).
+        Exactly once per matched channel: a redundant cid-less exact channel
+        and ``/<cid>/**`` collapse to the exact channel, while two distinct
+        exact subscriptions each get their own event (see _pick_targets).
         """
         for client in list(self._clients.values()):
             targets: dict[str, tuple[dict, bool]] = {}
@@ -435,32 +596,29 @@ class CometdManager:
                 if sub_player and sub_player not in ("", player_id, *_ANY_PLAYER):
                     continue
                 targets.setdefault(sub, (stored, True))
-            picked = self._pick_target(targets, base)
-            if picked is None:
-                continue
-            channel, data = picked
-            try:
-                request = _stored_request(data)
-                if request is not None:
-                    # A subscription that names no player still gets the
-                    # changed player's status (Perl dispatches mac-less
-                    # subscriptions for any client).
-                    if not _request_player(request):
-                        command = next(
-                            (item for item in request
-                             if isinstance(item, list) and item),
-                            list(JIVE_STATUS_REQUEST))
-                        request = [player_id, command]
-                else:
-                    request = [player_id, list(JIVE_STATUS_REQUEST)]
-                result = await self._dispatch(request)
-                self.push(client.client_id, {
-                    "channel": channel,
-                    "data": result,
-                    "id": 0,
-                })
-            except Exception:  # noqa: BLE001
-                pass
+            for channel, data in self._pick_targets(targets, base):
+                try:
+                    request = _stored_request(data)
+                    if request is not None:
+                        # A subscription that names no player still gets the
+                        # changed player's status (Perl dispatches mac-less
+                        # subscriptions for any client).
+                        if not _request_player(request):
+                            command = next(
+                                (item for item in request
+                                 if isinstance(item, list) and item),
+                                list(JIVE_STATUS_REQUEST))
+                            request = [player_id, command]
+                    else:
+                        request = [player_id, list(JIVE_STATUS_REQUEST)]
+                    result = await self._dispatch(request)
+                    self.push(client.client_id, {
+                        "channel": channel,
+                        "data": result,
+                        "id": 0,
+                    })
+                except Exception:  # noqa: BLE001
+                    pass
 
     async def notify_favorites_changed(self) -> None:
         """Push a 'favorites changed' event to all favorites subscribers.
@@ -539,6 +697,11 @@ class CometdManager:
                         })
                     except Exception:  # noqa: BLE001
                         pass
+            # Drop bookkeeping for clients the idle reaper removed — a
+            # per-(client, channel) key would otherwise grow forever.
+            live = {c.client_id for c in self._clients.values()}
+            for key in [k for k in last if k[0] not in live]:
+                del last[key]
 
     # ------------------------------------------------------------------
     # Message handling
@@ -577,11 +740,29 @@ class CometdManager:
                 # a TOP-LEVEL field of /meta/subscribe — accept all.
                 subscription = (data.get("subscription") or data.get("response")
                                 or msg.get("subscription") or "")
-                # Orange Squeeze's /slim/subscribe carries NO clientId —
-                # derive it from the subscription path (/<clientId>/...).
-                if not cid and subscription.startswith("/"):
-                    cid = subscription.split("/")[1]
-                client = self.get_or_create(cid)
+                if channel == "/slim/subscribe":
+                    # Perl Slim/Web/Cometd.pm:479-492: a /slim/subscribe is a
+                    # request+subscribe and needs BOTH data.request and
+                    # data.response. Missing either is answered with an error
+                    # (successful:false) — never a silent success the client
+                    # trusts while nothing was registered (review P3-3).
+                    request = data.get("request")
+                    if not (isinstance(request, list) and request):
+                        reply.update({"successful": False,
+                                      "error": "request data key not found"})
+                        replies.append(reply)
+                        continue
+                    if not data.get("response"):
+                        reply.update({"successful": False,
+                                      "error": "response data key not found"})
+                        replies.append(reply)
+                        continue
+                # Orange Squeeze's /slim/subscribe carries NO clientId — derive
+                # it from the response channel (/<clientId>/...). A namespace
+                # root like /slim/... is never a clientId (review P3-2).
+                if not cid:
+                    cid = _client_id_from_channel(subscription)
+                client = self.get_or_create(cid) if cid else None
                 if client is not None and subscription:
                     # Store the subscription together with its request. On a
                     # /slim/subscribe (jive Comet.lua:286-296) that request is
@@ -605,7 +786,13 @@ class CometdManager:
                             # — a missing id breaks the whole array parse.
                             "id": msg.get("id", ""),
                         })
-                reply.update({"successful": client is not None, "error": None})
+                if client is not None:
+                    reply.update({"successful": True, "error": None})
+                else:
+                    # No clientId and no derivable id in the response channel:
+                    # never mint a client (review P3-2) — ack the failure.
+                    reply.update({"successful": False,
+                                  "error": "clientId not found"})
                 # libcometd (SqueezeClient) requires the subscription
                 # field in the ack — otherwise 'Subscription response
                 # missing'.
@@ -614,6 +801,7 @@ class CometdManager:
 
             elif channel in ("/meta/unsubscribe", "/slim/unsubscribe"):
                 client = self.get(cid)
+                self.touch(cid)
                 data = msg.get("data", {})
                 # Accept data.unsubscribe, data.subscription, or the TOP-LEVEL
                 # 'subscription' field (libcometd/Android send it top-level,
@@ -627,11 +815,12 @@ class CometdManager:
             elif channel == "/slim/request":
                 data = msg.get("data", {})
                 response_channel = data.get("response", "")
-                # Orange Squeeze's slim/request carries NO clientId —
-                # derive it from the response channel (/<clientId>/...).
-                if not cid and response_channel.startswith("/"):
-                    cid = response_channel.split("/")[1]
-                client = self.get_or_create(cid)
+                # Orange Squeeze's slim/request carries NO clientId — derive it
+                # from the response channel (/<clientId>/...); a namespace root
+                # like "slim" is never a clientId (review P3-2).
+                if not cid:
+                    cid = _client_id_from_channel(response_channel)
+                client = self.get_or_create(cid) if cid else None
                 request = data.get("request") or []
                 result = await self._dispatch(request)
                 if client is not None:
@@ -657,6 +846,10 @@ class CometdManager:
                 reply.update({"successful": True})
 
             elif channel == "/meta/connect":
+                # A (re)connect is activity: Perl cancels the autokill timer
+                # here (Cometd.pm:289 killTimers) so a client that keeps
+                # polling is never reaped while it is live.
+                self.touch(cid)
                 # Deliberately NOT replied to here: /meta/connect long-polls,
                 # and the transport (cometd_stream.py / web/app.py) writes
                 # the one and only connect ack itself. Replying here as well
