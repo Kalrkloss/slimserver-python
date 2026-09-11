@@ -2527,16 +2527,30 @@ class JSONRPCAPI:
     def _browselibrary_menu_actions(kind: str) -> dict:
         """Perl base.actions for a browselibrary menu window — SqueezePlay
         uses 'go' to drill (album→mode:tracks, artist→mode:albums, …) and
-        'play'/'add' to load the commonParams item into the playlist."""
+        'play'/'add' to load the commonParams item into the playlist.
+        For a TRACK list the plain go must NOT drill (tracks are leaves):
+        Perl marks it context-only (window.isContextMenu), otherwise every
+        single tap on a song re-opens the same list (infinite recursion)."""
         go_mode = {"albums": "tracks", "artists": "albums",
                    "genres": "albums", "years": "albums",
                    "folder": "bmf", "tracks": "tracks"}.get(kind, "albums")
         go_params: dict = {"mode": go_mode, "menu": 1}
         if kind == "artists":
             go_params["menu_mode"] = "artists"
+        go_action: dict = {"player": 0, "cmd": ["browselibrary", "items"],
+                           "itemsParams": "commonParams",
+                           "params": go_params}
+        if kind in ("tracks", "folder"):
+            # Context-menu only (press-and-hold) — a plain tap on an audio
+            # row or folder child must not re-open the same list.
+            go_action = {"player": 0, "cmd": ["browselibrary", "items"],
+                         "itemsParams": "playControlParams",
+                         "window": {"isContextMenu": 1},
+                         "params": {"mode": go_mode, "menu": 1,
+                                    "useContextMenu": 1,
+                                    "_index": 0, "_quantity": 1}}
         actions: dict = {
-            "go": {"player": 0, "cmd": ["browselibrary", "items"],
-                   "itemsParams": "commonParams", "params": go_params},
+            "go": go_action,
             "play": {"player": 0, "cmd": ["playlistcontrol"],
                      "itemsParams": "commonParams",
                      "params": {"cmd": "load", "menu": 1},
@@ -2545,10 +2559,6 @@ class JSONRPCAPI:
                     "itemsParams": "commonParams",
                     "params": {"cmd": "add", "menu": 1}},
         }
-        if kind == "folder":
-            actions["go"] = {"player": 0, "cmd": ["browselibrary", "items"],
-                             "itemsParams": "commonParams",
-                             "params": {"mode": "bmf", "menu": 1}}
         return actions
 
     async def _library_rows(self, mode: str, start: int, count: int,
