@@ -443,3 +443,300 @@ def test_slim_subscribe_without_request_is_an_error_ack():
     assert ack["error"] == "request data key not found"
     assert subs == {}
     assert calls == []
+
+
+# ---------------------------------------------------------------------------
+# R0.6 P0 — publish on the channel spelling the CLIENT registered.
+#
+# SqueezePlay subscribes with the lower-case colon form of the MAC
+# (``/14ff96e66d084eb6/slim/playerstatus/1c:87:2c:47:fc:36``, live log
+# 19:17:50) while the STAT handler calls ``notify_player_status(player.mac)``
+# with the upper-case ``1C:87:2C:47:FC:36``. Two defects followed:
+#
+#   * the subscription was skipped entirely (case-sensitive player compare),
+#   * a glob pushed on a REBUILT ``/…/playerstatus/<UPPER>`` channel, which
+#     jive discards as "not subscribed" (Comet.lua compares the channel name
+#     verbatim) — Now-Playing froze and the playlist read "Nichts".
+#
+# Rules pinned here: the event goes out on the client's own channel name,
+# player ids compare case-insensitively (colon/format-insensitive), and a
+# glob concretises to the channel the client registered for that player.
+# ---------------------------------------------------------------------------
+
+UPPER_PLAYER = PLAYER.upper()  # 1C:87:2C:47:FC:36 — what PlayerState.mac holds
+
+
+def test_lowercase_subscription_gets_uppercase_player_event_on_its_own_channel():
+    """(a) request-driven lower-case sub + notify(UPPER) -> lower-case channel."""
+
+    async def run():
+        mgr, rec = _manager()
+        cid = await _handshake(mgr)
+        response = f"/{cid}/slim/playerstatus/{PLAYER}"  # lower-case, as jive sent it
+        await mgr.handle_messages([{
+            "channel": "/slim/subscribe", "id": 2,
+            "data": {"request": [PLAYER, JIVE_STATUS_CMD], "response": response},
+        }])
+        await mgr.wait_for_events(cid, timeout=0)  # drain seed push
+        rec.calls.clear()
+        await mgr.notify_player_status(UPPER_PLAYER)
+        return response, rec.calls, await mgr.wait_for_events(cid, timeout=0)
+
+    response, calls, events = _run(run())
+    assert calls == [[PLAYER, JIVE_STATUS_CMD]], calls
+    assert len(events) == 1, f"expected exactly one push, got {events}"
+    assert events[0]["channel"] == response, events
+    assert events[0]["data"]["current_title"] == "Titel 51994"
+
+
+def test_channel_only_lowercase_subscription_matches_uppercase_player_id():
+    """(a') channel-only sub: the player comes from the subscription path."""
+
+    async def run():
+        mgr, rec = _manager()
+        cid = await _handshake(mgr)
+        channel = f"/{cid}/slim/playerstatus/{PLAYER}"
+        await mgr.handle_messages([{
+            "channel": "/meta/subscribe", "clientId": cid, "id": 2,
+            "subscription": channel,
+        }])
+        await mgr.wait_for_events(cid, timeout=0)
+        rec.calls.clear()
+        await mgr.notify_player_status(UPPER_PLAYER)
+        return channel, await mgr.wait_for_events(cid, timeout=0)
+
+    channel, events = _run(run())
+    assert len(events) == 1, f"expected exactly one push, got {events}"
+    assert events[0]["channel"] == channel, events
+
+
+def test_uppercase_subscription_gets_lowercase_player_event_on_its_own_channel():
+    """(b) request-driven upper-case sub + notify(lower) -> upper-case channel."""
+
+    async def run():
+        mgr, rec = _manager()
+        cid = await _handshake(mgr)
+        response = f"/{cid}/slim/playerstatus/{UPPER_PLAYER}"
+        await mgr.handle_messages([{
+            "channel": "/slim/subscribe", "id": 2,
+            "data": {"request": [UPPER_PLAYER, JIVE_STATUS_CMD], "response": response},
+        }])
+        await mgr.wait_for_events(cid, timeout=0)
+        rec.calls.clear()
+        await mgr.notify_player_status(PLAYER)  # lower-case STAT mac
+        return response, await mgr.wait_for_events(cid, timeout=0)
+
+    response, events = _run(run())
+    assert len(events) == 1, f"expected exactly one push, got {events}"
+    assert events[0]["channel"] == response, events
+
+
+def test_glob_plus_targeted_sub_pushes_once_on_targeted_channel_spelling():
+    """(c) glob + targeted sub -> ONE event, on the targeted channel name."""
+
+    async def run():
+        mgr, rec = _manager()
+        cid = await _handshake(mgr)
+        await mgr.handle_messages([{
+            "channel": "/meta/subscribe", "clientId": cid, "id": 2,
+            "subscription": f"/{cid}/**",
+        }])
+        response = f"/{cid}/slim/playerstatus/{PLAYER}"
+        await mgr.handle_messages([{
+            "channel": "/slim/subscribe", "id": 3,
+            "data": {"request": [PLAYER, JIVE_STATUS_CMD], "response": response},
+        }])
+        await mgr.wait_for_events(cid, timeout=0)
+        rec.calls.clear()
+        await mgr.notify_player_status(UPPER_PLAYER)
+        return response, rec.calls, await mgr.wait_for_events(cid, timeout=0)
+
+    response, calls, events = _run(run())
+    assert len(events) == 1, f"exactly one event per client, got {events}"
+    assert events[0]["channel"] == response, events
+    # the targeted subscription's stored request is the one re-executed
+    assert calls == [[PLAYER, JIVE_STATUS_CMD]], calls
+
+
+def test_glob_registered_after_targeted_sub_still_pushes_once_on_target():
+    """(c') same as (c) with the registration order reversed."""
+
+    async def run():
+        mgr, rec = _manager()
+        cid = await _handshake(mgr)
+        response = f"/{cid}/slim/playerstatus/{PLAYER}"
+        await mgr.handle_messages([{
+            "channel": "/slim/subscribe", "id": 2,
+            "data": {"request": [PLAYER, JIVE_STATUS_CMD], "response": response},
+        }])
+        await mgr.handle_messages([{
+            "channel": "/meta/subscribe", "clientId": cid, "id": 3,
+            "subscription": f"/{cid}/**",
+        }])
+        await mgr.wait_for_events(cid, timeout=0)
+        rec.calls.clear()
+        await mgr.notify_player_status(UPPER_PLAYER)
+        return response, rec.calls, await mgr.wait_for_events(cid, timeout=0)
+
+    response, calls, events = _run(run())
+    assert len(events) == 1, f"exactly one event per client, got {events}"
+    assert events[0]["channel"] == response, events
+    assert calls == [[PLAYER, JIVE_STATUS_CMD]], calls
+
+
+def test_glob_only_client_uses_registered_spelling_for_concrete_channel():
+    """Glob-only client: no exact channel of its own -> the standard
+    playerstatus path, still built from the spelling the client used in its
+    player-bearing subscriptions (here only a menustatus channel)."""
+
+    async def run():
+        mgr, rec = _manager()
+        cid = await _handshake(mgr)
+        await mgr.handle_messages([{
+            "channel": "/meta/subscribe", "clientId": cid, "id": 2,
+            "subscription": f"/{cid}/**",
+        }])
+        # a player-bearing channel in the client's lower-case spelling
+        await mgr.handle_messages([{
+            "channel": "/meta/subscribe", "clientId": cid, "id": 3,
+            "subscription": f"/{cid}/slim/menustatus/{PLAYER}",
+        }])
+        await mgr.wait_for_events(cid, timeout=0)
+        await mgr.wait_for_events(cid, timeout=0)
+        rec.calls.clear()
+        await mgr.notify_player_status(UPPER_PLAYER)
+        return await mgr.wait_for_events(cid, timeout=0)
+
+    events = _run(run())
+    assert len(events) == 1, f"exactly one event, got {events}"
+    assert events[0]["channel"].endswith(f"/slim/playerstatus/{PLAYER}"), events
+    assert UPPER_PLAYER not in events[0]["channel"], events
+
+
+def test_serverstatus_push_is_unaffected_by_player_normalisation():
+    """(d) serverstatus keeps its own channel spelling and stays request-driven."""
+
+    async def run():
+        mgr, rec = _manager()
+        cid = await _handshake(mgr)
+        server_channel = f"/{cid}/slim/serverstatus"
+        await mgr.handle_messages([{
+            "channel": "/slim/subscribe", "id": 2,
+            "data": {"request": ["", ["serverstatus", "0", "50", "subscribe:60"]],
+                     "response": server_channel},
+        }])
+        # an upper-case playerstatus sub of the SAME client must not leak in
+        await mgr.handle_messages([{
+            "channel": "/slim/subscribe", "id": 3,
+            "data": {"request": [UPPER_PLAYER, JIVE_STATUS_CMD],
+                     "response": f"/{cid}/slim/playerstatus/{UPPER_PLAYER}"},
+        }])
+        await mgr.wait_for_events(cid, timeout=0)
+        await mgr.wait_for_events(cid, timeout=0)
+        rec.calls.clear()
+        await mgr.notify_server_status()
+        server_events = await mgr.wait_for_events(cid, timeout=0)
+        await mgr.notify_player_status(PLAYER)
+        player_events = await mgr.wait_for_events(cid, timeout=0)
+        return server_channel, server_events, player_events, cid
+
+    server_channel, server_events, player_events, cid = _run(run())
+    assert len(server_events) == 1, server_events
+    assert server_events[0]["channel"] == server_channel
+    # the playerstatus sub is matched case-insensitively and pushed on ITS
+    # own (upper-case) channel
+    assert len(player_events) == 1, player_events
+    assert player_events[0]["channel"] == f"/{cid}/slim/playerstatus/{UPPER_PLAYER}"
+
+
+def test_two_players_only_the_matching_client_is_notified():
+    """(e) two clients, two players: only the changed player's client gets it."""
+    other = "aa:bb:cc:dd:ee:ff"
+
+    async def run():
+        mgr, rec = _manager()
+        cid_a = await _handshake(mgr)
+        cid_b = await _handshake(mgr)
+        a_channel = f"/{cid_a}/slim/playerstatus/{PLAYER}"
+        b_channel = f"/{cid_b}/slim/playerstatus/{other}"
+        await mgr.handle_messages([{
+            "channel": "/slim/subscribe", "id": 2,
+            "data": {"request": [PLAYER, JIVE_STATUS_CMD], "response": a_channel},
+        }])
+        await mgr.handle_messages([{
+            "channel": "/slim/subscribe", "clientId": cid_b, "id": 3,
+            "data": {"request": [other, JIVE_STATUS_CMD], "response": b_channel},
+        }])
+        await mgr.wait_for_events(cid_a, timeout=0)
+        await mgr.wait_for_events(cid_b, timeout=0)
+        rec.calls.clear()
+        await mgr.notify_player_status(UPPER_PLAYER)
+        a_events = await mgr.wait_for_events(cid_a, timeout=0)
+        b_events = await mgr.wait_for_events(cid_b, timeout=0)
+        return a_channel, b_channel, a_events, b_events
+
+    a_channel, b_channel, a_events, b_events = _run(run())
+    assert [e["channel"] for e in a_events] == [a_channel], a_events
+    assert b_events == [], b_events
+
+
+def test_live_squeezeplay_subscription_set_updates_now_playing():
+    """Live repro (log 19:17:50, cid 14ff96e66d084eb6): the full SqueezePlay
+    registration set + a STAT change with the upper-case PlayerState.mac must
+    produce exactly ONE event, on the lower-case channel jive holds, carrying
+    the client's stored request (current_title/item_loop → Now-Playing and the
+    playlist refresh instead of "Nichts")."""
+
+    async def run():
+        mgr, rec = _manager()
+        hs = await mgr.handle_messages([{
+            "channel": "/meta/handshake", "id": 1,
+            "ext": {"uuid": "4ff96e66d084eb6"},
+        }])
+        cid = hs[0]["clientId"]
+
+        def sub(msgid, request, response):
+            return {"channel": "/slim/subscribe", "id": msgid,
+                    "data": {"request": request, "response": response}}
+
+        await mgr.handle_messages([{  # Comet.lua:702 catch-all
+            "channel": "/meta/subscribe", "clientId": cid, "id": 2,
+            "subscription": f"/{cid}/**",
+        }])
+        for msgid, request, response in (
+            (3, ["", ["serverstatus", 0, 50, "subscribe:60"]],
+             f"/{cid}/slim/serverstatus"),
+            (4, [PLAYER, ["menustatus"]], f"/{cid}/slim/menustatus/{PLAYER}"),
+            (5, [PLAYER, JIVE_STATUS_CMD], f"/{cid}/slim/playerstatus/{PLAYER}"),
+            (6, [PLAYER, ["displaystatus", "subscribe:showbriefly"]],
+             f"/{cid}/slim/displaystatus/{PLAYER}"),
+        ):
+            await mgr.handle_messages([sub(msgid, request, response)])
+        for _ in range(6):
+            await mgr.wait_for_events(cid, timeout=0)  # drain the seed pushes
+        rec.calls.clear()
+
+        # the STAT handler passes PlayerState.mac — UPPER case
+        await mgr.notify_player_status(UPPER_PLAYER)
+        return cid, rec.calls, await mgr.wait_for_events(cid, timeout=0)
+
+    cid, calls, events = _run(run())
+    assert cid == "14ff96e66d084eb6"  # the live client id
+    assert [e["channel"] for e in events] == [f"/{cid}/slim/playerstatus/{PLAYER}"], \
+        events
+    assert calls == [[PLAYER, JIVE_STATUS_CMD]], calls
+    assert events[0]["data"]["current_title"] == "Titel 51994"
+    assert events[0]["data"]["playlist_tracks"] == 1
+
+
+def test_player_key_normalises_case_and_colons():
+    """MAC comparison helper: case-insensitive, colon-insensitive, '' never
+    matches (so a missing player cannot equal a real one)."""
+    from lyrion.web.cometd import _player_key, _same_player
+
+    assert _player_key("1C:87:2C:47:FC:36") == _player_key("1c872c47fc36")
+    assert _same_player("1C:87:2C:47:FC:36", "1c:87:2c:47:fc:36")
+    assert _same_player("1c872c47fc36", "1C:87:2C:47:FC:36")
+    assert not _same_player("", "1c:87:2c:47:fc:36")
+    assert not _same_player("", "")
+    assert not _same_player("aa:bb:cc:dd:ee:ff", "1c:87:2c:47:fc:36")

@@ -128,6 +128,86 @@ def _channel_matches(pattern: str, channel: str) -> bool:
     return False
 
 
+def _player_key(value) -> str:
+    """Comparison key for a player id: lower-case, no colons.
+
+    SqueezePlay subscribes with the lower-case colon form of the MAC
+    (``/14ff96e66d084eb6/slim/playerstatus/1c:87:2c:47:fc:36``, live log) while
+    ``PlayerState.mac`` — the argument of every notify_* call — is upper-case
+    (``1C:87:2C:47:FC:36``).  ``PlayerManager.get_player`` already treats both
+    as the same player, so cometd routing has to compare them the same way or
+    the client never receives its own player's events.
+    """
+    if not isinstance(value, str):
+        return ""
+    return value.replace(":", "").lower()
+
+
+def _same_player(first, second) -> bool:
+    """True when two player ids name the same player; '' matches nothing."""
+    key = _player_key(first)
+    return bool(key) and key == _player_key(second)
+
+
+def _channel_player(channel: str) -> str:
+    """The player named by a channel's last path segment ('' when none)."""
+    if not isinstance(channel, str):
+        return ""
+    parts = channel.split("/")
+    return parts[-1] if len(parts) >= 2 else ""
+
+
+def _is_player_status_subscription(channel: str) -> bool:
+    """True when a channel-only subscription carries *player status*.
+
+    ``/x/slim/playerstatus/<mac>`` and ``/x/slim/status/<mac>`` qualify.
+    ``/x/slim/displaystatus/<mac>`` and ``/x/slim/menustatus/<mac>`` merely
+    *contain* ``status/`` and must NOT be fed a playerstatus payload — their
+    own command drives them (a request-driven one is filtered by its command
+    above).  A trailing empty segment keeps the old player-agnostic
+    tolerance: only the player comparison then decides.
+    """
+    if not isinstance(channel, str):
+        return False
+    parts = channel.split("/")
+    if len(parts) < 2:
+        return False
+    if parts[-1] == "":
+        return "playerstatus" in channel or "/status/" in channel
+    return parts[-2] in ("playerstatus", "status")
+
+
+def _status_channel_player(channel: str) -> str:
+    """Player named by a *player-status* channel, '' when it is not one.
+
+    ``/x/slim/playerstatus/<mac>`` and ``/x/slim/status/<mac>`` qualify;
+    ``/x/slim/displaystatus/<mac>`` and ``/x/slim/menustatus/<mac>`` must
+    NOT — they name the same player but a different sink, so a glob must
+    never be concretised onto them.
+    """
+    if not isinstance(channel, str):
+        return ""
+    parts = channel.split("/")
+    if len(parts) >= 2 and parts[-2] in ("playerstatus", "status"):
+        return parts[-1]
+    return ""
+
+
+def _set_target(targets: dict[str, tuple[dict, bool]], channel: str,
+                stored: dict, exact: bool) -> None:
+    """Record one client's delivery on a concrete channel.
+
+    The channel key is the dedupe: Perl delivers once per matched channel
+    (Manager::deliver_events).  When a glob and an exact subscription
+    resolve to the same channel the exact one wins, so the request the
+    client explicitly registered (pagination/subscribe:N/tags) is the one
+    re-executed.
+    """
+    current = targets.get(channel)
+    if current is None or exact or not current[1]:
+        targets[channel] = (stored, exact)
+
+
 # Channel roots that are namespaces, never clientIds. A /slim/subscribe
 # without a clientId derives the id from its response channel's first segment
 # (Orange Squeeze sends none); without this guard a response channel like
@@ -477,6 +557,48 @@ class CometdManager:
         chosen = exact or globs[:1]
         return [(c, targets[c][0]) for c in chosen]
 
+    def _registered_player_spelling(self, client: CometdClient,
+                                    player_id: str) -> str:
+        """The spelling of ``player_id`` the client itself registered.
+
+        Events must go out on the exact channel a client subscribed to: jive
+        (share/jive/jive/net/Comet.lua) compares the channel name verbatim, so
+        an event pushed on a channel we rebuilt with a different mac spelling
+        is dropped as "not subscribed" and the Now-Playing screen freezes.
+        SqueezePlay registers ``/<cid>/slim/playerstatus/1c:87:...`` (lower
+        case) while ``PlayerState.mac`` is upper case.  Returns ``player_id``
+        unchanged when the client registered no concrete channel naming that
+        player (a glob-only client cannot express a spelling of its own).
+        """
+        for sub in list(client.subscriptions):
+            if _is_glob(sub):
+                continue
+            candidate = _channel_player(sub)
+            if candidate and _same_player(candidate, player_id):
+                return candidate
+        return player_id
+
+    @staticmethod
+    def _glob_concrete_channel(client: CometdClient, pattern: str,
+                               player_id: str, base: list[str]) -> str:
+        """Concrete channel a glob subscription is delivered on.
+
+        Preference: a *player-status* channel the client itself registered for
+        this player that the pattern matches (that is the channel jive holds,
+        so it accepts the event and calls its sink); otherwise the standard
+        playerstatus path from ``base``, already built with the client's own
+        spelling.  Menu/display status channels are skipped — they name the
+        same player but a different sink.
+        """
+        for sub in list(client.subscriptions):
+            if _is_glob(sub):
+                continue
+            sub_player = _status_channel_player(sub)
+            if sub_player and _same_player(sub_player, player_id) \
+                    and _channel_matches(pattern, sub):
+                return sub
+        return next((c for c in base if _channel_matches(pattern, c)), "")
+
     def push(self, client_id: str, event: dict) -> None:
         client = self._clients.get(client_id)
         if client is None:
@@ -551,14 +673,26 @@ class CometdManager:
         catch-all) falls back to the jive default request, which is what
         makes the Now-Playing title update (LIVE-01).
 
+        Published on the CLIENT's channel spelling: every event goes out on
+        the channel name exactly as that client registered it (a glob is
+        concretised to the channel the client holds for this player).  jive
+        compares the channel name verbatim, so a rebuilt
+        ``/…/playerstatus/<MAC>`` with a different case is discarded as
+        "not subscribed" and Now-Playing freezes.  Player ids are compared
+        case- and colon-insensitively (``_same_player``) because
+        ``PlayerState.mac`` is upper-case while clients register lower-case.
+
         Exactly once per matched channel: a redundant cid-less exact channel
         and ``/<cid>/**`` collapse to the exact channel, while two distinct
         exact subscriptions each get their own event (see _pick_targets).
         """
         for client in list(self._clients.values()):
             targets: dict[str, tuple[dict, bool]] = {}
-            base = [f"/{client.client_id}/slim/playerstatus/{player_id}",
-                    f"/slim/playerstatus/{player_id}"]
+            # Candidate concrete channels, built with the spelling THIS client
+            # registered for the player (fallback: the id we were given).
+            spelling = self._registered_player_spelling(client, player_id)
+            base = [f"/{client.client_id}/slim/playerstatus/{spelling}",
+                    f"/slim/playerstatus/{spelling}"]
             for sub, data in list(client.subscriptions.items()):
                 stored = data if isinstance(data, dict) else {}
                 request = _stored_request(data)
@@ -570,32 +704,33 @@ class CometdManager:
                         continue
                     req_player = _request_player(request)
                     if req_player and req_player not in _ANY_PLAYER \
-                            and req_player != player_id:
+                            and not _same_player(req_player, player_id):
                         continue
                     channel = sub
                     if _is_glob(sub):
-                        channel = next(
-                            (c for c in base if _channel_matches(sub, c)), "")
+                        channel = self._glob_concrete_channel(
+                            client, sub, player_id, base)
                     if channel:
-                        targets.setdefault(channel, (stored, sub == channel))
+                        _set_target(targets, channel, stored, sub == channel)
                     continue
                 if _is_glob(sub):
                     # e.g. /<cid>/** or /<cid>/slim/playerstatus/* — deliver
-                    # on the concrete channel the pattern matches.
-                    for channel in base:
-                        if _channel_matches(sub, channel):
-                            targets.setdefault(channel, (stored, False))
+                    # on the concrete channel the client holds for this player.
+                    channel = self._glob_concrete_channel(
+                        client, sub, player_id, base)
+                    if channel:
+                        _set_target(targets, channel, stored, False)
                     continue
-                if "playerstatus" not in sub and "status/" not in sub:
+                if not _is_player_status_subscription(sub):
                     continue
-                parts = sub.split("/")
-                sub_player = parts[-1] if len(parts) >= 2 else ""
+                sub_player = _channel_player(sub)
                 # The /null/... and 00:00:00:00:00:00 forms (SqueezeCtrl)
                 # are app-chosen and player-agnostic — deliver to them for
                 # ANY player change.
-                if sub_player and sub_player not in ("", player_id, *_ANY_PLAYER):
+                if sub_player and sub_player not in _ANY_PLAYER \
+                        and not _same_player(sub_player, player_id):
                     continue
-                targets.setdefault(sub, (stored, True))
+                _set_target(targets, sub, stored, True)
             for channel, data in self._pick_targets(targets, base):
                 try:
                     request = _stored_request(data)
