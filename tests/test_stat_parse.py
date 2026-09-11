@@ -328,8 +328,34 @@ def test_stat_persists_elapsed_and_signal_strength(monkeypatch):
     client, player = _client_and_player(monkeypatch)
     client._handle_stat_frame(player.mac, bytes.fromhex(SP_LIVE02_STUCK))
     assert player.elapsed == pytest.approx(50.154)
-    # 0xffff means "unknown" and must not clobber the stored value.
+    # The whole decoded STAT struct is kept for diagnostics.
     assert player._stat["jiffies"] == 4371376
+    # 0xffff = "not a wireless strength" -> Perl/status report 0.
+    assert player.signal_strength == 0
+
+
+@pytest.mark.parametrize("raw,expected", [
+    (42, 42),        # a real wireless percentage
+    (100, 100),      # boundary: Perl accepts <= 100
+    (101, 0),        # > 100 -> not a strength
+    (200, 0),        # R0.5-P3: used to be stored as 200
+    (0x00FF, 0),     # 255 -> used to be stored as 255
+    (0x0100, 0),     # 256
+    (0xFFFF, 0),     # "unknown"
+    (0, 0),
+])
+def test_signal_strength_follows_perls_rule(monkeypatch, raw, expected):
+    """Perl (Slimproto.pm:468-478 signalStrength) returns the value only when
+    ``signal_strength <= 100`` and undef otherwise (-> status 0). There is no
+    ``& 0xFF`` masking; a stale stored value must not survive an
+    out-of-range report either."""
+    client, player = _client_and_player(monkeypatch)
+    player.signal_strength = 77          # previously reported value
+    payload = bytearray(53)
+    payload[0:4] = b"STMt"
+    payload[23:25] = struct.pack(">H", raw)
+    client._handle_stat_frame(player.mac, bytes(payload))
+    assert player.signal_strength == expected
 
 
 # ──────────────────────────────────────────────────────────────────────

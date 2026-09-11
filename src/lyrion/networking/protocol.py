@@ -772,15 +772,11 @@ class SlimProtoClient:
                 except Exception as exc:
                     logger.warning("SETD query failed for %s: %s", mac_str, exc)
 
-                # Register writer so play/stop commands can reach this player
-                # (key normalized: uppercase, no colons — same as PlayerManager)
                 mac_key = mac_str.replace(":", "").upper()
-                self._player_writers[mac_key] = writer
-                # Track connection count per MAC (Squeezelite uses 2 TCP
-                # connections; only the last close unregisters).
-                self._player_connections[mac_key] = (
-                    self._player_connections.get(mac_key, 0) + 1
-                )
+                # Register writer so play/stop commands can reach this player
+                # (key normalized: uppercase, no colons — same as
+                # PlayerManager). A (re)connect also drops a stale strm guard.
+                self._register_player_writer(mac_key, writer)
 
                 # Start keepalive: Squeezelite declares the connection dead after
                 # ~35s without any server message ("No messages from server -
@@ -975,12 +971,10 @@ class SlimProtoClient:
             # Register this player with the PlayerManager
             mac_formatted = ":".join(f"{b:02X}" for b in hello.mac)
             # The binary HELO path must populate the same writer registry as
-            # the Squeezelite/ASCII-HELO path. Playback commands use this map.
+            # the Squeezelite/ASCII-HELO path (playback commands use this map),
+            # and a (re)connect drops a stale strm guard.
             mac_key = mac_formatted.replace(":", "").upper()
-            self._player_writers[mac_key] = writer
-            self._player_connections[mac_key] = (
-                self._player_connections.get(mac_key, 0) + 1
-            )
+            self._register_player_writer(mac_key, writer)
             model_name = hello.device_id.strip() or "squeezebox"
             player_ip = peer[0] if peer else "unknown"
             player_port = peer[1] if peer else 0
@@ -1052,6 +1046,9 @@ class SlimProtoClient:
                         self._player_connections.pop(key, None)
                         if self._player_writers.get(key) is writer:
                             self._player_writers.pop(key, None)
+                        # The player is gone: it cannot still hold a stream
+                        # we sent (R0.5-P1), so drop the guard as well.
+                        self._reset_strm_guard(key, "player disconnected")
                         from lyrion.player.manager import PlayerManager, _formats_for_model
                         if keep_registered:
                             # DSCO end-of-stream: the player reconnects
@@ -1325,6 +1322,47 @@ class SlimProtoClient:
         ])
         return struct.pack(">H", len(payload)) + payload
 
+    @staticmethod
+    def _reset_strm_guard(mac: str, reason: str = "") -> None:
+        """Forget the track we streamed for ``mac`` (idempotency guard).
+
+        Call this on EVERY path where the player demonstrably no longer holds
+        the stream we sent: an incoming ``STMf``/``STMn``, the track-end path
+        (``_advance_after_track``), a stop/pause, and a disconnect/
+        reconnect. Otherwise the guard stays armed and a replay of the SAME
+        track sends 0 frames while reporting success — the player stays
+        silent and nothing but a track change can repair it (R0.5-P1).
+
+        It deliberately does NOT touch ``stream_in_flight``: that flag
+        belongs to the send currently in progress and is released by its own
+        ``finally``.
+        """
+        try:
+            from lyrion.player.manager import PlayerManager
+            p = PlayerManager().get_player(mac)
+            if p is not None and p.strm_sent_track is not None:
+                logger.debug(
+                    "strm guard reset for %s (%s)", mac, reason or "stream lost",
+                )
+                p.strm_sent_track = None
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("strm guard reset failed for %s: %s", mac, exc)
+
+    def _register_player_writer(self, mac_key: str, writer) -> None:
+        """Register (or replace) the SlimProto writer for ``mac_key``.
+
+        A (re)connect means the player has no stream in progress: Perl
+        disassociates the streaming socket on stop/play (Squeezebox.pm:
+        206-216) and the fresh SlimProto connection starts with
+        readyToStream(1). Clear any stale strm guard so the next play of the
+        same track streams again instead of being skipped into silence.
+        """
+        self._player_writers[mac_key] = writer
+        self._player_connections[mac_key] = (
+            self._player_connections.get(mac_key, 0) + 1
+        )
+        self._reset_strm_guard(mac_key, "player (re)connected")
+
     async def send_flush_to_player(self, mac: str) -> bool:
         """Send a 'strm' flush command ('f') to a player.
 
@@ -1346,13 +1384,7 @@ class SlimProtoClient:
             await writer.drain()
             # A flush tears the player's buffers down — the next play of the
             # same track MUST send a fresh strm frame, so clear the guard.
-            try:
-                from lyrion.player.manager import PlayerManager
-                _p = PlayerManager().get_player(mac)
-                if _p is not None:
-                    _p.strm_sent_track = None
-            except Exception:  # noqa: BLE001
-                pass
+            self._reset_strm_guard(mac, "strm 'f' (flush) sent")
             logger.info("Sent strm 'f' (flush) to %s", mac)
             return True
         except (ConnectionError, OSError, RuntimeError):
@@ -1398,6 +1430,26 @@ class SlimProtoClient:
         Squeezelite opens its own TCP connection to the server (ip from the
         slimproto connection when server_ip=0) and issues the HTTP request
         string we embed in the frame.
+
+        Idempotency guard (LIVE-02 / R0.5-P1): a repeat `playlistcontrol
+        cmd:load` for the track that is ALREADY streaming must not flush and
+        restart the player's buffers. The guard therefore compares against
+        the track we actually streamed (``strm_sent_track``) — the caller
+        cannot set that optimistically — and it is cleared on every path
+        where the player demonstrably lost that stream (player flush `STMf`,
+        decode error `STMn`, track end, stop/pause, disconnect/reconnect).
+        Perl does the same by closing the streaming socket and setting
+        readyToStream(1): stop -> stream('q') + streamingsocket(undef) +
+        readyToStream(1) (Squeezebox.pm:206-216), flush -> stream('f') +
+        readyToStream(1) (Squeezebox2.pm:387-396), STMn -> readyToStream(1) +
+        playerStreamingFailed (Squeezebox2.pm:153-157). A guard that outlives
+        the stream is worse than a duplicate strm: the play request reports
+        success while the player stays silent.
+
+        The claim on the track is taken synchronously, BEFORE the first
+        ``await`` (``PlayerState.stream_in_flight``), so two concurrent calls
+        for the same track cannot both pass the check and send (R0.5-P3); it
+        is released in ``finally``.
         """
         mac = mac.upper().replace(":", "")
         writer = self._player_writers.get(mac)
@@ -1414,27 +1466,55 @@ class SlimProtoClient:
         # flush/connect/underrun loop tore the buffers down before any audio
         # could play (see .hermes/gap-analysis/06 LIVE-02: 6 strm frames in
         # 8 s, out_fullness flipping 0 <-> 3525496, elapsed frozen).
+        #
+        # Compare against the track we ACTUALLY streamed, not
+        # current_track_id: the caller sets current_track_id and mode='play'
+        # optimistically BEFORE calling us, so guarding on those made every
+        # fresh play a silent no-op (no strm frame at all — the player stayed
+        # silent with mode=play).
+        existing = None
         try:
             from lyrion.player.manager import PlayerManager
-            _existing = PlayerManager().get_player(mac)
-            # Compare against the track we ACTUALLY streamed last, not
-            # current_track_id: the caller sets current_track_id and
-            # mode='play' optimistically BEFORE calling us, so guarding on
-            # those made every fresh play a silent no-op (no strm frame at
-            # all — the player stayed silent with mode=play).
-            if (
-                _existing is not None
-                and _existing.mode == "play"
-                and _existing.strm_sent_track == track_id
-            ):
+            existing = PlayerManager().get_player(mac)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("strm idempotency check failed for %s: %s", mac, exc)
+
+        if existing is not None:
+            if existing.mode == "play" and existing.strm_sent_track == track_id:
                 logger.info(
                     "strm for %s track=%d already playing — skipping re-stream",
                     mac, track_id,
                 )
                 return True
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("strm idempotency check failed for %s: %s", mac, exc)
+            # R0.5-P3: check-and-set must not be separated by an await.
+            # Claim the track now; a concurrent call for the SAME track stops
+            # here instead of flushing/streaming a second time (observed live:
+            # two `Sent strm ... track=51997` in the same second for two
+            # parallel cmd:load requests). A call for a DIFFERENT track is a
+            # genuine switch and is not blocked.
+            if existing.stream_in_flight == track_id:
+                logger.info(
+                    "strm for %s track=%d already in flight — skipping duplicate",
+                    mac, track_id,
+                )
+                return True
+            existing.stream_in_flight = track_id
 
+        try:
+            return await self._stream_track_to_player(mac, track_id, writer)
+        finally:
+            if existing is not None and existing.stream_in_flight == track_id:
+                existing.stream_in_flight = None
+
+    async def _stream_track_to_player(self, mac: str, track_id: int, writer) -> bool:
+        """Do the flush + ``strm 's'`` send for ``track_id``.
+
+        Split out of :meth:`send_strm_to_player` so that the in-flight claim
+        is released in a ``finally`` on every exit path — including
+        exceptions the send itself does not catch (a leaked claim would
+        swallow every future play of that track, the exact failure this
+        guard exists to prevent).
+        """
         # Load track metadata for codec
         mime = None
         track_path = None
@@ -1935,6 +2015,10 @@ class SlimProtoClient:
         try:
             writer.write(frame)
             await writer.drain()
+            # Perl stop(): stream('q') + streamingsocket(undef) +
+            # readyToStream(1) (Squeezebox.pm:206-216). The player has no
+            # stream any more, so the next play MUST re-stream (R0.5-P1).
+            self._reset_strm_guard(mac, "strm 'q' (stop) sent")
             logger.info("Sent strm 'q' (stop) to %s", mac)
             return True
         except (ConnectionError, OSError, RuntimeError):
@@ -2310,23 +2394,50 @@ class SlimProtoClient:
                         player.elapsed = stat["elapsed_seconds_precise"]
                     except Exception:
                         pass
-                    # signalstrength was hard-coded 0 in the status before;
-                    # keep the raw STAT value (0xffff = "unknown").
-                    if stat["signal_strength"] not in (0, 0xFFFF):
-                        player.signal_strength = stat["signal_strength"] & 0xFF
+                    # signal_strength follows Perl's rule (Slimproto.pm:468-478
+                    # signalStrength): only 0..100 is a wireless percentage;
+                    # anything else (0xffff = "unknown", >100 = wired) makes
+                    # Perl return undef, i.e. the status reports 0. There is
+                    # no `& 0xFF` masking in Perl.
+                    _ss = stat["signal_strength"]
+                    player.signal_strength = _ss if 0 < _ss <= 100 else 0
                     # Keep the whole decoded struct for diagnostics/sync
                     # (Perl keeps it in %status and exposes
                     # getPlayPointData -> jiffies/elapsed_ms/elapsed_s).
-                    # setattr keeps this file self-contained (state.py is
-                    # owned elsewhere); declare it on PlayerState later.
-                    setattr(player, "_stat", stat)
+                    # `_stat` is declared on PlayerState (state.py).
+                    player._stat = stat
                     if event == "STMt":
-                        # TIMING heartbeat: only sent while the output is
-                        # RUNNING. If the UI state says otherwise (e.g. the
-                        # STMo start underrun flipped it), reconcile to play.
-                        # (Real LMS derives mode from the decoder/output
-                        # state the same way.)
-                        if player.mode != "play" and getattr(player, "remote", 0):
+                        # TIMING heartbeat (~1/s while the output is RUNNING).
+                        # This branch carries BOTH meanings; the former
+                        # duplicate `elif event == "STMt"` further down was
+                        # unreachable dead code and is merged here (R0.5-P3):
+                        #
+                        # 1. NATURAL TRACK END: the decoder ran dry earlier
+                        #    (STMd seen after the track started) AND the output
+                        #    buffer has fully drained. Perl's player reports
+                        #    STMu/playerStopped then and the controller advances
+                        #    (Squeezebox2.pm:162-163). The player no longer
+                        #    holds this stream, so drop the strm guard BEFORE
+                        #    advancing (R0.5-P1) — otherwise a replay of the
+                        #    same track is swallowed.
+                        # 2. RECONCILE: the tick is only sent while the output
+                        #    runs, so if the UI state says otherwise (e.g. an
+                        #    STMo start underrun flipped it) correct it to
+                        #    play — remote streams only, they never "end".
+                        stmd_at = getattr(player, "_last_stmd", None)
+                        started_at = getattr(player, "_track_started_at", None)
+                        # squeezelite sends STMd just BEFORE STMs at track
+                        # start; only an STMd from after the start is "decoder
+                        # is really dry".
+                        stmd_after_start = bool(
+                            stmd_at and (started_at is None or stmd_at > started_at)
+                        )
+                        if (player.mode == "play" and out_fullness == 0
+                                and stmd_after_start):
+                            player._last_stmd = None  # consume the signal
+                            player.strm_sent_track = None
+                            asyncio.create_task(_advance_after_track(pm, mac_str))
+                        elif player.mode != "play" and getattr(player, "remote", 0):
                             player.mode = "play"
                     elif event == "STMd":
                         # DECODE_COMPLETE — decoder has no more data. With
@@ -2347,35 +2458,33 @@ class SlimProtoClient:
                         # that decodes but stays silent shows STMs/STMd
                         # exactly like a healthy WAV — compare codecs.
                         player._last_stmd_codec = getattr(player, "_current_codec", "")
-                    elif event == "STMt":
-                        # PERIODIC TICK (~1/s) — squeezelite sends STMt
-                        # every second while playing, right after STMs, and
-                        # at real end of track. Distinguish via the output
-                        # buffer: a tick during playback still has data
-                        # buffered (fullness > 0). Real end-of-track: the
-                        # decoder ran dry earlier (STMd seen since the
-                        # last track start, allowing the start-burst STMd)
-                        # AND the output buffer fully drained.
-                        stmd_at = getattr(player, "_last_stmd", None)
-                        if player.mode == "play" and out_fullness == 0 and stmd_at:
-                            player._last_stmd = None  # consume the signal
-                            asyncio.create_task(_advance_after_track(pm, mac_str))
                     elif event == "STMs":
                         # TRACK_STARTED — a new track started playing
                         player.mode = "play"
                         player.pause_requested = False
                         player._track_started_at = time.time()
                     elif event == "STMf":
-                        # FLUSH/STOP ack — the player stopped; mark stop
-                        # only if the server didn't already (natural end
-                        # vs. user stop / pause-stop).
+                        # FLUSH/CLOSE ack — the player flushed its buffers and
+                        # closed the stream. Perl: flush() = stream('f') +
+                        # readyToStream(1) (Squeezebox2.pm:387-396), stop() =
+                        # stream('q') + streamingsocket(undef) +
+                        # readyToStream(1) (Squeezebox.pm:206-216). The player
+                        # no longer holds the stream we sent, so drop the strm
+                        # guard (R0.5-P1) — a replay of the SAME track must
+                        # stream again.
+                        player.strm_sent_track = None
+                        # Mark stop only if the server didn't already
+                        # (natural end vs. user stop / pause-stop).
                         if player.mode not in ("pause",):
                             player.mode = "stop"
                             player.pause_requested = False
                         else:
                             player.pause_requested = False  # pause-ack
                     elif event == "STMp":
-                        # PAUSE ack
+                        # PAUSE ack. This firmware is paused with strm 'q'
+                        # (see manager.pause_player), i.e. its buffers are
+                        # gone — a resume MUST re-stream, so drop the guard.
+                        player.strm_sent_track = None
                         player.mode = "pause"
                         player.pause_requested = False
                     elif event == "STMr":
@@ -2384,8 +2493,12 @@ class SlimProtoClient:
                         player.pause_requested = False
                     elif event == "STMn":
                         # DECODE_ERROR — the player could not decode the
-                        # stream; log and fall back to stop.
+                        # stream; log and fall back to stop. Perl:
+                        # readyToStream(1) + playerStreamingFailed
+                        # (Squeezebox2.pm:153-157) — the track is gone, so
+                        # drop the strm guard too (R0.5-P1).
                         logger.warning("STAT STMn (decode error) from %s", mac_str)
+                        player.strm_sent_track = None
                         player.mode = "stop"
                         player.pause_requested = False
                     elif event in ("STMo", "STMu"):
@@ -2398,14 +2511,18 @@ class SlimProtoClient:
                         stmd_at = getattr(player, "_last_stmd", None)
                         if player.mode == "play" and out_fullness == 0 and stmd_at:
                             player._last_stmd = None  # consume the signal
+                            player.strm_sent_track = None
                             asyncio.create_task(_advance_after_track(pm, mac_str))
                     elif event == "pause":
+                        player.strm_sent_track = None
                         player.mode = "pause"
                         player.pause_requested = False
                     elif event == "stop":
                         # A pause is implemented as strm 'q' (firmware does
                         # not honour strm 'p') — the resulting STAT stop is
-                        # the pause-ack and must keep mode="pause".
+                        # the pause-ack and must keep mode="pause". Either
+                        # way the player flushed its stream (R0.5-P1).
+                        player.strm_sent_track = None
                         if player.pause_requested:
                             player.pause_requested = False
                             player.mode = "pause"
@@ -2516,9 +2633,17 @@ async def _advance_after_track(pm, mac_str: str) -> None:
 
     A remote (radio) stream NEVER ends — an underrun there is just a
     buffer hiccup, not track end. Never advance/stop on it.
+
+    Called on the end-of-track path only: the player demonstrably does not
+    hold the stream we sent any more, so the strm idempotency guard is
+    dropped FIRST — even when there is nothing to advance to (empty
+    playlist, remote stream), else a replay of the same track is swallowed
+    (R0.5-P1).
     """
     try:
         player = pm.get_player(mac_str)
+        if player is not None:
+            player.strm_sent_track = None
         if player is None or not player.playlist:
             return
         if getattr(player, "remote", 0):

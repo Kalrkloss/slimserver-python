@@ -40,8 +40,15 @@ class PlayerState:
     current_track_id: Optional[int] = None
     # Track id of the last strm frame actually written to the player (used
     # by the send-idempotency guard; NOT current_track_id, which the caller
-    # sets optimistically before the frame goes out).
+    # sets optimistically before the frame goes out). Cleared on EVERY path
+    # where the player no longer holds that stream (incoming STMf/STMn,
+    # track end, stop/pause, disconnect/reconnect) — a stale value makes a
+    # replay of the same track a silent no-op.
     strm_sent_track: Optional[int] = None
+    # Track id a send_strm_to_player call is CURRENTLY sending. Claimed
+    # synchronously before the first await and released in `finally`, so two
+    # concurrent calls for the same track cannot both flush+stream.
+    stream_in_flight: Optional[int] = None
     # P6-1: fields used by the status handlers were set via setattr —
     # declare them so tooling/linters see them and typos fail early.
     elapsed: float = 0.0          # seconds into the current track (STAT)
@@ -95,6 +102,8 @@ class PlayerState:
     # SlimProto STAT bookkeeping (set by the protocol handler):
     _last_stmd: Optional[float] = None        # last DECODE_COMPLETE time
     _track_started_at: Optional[float] = None  # last STMs time
+    _last_stmd_codec: str = ""                # codec of the last STMd
+    _stat: Optional[dict] = None              # last decoded STAT struct
 
     def update_activity(self) -> None:
         """Mark the last activity timestamp to now."""

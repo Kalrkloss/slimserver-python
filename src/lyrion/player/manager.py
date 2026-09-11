@@ -698,11 +698,14 @@ class PlayerManager:
         # An explicit stop ends any pending pause.
         player.pause_requested = False
         ok = await handler.send_stop_to_player(player.mac)
+        # The guard is dropped even when the command could NOT be delivered
+        # (writer gone): the local "we streamed track X" belief is not
+        # authoritative in that case, and a stale guard would make the play
+        # after the next reconnect a silent no-op (R0.5-P1, g4). Re-streaming
+        # an unchanged track is harmless, staying silent is not.
+        player.strm_sent_track = None
         if ok:
             player.mode = "stop"
-            # A stopped player has no stream: the next play must send a
-            # fresh strm frame (idempotency guard reset).
-            player.strm_sent_track = None
             player.last_activity = time.time()
         return ok
 
