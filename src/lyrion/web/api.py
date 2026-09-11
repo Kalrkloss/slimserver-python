@@ -3,8 +3,10 @@ from __future__ import annotations
 
 import json
 import logging
+import posixpath
 import re
 import time
+import urllib.parse
 from typing import Any, Callable, Optional
 
 logger = logging.getLogger(__name__)
@@ -90,9 +92,9 @@ def _genre_id_to_text(genre_id) -> str:
 
 
 def _expand_track_ids(tagged: dict) -> list[int]:
-    """Resolve album_id/artist_id/year/genre_id filter tokens to the full
-    ordered track-id list (SqueezePlay 'playlistcontrol' + playlist play/add
-    expansion, Perl playlist control parity)."""
+    """Resolve album_id/artist_id/year/genre_id/folder_id filter tokens to
+    the full ordered track-id list (SqueezePlay 'playlistcontrol' +
+    playlist play/add expansion, Perl playlist control parity)."""
     where: list[str] = []
     params: list = []
     if tagged.get("album_id"):
@@ -110,11 +112,203 @@ def _expand_track_ids(tagged: dict) -> list[int]:
         if genre_text:
             where.append("t.genre = ?")
             params.append(genre_text)
+    if tagged.get("folder_id"):
+        # „Musikordner“ (mode:bmf): every track below that directory —
+        # Perl's folderId expansion in playlistControl.
+        where.append("t.url LIKE ?")
+        params.append(_bmf_encoded_prefix(tagged["folder_id"]) + "%")
     if not where:
         return []
     sql = ("SELECT t.id FROM tracks t WHERE " + " AND ".join(where)
            + " ORDER BY t.tracknum, t.title")
     return [int(r["id"]) for r in _db_query(sql, tuple(params))]
+
+
+# ---------------------------------------------------------------------------
+# „Musikordner“ (mode:bmf) — the folder tree, aggregated from the track URLs
+# (never from a filesystem walk: the library lives on an SMB share with
+# 100k+ files, so the directory levels are derived from tracks.url).
+# ---------------------------------------------------------------------------
+
+
+def _bmf_musicdir_pref() -> str:
+    """The runtime ``musicdir`` preference ('' when unset).
+
+    Read through lyrion.config's runtime preference store — the same source
+    the importer/rescan uses — NOT the library DB: the prefs table lives in
+    prefs.db, lyrion.db has none. Tests monkeypatch this function.
+    """
+    try:
+        from lyrion.config import get_config
+        return str(get_config().get("musicdir", "") or "")
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _bmf_path(value: str) -> str:
+    """Decoded absolute path for a ``file://`` URI or plain path token.
+
+    Track URLs are percent-encoded the way the importer stores them
+    (``Path.as_uri()``: ``smb-share%3Aserver%3D…``, ``%20`` for spaces,
+    ``%2B`` for '+'), while the ``musicdir`` pref and the drill tokens are
+    plain paths — so every comparison decodes first. Exactly this
+    encoding mismatch, plus taking the first URL component as a folder
+    name, produced the bogus ``home``/``run`` top level.
+    """
+    s = str(value or "").strip()
+    if s[:7].lower() == "file://":
+        s = s[7:]
+    if "%" in s:
+        try:
+            s = urllib.parse.unquote(s)
+        except Exception:  # noqa: BLE001
+            pass
+    s = s.replace("\\", "/")
+    while "//" in s:
+        s = s.replace("//", "/")
+    if s and not s.startswith("/"):
+        s = "/" + s
+    return s.rstrip("/")
+
+
+def _bmf_encoded_prefix(directory: str) -> str:
+    """``file://``-prefixed, percent-encoded ``directory`` + '/' (LIKE bound)."""
+    return "file://" + urllib.parse.quote(_bmf_path(directory), safe="/") + "/"
+
+
+def _bmf_count_under(root: str) -> int:
+    """Tracks whose URL lives below ``root`` (0 on any error)."""
+    try:
+        rows = _db_query("SELECT COUNT(*) AS n FROM tracks WHERE url LIKE ?",
+                         (_bmf_encoded_prefix(root) + "%",))
+        return int(list(rows[0].values())[0]) if rows else 0
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def _bmf_music_root() -> str:
+    """Browse root of „Musikordner“.
+
+    Preferred source is the runtime ``musicdir`` preference. Without it the
+    longest common directory root of the ``file://`` track URLs is used —
+    but only when it really holds more than one track and is not the
+    filesystem root: a few tracks outside the library (e.g. three test
+    files under ``~/Music``) must not drag the browse root up to ``/``.
+    """
+    pref = _bmf_path(_bmf_musicdir_pref())
+    if pref:
+        return pref
+    dirs: list[str] = []
+    try:
+        for row in _db_query("SELECT DISTINCT url FROM tracks "
+                             "WHERE url LIKE 'file://%'"):
+            d = posixpath.dirname(_bmf_path(row.get("url") or ""))
+            if d and d != "/":
+                dirs.append(d)
+    except Exception:  # noqa: BLE001
+        return ""
+    if not dirs:
+        return ""
+    root = posixpath.commonpath(dirs) if len(dirs) > 1 else dirs[0]
+    if root in ("", "/"):
+        # Unrelated trees side by side (library + strays): keep the tree
+        # holding the most tracks and use its own common root.
+        groups: dict[str, list[str]] = {}
+        for d in dirs:
+            parts = d.split("/")
+            groups.setdefault(parts[1] if len(parts) > 1 else d, []).append(d)
+        main = max(groups.values(), key=len)
+        root = posixpath.commonpath(main) if len(main) > 1 else main[0]
+    if root in ("", "/"):
+        return ""
+    # "nur wenn sie mehr als einen Track umfasst": a single track must not
+    # define a browse root.
+    return root if _bmf_count_under(root) > 1 else ""
+
+
+def _bmf_resolve_dir(token: str, root: str) -> str:
+    """Directory a ``mode:bmf`` drill token (folder_id/search/url) points at.
+
+    Accepts an absolute path below ``root``, a ``file://`` URI or a path
+    relative to ``root``; anything else falls back to ``root`` (browse the
+    top level instead of leaking a foreign directory).
+    """
+    p = _bmf_path(token)
+    if not p or p == "/":
+        return root
+    if p == root or p.startswith(root + "/"):
+        return p
+    cand = _bmf_path(root + "/" + p.lstrip("/"))
+    if cand == root or cand.startswith(root + "/"):
+        return cand
+    return root
+
+
+def _bmf_children(directory: str, start: int = 0,
+                  count: int = 200) -> tuple[list, int]:
+    """Children of ``directory``, aggregated from the track URLs.
+
+    Returns ``(rows, total)``: ``type 'folder'`` subdirectories (``id`` =
+    absolute path, ``name`` = decoded folder name) followed by ``type
+    'audio'`` files directly in the directory (``id`` = track id) — Perl's
+    bmf lists files there too. Everything comes from one prefix ``LIKE``
+    over ``tracks.url`` (``DISTINCT``/``GROUP BY`` on the path segment);
+    the filesystem is never touched.
+    """
+    prefix = _bmf_encoded_prefix(directory)
+    like = prefix + "%"
+    off = len(prefix) + 1          # 1-based index behind "<dir>/"
+    try:
+        rows = _db_query(
+            "SELECT seg, COUNT(*) AS n FROM ("
+            " SELECT CASE WHEN instr(substr(url, ?), '/') > 0"
+            "             THEN substr(url, ?, instr(substr(url, ?), '/') - 1)"
+            "             ELSE NULL END AS seg"
+            " FROM tracks WHERE url LIKE ?"
+            ") WHERE seg IS NOT NULL AND seg != ''"
+            " GROUP BY seg ORDER BY seg COLLATE NOCASE",
+            (off, off, off, like))
+    except Exception:  # noqa: BLE001
+        rows = []
+    folders: list[tuple[str, str]] = []
+    for r in rows:
+        name = urllib.parse.unquote(str(r["seg"]))
+        path = _bmf_path(directory + "/" + name)
+        if path == directory or not path.startswith(directory + "/"):
+            continue               # encoding drift / foreign tree → drop
+        folders.append((name, path))
+    folders.sort(key=lambda t: t[0].casefold())
+    try:
+        cnt = _db_query("SELECT COUNT(*) AS n FROM tracks WHERE url LIKE ?"
+                        " AND instr(substr(url, ?), '/') = 0", (like, off))
+        loose_total = int(list(cnt[0].values())[0]) if cnt else 0
+    except Exception:  # noqa: BLE001
+        loose_total = 0
+    total = len(folders) + loose_total
+    # Folders first, then the loose files of this directory (Perl returns
+    # both in one list).
+    out: list[dict] = [{"id": path, "name": name, "title": name,
+                        "type": "folder"}
+                       for name, path in folders[start:start + count]]
+    left = count - len(out)
+    if left > 0:
+        t_off = 0 if start < len(folders) else start - len(folders)
+        trows: list = []
+        try:
+            trows = _db_query(
+                "SELECT t.id, t.url FROM tracks t WHERE t.url LIKE ?"
+                " AND instr(substr(t.url, ?), '/') = 0"
+                " ORDER BY t.url COLLATE NOCASE, t.id LIMIT ? OFFSET ?",
+                (like, off, left, t_off))
+        except Exception:  # noqa: BLE001
+            trows = []
+        for r in trows:
+            # Perl's bmf shows the decoded file name for files (tags are
+            # what the album/year views are for).
+            name = posixpath.basename(_bmf_path(r.get("url") or ""))
+            out.append({"id": r["id"], "name": name, "title": name,
+                        "type": "audio"})
+    return out, total
 
 
 class JSONRPCError(Exception):
@@ -2024,7 +2218,8 @@ class JSONRPCAPI:
                             _k, _, _v = _s.partition(":")
                             tagged[_k] = _v
                     if any(k in tagged for k in
-                           ("album_id", "artist_id", "year", "genre_id")):
+                           ("album_id", "artist_id", "year", "genre_id",
+                            "folder_id")):
                         try:
                             _ids = _expand_track_ids(tagged)
                             for _tid in _ids:
@@ -2086,7 +2281,8 @@ class JSONRPCAPI:
                             k, _, v = s.partition(":")
                             tagged[k] = v
                     if "album_id" in tagged or "artist_id" in tagged \
-                            or "year" in tagged or "genre_id" in tagged:
+                            or "year" in tagged or "genre_id" in tagged \
+                            or "folder_id" in tagged:
                         # Expand to all matching tracks (one query).
                         try:
                             ids = _expand_track_ids(tagged)
@@ -2475,6 +2671,18 @@ class JSONRPCAPI:
                     "albums")
         search = next((str(a)[7:] for a in args if str(a).startswith("search:")),
                       "")
+        # „Musikordner“ drill token: SqueezePlay sends the tapped row's
+        # item params back (Perl: folder_id; older shapes: url / item_id).
+        # Accept all of them for bmf so a folder tap really descends;
+        # a purely numeric item_id is a track id, not a folder path.
+        if mode in ("bmf", "musicfolder") and not search:
+            for _k in ("folder_id", "url", "item_id"):
+                _tok = next((str(a)[len(_k) + 1:] for a in args
+                             if str(a).startswith(_k + ":")
+                             and str(a)[len(_k) + 1:].strip()), "")
+                if _tok and not (_k == "item_id" and _tok.isdigit()):
+                    search = _tok
+                    break
         # Drill-down ids SqueezePlay merges from the parent item's
         # commonParams (album_id:45, artist_id:…, year:…, genre_id:…).
         filters: dict = {}
@@ -2530,6 +2738,26 @@ class JSONRPCAPI:
 
         loop = []
         for r in rows:
+            if kind == "folder" and r.get("type") == "audio":
+                # A file inside the browsed „Musikordner“ directory — Perl's
+                # bmf lists files next to folders. It is a leaf, so the tap
+                # plays the track instead of descending.
+                loop.append({
+                    "id": str(r["id"]),
+                    "name": r["name"],
+                    "text": r["name"],
+                    "title": r["name"],
+                    "type": "audio",
+                    "isaudio": 1,
+                    "hasitems": 0,
+                    "actions": {
+                        "go": {"player": 0, "cmd": ["songinfo"],
+                               "params": {"track_id": r["id"]}},
+                        "play": {"player": 0, "cmd": ["playlist", "play"],
+                                 "params": {"track_id": r["id"]}},
+                    },
+                })
+                continue
             if kind == "albums":
                 ident, name, image = str(r["id"]), r["title"] or "", \
                     (f"/music/{r['id']}/cover.jpg" if r.get("artwork") else "")
@@ -2564,8 +2792,11 @@ class JSONRPCAPI:
             elif kind == "folder":
                 ident, name = str(r["id"]), r["name"]
                 go = ["browselibrary", "items"]
-                go_params = {"mode": "bmf", "search": str(r["id"])}
-                play_params = {}
+                # 'search:' is this server's original drill token,
+                # 'folder_id:' the Perl one — emit both, accept both.
+                go_params = {"mode": "bmf", "search": ident,
+                             "folder_id": ident}
+                play_params = {"folder_id": ident}
                 icon = "html/images/musicfolder.png"
             else:
                 continue
@@ -2686,10 +2917,47 @@ class JSONRPCAPI:
                 if url:
                     preset["favorites_url"] = str(url)
                 item["presetParams"] = preset
+            elif kind == "folder" and r.get("type") == "audio":
+                # A file in the browsed folder (Perl bmf lists files too):
+                # an audio leaf carrying the track, not a drill target.
+                text = r["name"] or ""
+                item["type"] = "audio"
+                item["text"] = text
+                item["textkey"] = text[:1].upper()
+                item["commonParams"] = {"track_id": int(r["id"])}
+                item["actions"] = {
+                    "play": {"player": 0, "cmd": ["playlistcontrol"],
+                             "params": {"cmd": "load", "menu": 1,
+                                        "track_id": str(r["id"])},
+                             "nextWindow": "nowPlaying"},
+                    "add": {"player": 0, "cmd": ["playlistcontrol"],
+                            "params": {"cmd": "add", "menu": 1,
+                                       "track_id": str(r["id"])}},
+                }
             elif kind == "folder":
-                item["text"] = r["name"] or ""
+                text = r["name"] or ""
                 ident = str(r["id"])
-                item["commonParams"] = {"url": ident}
+                item["text"] = text
+                item["textkey"] = text[:1].upper()
+                item["id"] = ident
+                # Two drill vocabularies on purpose: 'folder_id' (Perl) and
+                # 'url' (this server's earlier shape) — the bmf branch
+                # accepts both, so the roundtrip works for old and new taps.
+                item["commonParams"] = {"folder_id": ident, "url": ident}
+                # Perl bmf folder item (BrowseLibrary): add/add-hold/play
+                # carry the folder id, so they load the whole folder.
+                item["actions"] = {
+                    "add": {"player": 0, "cmd": ["playlistcontrol"],
+                            "params": {"cmd": "add", "menu": 1,
+                                       "folder_id": ident}},
+                    "add-hold": {"player": 0, "cmd": ["playlistcontrol"],
+                                 "params": {"cmd": "insert", "menu": 1,
+                                            "folder_id": ident}},
+                    "play": {"player": 0, "cmd": ["playlistcontrol"],
+                             "params": {"cmd": "load", "menu": 1,
+                                        "folder_id": ident},
+                             "nextWindow": "nowPlaying"},
+                }
                 item["icon"] = "html/images/musicfolder.png"
             else:
                 continue
@@ -2949,39 +3217,16 @@ class JSONRPCAPI:
                              "WHERE year > 0")
             return rows, total, "years_loop", "years"
         if mode in ("bmf", "musicfolder"):
-            # folder browse: build the tree from the track URLs
-            if search:
-                where = " AND url LIKE ?"
-                like = search.rstrip("/") + "/%"
-                rows = q("SELECT DISTINCT url FROM tracks "
-                         "WHERE url LIKE 'file://%'" + where +
-                         " ORDER BY url LIMIT ? OFFSET ?", like, count, start)
-            else:
-                rows = q("SELECT DISTINCT url FROM tracks "
-                         "WHERE url LIKE 'file://%' "
-                         "ORDER BY url LIMIT ? OFFSET ?", count, start)
-            names = []
-            for r in rows:
-                url = r["url"]
-                path = (url[len("file://"):].lstrip("/")
-                        if url.startswith("file://") else url.lstrip("/"))
-                if search:
-                    # Normalize search to the same form as path (no file://
-                    # prefix) — slicing by the original URI's length produced
-                    # garbage child names.
-                    s = search
-                    if s.startswith("file://"):
-                        s = s[len("file://"):].lstrip("/")
-                    rel = path[len(s.rstrip("/")) + 1:]
-                    names.append(rel.split("/", 1)[0])
-                else:
-                    parts = path.split("/")
-                    names.append(parts[0] if len(parts) >= 2 else path)
-            names = list(dict.fromkeys(n for n in names if n))
-            loop_rows = [{"id": search.rstrip("/") + "/" + n if search
-                          else "file:///" + n, "name": n}
-                         for n in names]
-            return loop_rows, len(names), "musicfolder_loop", "folder"
+            # „Musikordner“: the tree is aggregated from the track URLs
+            # below the musicdir root. Without a root (no pref, no
+            # multi-track library) the folder stays empty instead of
+            # showing the first URL component ("home"/"run" bug).
+            root = _bmf_music_root()
+            if not root:
+                return [], 0, "musicfolder_loop", "folder"
+            directory = _bmf_resolve_dir(search, root) if search else root
+            rows, total = _bmf_children(directory, start, count)
+            return rows, total, "musicfolder_loop", "folder"
         if mode == "search":
             # My Music → Suchen: search track titles (falling back to an
             # empty list instead of dumping every album).
