@@ -18,10 +18,15 @@ slim.request params (player + command array) and are dispatched through
 the JSON-RPC handler.
 
 Client lifecycle: a client is removed on /meta/disconnect, when the
-transport connection that owned it closes (cometd_stream.py, and the ASGI
-streaming handler in web/app.py), or when it goes idle past
-LONG_POLLING_AUTOKILL — Perl's disconnect timer, which catches the
-handshake-only and non-connecting clients no close handler can see.
+transport connection that handled its /meta/connect closes
+(cometd_stream.py, and the ASGI streaming handler in web/app.py), or when
+it goes idle past LONG_POLLING_AUTOKILL — Perl's disconnect timer, which
+catches the handshake-only and non-connecting clients no close handler can
+see. A connection that merely carried a handshake/subscribe/request POST
+never removes the client: those POSTs normally live on another socket than
+the connect (HTTP long-polling, Comet.lua:184), and Perl registers a
+connection with the manager only in the /meta/(re)connect branch
+(Slim/Web/Cometd.pm:286).
 """
 from __future__ import annotations
 
@@ -416,9 +421,12 @@ class CometdManager:
     def register_connection(self, client_id: str, owner: object) -> None:
         """Make ``owner`` the client's current (newest) transport connection.
 
-        Mirrors Perl Manager::register_connection — a reconnect overwrites the
-        stored connection. Combined with remove_if_owner this keeps a stale
-        connection's close from removing a client that already reconnected.
+        Called ONLY by a connection that processed the client's /meta/connect
+        — mirrors Perl Manager::register_connection (Cometd.pm:286, reached
+        only from the /meta/(re)connect branch). Combined with
+        remove_if_owner this keeps a stale connection's close from removing a
+        client that already reconnected, and stops a handshake/subscribe/
+        request POST (which never calls this) from ever owning the client.
         """
         client = self._clients.get(client_id)
         if client is None:
@@ -427,10 +435,19 @@ class CometdManager:
         client.last_seen = self._clock()
 
     def remove_if_owner(self, client_id: str, owner: object) -> bool:
-        """Remove the client only while ``owner`` is its current connection."""
+        """Remove the client only while ``owner`` is its current connection.
+
+        Mirrors Perl webCloseHandler (Cometd.pm:1003): only the connection
+        that handled the client's /meta/connect may remove it. A connection
+        that merely carried a handshake/subscribe/request POST finds
+        ``client.owner`` pointing at another connection (or None) and must do
+        nothing — those POSTs often live on a different socket than the
+        connect (HTTP long-polling, Comet.lua:184).
+        """
         client = self._clients.get(client_id)
         if client is None or client.owner is not owner:
             return False
+        logger.info("Cometd connection close -> removing client %s", client_id)
         self.remove(client_id)
         return True
 

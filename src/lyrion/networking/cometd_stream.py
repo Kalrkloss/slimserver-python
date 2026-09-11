@@ -139,12 +139,15 @@ def _dechunk(data: bytes) -> bytes:
 
 async def _handle_connection(manager, reader: asyncio.StreamReader,
                              writer: asyncio.StreamWriter, web_port: int) -> None:
-    # Every client this socket touches. Perl removes them via
-    # webCloseHandler -> disconnectClient; this server has no close callback,
-    # so the connection owns them and drops them in its ``finally`` — also a
-    # handshake-only client and one created by a non-connect POST that never
-    # opens a /meta/connect. ``owner`` is the connection's identity so a
-    # reconnected client is only removed by its newest connection.
+    # The connection's identity. Only the connection that processed a client's
+    # /meta/connect becomes that client's owner; this connection may remove a
+    # client only while it still owns it. Perl does the same: Cometd.pm:286
+    # calls $manager->register_connection ONLY in the /meta/(re)connect branch,
+    # and webCloseHandler (Cometd.pm:1003) drops a client only when the lost
+    # connection is that registered connection. A client spreads its POSTs over
+    # several sockets (HTTP long-polling, Comet.lua:184 "2 pools, 1 for chunked
+    # responses and 1 for requests"), so a handshake/subscribe/request POST
+    # ending — the normal case — must never erase the client.
     owner = object()
     conn_cids: set[str] = set()
     try:
@@ -179,7 +182,8 @@ async def _handle_connection(manager, reader: asyncio.StreamReader,
                 # Remember every client this socket touched: handshake ids
                 # arrive in the replies, explicit ones in the messages, and
                 # Orange Squeeze's cid-less /slim/* in their response channel.
-                # The connection drops them all when it closes.
+                # They are only TOUCHED (last_seen/autokill window) — never
+                # owned — unless this batch carried their /meta/connect.
                 for m in messages:
                     if not isinstance(m, dict):
                         continue
@@ -193,13 +197,22 @@ async def _handle_connection(manager, reader: asyncio.StreamReader,
                     if isinstance(r, dict) and r.get("clientId"):
                         conn_cids.add(r["clientId"])
                 for c in conn_cids:
-                    manager.register_connection(c, owner)
+                    manager.touch(c)
                 connect_msgs = [m for m in messages if isinstance(m, dict)
                                 and m.get("channel") == "/meta/connect"]
 
                 if connect_msgs:
                     msg = connect_msgs[0]
                     cid = msg.get("clientId", "")
+                    # This connection processed the client's /meta/connect: it
+                    # now OWNS the client and is the only connection allowed to
+                    # drop it (Perl register_connection on (re)connect). A
+                    # later connect on a new socket overwrites the owner, so
+                    # this connection's close leaves the reconnected client
+                    # alone (remove_if_owner).
+                    if cid:
+                        conn_cids.add(cid)
+                        manager.register_connection(cid, owner)
                     logger.info("NativeCometd connect: cid=%s (POST hatte %d Nachrichten: %s)",
                                 cid, len(messages),
                                 ",".join(m.get("channel", "?") for m in messages))
@@ -269,6 +282,13 @@ async def _handle_connection(manager, reader: asyncio.StreamReader,
                                         manager.connection_closed(stream_cid)
                                         manager.connection_open(new_cid)
                                         stream_cid = new_cid
+                                    # A connect in this batch (re)registers this
+                                    # connection as the client's owner — Perl's
+                                    # register_connection, only reached from
+                                    # /meta/(re)connect (Cometd.pm:286).
+                                    if stream_cid:
+                                        conn_cids.add(stream_cid)
+                                        manager.register_connection(stream_cid, owner)
                                     payload = list(nreplies) + [{
                                         "channel": "/meta/connect",
                                         "successful": True,
@@ -302,14 +322,14 @@ async def _handle_connection(manager, reader: asyncio.StreamReader,
                         manager.connection_closed(stream_cid)
                         # The streaming connection is gone: client closed it,
                         # app was killed, or the body was truncated — no
-                        # /meta/disconnect ever arrives. Drop the client here
-                        # (only if this connection still owns it) — otherwise
-                        # it stays in the manager forever and the notify_* /
-                        # keepalive loops keep filling a queue nobody reads.
-                        # Perl does the same from webCloseHandler ->
-                        # disconnectClient. Handshake-only / non-connect
-                        # clients are dropped by the outer finally below and,
-                        # on the ASGI path, by the manager's idle reaper.
+                        # /meta/disconnect ever arrives. Drop the client here,
+                        # but only while this connection is still its owner
+                        # (a newer connect on another socket may have taken
+                        # over). Perl does the same from webCloseHandler ->
+                        # disconnectClient (Cometd.pm:1003). A client that
+                        # never connected on this socket is only reaped by its
+                        # own connect connection, /meta/disconnect, or the idle
+                        # autokill (LONG_POLLING_AUTOKILL).
                         manager.remove_if_owner(stream_cid, owner)
                     break
                 else:
@@ -349,11 +369,16 @@ async def _handle_connection(manager, reader: asyncio.StreamReader,
             asyncio.IncompleteReadError, EOFError):
         pass
     finally:
-        # The socket is gone: drop every client this connection owned —
-        # including a handshake-only client that never issued /meta/connect
-        # and one created by a non-connect POST (review repros H/I). Only the
-        # client's current connection may remove it, so a reconnect that
-        # already claimed the id is left alone (Perl webCloseHandler).
+        # The socket is gone. ``conn_cids`` holds every client this connection
+        # touched, but only a client this connection CONNECTED still has it as
+        # owner — remove_if_owner is a no-op for all the rest, so a
+        # handshake-/subscribe-/request-POST socket closing never erases a
+        # client whose /meta/connect lives elsewhere (HTTP long-polling's
+        # response/request pools, Comet.lua:184). It also leaves a client
+        # alone whose reconnect on a newer socket already claimed the id
+        # (Perl webCloseHandler's "is this the current connection?" check,
+        # Cometd.pm:1003). Handshake-only clients are reaped by the idle
+        # autokill (LONG_POLLING_AUTOKILL) / /meta/disconnect.
         for cid in conn_cids:
             manager.remove_if_owner(cid, owner)
         # Always release the socket — also for a truncated body / aborted

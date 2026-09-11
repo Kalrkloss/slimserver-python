@@ -180,24 +180,19 @@ async def _handle_cometd(cometd: CometdManager, path: str, receive, send) -> Non
         logger.info("Cometd body not JSON (%s): %.160s", exc, body.decode("utf-8", errors="replace"))
         messages = []
 
-    # Every client this POST concerns; dropped if the response cannot be
-    # delivered (client aborted) — the ASGI path gets no other close signal.
-    cids: set[str] = set()
-    for m in messages:
-        if isinstance(m, dict) and m.get("clientId"):
-            cids.add(m["clientId"])
-
     replies: list[dict] = []
     try:
         replies = await cometd.handle_messages(messages)
     except Exception as exc:  # noqa: BLE001
         logger.warning("Cometd handle_messages failed: %s", exc)
-    for r in replies:
-        if isinstance(r, dict) and r.get("clientId"):
-            cids.add(r["clientId"])
 
     connect_msgs = [m for m in messages if isinstance(m, dict)
                     and m.get("channel") == "/meta/connect"]
+    # cid -> owner of every /meta/connect this POST holds. ONLY these clients
+    # may be dropped when the response cannot be delivered: a handshake/
+    # subscribe/request POST that aborts must not erase a client whose connect
+    # is served by another request/socket (HTTP long-polling, Comet.lua:184).
+    poll_owners: dict[str, object] = {}
 
     try:
         if connect_msgs:
@@ -209,7 +204,15 @@ async def _handle_cometd(cometd: CometdManager, path: str, receive, send) -> Non
                 if msg.get("connectionType") == "streaming":
                     await _handle_streaming_connect(cometd, cid, msg, replies, send)
                     return
-                # long-polling: hold until events arrive or timeout
+                # long-polling: this POST IS the client's connect connection —
+                # it owns the client until a newer connect takes over (Perl
+                # registers the connection with the manager only in the
+                # /meta/(re)connect branch, Cometd.pm:286).
+                if cid:
+                    owner = object()
+                    cometd.register_connection(cid, owner)
+                    poll_owners[cid] = owner
+                # hold until events arrive or timeout
                 events = await cometd.wait_for_events(cid)
                 replies.append({
                     "channel": "/meta/connect",
@@ -249,14 +252,16 @@ async def _handle_cometd(cometd: CometdManager, path: str, receive, send) -> Non
         })
         await send({"type": "http.response.body", "body": response})
     except Exception as exc:  # noqa: BLE001
-        # The response could not be written — the client is gone. Drop the
-        # clients this POST created/used so notify_* / keepalive_loop stop
-        # queueing for them. (Streaming connects clean up in their own
-        # finally.)
-        logger.info("Cometd response aborted (%s) — dropping client(s) %s",
-                    exc, sorted(cids))
-        for cid in cids:
-            cometd.remove(cid)
+        # The response could not be written — the client is gone from THIS
+        # request. Only a connection that processed the client's /meta/connect
+        # may remove it (Perl webCloseHandler, Cometd.pm:1003); a failed
+        # handshake/subscribe/request POST leaves the client alone, because its
+        # connect is normally served by another request/socket. (Streaming
+        # connects clean up in their own finally.)
+        logger.info("Cometd response aborted (%s) — dropping connect client(s) %s",
+                    exc, sorted(poll_owners))
+        for cid, owner in poll_owners.items():
+            cometd.remove_if_owner(cid, owner)
 
 
 _MIME_BY_EXT = {

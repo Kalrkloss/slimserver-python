@@ -676,9 +676,21 @@ def test_idle_reaper_spares_client_with_open_streaming_connection():
     assert client is None
 
 
-def test_native_handshake_only_then_close_removes_client():
-    """handshake then abrupt close (no /meta/connect) must not leak the
-    client in the manager (review repro H)."""
+def test_native_handshake_only_post_close_keeps_client(caplog):
+    """P0 case (a): a /meta/handshake POST ending must NOT remove the client.
+
+    A Bayeux client spreads its POSTs over several sockets — HTTP
+    long-polling keeps a response pool (the /meta/connect) and a request
+    pool (handshake/subscribe/request; Comet.lua:184 "2 pools, 1 for
+    chunked responses and 1 for requests"). The handshake POST socket
+    therefore ends as soon as its reply is written, which is normal, not
+    a disconnect. Perl Cometd.pm:286 registers the connection with the
+    manager ONLY in the /meta/(re)connect branch, and webCloseHandler
+    (Cometd.pm:1003) removes a client only when the lost connection is
+    that registered connection.
+    """
+    caplog.set_level("INFO")
+
     async def run():
         mgr = CometdManager(_StubRPC())
         server = await start_cometd_server(mgr, "127.0.0.1", 0)
@@ -690,31 +702,39 @@ def test_native_handshake_only_then_close_removes_client():
             hs = json.loads(await _read_clen_reply(reader))
             cid = hs[0]["clientId"]
             assert mgr.get(cid) is not None
-            writer.close()  # abrupt: never sends /meta/disconnect nor connect
+            writer.close()  # handshake POST socket ends (no connect here)
             try:
                 await writer.wait_closed()
             except Exception:  # noqa: BLE001
                 pass
-            for _ in range(60):
-                if mgr.get(cid) is None:
-                    break
-                await asyncio.sleep(0.05)
+            # Give the handler's ``finally`` ample time to (wrongly) remove
+            # the client — the connection loops try exactly once.
+            await asyncio.sleep(0.3)
             return cid, mgr.get(cid)
         finally:
             server.close()
             await server.wait_closed()
 
-    _cid, client = _run(run())
-    assert client is None, "handshake-only client must be dropped on close"
+    cid, client = _run(run())
+    assert f"removing client {cid}" not in caplog.text, \
+        f"handshake-POST close removed the client; log: {caplog.text}"
+    assert client is not None, (
+        "handshake-POST close must not drop the client "
+        f"(log: {caplog.text})")
 
 
-def test_native_non_connect_post_close_stops_keepalive_work():
-    """A non-connect POST (long-poll style) creates/keeps a client; closing
-    the socket without /meta/disconnect must drop it, and the subscribe:N
-    keep-alive must stop dispatching for it (review repro I)."""
+def test_native_subscribe_post_close_keeps_client_and_subscriptions(caplog):
+    """P0 case (b): a /meta/subscribe POST ending must NOT remove the client
+    or its subscriptions.
+
+    Same rule as case (a): the subscribe POST is a request-pool socket; the
+    client's /meta/connect lives on another socket and keeps ownership.
+    """
+    caplog.set_level("INFO")
+    player = "02:11:22:33:44:55"
+
     async def run():
-        rpc = _StubRPC()
-        mgr = CometdManager(rpc)
+        mgr = CometdManager(_StubRPC())
         server = await start_cometd_server(mgr, "127.0.0.1", 0)
         try:
             port = server.sockets[0].getsockname()[1]
@@ -723,44 +743,41 @@ def test_native_non_connect_post_close_stops_keepalive_work():
             await writer.drain()
             cid = json.loads(await _read_clen_reply(reader))[0]["clientId"]
 
-            # non-connect POST with a 1s keep-alive subscription
+            # non-connect POST that stores a subscription
             writer.write(_post_bytes([{
-                "channel": "/slim/subscribe", "id": 2,
-                "data": {
-                    "request": [cid, ["status", "-", 1, "subscribe:1"]],
-                    "response": f"/{cid}/slim/playerstatus/{cid}",
-                },
+                "channel": "/meta/subscribe", "clientId": cid, "id": 2,
+                "subscription": f"/{cid}/slim/playerstatus/{player}",
             }]))
             await writer.drain()
             await _read_clen_reply(reader)
-            assert mgr.get(cid) is not None
-            assert f"/{cid}/slim/playerstatus/{cid}" in mgr.get(cid).subscriptions
+            assert f"/{cid}/slim/playerstatus/{player}" in mgr.get(cid).subscriptions
 
-            keepalive = asyncio.create_task(mgr.keepalive_loop())
-            writer.close()  # abrupt: no /meta/disconnect
+            writer.close()  # subscribe POST socket ends, no /meta/disconnect
             try:
                 await writer.wait_closed()
             except Exception:  # noqa: BLE001
                 pass
-            for _ in range(60):
-                if mgr.get(cid) is None:
-                    break
-                await asyncio.sleep(0.05)
-            rpc.calls.clear()
-            await asyncio.sleep(2.3)  # > 2 keep-alive intervals
-            keepalive.cancel()
-            try:
-                await keepalive
-            except asyncio.CancelledError:
-                pass
-            return cid, mgr.get(cid), rpc.calls
+            await asyncio.sleep(0.3)
+            client = mgr.get(cid)
+            subs = dict(client.subscriptions) if client else {}
+            if client is not None:
+                await mgr.notify_player_status(player)
+                events = await mgr.wait_for_events(cid, timeout=0)
+            else:
+                events = []
+            return cid, client, subs, events
         finally:
             server.close()
             await server.wait_closed()
 
-    _cid, client, calls = _run(run())
-    assert client is None, "non-connect client must be dropped on close"
-    assert calls == [], f"keep-alive must not dispatch for a dead client: {calls}"
+    cid, client, subs, events = _run(run())
+    assert f"removing client {cid}" not in caplog.text, \
+        f"subscribe-POST close removed the client; log: {caplog.text}"
+    assert client is not None, (
+        "subscribe-POST close must not drop the client "
+        f"(log: {caplog.text})")
+    assert f"/{cid}/slim/playerstatus/{player}" in subs, subs
+    assert any("playerstatus" in e["channel"] for e in events), events
 
 
 def test_asgi_streaming_connect_removes_client_on_abort():
@@ -855,3 +872,240 @@ def test_connect_ack_position_is_documented_perl_deviation():
     follow = _run(run())
     assert [m["channel"] for m in follow] == ["/meta/subscribe", "/meta/connect"]
     assert follow[0]["channel"] != "/meta/connect"
+
+
+# ---------------------------------------------------------------------------
+# P0 regression (commit 0023b9930): connection cleanup may only remove the
+# client whose /meta/connect that connection handled.
+#
+# The regression: cometd_stream.py made EVERY cid a POST touched owned by that
+# socket and removed them all in its ``finally``. A client that spreads its
+# POSTs over sockets (HTTP long-polling: Comet.lua:184 "2 pools, 1 for chunked
+# responses and 1 for requests") lost clientId and subscriptions as soon as a
+# handshake/subscribe/request POST ended, so notify_player_status found zero
+# clients (protocol.py:2550 "STAT … → notify_player_status (0 cometd
+# clients)") and pushed nothing.  Perl registers the connection with the
+# manager ONLY in the /meta/(re)connect branch (Cometd.pm:286) and removes a
+# client only when that connection closes (webCloseHandler, Cometd.pm:1003).
+# ---------------------------------------------------------------------------
+
+_PLAYER = "02:11:22:33:44:55"
+
+
+async def _stream_connect_cid(server, cid, request_id=9):
+    """New socket + streaming /meta/connect for an EXISTING cid.
+
+    Returns (reader, writer) with the connect ack chunk already consumed.
+    """
+    port = server.sockets[0].getsockname()[1]
+    reader, writer = await asyncio.open_connection("127.0.0.1", port)
+    writer.write(_post_bytes([{
+        "channel": "/meta/connect", "clientId": cid, "id": request_id,
+        "connectionType": "streaming"}]))
+    await writer.drain()
+    head = await _read_headers(reader)
+    assert b"chunked" in head.lower(), head
+    first = json.loads(await _read_chunk(reader))
+    assert any(m.get("channel") == "/meta/connect" for m in first), first
+    return reader, writer
+
+
+def test_p0_connect_socket_close_removes_client():
+    """P0 case (c): the connection that processed /meta/connect owns the
+    client; its close removes it (Perl webCloseHandler, Cometd.pm:1003) even
+    while the client's other POST socket is still open."""
+    player = _PLAYER
+
+    async def run():
+        mgr = CometdManager(_StubRPC())
+        server = await start_cometd_server(mgr, "127.0.0.1", 0)
+        try:
+            port = server.sockets[0].getsockname()[1]
+            # socket 1: handshake + streaming connect (the "response" pool)
+            _r1, w1, cid = await _open_stream(server)
+            # socket 2: subscribe POST (the "request" pool), left open
+            reader2, w2 = await asyncio.open_connection("127.0.0.1", port)
+            w2.write(_post_bytes([{
+                "channel": "/meta/subscribe", "clientId": cid, "id": 3,
+                "subscription": f"/{cid}/slim/playerstatus/{player}"}]))
+            await w2.drain()
+            await _read_clen_reply(reader2)
+
+            w1.close()  # the CONNECT socket goes away
+            try:
+                await w1.wait_closed()
+            except Exception:  # noqa: BLE001
+                pass
+            for _ in range(60):
+                if mgr.get(cid) is None:
+                    break
+                await asyncio.sleep(0.05)
+            removed = mgr.get(cid) is None
+            w2.close()
+            try:
+                await w2.wait_closed()
+            except Exception:  # noqa: BLE001
+                pass
+            return cid, removed
+        finally:
+            server.close()
+            await server.wait_closed()
+
+    _cid, removed = _run(run())
+    assert removed, "closing the /meta/connect connection must drop the client"
+
+
+def test_p0_meta_disconnect_removes_client():
+    """P0 case (d): an explicit /meta/disconnect removes the client."""
+    async def run():
+        mgr = CometdManager(_StubRPC())
+        hs = await mgr.handle_messages([{"channel": "/meta/handshake", "id": 1}])
+        cid = hs[0]["clientId"]
+        await mgr.handle_messages([{
+            "channel": "/meta/subscribe", "clientId": cid, "id": 2,
+            "subscription": f"/{cid}/slim/playerstatus/{_PLAYER}"}])
+        replies = await mgr.handle_messages([{
+            "channel": "/meta/disconnect", "clientId": cid, "id": 3}])
+        return cid, replies, mgr.get(cid)
+
+    _cid, replies, client = _run(run())
+    assert replies[0]["successful"] is True
+    assert client is None, "/meta/disconnect must remove the client"
+
+
+def test_p0_idle_timeout_reaps_handshake_only_client():
+    """P0 case (e): LONG_POLLING_AUTOKILL (Perl Cometd.pm:49) is the path that
+    removes a handshake-only client — the POST socket ending is not.
+
+    A frozen clock stands in for the 180 s window; the client must survive the
+    socket close and then be reaped once the window expires.
+    """
+    now, clock = _fake_clock()
+
+    async def run():
+        mgr = CometdManager(_StubRPC(), clock=clock)
+        server = await start_cometd_server(mgr, "127.0.0.1", 0)
+        try:
+            port = server.sockets[0].getsockname()[1]
+            reader, writer = await asyncio.open_connection("127.0.0.1", port)
+            writer.write(_post_bytes([{"channel": "/meta/handshake", "id": 1}]))
+            await writer.drain()
+            cid = json.loads(await _read_clen_reply(reader))[0]["clientId"]
+            writer.write(_post_bytes([{
+                "channel": "/meta/subscribe", "clientId": cid, "id": 2,
+                "subscription": f"/{cid}/slim/playerstatus/{_PLAYER}"}]))
+            await writer.drain()
+            await _read_clen_reply(reader)
+            writer.close()  # never connects, never disconnects
+            try:
+                await writer.wait_closed()
+            except Exception:  # noqa: BLE001
+                pass
+            await asyncio.sleep(0.3)
+            survived = mgr.get(cid) is not None
+            now[0] += LONG_POLLING_AUTOKILL + 1
+            reaped = mgr.kill_idle_clients()
+            return cid, survived, reaped, mgr.get(cid)
+        finally:
+            server.close()
+            await server.wait_closed()
+
+    cid, survived, reaped, client = _run(run())
+    assert survived, "handshake-only client must survive the POST socket close"
+    assert reaped == [cid], "the idle autokill must reap the handshake-only client"
+    assert client is None
+
+
+def test_p0_reconnect_new_socket_keeps_subscriptions():
+    """P0 case (f): a new /meta/connect on a new socket takes over ownership
+    (Perl register_connection overwrites the stored connection); the stale
+    socket's close must neither remove the client nor lose its subscriptions,
+    and the new socket keeps receiving the pushes."""
+    player = _PLAYER
+
+    async def run():
+        mgr = CometdManager(_StubRPC())
+        server = await start_cometd_server(mgr, "127.0.0.1", 0)
+        try:
+            # socket 1: handshake + connect + subscribe (owns the client)
+            reader1, writer1, cid = await _open_stream(server)
+            await _read_chunk(reader1)  # connect ack
+            writer1.write(_post_bytes([{
+                "channel": "/meta/subscribe", "clientId": cid, "id": 3,
+                "subscription": f"/{cid}/slim/playerstatus/{player}"}]))
+            await writer1.drain()
+            await _read_chunk(reader1)  # subscribe ack + seed event
+
+            # socket 2: the client reconnects — the new connect owns it now
+            reader2, writer2 = await _stream_connect_cid(server, cid, request_id=4)
+
+            # the stale socket ends: it must not take the client with it
+            writer1.close()
+            try:
+                await writer1.wait_closed()
+            except Exception:  # noqa: BLE001
+                pass
+            await asyncio.sleep(0.3)
+            client = mgr.get(cid)
+            alive = client is not None
+            subs = dict(client.subscriptions) if client else {}
+            # the new socket still serves the subscriptions
+            await mgr.notify_player_status(player)
+            try:
+                pushed = json.loads(await _read_chunk(reader2))
+            except Exception:  # noqa: BLE001
+                pushed = []
+            writer2.close()
+            try:
+                await writer2.wait_closed()
+            except Exception:  # noqa: BLE001
+                pass
+            return cid, alive, subs, pushed
+        finally:
+            server.close()
+            await server.wait_closed()
+
+    cid, alive, subs, pushed = _run(run())
+    assert alive, "a stale connection close must not remove a reconnected client"
+    assert f"/{cid}/slim/playerstatus/{player}" in subs, subs
+    assert any("playerstatus" in m.get("channel", "") for m in pushed), pushed
+
+
+def test_p0_asgi_non_connect_post_abort_keeps_client(caplog):
+    """P0: on the ASGI path a failed handshake/subscribe/request response
+    (client gone from that POST) must not erase a client whose /meta/connect
+    is served elsewhere."""
+    caplog.set_level("INFO")
+
+    async def run():
+        from lyrion.web.app import _handle_cometd
+
+        mgr = CometdManager(_StubRPC())
+        hs = await mgr.handle_messages([{"channel": "/meta/handshake", "id": 1}])
+        cid = hs[0]["clientId"]
+        await mgr.handle_messages([{
+            "channel": "/meta/subscribe", "clientId": cid, "id": 2,
+            "subscription": f"/{cid}/**"}])
+        body = json.dumps([{
+            "channel": "/slim/request", "clientId": cid, "id": 3,
+            "data": {"request": ["", ["serverstatus", "0", "1"]],
+                     "response": f"/{cid}/slim/request"}}]).encode()
+        sent = []
+
+        async def receive():
+            if not sent:
+                sent.append(1)
+                return {"type": "http.request", "body": body,
+                        "more_body": False}
+            return {"type": "http.disconnect"}
+
+        async def send(message):
+            raise RuntimeError("client gone")
+
+        await _handle_cometd(mgr, "/cometd", receive, send)
+        return cid, mgr.get(cid)
+
+    _cid, client = _run(run())
+    assert client is not None, (
+        "a non-connect POST abort must not drop the client "
+        f"(log: {caplog.text})")
