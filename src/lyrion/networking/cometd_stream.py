@@ -53,7 +53,17 @@ async def _read_http_request(reader: asyncio.StreamReader) -> dict | None:
     length = int(headers.get(b"content-length", b"0") or 0)
     if length > MAX_BODY:
         return None
-    body = await reader.readexactly(length) if length else b""
+    if not length:
+        return {"headers": headers, "body": b""}
+    try:
+        body = await reader.readexactly(length)
+    except (asyncio.IncompleteReadError, EOFError, ConnectionError, OSError):
+        # Truncated/aborted body: the peer vanished mid-POST. Treat it as
+        # EOF so the caller unwinds and closes the socket. Without this
+        # asyncio.IncompleteReadError escaped the handler (it is not a
+        # ConnectionError) and the transport stayed open until GC.
+        logger.info("NativeCometd: abgebrochener Body (Content-Length %d)", length)
+        return None
     return {"headers": headers, "body": body}
 
 
@@ -171,6 +181,8 @@ async def _handle_connection(manager, reader: asyncio.StreamReader,
                         "advice": {"reconnect": "retry", "interval": 0,
                                    "timeout": 25},
                     }
+                    # handle_messages() deliberately does NOT answer
+                    # /meta/connect, so this is the one and only connect ack.
                     first = list(replies) + [connect_ack]
                     events = await manager.wait_for_events(cid, timeout=0)
                     first.extend(events)
@@ -194,6 +206,7 @@ async def _handle_connection(manager, reader: asyncio.StreamReader,
                         pass
                     # The request loop keeps running; the push task must
                     # survive until the connection closes.
+                    stream_cid = cid
                     try:
                         while True:
                             nxt = await _read_http_request(reader)
@@ -222,9 +235,12 @@ async def _handle_connection(manager, reader: asyncio.StreamReader,
                                     # write would corrupt the frame). Keep the
                                     # acks from the same batch so a pipelined
                                     # subscribe/request is not left
-                                    # unacknowledged; result events themselves
-                                    # flow via push_task (exactly once).
+                                    # unacknowledged. handle_messages() does
+                                    # not answer /meta/connect itself, so this
+                                    # ack is the only one; result events flow
+                                    # via push_task (exactly once).
                                     nc = nconnect[0]
+                                    stream_cid = nc.get("clientId", stream_cid)
                                     payload = list(nreplies) + [{
                                         "channel": "/meta/connect",
                                         "successful": True,
@@ -236,30 +252,44 @@ async def _handle_connection(manager, reader: asyncio.StreamReader,
                                     await writer.drain()
                                 else:
                                     # Non-connect POSTs (slim/request
-                                    # publishes): reply with the ACKS
-                                    # inline (the OkHttp caller waits for
-                                    # a Content-Length response); the
-                                    # result events flow via push_task.
+                                    # publishes): the acks go into the SAME
+                                    # open chunked body — as a chunk. Writing
+                                    # a complete HTTP response here (status
+                                    # line + Content-Length) spliced a second
+                                    # HTTP message into the streaming body and
+                                    # corrupted the framing: the client reads
+                                    # this body with its HttpResponseInputStream
+                                    # and cannot tell where that fake response
+                                    # ends. Result events flow via push_task.
                                     nack = json.dumps(nreplies).encode("utf-8")
-                                    writer.write(
-                                        b"HTTP/1.1 200 OK\r\n"
-                                        b"Content-Type: application/json\r\n"
-                                        + f"Content-Length: {len(nack)}\r\n\r\n".encode()
-                                        + nack)
+                                    writer.write(f"{len(nack):x}\r\n".encode()
+                                                 + nack + b"\r\n")
                                     await writer.drain()
                     finally:
                         push_task.cancel()
+                        try:
+                            await push_task
+                        except (asyncio.CancelledError, Exception):
+                            pass
+                        # The connection is gone (client closed it, app was
+                        # killed, or the body was truncated) — no
+                        # /meta/disconnect ever arrives. Drop the client here:
+                        # otherwise it stays in the manager forever and the
+                        # notify_* / keepalive loops keep filling an event
+                        # queue nobody reads. Perl does the same from
+                        # webCloseHandler -> disconnectClient.
+                        manager.remove(stream_cid)
                     break
                 else:
                     # no connect: reply with acks AND any queued events.
                     # The result of a slim/request / a subscription's
                     # initial payload is delivered EXACTLY ONCE, in this
-                    # reply (Perl semantics — Jive registers a one-time
-                    # notify for request ids and logs every duplicate as
-                    # "event we aren't subscribed to"; duplicates also
-                    # made Jive treat its subscriptions as unacknowledged
-                    # and keep them pending, so it never re-registered
-                    # serverstatus/playerstatus after a reconnect).
+                    # reply (the manager clears the queue per client, like
+                    # Perl's get_pending_events()). A duplicate would make
+                    # Jive log "event we aren't subscribed to" and can
+                    # leave its subscriptions pending instead of
+                    # re-registering serverstatus/playerstatus after a
+                    # reconnect.
                     events = []
                     for m in messages:
                         if not isinstance(m, dict):
@@ -284,12 +314,18 @@ async def _handle_connection(manager, reader: asyncio.StreamReader,
                 writer.write(head)
                 writer.write(payload)
                 await writer.drain()
-    except (ConnectionError, OSError, RuntimeError, asyncio.CancelledError):
+    except (ConnectionError, OSError, RuntimeError, asyncio.CancelledError,
+            asyncio.IncompleteReadError, EOFError):
         pass
-    try:
-        writer.close()
-    except Exception:
-        pass
+    finally:
+        # Always release the socket — also for a truncated body / aborted
+        # connection, which used to escape the handler (IncompleteReadError
+        # is neither a ConnectionError nor an OSError) and leak the
+        # transport until GC.
+        try:
+            writer.close()
+        except Exception:
+            pass
 
 
 async def start_cometd_server(manager, host: str, port: int,

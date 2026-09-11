@@ -21,7 +21,8 @@ ASGI handler (web/app.py) rely on.
 import asyncio
 import json
 
-from lyrion.web.cometd import CometdManager, _channel_matches
+from lyrion.networking.cometd_stream import start_cometd_server
+from lyrion.web.cometd import MAX_QUEUED_EVENTS, CometdManager, _channel_matches
 
 
 class _StubRPC:
@@ -45,16 +46,38 @@ def _run(coro):
 
 
 def test_channel_glob_matches_perl_semantics():
-    # Perl Manager::add_channels: '/foo/**' -> ^/foo/, '/foo/*' -> ^/foo/[^/]+
+    """``/foo/**`` and ``/foo/*`` mirror Perl Manager::add_channels.
+
+    Perl rewrites ``/foo/**`` to ``^/foo/`` and ``/foo/*`` to
+    ``^/foo/[^/]+`` when registering a channel; anything without that
+    glob suffix is an exact channel key.  The Perl regex for ``/foo/*``
+    is not end-anchored, so it also matches ``/foo/bar/boo`` (Perl's own
+    comment claims the opposite, the regex and this code agree; verified
+    against Perl 5.38).
+    """
     assert _channel_matches("/1abc/**", "/1abc/slim/serverstatus")
     assert _channel_matches("/1abc/**", "/1abc/slim/playerstatus/aa:bb")
     assert not _channel_matches("/1abc/**", "/other/slim/serverstatus")
     assert not _channel_matches("/1abc/**", "/1abc")  # needs the trailing /
     assert _channel_matches("/slim/**", "/slim/serverstatus")
     assert _channel_matches("/slim/*", "/slim/serverstatus")
-    assert _channel_matches("**", "/anything/at/all")
+    assert _channel_matches("/slim/*", "/slim/serverstatus/extra")  # prefix
     assert not _channel_matches("/slim/serverstatus", "/slim/playerstatus/x")
     assert _channel_matches("/slim/serverstatus", "/slim/serverstatus")
+
+
+def test_bare_double_star_is_a_python_extension_not_perl():
+    """A bare ``**``/``/**`` is tolerated here, but is NOT Perl semantics.
+
+    Perl only rewrites the ``/<something>/**`` and ``/<something>/*``
+    forms; a bare ``**`` is passed to Tie::RegexpHash unchanged and does
+    not compile as a regex (``perl -e '"/x/y" =~ "**"'`` dies with
+    "Quantifier follows nothing in regex").  No real client sends it —
+    jive registers ``/<clientId>/**`` (Comet.lua:702).  The bare forms
+    are matched anyway as a Python-side courtesy, not as Perl parity.
+    """
+    assert _channel_matches("**", "/anything/at/all")
+    assert _channel_matches("/**", "/anything/at/all")
 
 
 def test_handshake_and_subscribe_glob_and_targeted():
@@ -289,6 +312,7 @@ def test_native_stream_single_delivery_and_chunk_framing():
                 head = await read_headers(reader)
                 assert b"chunked" in head.lower(), head
                 first = json.loads(await read_chunk(reader))
+                assert sum(1 for m in first if m["channel"] == "/meta/connect") == 1, first
                 assert first[-1]["channel"] == "/meta/connect"
                 assert first[-1]["successful"] is True
 
@@ -304,6 +328,9 @@ def test_native_stream_single_delivery_and_chunk_framing():
                 channels = [m["channel"] for m in ack]
                 assert "/meta/subscribe" in channels, ack
                 assert "/meta/connect" in channels, ack
+                # ... exactly ONE connect ack (the follow-up connect is
+                # answered by the stream handler, not by handle_messages)
+                assert sum(1 for c in channels if c == "/meta/connect") == 1, ack
                 # glob registration produced no junk event
                 assert not any(m.get("data") for m in ack), ack
 
@@ -321,3 +348,257 @@ def test_native_stream_single_delivery_and_chunk_framing():
             await server.wait_closed()
 
     _run(run())
+
+
+# ---------------------------------------------------------------------------
+# Review fixes (R0-B): one connect ack, exactly-once per CLIENT, resource
+# cleanup on abrupt close / truncated body, framed ack for non-connect POSTs.
+# ---------------------------------------------------------------------------
+
+
+def _post_bytes(payload) -> bytes:
+    body = json.dumps(payload).encode()
+    return (b"POST /cometd HTTP/1.1\r\nHost: x\r\n"
+            b"Content-Type: application/json\r\n"
+            + f"Content-Length: {len(body)}\r\n\r\n".encode() + body)
+
+
+async def _read_headers(reader) -> bytes:
+    head = b""
+    while True:
+        line = await asyncio.wait_for(reader.readline(), timeout=5)
+        head += line
+        if line in (b"\r\n", b"\n", b""):
+            return head
+
+
+async def _read_chunk(reader) -> bytes:
+    size = int((await asyncio.wait_for(reader.readline(), timeout=5)).strip(), 16)
+    if size == 0:
+        return b""
+    data = await asyncio.wait_for(reader.readexactly(size), timeout=5)
+    await asyncio.wait_for(reader.readexactly(2), timeout=5)  # trailing CRLF
+    return data
+
+
+async def _open_stream(server):
+    """Handshake + streaming /meta/connect; returns (reader, writer, cid)."""
+    port = server.sockets[0].getsockname()[1]
+    reader, writer = await asyncio.open_connection("127.0.0.1", port)
+    writer.write(_post_bytes([{"channel": "/meta/handshake", "id": 1}]))
+    await writer.drain()
+    head = await _read_headers(reader)
+    clen = 0
+    for line in head.split(b"\r\n"):
+        if line.lower().startswith(b"content-length:"):
+            clen = int(line.split(b":", 1)[1].strip())
+    hs = json.loads(await asyncio.wait_for(reader.readexactly(clen), timeout=5))
+    cid = hs[0]["clientId"]
+    writer.write(_post_bytes([{"channel": "/meta/connect", "clientId": cid,
+                               "id": 2, "connectionType": "streaming"}]))
+    await writer.drain()
+    head = await _read_headers(reader)
+    assert b"chunked" in head.lower(), head
+    return reader, writer, cid
+
+
+def test_handle_messages_never_answers_meta_connect():
+    """The transport writes the one and only /meta/connect ack."""
+    async def run():
+        mgr = CometdManager(_StubRPC())
+        hs = await mgr.handle_messages([{"channel": "/meta/handshake", "id": 1}])
+        cid = hs[0]["clientId"]
+        return await mgr.handle_messages([
+            {"channel": "/meta/subscribe", "clientId": cid, "id": 2,
+             "subscription": f"/{cid}/**"},
+            {"channel": "/meta/connect", "clientId": cid, "id": 3},
+        ])
+
+    replies = _run(run())
+    assert [r["channel"] for r in replies] == ["/meta/subscribe"], replies
+
+
+def test_connect_chunk_contains_exactly_one_connect_ack():
+    async def run():
+        mgr = CometdManager(_StubRPC())
+        server = await start_cometd_server(mgr, "127.0.0.1", 0)
+        try:
+            reader, writer, cid = await _open_stream(server)
+            try:
+                first = json.loads(await _read_chunk(reader))
+                writer.write(_post_bytes([
+                    {"channel": "/meta/subscribe", "clientId": cid, "id": 3,
+                     "subscription": f"/{cid}/**"},
+                    {"channel": "/meta/connect", "clientId": cid, "id": 4},
+                ]))
+                await writer.drain()
+                follow = json.loads(await _read_chunk(reader))
+                return first, follow
+            finally:
+                writer.close()
+        finally:
+            server.close()
+            await server.wait_closed()
+
+    first, follow = _run(run())
+    for chunk in (first, follow):
+        assert sum(1 for m in chunk if m["channel"] == "/meta/connect") == 1, chunk
+
+
+def test_cidless_exact_plus_glob_delivers_once_per_client():
+    """A cid-less exact channel + a glob must not double-deliver."""
+    async def run():
+        mgr = CometdManager(_StubRPC())
+        hs = await mgr.handle_messages([{"channel": "/meta/handshake", "id": 1}])
+        cid = hs[0]["clientId"]
+        await mgr.handle_messages([{"channel": "/meta/subscribe", "clientId": cid,
+                                    "id": 2, "subscription": f"/{cid}/**"}])
+        await mgr.handle_messages([{"channel": "/meta/subscribe", "clientId": cid,
+                                    "id": 3, "subscription": "/slim/serverstatus"}])
+        await mgr.wait_for_events(cid, timeout=0)  # seed of the exact sub
+        await mgr.notify_server_status()
+        return await mgr.wait_for_events(cid, timeout=0)
+
+    events = _run(run())
+    assert len(events) == 1, f"exactly once per client, got {events}"
+    # the channel the client explicitly subscribed to wins over the glob
+    assert events[0]["channel"] == "/slim/serverstatus"
+
+
+def test_cidless_exact_plus_glob_playerstatus_delivers_once():
+    player = "02:11:22:33:44:55"
+
+    async def run():
+        mgr = CometdManager(_StubRPC())
+        hs = await mgr.handle_messages([{"channel": "/meta/handshake", "id": 1}])
+        cid = hs[0]["clientId"]
+        await mgr.handle_messages([{"channel": "/meta/subscribe", "clientId": cid,
+                                    "id": 2, "subscription": f"/{cid}/**"}])
+        await mgr.handle_messages([{
+            "channel": "/meta/subscribe", "clientId": cid, "id": 3,
+            "subscription": f"/slim/playerstatus/{player}"}])
+        await mgr.wait_for_events(cid, timeout=0)
+        await mgr.notify_player_status(player)
+        return await mgr.wait_for_events(cid, timeout=0)
+
+    events = _run(run())
+    assert len(events) == 1, f"exactly once per client, got {events}"
+    assert events[0]["channel"] == f"/slim/playerstatus/{player}"
+
+
+def test_queue_is_bounded_and_drops_oldest():
+    """A stalled/dead client must not grow its queue without bound."""
+    async def run():
+        mgr = CometdManager(_StubRPC())
+        hs = await mgr.handle_messages([{"channel": "/meta/handshake", "id": 1}])
+        cid = hs[0]["clientId"]
+        for i in range(MAX_QUEUED_EVENTS + 37):
+            mgr.push(cid, {"channel": "/x", "data": {"n": i}, "id": i})
+        return await mgr.wait_for_events(cid, timeout=0)
+
+    events = _run(run())
+    assert len(events) == MAX_QUEUED_EVENTS, len(events)
+    assert events[-1]["data"]["n"] == MAX_QUEUED_EVENTS + 36  # newest kept
+    assert events[0]["data"]["n"] == 37                       # oldest dropped
+
+
+def test_abrupt_close_removes_client_and_queue():
+    """No /meta/disconnect (app killed, network gone) must still drop the
+    client — otherwise notify_* keeps filling a queue nobody reads."""
+    async def run():
+        mgr = CometdManager(_StubRPC())
+        server = await start_cometd_server(mgr, "127.0.0.1", 0)
+        try:
+            reader, _writer, cid = await _open_stream(server)
+            await _read_chunk(reader)
+            assert mgr.get(cid) is not None
+            _writer.close()  # abrupt: no /meta/disconnect is ever sent
+            try:
+                await _writer.wait_closed()
+            except Exception:  # noqa: BLE001
+                pass
+            for _ in range(60):
+                if mgr.get(cid) is None:
+                    break
+                await asyncio.sleep(0.05)
+            return cid, mgr.get(cid)
+        finally:
+            server.close()
+            await server.wait_closed()
+
+    _cid, client = _run(run())
+    assert client is None, "client + event queue must be dropped on close"
+
+
+def test_truncated_body_closes_cleanly():
+    """A body shorter than Content-Length must not leak the socket or
+    surface an unhandled asyncio.IncompleteReadError."""
+    async def run():
+        mgr = CometdManager(_StubRPC())
+        server = await start_cometd_server(mgr, "127.0.0.1", 0)
+        loop = asyncio.get_running_loop()
+        captured: list = []
+        prev = loop.get_exception_handler()
+        loop.set_exception_handler(lambda _loop, ctx: captured.append(ctx))
+        try:
+            reader, writer, cid = await _open_stream(server)
+            await _read_chunk(reader)
+            # Content-Length claims 100 bytes, only 5 arrive, then EOF
+            writer.write(b"POST /cometd HTTP/1.1\r\nHost: x\r\n"
+                         b"Content-Length: 100\r\n\r\n[1,2,")
+            await writer.drain()
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:  # noqa: BLE001
+                pass
+            for _ in range(60):
+                if mgr.get(cid) is None:
+                    break
+                await asyncio.sleep(0.05)
+            return mgr.get(cid), captured
+        finally:
+            loop.set_exception_handler(prev)
+            server.close()
+            await server.wait_closed()
+
+    client, captured = _run(run())
+    names = [type(ctx.get("exception")).__name__
+             for ctx in captured if ctx.get("exception")]
+    assert "IncompleteReadError" not in names, captured
+    assert "EOFError" not in names, captured
+    assert client is None, "truncated body must close the connection"
+
+
+def test_non_connect_post_on_stream_is_answered_as_a_chunk():
+    """A POST while the stream is open must be answered as a CHUNK.
+
+    A complete HTTP response (``HTTP/1.1 200 OK`` + Content-Length)
+    written into the already-open ``Transfer-Encoding: chunked`` body
+    corrupts the framing — the same argument the connect path fixed.
+    """
+    async def run():
+        mgr = CometdManager(_StubRPC())
+        server = await start_cometd_server(mgr, "127.0.0.1", 0)
+        try:
+            reader, writer, cid = await _open_stream(server)
+            try:
+                await _read_chunk(reader)
+                writer.write(_post_bytes([{
+                    "channel": "/slim/request", "clientId": cid, "id": 5,
+                    "data": {"request": ["", ["serverstatus", "0", "1"]],
+                             "response": f"/{cid}/slim/request"},
+                }]))
+                await writer.drain()
+                # ValueError here means a bare HTTP status line was written
+                return await _read_chunk(reader)
+            finally:
+                writer.close()
+        finally:
+            server.close()
+            await server.wait_closed()
+
+    raw = _run(run())
+    assert b"HTTP/1.1" not in raw, raw
+    payload = json.loads(raw)
+    assert any(m.get("channel") == "/slim/request" for m in payload), payload

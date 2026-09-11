@@ -31,6 +31,12 @@ logger = logging.getLogger(__name__)
 
 LONG_POLL_TIMEOUT = 25  # seconds a /meta/connect request is held open
 
+# Upper bound for one client's pending-event queue. Perl has no explicit cap
+# (it relies on LONG_POLLING_AUTOKILL / webCloseHandler to drop dead clients);
+# this is a Python-side safety net so a stalled or half-dead client cannot grow
+# the queue forever. Oldest events are dropped first.
+MAX_QUEUED_EVENTS = 256
+
 
 @dataclass
 class CometdClient:
@@ -53,6 +59,14 @@ def _is_glob(pattern: str) -> bool:
     /meta/subscribe (Comet.lua:702) in addition to its targeted
     /slim/subscribe response channels. A pattern is only a channel
     *matcher* — it must never be dispatched as a query.
+
+    ``/foo/**`` and ``/foo/*`` are Perl's own forms: Perl's
+    Manager::add_channels turns them into the regexes ``^/foo/`` resp.
+    ``^/foo/[^/]+``. The bare ``**`` / ``/**`` forms are tolerated
+    Python-side only — Perl has no such form (it rewrites only
+    ``/<something>/**`` and ``/<something>/*``, and a bare ``**`` is not
+    even a valid regex: "Quantifier follows nothing"). No real client
+    sends them; keeping them costs nothing for third-party catch-alls.
     """
     return pattern in ("**", "/**") or pattern.endswith("/**") \
         or pattern.endswith("/*")
@@ -62,12 +76,19 @@ def _channel_matches(pattern: str, channel: str) -> bool:
     """Bayeux channel matching, mirroring Perl
     Slim::Web::Cometd::Manager::add_channels:
 
-    - ``/foo/**`` -> ``^/foo/``  (matches /foo/bar, /foo/bar/boo, not /foo)
-    - ``/foo/*``  -> ``^/foo/[^/]+``
+    - ``/foo/**`` -> ``^/foo/``  (matches /foo/bar and /foo/bar/boo,
+      not /foo; the trailing slash is mandatory)
+    - ``/foo/*``  -> ``^/foo/[^/]+`` (Perl's regex is NOT end-anchored,
+      so it is a prefix match: /foo/bar *and* /foo/bar/boo)
     - anything else matches the channel exactly.
 
-    The bare ``**`` / ``/**`` forms match every channel (SqueezePlay's
-    catch-all; Perl stores them as-is and RegexpHash matches them).
+    The bare ``**`` / ``/**`` forms match every channel, but that is a
+    Python-side courtesy and **not** Perl semantics: Perl rewrites only
+    the ``/<something>/**`` and ``/<something>/*`` patterns and hands
+    everything else to Tie::RegexpHash unchanged, where a bare ``**``
+    does not compile as a regex ("Quantifier follows nothing in
+    regex", verified with Perl 5.38). No real client sends it — jive
+    registers ``/<clientId>/**`` (Comet.lua:702).
     """
     if pattern == channel:
         return True
@@ -242,34 +263,69 @@ class CometdManager:
     def remove(self, client_id: str) -> None:
         self._clients.pop(client_id, None)
 
-    def _matched_channels(self, client: CometdClient,
-                          base_channels: list[str]) -> dict[str, dict]:
-        """Return {concrete_event_channel: stored_subscription_data}.
+    def _matched_targets(self, client: CometdClient,
+                         base_channels: list[str],
+                         ) -> dict[str, tuple[dict, bool]]:
+        """Return {concrete_event_channel: (subscription_data, exact)}.
 
         ``base_channels`` are the real channels an event can be sent on,
         most-specific first (e.g. ``/<cid>/slim/serverstatus`` then
         ``/slim/serverstatus``). A client is included when any of its
         subscriptions matches one of them — exact channels and Bayeux
-        globs alike. An exact subscription wins over a glob for the same
+        globs alike; per subscription the most specific matching base
+        channel wins. An exact subscription wins over a glob for the same
         channel so the stored request (pagination/subscribe:N/tags) is
-        preserved. Result is de-duplicated, so a client holding both
-        ``/<cid>/**`` and the targeted channel gets the event exactly
-        once (Perl delivers to the matched channel, not per-channel).
+        preserved.
+
+        The second element tells the caller whether the entry came from an
+        exact channel or from a glob; ``_pick_target`` uses if to collapse
+        several matches for ONE client into a single delivery (a client
+        holding both a cid-less exact channel and ``/<cid>/**`` would
+        otherwise get the same event twice).
         """
-        matched: dict[str, dict] = {}
+        matched: dict[str, tuple[dict, bool]] = {}
         for sub, data in list(client.subscriptions.items()):
+            stored = data if isinstance(data, dict) else {}
             for channel in base_channels:
                 if sub == channel or _channel_matches(sub, channel):
-                    if channel not in matched or sub == channel:
-                        matched[channel] = data if isinstance(data, dict) else {}
+                    exact = sub == channel
+                    if channel not in matched or exact:
+                        matched[channel] = (stored, exact)
                     break
         return matched
+
+    @staticmethod
+    def _pick_target(targets: dict[str, tuple[dict, bool]],
+                     base_channels: list[str]) -> tuple[str, dict] | None:
+        """Reduce one client's channel matches to a SINGLE delivery.
+
+        Perl delivers an event once per *matched channel*; the Python
+        server synthesises the concrete channel, so a client that holds a
+        cid-less exact channel *and* a catch-all glob matches two
+        channels for one event. Jive treats the second copy as "event we
+        aren't subscribed to", so exactly-once is enforced per client:
+        an exact subscription wins over a glob (it is the channel the
+        client explicitly named and it keeps the stored request), ties
+        keep the most specific base channel.
+        """
+        for exact in (True, False):
+            for channel in list(base_channels) + [c for c in targets
+                                                   if c not in base_channels]:
+                entry = targets.get(channel)
+                if entry is not None and entry[1] is exact:
+                    return channel, entry[0]
+        return None
 
     def push(self, client_id: str, event: dict) -> None:
         client = self._clients.get(client_id)
         if client is None:
             return
         client.events.append(event)
+        if len(client.events) > MAX_QUEUED_EVENTS:
+            # Drop the oldest — a stalled/dead client must not grow the
+            # queue without bound (Perl drops the whole client via
+            # LONG_POLLING_AUTOKILL; this cap is the cheap safety net).
+            del client.events[:len(client.events) - MAX_QUEUED_EVENTS]
         client.notify.set()
 
     async def notify_server_status(self) -> None:
@@ -286,11 +342,14 @@ class CometdManager:
         Request-driven (Perl parity): the stored request is re-executed and
         its result pushed; only a subscription without a request falls back
         to the jive serverstatus request.
+
+        Exactly once per CLIENT: a client holding both a targeted channel
+        and ``/<cid>/**`` gets a single event (see _pick_target).
         """
         for client in list(self._clients.values()):
             base = [f"/{client.client_id}/slim/serverstatus",
                     "/slim/serverstatus"]
-            targets = self._matched_channels(client, base)
+            targets = self._matched_targets(client, base)
             for sub, data in list(client.subscriptions.items()):
                 request = _stored_request(data)
                 if request is None or _request_command(request) != "serverstatus":
@@ -299,18 +358,23 @@ class CometdManager:
                 if _is_glob(sub):
                     channel = next((c for c in base if _channel_matches(sub, c)), "")
                 if channel:
-                    targets.setdefault(channel, data)
-            for channel, data in targets.items():
-                try:
-                    request = _stored_request(data) or ["", list(JIVE_SERVERSTATUS_REQUEST)]
-                    result = await self._dispatch(request)
-                    self.push(client.client_id, {
-                        "channel": channel,
-                        "data": result,
-                        "id": 0,
-                    })
-                except Exception:  # noqa: BLE001
-                    pass
+                    targets.setdefault(channel,
+                                       (data if isinstance(data, dict) else {},
+                                        sub == channel))
+            picked = self._pick_target(targets, base)
+            if picked is None:
+                continue
+            channel, data = picked
+            try:
+                request = _stored_request(data) or ["", list(JIVE_SERVERSTATUS_REQUEST)]
+                result = await self._dispatch(request)
+                self.push(client.client_id, {
+                    "channel": channel,
+                    "data": result,
+                    "id": 0,
+                })
+            except Exception:  # noqa: BLE001
+                pass
 
     async def notify_player_status(self, player_id: str) -> None:
         """Push a fresh player status to status/playerstatus subscribers.
@@ -326,12 +390,16 @@ class CometdManager:
         A subscription without a request (the pure ``/<cid>/**``
         catch-all) falls back to the jive default request, which is what
         makes the Now-Playing title update (LIVE-01).
+
+        Exactly once per CLIENT: a client holding both a cid-less exact
+        channel and ``/<cid>/**`` gets a single event (see _pick_target).
         """
         for client in list(self._clients.values()):
-            targets: dict[str, dict] = {}
+            targets: dict[str, tuple[dict, bool]] = {}
             base = [f"/{client.client_id}/slim/playerstatus/{player_id}",
                     f"/slim/playerstatus/{player_id}"]
             for sub, data in list(client.subscriptions.items()):
+                stored = data if isinstance(data, dict) else {}
                 request = _stored_request(data)
                 if request is not None:
                     # request + subscribe: only deliver status subscriptions
@@ -348,14 +416,14 @@ class CometdManager:
                         channel = next(
                             (c for c in base if _channel_matches(sub, c)), "")
                     if channel:
-                        targets.setdefault(channel, data)
+                        targets.setdefault(channel, (stored, sub == channel))
                     continue
                 if _is_glob(sub):
                     # e.g. /<cid>/** or /<cid>/slim/playerstatus/* — deliver
                     # on the concrete channel the pattern matches.
                     for channel in base:
                         if _channel_matches(sub, channel):
-                            targets.setdefault(channel, data)
+                            targets.setdefault(channel, (stored, False))
                     continue
                 if "playerstatus" not in sub and "status/" not in sub:
                     continue
@@ -366,30 +434,33 @@ class CometdManager:
                 # ANY player change.
                 if sub_player and sub_player not in ("", player_id, *_ANY_PLAYER):
                     continue
-                targets.setdefault(sub, data)
-            for channel, data in targets.items():
-                try:
-                    request = _stored_request(data)
-                    if request is not None:
-                        # A subscription that names no player still gets the
-                        # changed player's status (Perl dispatches mac-less
-                        # subscriptions for any client).
-                        if not _request_player(request):
-                            command = next(
-                                (item for item in request
-                                 if isinstance(item, list) and item),
-                                list(JIVE_STATUS_REQUEST))
-                            request = [player_id, command]
-                    else:
-                        request = [player_id, list(JIVE_STATUS_REQUEST)]
-                    result = await self._dispatch(request)
-                    self.push(client.client_id, {
-                        "channel": channel,
-                        "data": result,
-                        "id": 0,
-                    })
-                except Exception:  # noqa: BLE001
-                    pass
+                targets.setdefault(sub, (stored, True))
+            picked = self._pick_target(targets, base)
+            if picked is None:
+                continue
+            channel, data = picked
+            try:
+                request = _stored_request(data)
+                if request is not None:
+                    # A subscription that names no player still gets the
+                    # changed player's status (Perl dispatches mac-less
+                    # subscriptions for any client).
+                    if not _request_player(request):
+                        command = next(
+                            (item for item in request
+                             if isinstance(item, list) and item),
+                            list(JIVE_STATUS_REQUEST))
+                        request = [player_id, command]
+                else:
+                    request = [player_id, list(JIVE_STATUS_REQUEST)]
+                result = await self._dispatch(request)
+                self.push(client.client_id, {
+                    "channel": channel,
+                    "data": result,
+                    "id": 0,
+                })
+            except Exception:  # noqa: BLE001
+                pass
 
     async def notify_favorites_changed(self) -> None:
         """Push a 'favorites changed' event to all favorites subscribers.
@@ -476,8 +547,9 @@ class CometdManager:
     async def handle_messages(self, messages: list[dict]) -> list[dict]:
         """Handle one batch of Bayeux messages, return immediate replies.
 
-        /meta/connect messages are NOT answered here — they long-poll
-        and get their reply through wait_for_events().
+        /meta/connect messages are NOT answered here — they long-poll and
+        get their single reply from the transport (cometd_stream.py or
+        web/app.py), which also writes it into the streaming chunk.
         """
         replies: list[dict] = []
         for msg in messages:
@@ -583,6 +655,14 @@ class CometdManager:
 
             elif channel == "/meta/ping":
                 reply.update({"successful": True})
+
+            elif channel == "/meta/connect":
+                # Deliberately NOT replied to here: /meta/connect long-polls,
+                # and the transport (cometd_stream.py / web/app.py) writes
+                # the one and only connect ack itself. Replying here as well
+                # sent two /meta/connect answers per connect, and jive calls
+                # _connected() for every one of them (Comet.lua:760-770).
+                continue
 
             else:
                 reply.update({"successful": True})
