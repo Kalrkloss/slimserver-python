@@ -71,14 +71,27 @@ def test_status_required_types(server_up):
     # the right JSON types — a string where an Int is expected crashes.
     assert isinstance(r.get("count"), int), f"count must be Int, got {r.get('count')!r}"
     assert isinstance(r.get("playlist_tracks"), int), "playlist_tracks must be Int"
-    assert isinstance(r.get("playlist_cur_index"), int), "playlist_cur_index must be Int"
+    # Perl sends playlist_cur_index as a STRING (Queries.pm:4208; live probe
+    # gap-analysis CTRL-04 → "0"); SqueezePlay does
+    # tonumber(event.data.playlist_cur_index).
+    assert isinstance(r.get("playlist_cur_index"), str), (
+        f"playlist_cur_index must be a String like Perl, got {r.get('playlist_cur_index')!r}")
+    assert str(r.get("playlist_cur_index")).isdigit(), (
+        f"playlist_cur_index must be a numeric string, got {r.get('playlist_cur_index')!r}")
     assert isinstance(r.get("mode"), str), "mode must be a String"
     assert r.get("mode") in ("play", "pause", "stop"), f"bad mode {r.get('mode')!r}"
     assert isinstance(r.get("player_name"), str), "player_name must be String"
-    # shuffle/repeat are string enums "0"/"1"/"2" (SqueezeClient will crash
-    # on the real words 'off'/'shuffle').
-    assert r.get("playlist shuffle") in ("0", "1", "2"), "playlist shuffle must be a '0/1/2' string"
-    assert r.get("playlist repeat") in ("0", "1", "2"), "playlist repeat must be a '0/1/2' string"
+    # Perl sends shuffle/repeat as INTEGERS (Queries.pm:4186-4190
+    # `$repeat += 0` / `$shuffle += 0`; live probe gap-analysis CTRL-03 →
+    # `"playlist shuffle": 0`).
+    assert isinstance(r.get("playlist shuffle"), int) \
+        and not isinstance(r.get("playlist shuffle"), bool), (
+            f"playlist shuffle must be an Int like Perl, got {r.get('playlist shuffle')!r}")
+    assert isinstance(r.get("playlist repeat"), int) \
+        and not isinstance(r.get("playlist repeat"), bool), (
+            f"playlist repeat must be an Int like Perl, got {r.get('playlist repeat')!r}")
+    assert r.get("playlist shuffle") in (0, 1, 2)
+    assert r.get("playlist repeat") in (0, 1, 2)
 
 
 def test_status_duration_present(server_up):
@@ -112,6 +125,47 @@ def test_status_item_loop_has_text_track_artist_album(server_up):
         f"item_loop[0] must expose text or track for SqueezePlay, got {sorted(it.keys())}")
     # title should always be present
     assert "title" in it, f"item_loop[0] missing title: {sorted(it.keys())}"
+
+
+def test_status_item_loop_carries_jive_params_and_artwork(server_up):
+    """R0.6-A / LIVE-06: SqueezePlay's _whatsPlaying reads
+    ``item_loop[1].params.track_id`` (Player.lua:269-282) and the artwork
+    from ``item_loop[1]["icon-id"] or .icon``; NowPlayingApplet.lua:117 reads
+    ``item['params']['track_id']``. Perl's ``_addJiveSong`` puts
+    ``params``/``style``/``icon`` on every item."""
+    r = lms(TEST_PLAYER, ["status", "-", "1", "menu:menu", "useContextMenu:1"])
+    loop = r.get("item_loop") or []
+    if not loop:
+        pytest.skip("playlist empty")
+    it = loop[0]
+    assert isinstance(it.get("params"), dict), (
+        f"item_loop[0] needs a params dict for SqueezePlay, got {sorted(it.keys())}")
+    assert "track_id" in it["params"], f"params needs track_id: {it['params']!r}"
+    assert isinstance(it["params"]["track_id"], int), "params.track_id must be numeric"
+    assert it.get("style") == "itemplay", f"item style must be itemplay, got {it.get('style')!r}"
+    # artwork: 'icon' (from artwork_url) or 'icon-id' — the local placeholder
+    # /html/images/favorites.png is acceptable for a cover-less stream
+    assert it.get("icon") or it.get("icon-id"), (
+        f"item_loop[0] needs icon-id/icon for the Now-Playing artwork: {sorted(it.keys())}")
+
+
+def test_status_time_and_duration_are_numeric(server_up):
+    """R0.6-A / LIVE-06: the progress bar and the elapsed/remaining time read
+    ``event.data.time``/``event.data.duration`` (Player.lua:1193-1194).
+    For a local track the duration must be the real DB track length — not the
+    elapsed position (that pinned the bar at maximum and froze the time)."""
+    r = lms(TEST_PLAYER, ["status", "-", "1", "menu:menu", "useContextMenu:1"])
+    assert r.get("time") is not None and float(r["time"]) >= 0, f"bad time {r.get('time')!r}"
+    assert r.get("duration") is not None and float(r["duration"]) > 0, (
+        f"duration must be > 0, got {r.get('duration')!r}")
+    loop = r.get("item_loop") or []
+    if r.get("mode") == "play" and loop and loop[0].get("trackType") == "local":
+        item_dur = float(loop[0].get("duration") or 0)
+        # a known track length must NOT be replaced by the elapsed position
+        if item_dur > 0:
+            assert float(r["duration"]) == item_dur, (
+                f"local duration {r['duration']} must be the track length "
+                f"{item_dur}, not the elapsed position {r.get('time')}")
 
 
 # ----------------------------------------------------------------------

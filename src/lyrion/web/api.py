@@ -1089,10 +1089,25 @@ class JSONRPCAPI:
         if player is None:
             return {"mode": "stop", "power": 0, "player_name": "", "playlist_tracks": 0}
 
-        # Track metadata from DB for playlist_loop (only int ids)
+        # Track metadata from DB for the playlist loop (local tracks only).
+        # A playlist entry is local when it is an int — or a digit-only
+        # string (CLI/plugin paths hand us "51994"; a bare number is never
+        # a stream URL, so the coercion is safe). Without it a numeric
+        # string was mistaken for a radio URL: title = "51994", duration 0,
+        # no artwork, no params.track_id — the exact SqueezePlay symptoms
+        # (progress bar at maximum, no title switch).
+        def _local_id(entry: object) -> int | None:
+            """Return the DB track id for a local playlist entry, else None."""
+            if isinstance(entry, bool):
+                return None
+            if isinstance(entry, int):
+                return entry
+            text = str(entry)
+            return int(text) if text.isdigit() else None
+
         loop = []
         playlist_ids = getattr(player, "playlist", []) or []
-        int_ids = [i for i in playlist_ids if isinstance(i, int)]
+        int_ids = [x for x in (_local_id(e) for e in playlist_ids) if x is not None]
         track_rows = await self._load_tracks(int_ids) if int_ids else {}
 
         # tags:<code> — songinfo letter codes (lyrion.org CLI docs).
@@ -1123,14 +1138,15 @@ class JSONRPCAPI:
         _cur_title = getattr(player, "current_title", "") or ""
         _cur_artist = ""
         _cur_track = _cur_title
-        if isinstance(_cur_tid, str) and " - " in _cur_title:
+        if _cur_tid is not None and _local_id(_cur_tid) is None and " - " in _cur_title:
             _artist, _track = _cur_title.split(" - ", 1)
             _cur_artist = _artist.strip()
             _cur_track = _track.strip()
 
         for i, tid in enumerate(playlist_ids):
-            if isinstance(tid, int):
-                info = track_rows.get(tid, {})
+            tid_local = _local_id(tid)
+            if tid_local is not None:
+                info = track_rows.get(tid_local, {})
                 title = info.get("title", "Unknown")
                 url = info.get("url", "")
                 duration = info.get("duration", 0) or 0
@@ -1147,17 +1163,18 @@ class JSONRPCAPI:
                 except Exception:
                     pass
                 info = {"remote": 1}
-            item: dict = {"id": tid, "playlist index": i}
+            item: dict = {"id": tid_local if tid_local is not None else tid,
+                          "playlist index": i}
             # title/trackType are always present (Orange Squeeze does
             # firstItem.get("trackType").asText() — a missing field is a
             # NULL NPE crash).
             item["title"] = title
             item["text"] = title          # SqueezePlay _extractTrackInfo fallback
-            item["trackType"] = "local" if isinstance(tid, int) else "remote"
+            item["trackType"] = "local" if tid_local is not None else "remote"
             # SqueezePlay now-playing reads _track.track/.artist/.album —
             # provide them for LOCAL tracks (a remote stream intentionally
             # omits `track` so SqueezePlay falls back to text + current_title).
-            if isinstance(tid, int):
+            if tid_local is not None:
                 item["track"] = title
                 item["artist"] = info.get("artist", "")
                 item["album"] = info.get("album", "")
@@ -1198,14 +1215,44 @@ class JSONRPCAPI:
                     item["remote"] = 1 if value else 0
                 else:
                     item[field] = value
+            # Jive item params (Perl _addJiveSong, Queries.pm:5637-5641):
+            # SqueezePlay's Now-Playing reads params.track_id
+            # (Player.lua:269-282, NowPlayingApplet.lua:117) — without it the
+            # "current title" screen never follows the playing track.
+            params: dict = {"playlist_index": i}
+            if tid_local is not None:
+                params["track_id"] = tid_local
+                if info.get("album_id"):
+                    params["album_id"] = info["album_id"]
+                if info.get("artist_id"):
+                    params["artist_id"] = info["artist_id"]
+            else:
+                # Perl: 'track_id' => ($songData->{'id'} + 0) — a URL
+                # stringifies to 0, so a remote item carries track_id 0.
+                params["track_id"] = 0
+            item["params"] = params
+            # Perl marks every playable jive item as style 'itemplay'.
+            item["style"] = "itemplay"
+            # Artwork (Perl _addJiveSong, Queries.pm:5619-5629):
+            # artwork_url -> 'icon', else coverid/artwork_track_id ->
+            # 'icon-id', else the radio placeholder for a cover-less remote
+            # item. SqueezePlay reads both (Player.lua:282).
+            _art = item.get("artwork_url") or info.get("artwork_url") or ""
+            if _art:
+                item["icon"] = _art
+            elif info.get("cover"):
+                item["icon-id"] = f"/music/{info['cover']}/cover.jpg"
+            elif tid_local is None:
+                item["icon-id"] = "/html/images/favorites.png"
             loop.append(item)
 
         cur = player.playlist_position or 0
-        if cur < len(playlist_ids) and isinstance(playlist_ids[cur], int):
-            cur_info = track_rows.get(playlist_ids[cur], {})
+        cur_local = _local_id(playlist_ids[cur]) if cur < len(playlist_ids) else None
+        if cur_local is not None:
+            cur_info = track_rows.get(cur_local, {})
         else:
             cur_info = {}
-        if cur < len(playlist_ids) and not isinstance(playlist_ids[cur], int):
+        if cur < len(playlist_ids) and cur_local is None:
             # Radio stream: title = station name (current_title if set,
             # else host) — never the full URL.
             url_str = str(playlist_ids[cur])
@@ -1221,18 +1268,24 @@ class JSONRPCAPI:
         # StreamTitle must not linger over local tracks).
         if (getattr(player, "current_title", "")
                 and cur < len(playlist_ids)
-                and not isinstance(playlist_ids[cur], int)):
+                and cur_local is None):
             cur_info["title"] = player.current_title
 
-        elapsed = getattr(player, "elapsed", 0) or 0
-        if player.mode != "play":
+        # Playback progress. Perl's Slim::Player::Source::songTime() keeps
+        # the position while paused (StreamingController::playingSongElapsed
+        # returns resumeTime) and reports 0 (int) when stopped
+        # (Squeezebox2::songElapsedSeconds returns 0 if isStopped, else
+        # elapsedMilliseconds/1000 — a fractional value). SqueezePlay must
+        # not reset the progress bar on pause.
+        elapsed = float(getattr(player, "elapsed", 0) or 0)
+        if player.mode == "stop":
             elapsed = 0
 
         # remoteMeta: SqueezeClient / ioBroker expect the live-stream
         # metadata block for remote streams (radio).
         remote_meta = {}
         cur_url = getattr(player, "current_url", None)
-        if cur_url and not isinstance(playlist_ids[cur] if cur < len(playlist_ids) else None, int):
+        if cur_url and cur_local is None:
             # Station logo if one is stored (playlist add image:<path>),
             # else a default placeholder (Perl uses html/images/favorites.png
             # — the "heart" SqueezePlay draws for cover-less streams).
@@ -1260,7 +1313,16 @@ class JSONRPCAPI:
             sync_fields["sync_master"] = player.sync_master
         if getattr(player, "sync_slaves", None):
             sync_fields["sync_slaves"] = ",".join(player.sync_slaves)
-        cur_tid = playlist_ids[cur] if cur < len(playlist_ids) else None
+
+        # Perl returns the requested window, and its FIRST item is the
+        # playing track for `status - <qty>`: SqueezePlay's _whatsPlaying
+        # reads item_loop[1], Material's server.js:606 / SqueezeJS Base.js:389
+        # read playlist_loop[0] as the current song, and the Material queue
+        # pages through `status <start> <count>` (lmsList). Each item keeps
+        # its absolute "playlist index" so the client can map window → queue.
+        # (Perl: normalize($index, $quantity, $songCount), Queries.pm:4425.)
+        win_start, win_end = self._status_window(args, int(cur), len(playlist_ids))
+        item_loop = loop[win_start:win_end + 1] if win_start <= win_end else []
 
         result: dict = {
             "mode": player.mode,
@@ -1270,16 +1332,19 @@ class JSONRPCAPI:
             "player_connected": 1,
             # SqueezePlay reads playerStatus.remote == 1 to append the live
             # current_title for a radio stream.
-            "remote": 1 if isinstance(cur_tid, str) else 0,
-            # SqueezeClient parses these as STRING enums ("0"/"1"/"2",
-            # PlayerStatus.ShuffleState/RepeatState @SerialName) — an int
-            # breaks kotlinx serialization → app crash on connect.
-            "playlist shuffle": str(int(getattr(player, "shuffle", 0) or 0)),
-            "playlist repeat": str(int(getattr(player, "repeat", 0) or 0)),
+            "remote": 1 if cur_local is None else 0,
+            # Perl Queries.pm:4186-4190 sends these as INTEGERS
+            # (`$repeat += 0; $shuffle += 0`) — live probe (docs/
+            # status-parity-analysis.md, gap-analysis CTRL-03) confirms
+            # `"playlist shuffle": 0` / `"playlist repeat": 0` as ints.
+            "playlist shuffle": int(getattr(player, "shuffle", 0) or 0),
+            "playlist repeat": int(getattr(player, "repeat", 0) or 0),
             "mixer volume": player.volume or 50,
             "playlist_tracks": len(playlist_ids),
-            # Int (no default in PlayerStatusResponse) — a string crashes.
-            "playlist_cur_index": int(cur) if str(cur).isdigit() else 0,
+            # Perl sends this as a STRING (`"playlist_cur_index": "0"`,
+            # Queries.pm:4208 + live probe gap-analysis CTRL-04);
+            # SqueezePlay does tonumber(event.data.playlist_cur_index).
+            "playlist_cur_index": str(int(cur)),
             "time": elapsed,
             "rate": 1 if player.mode == "play" else 0,
             # Perl parity: 'playlist mode' mirrors the repeat state
@@ -1291,7 +1356,7 @@ class JSONRPCAPI:
             "signalstrength": 0,
             "seq_no": int(getattr(player, "_seq_no", 0) or 0),
             "playlist_timestamp": time.time(),
-            "playlist_loop": loop,
+            "playlist_loop": item_loop,
         }
         # Jive/SqueezePlay Now Playing reads the current_* fields (not
         # 'title'): a radio stream shows its StreamTitle, a local track its
@@ -1322,8 +1387,8 @@ class JSONRPCAPI:
         # SqueezeClient's PlayerStatusResponse declares 'count: Int' and
         # 'offset: String?' WITHOUT defaults — a missing count crashes the
         # app on connect. Perl parity: count = number of items returned.
-        result["count"] = len(loop)
-        result["offset"] = "0"
+        result["count"] = len(item_loop)
+        result["offset"] = str(win_start)
         # Player IP:port (Perl sends 'ip:port' of the control connection).
         try:
             result["player_ip"] = f"{player.ip}:{getattr(player, 'port', 0) or 0}"
@@ -1336,26 +1401,61 @@ class JSONRPCAPI:
             result.setdefault("artist", cur_info.get("artist", ""))
             result.setdefault("title", cur_info.get("title", ""))
             result.setdefault("album", cur_info.get("album", ""))
-            # Report a duration for a live stream as a non-zero value: leaving
-            # it out (null) makes SqueezePlay's status processing choke and
-            # prevents the Now-Playing window from opening, while a 0 makes
+            # Duration: for a LOCAL track the real DB length (Perl
+            # `$song->duration()`, Queries.pm:4101) — never 0 and never the
+            # elapsed position (that pinned SqueezePlay's progress bar at
+            # maximum and froze the remaining-time display). For a live
+            # stream keep the non-zero rule: leaving it out (null) makes
+            # SqueezePlay's status processing choke and prevents the
+            # Now-Playing window from opening, while a 0 makes
             # SqueezeClient's seek-slider crash (valueTo=0.1 vs growing
             # position). Using the position keeps valueTo >= value for
             # SqueezeClient while still giving SqueezePlay a duration.
             dur = float(cur_info.get("duration", 0) or 0)
             pos = float(elapsed or 0)
-            if dur <= 0 and pos > 0:
+            if dur <= 0 and cur_local is None and pos > 0:
                 dur = pos
             if dur <= 0:
                 dur = 1.0
             result["duration"] = dur
-            result["item_loop"] = loop
+            result["item_loop"] = item_loop
         result |= sync_fields
         if remote_meta:
             result["remoteMeta"] = remote_meta
         if menu_block:
             result["menu"] = menu_block
         return result
+
+    @staticmethod
+    def _status_window(args: list[str] | None, cur: int, total: int) -> tuple[int, int]:
+        """Perl ``Slim::Control::Request::normalize`` for the status loop.
+
+        ``status - <qty>`` (index ``-``) starts the window at the playing
+        track (Queries.pm:4425 ``normalize($playlist_cur_index, $quantity,
+        $songCount)``); ``status <n> <qty>`` starts at ``n``. Returns an
+        inclusive ``(start, end)`` pair; ``start > end`` means "no items".
+        """
+        tokens = [str(a) for a in (args or [])]
+        index_tok = tokens[0] if tokens else "-"
+        qty = 0
+        if len(tokens) > 1 and tokens[1].lstrip("-").isdigit():
+            qty = int(tokens[1])
+        if index_tok == "-":
+            start = int(cur)
+        elif index_tok.lstrip("-").isdigit():
+            start = int(index_tok)
+        else:
+            start = 0
+        if qty <= 0:
+            qty = int(total)          # Perl: $numofitems = $count when undef
+        if not total:
+            return 0, -1
+        last = int(total) - 1
+        if start > last:
+            return 0, -1
+        if start < 0:
+            start = 0
+        return start, min(start + qty - 1, last)
 
     def _home_menu(self) -> list[dict]:
         """The root browse menu (Home), matching the real LMS item shape
