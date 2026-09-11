@@ -81,6 +81,104 @@ def _channel_matches(pattern: str, channel: str) -> bool:
     return False
 
 
+# ---------------------------------------------------------------------------
+# Request-driven subscriptions (Perl Slim::Web::Cometd:390-470)
+# ---------------------------------------------------------------------------
+# A Jive controller subscribes WITH a request and the Perl server stores it:
+# on every change the same request is executed again and its result pushed to
+# the response channel.  SqueezePlay's Now-Playing does exactly this
+# (share/jive/jive/slim/Player.lua:993):
+#
+#   comet:subscribe('/slim/playerstatus/<id>',
+#       _getSink(self, {'status','-',10,'menu:menu','useContextMenu:1',
+#                       'subscribe:600'}), self.id, cmd)
+#
+# which Comet.lua:286-296 turns into
+#   {channel:'/slim/subscribe', data:{request:[<player>,[...]], response:...}}
+#
+# Subscriptions that arrive WITHOUT a request (the bare /<cid>/** catch-all)
+# still need a renderable payload: a plain `playerstatus - 1` answer carries
+# no current_title/item_loop, which is why SqueezePlay's displayed title
+# never updated (LIVE-01).  The fallbacks below are the jive forms.
+JIVE_STATUS_REQUEST = ["status", "-", 10, "menu:menu", "useContextMenu:1"]
+JIVE_SERVERSTATUS_REQUEST = ["serverstatus", "0", "50", "subscribe:60"]
+
+# Commands that carry player status. Perl's Request::subscribe registers the
+# auto-execute callback on the *dispatched command*, so a subscription for
+# the jive `status` command and one for the Android `playerstatus` command
+# must both be re-executed on a STAT change.
+_PLAYER_STATUS_COMMANDS = ("status", "playerstatus")
+
+# Players a subscription may be registered for without meaning a concrete
+# player (SqueezeCtrl uses /null/ and 00:00:00:00:00:00).
+_ANY_PLAYER = ("null", "00:00:00:00:00:00")
+
+
+def _stored_request(data) -> list | None:
+    """Return the request a subscription stored, or None.
+
+    ``/slim/subscribe`` + ``/meta/subscribe`` with ``data.request`` register
+    "request + subscribe" (Perl handleRequest type=subscribe); a pure channel
+    registration stores no request and must not be dispatched.
+    """
+    if isinstance(data, dict):
+        request = data.get("request")
+        if isinstance(request, list) and request:
+            return request
+    return None
+
+
+def _request_command(request: list) -> str:
+    """First command token of a slim.request payload.
+
+    Handles ``[player, [cmd, ...]]`` (jive/Android) and ``[[cmd, ...]]``
+    (Material, no player).
+    """
+    for item in request:
+        if isinstance(item, list):
+            if item and isinstance(item[0], str):
+                return item[0]
+            return ""
+    if request and isinstance(request[0], str):
+        return request[0]
+    return ""
+
+
+def _request_player(request: list) -> str:
+    """Player mac of a slim.request payload ('' when there is none)."""
+    if request and isinstance(request[0], str):
+        return request[0]
+    return ""
+
+
+def _default_request(subscription: str) -> list:
+    """Jive-default request for a subscription that carries none.
+
+    Mirrors the requests jive itself sends (Player.lua:993,
+    SlimServer.lua:540).  A Bayeux *pattern* (``/<cid>/**``) registers the
+    channel only — Perl's add_channels() never dispatches a query for a
+    pattern, and dispatching one emitted a junk event on the pattern channel
+    which Jive logged as "event we aren't subscribed to".
+    """
+    if not subscription or _is_glob(subscription):
+        return []
+    parts = subscription.split("/")
+    sub_player = parts[-1] if len(parts) >= 2 else ""
+    if "serverstatus" in subscription:
+        return ["", list(JIVE_SERVERSTATUS_REQUEST)]
+    if "playerstatus" in subscription or "/status" in subscription:
+        return [sub_player, list(JIVE_STATUS_REQUEST)]
+    if "menustatus" in subscription:
+        # Squeezer subscribes to /<cid>/slim/menustatus/* — deliver the
+        # home menu array.
+        return ["", ["menustatus"]]
+    if "favorites" in subscription:
+        # SqueezeCtrl subscribes to /<cid>/slim/favorites/* — deliver the
+        # favorites list (DB ids; the apps parse them as numbers).
+        return ["", ["favorites", "items"]]
+    return []
+
+
 def _set_manager(mgr: "CometdManager") -> None:
     global _manager
     _manager = mgr
@@ -184,14 +282,27 @@ class CometdManager:
         (SqueezePlay's catch-all) receives the event on the concrete
         ``/<cid>/slim/serverstatus`` channel, matching Perl's
         manager->deliver_events() channel matching.
+
+        Request-driven (Perl parity): the stored request is re-executed and
+        its result pushed; only a subscription without a request falls back
+        to the jive serverstatus request.
         """
         for client in list(self._clients.values()):
             base = [f"/{client.client_id}/slim/serverstatus",
                     "/slim/serverstatus"]
-            for channel, data in self._matched_channels(client, base).items():
+            targets = self._matched_channels(client, base)
+            for sub, data in list(client.subscriptions.items()):
+                request = _stored_request(data)
+                if request is None or _request_command(request) != "serverstatus":
+                    continue
+                channel = sub
+                if _is_glob(sub):
+                    channel = next((c for c in base if _channel_matches(sub, c)), "")
+                if channel:
+                    targets.setdefault(channel, data)
+            for channel, data in targets.items():
                 try:
-                    request = (data.get("request") if isinstance(data, dict)
-                               else None) or ["", ["serverstatus", "0", "100"]]
+                    request = _stored_request(data) or ["", list(JIVE_SERVERSTATUS_REQUEST)]
                     result = await self._dispatch(request)
                     self.push(client.client_id, {
                         "channel": channel,
@@ -205,40 +316,72 @@ class CometdManager:
         """Push a fresh player status to status/playerstatus subscribers.
 
         Called by the slimproto layer on every STAT change so the
-        Android controllers (SqueezeCtrl, Orange Squeeze, Squeezer) get
-        the new state immediately instead of on their next poll. This is
-        the push that moves SqueezePlay's play/pause icon, so it must
-        fire exactly once per subscription and on the subscribed channel.
+        controllers (SqueezePlay/SqueezeCtrl/Orange Squeeze/Squeezer) get
+        the new state immediately instead of on their next poll.
+
+        Delivery is request-driven (Perl parity): a subscription that
+        stored a request gets THAT request re-executed, so SqueezePlay's
+        ``status - 10 menu:menu useContextMenu:1`` subscription delivers
+        ``current_title``/``item_loop`` — not a bare playerstatus frame.
+        A subscription without a request (the pure ``/<cid>/**``
+        catch-all) falls back to the jive default request, which is what
+        makes the Now-Playing title update (LIVE-01).
         """
         for client in list(self._clients.values()):
             targets: dict[str, dict] = {}
             base = [f"/{client.client_id}/slim/playerstatus/{player_id}",
                     f"/slim/playerstatus/{player_id}"]
             for sub, data in list(client.subscriptions.items()):
+                request = _stored_request(data)
+                if request is not None:
+                    # request + subscribe: only deliver status subscriptions
+                    # of the changed player (Perl re-executes the request,
+                    # so its payload carries whatever the client asked for).
+                    if _request_command(request) not in _PLAYER_STATUS_COMMANDS:
+                        continue
+                    req_player = _request_player(request)
+                    if req_player and req_player not in _ANY_PLAYER \
+                            and req_player != player_id:
+                        continue
+                    channel = sub
+                    if _is_glob(sub):
+                        channel = next(
+                            (c for c in base if _channel_matches(sub, c)), "")
+                    if channel:
+                        targets.setdefault(channel, data)
+                    continue
                 if _is_glob(sub):
                     # e.g. /<cid>/** or /<cid>/slim/playerstatus/* — deliver
                     # on the concrete channel the pattern matches.
                     for channel in base:
                         if _channel_matches(sub, channel):
                             targets.setdefault(channel, data)
-                elif "playerstatus" in sub or "status/" in sub:
-                    parts = sub.split("/")
-                    sub_player = parts[-1] if len(parts) >= 2 else ""
-                    # Match the changed player. The /null/... and
-                    # 00:00:00:00:00:00 forms (SqueezeCtrl) are app-chosen
-                    # and player-agnostic — deliver to them for ANY player
-                    # change.
-                    if sub_player and sub_player not in (
-                            player_id, "null", "00:00:00:00:00:00", ""):
-                        continue
-                    targets.setdefault(sub, data)
+                    continue
+                if "playerstatus" not in sub and "status/" not in sub:
+                    continue
+                parts = sub.split("/")
+                sub_player = parts[-1] if len(parts) >= 2 else ""
+                # The /null/... and 00:00:00:00:00:00 forms (SqueezeCtrl)
+                # are app-chosen and player-agnostic — deliver to them for
+                # ANY player change.
+                if sub_player and sub_player not in ("", player_id, *_ANY_PLAYER):
+                    continue
+                targets.setdefault(sub, data)
             for channel, data in targets.items():
                 try:
-                    # Re-dispatch the ORIGINAL stored request (pagination/
-                    # menu/tags preserved) instead of a fixed short one.
-                    request = (data.get("request") if isinstance(data, dict)
-                               else None) or [player_id,
-                                              ["playerstatus", "-", "1"]]
+                    request = _stored_request(data)
+                    if request is not None:
+                        # A subscription that names no player still gets the
+                        # changed player's status (Perl dispatches mac-less
+                        # subscriptions for any client).
+                        if not _request_player(request):
+                            command = next(
+                                (item for item in request
+                                 if isinstance(item, list) and item),
+                                list(JIVE_STATUS_REQUEST))
+                            request = [player_id, command]
+                    else:
+                        request = [player_id, list(JIVE_STATUS_REQUEST)]
                     result = await self._dispatch(request)
                     self.push(client.client_id, {
                         "channel": channel,
@@ -355,6 +498,8 @@ class CometdManager:
 
             elif channel in ("/meta/subscribe", "/slim/subscribe"):
                 data = msg.get("data", {})
+                if not isinstance(data, dict):
+                    data = {}
                 # Material sends data.response, Jive/SqueezeClient send
                 # data.subscription, SqueezeCtrl sends 'subscription' as
                 # a TOP-LEVEL field of /meta/subscribe — accept all.
@@ -366,36 +511,19 @@ class CometdManager:
                     cid = subscription.split("/")[1]
                 client = self.get_or_create(cid)
                 if client is not None and subscription:
+                    # Store the subscription together with its request. On a
+                    # /slim/subscribe (jive Comet.lua:286-296) that request is
+                    # the query to re-execute on every change; on a pure
+                    # /meta/subscribe channel registration there is none.
                     client.subscriptions[subscription] = data
                     logger.info("Cometd %s subscribed %s", cid, subscription)
                     # Push the initial result of the subscription request.
-                    # SqueezeCtrl subscribes to /slim/serverstatus WITHOUT
-                    # a request — deliver the player list anyway.
-                    request = data.get("request") or []
-                    if not request and _is_glob(subscription):
-                        # A pure Bayeux pattern (jive's /<cid>/** via
-                        # /meta/subscribe) registers the channel ONLY —
-                        # Perl's add_channels() never dispatches a query
-                        # for a pattern, and dispatching one emitted a
-                        # junk event on the pattern channel that Jive
-                        # logged as "event we aren't subscribed to".
-                        request = []
-                    elif not request and "serverstatus" in subscription:
-                        request = ["", ["serverstatus", "0", "100", "subscribe:60"]]
-                    elif not request and "menustatus" in subscription:
-                        # Squeezer subscribes to /<cid>/slim/menustatus/*
-                        # without a request — deliver the home menu array
-                        request = ["", ["menustatus"]]
-                    elif not request and "favorites" in subscription:
-                        # SqueezeCtrl subscribes to /<cid>/slim/favorites/* —
-                        # deliver the favorites list (DB ids; the apps parse
-                        # them as numbers).
-                        request = ["", ["favorites", "items"]]
-                    elif not request and "playerstatus" in subscription:
-                        # SqueezeCtrl subscribes to /<cid>/slim/playerstatus/<player>
-                        parts = subscription.split("/")
-                        sub_player = parts[-1] if len(parts) >= 2 else ""
-                        request = [sub_player, ["playerstatus", "-", "1"]]
+                    # Without a client request fall back to the jive form so
+                    # the seed payload already carries title/playlist
+                    # (a bare `playerstatus - 1` does not — LIVE-01).
+                    request = _stored_request(data)
+                    if request is None:
+                        request = _default_request(subscription)
                     if request:
                         result = await self._dispatch(request)
                         self.push(cid, {
