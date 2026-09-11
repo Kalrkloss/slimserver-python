@@ -700,6 +700,9 @@ class PlayerManager:
         ok = await handler.send_stop_to_player(player.mac)
         if ok:
             player.mode = "stop"
+            # A stopped player has no stream: the next play must send a
+            # fresh strm frame (idempotency guard reset).
+            player.strm_sent_track = None
             player.last_activity = time.time()
         return ok
 

@@ -1344,6 +1344,15 @@ class SlimProtoClient:
         try:
             writer.write(frame)
             await writer.drain()
+            # A flush tears the player's buffers down — the next play of the
+            # same track MUST send a fresh strm frame, so clear the guard.
+            try:
+                from lyrion.player.manager import PlayerManager
+                _p = PlayerManager().get_player(mac)
+                if _p is not None:
+                    _p.strm_sent_track = None
+            except Exception:  # noqa: BLE001
+                pass
             logger.info("Sent strm 'f' (flush) to %s", mac)
             return True
         except (ConnectionError, OSError, RuntimeError):
@@ -1386,10 +1395,15 @@ class SlimProtoClient:
         try:
             from lyrion.player.manager import PlayerManager
             _existing = PlayerManager().get_player(mac)
+            # Compare against the track we ACTUALLY streamed last, not
+            # current_track_id: the caller sets current_track_id and
+            # mode='play' optimistically BEFORE calling us, so guarding on
+            # those made every fresh play a silent no-op (no strm frame at
+            # all — the player stayed silent with mode=play).
             if (
                 _existing is not None
                 and _existing.mode == "play"
-                and _existing.current_track_id == track_id
+                and _existing.strm_sent_track == track_id
             ):
                 logger.info(
                     "strm for %s track=%d already playing — skipping re-stream",
@@ -1516,6 +1530,15 @@ class SlimProtoClient:
         try:
             writer.write(frame)
             await writer.drain()
+            # Remember what we actually streamed (the idempotency guard
+            # above must not re-send for the SAME track while it plays).
+            try:
+                from lyrion.player.manager import PlayerManager
+                _p = PlayerManager().get_player(mac)
+                if _p is not None:
+                    _p.strm_sent_track = track_id
+            except Exception:  # noqa: BLE001
+                pass
             logger.info("Sent strm to %s: track=%d codec=%s", mac, track_id, codec)
             return True
         except (ConnectionError, OSError, RuntimeError) as exc:

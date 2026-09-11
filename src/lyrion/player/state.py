@@ -38,6 +38,10 @@ class PlayerState:
     # player's STAT stop-ack: the ack must NOT flip mode back to "stop".
     pause_requested: bool = False
     current_track_id: Optional[int] = None
+    # Track id of the last strm frame actually written to the player (used
+    # by the send-idempotency guard; NOT current_track_id, which the caller
+    # sets optimistically before the frame goes out).
+    strm_sent_track: Optional[int] = None
     # P6-1: fields used by the status handlers were set via setattr —
     # declare them so tooling/linters see them and typos fail early.
     elapsed: float = 0.0          # seconds into the current track (STAT)

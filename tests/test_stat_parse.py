@@ -434,6 +434,10 @@ async def test_repeat_load_of_same_playing_track_does_not_restart(monkeypatch):
     player = PlayerState(mac="1C:87:2C:47:FC:36", name="T", ip="127.0.0.1", port=0)
     player.mode = "play"
     player.current_track_id = 51994
+    # The guard keys off the track we ACTUALLY streamed (not the optimistic
+    # current_track_id the caller sets before sending) — see
+    # tests/test_strm_idempotency.py for the first-play regression.
+    player.strm_sent_track = 51994
     client, writer, mac = _strm_client(monkeypatch, player)
 
     ok = await client.send_strm_to_player(mac, 51994)
