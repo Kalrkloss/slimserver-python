@@ -1,0 +1,230 @@
+{
+ "method": "slim.request",
+ "id": 1,
+ "params": [
+  "1c:87:2c:47:fc:36",
+  [
+   "browselibrary",
+   "items",
+   "0",
+   1,
+   "menu:1",
+   "mode:tracks",
+   "album_id:45",
+   "useContextMenu:1"
+  ]
+ ],
+ "result": {
+  "base": {
+   "actions": {
+    "set-preset-4": {
+     "itemsParams": "presetParams",
+     "player": 0,
+     "cmd": [
+      "jivefavorites",
+      "set_preset",
+      "key:4"
+     ]
+    },
+    "set-preset-9": {
+     "player": 0,
+     "cmd": [
+      "jivefavorites",
+      "set_preset",
+      "key:9"
+     ],
+     "itemsParams": "presetParams"
+    },
+    "play": {
+     "params": {
+      "menu": 1,
+      "album_id": "45",
+      "cmd": "load",
+      "sort": "albumtrack"
+     },
+     "nextWindow": "nowPlaying",
+     "itemsParams": "playallParams",
+     "cmd": [
+      "playlistcontrol"
+     ],
+     "player": 0
+    },
+    "add-hold": {
+     "cmd": [
+      "playlistcontrol"
+     ],
+     "player": 0,
+     "params": {
+      "cmd": "insert",
+      "menu": 1
+     },
+     "itemsParams": "commonParams"
+    },
+    "add": {
+     "itemsParams": "addallParams",
+     "params": {
+      "album_id": "45",
+      "menu": 1,
+      "cmd": "add",
+      "sort": "albumtrack"
+     },
+     "player": 0,
+     "cmd": [
+      "playlistcontrol"
+     ]
+    },
+    "go": {
+     "player": 0,
+     "cmd": [
+      "browselibrary",
+      "items"
+     ],
+     "window": {
+      "isContextMenu": 1
+     },
+     "itemsParams": "playControlParams",
+     "params": {
+      "album_id": "45",
+      "menu": "1",
+      "_index": "0",
+      "useContextMenu": "1",
+      "mode": "tracks",
+      "_quantity": "1"
+     }
+    },
+    "set-preset-0": {
+     "cmd": [
+      "jivefavorites",
+      "set_preset",
+      "key:0"
+     ],
+     "player": 0,
+     "itemsParams": "presetParams"
+    },
+    "set-preset-6": {
+     "itemsParams": "presetParams",
+     "player": 0,
+     "cmd": [
+      "jivefavorites",
+      "set_preset",
+      "key:6"
+     ]
+    },
+    "set-preset-8": {
+     "player": 0,
+     "cmd": [
+      "jivefavorites",
+      "set_preset",
+      "key:8"
+     ],
+     "itemsParams": "presetParams"
+    },
+    "playControl": {
+     "player": 0,
+     "cmd": [
+      "browselibrary",
+      "items"
+     ],
+     "window": {
+      "isContextMenu": 1
+     },
+     "itemsParams": "playControlParams",
+     "params": {
+      "album_id": "45",
+      "menu": "1",
+      "_index": "0",
+      "useContextMenu": "1",
+      "mode": "tracks",
+      "_quantity": "1"
+     }
+    },
+    "set-preset-5": {
+     "cmd": [
+      "jivefavorites",
+      "set_preset",
+      "key:5"
+     ],
+     "player": 0,
+     "itemsParams": "presetParams"
+    },
+    "set-preset-1": {
+     "itemsParams": "presetParams",
+     "player": 0,
+     "cmd": [
+      "jivefavorites",
+      "set_preset",
+      "key:1"
+     ]
+    },
+    "set-preset-2": {
+     "cmd": [
+      "jivefavorites",
+      "set_preset",
+      "key:2"
+     ],
+     "player": 0,
+     "itemsParams": "presetParams"
+    },
+    "set-preset-7": {
+     "cmd": [
+      "jivefavorites",
+      "set_preset",
+      "key:7"
+     ],
+     "player": 0,
+     "itemsParams": "presetParams"
+    },
+    "more": {
+     "window": {
+      "isContextMenu": 1
+     },
+     "player": 0,
+     "cmd": [
+      "trackinfo",
+      "items"
+     ],
+     "itemsParams": "commonParams",
+     "params": {
+      "menu": 1,
+      "album_id": "45"
+     }
+    },
+    "set-preset-3": {
+     "player": 0,
+     "cmd": [
+      "jivefavorites",
+      "set_preset",
+      "key:3"
+     ],
+     "itemsParams": "presetParams"
+    }
+   }
+  },
+  "window": {
+   "windowStyle": "text_list"
+  },
+  "count": 6143,
+  "offset": 0,
+  "item_loop": [
+   {
+    "presetParams": {
+     "favorites_url": "file:///mnt/media/Musik/Metal/S/Sampler/PUNK/007(Molotow%20Soda).mp3",
+     "favorites_type": "audio",
+     "favorites_title": "007(Molotow Soda)"
+    },
+    "type": "audio",
+    "playallParams": {
+     "play_index": 0
+    },
+    "text": "007(Molotow Soda)",
+    "goAction": "playControl",
+    "commonParams": {
+     "track_id": 51102
+    },
+    "playControlParams": {
+     "xmlbrowserPlayControl": "0"
+    }
+   }
+  ]
+ }
+}

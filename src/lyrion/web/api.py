@@ -2371,6 +2371,17 @@ class JSONRPCAPI:
             for key in ("album_id", "artist_id", "genre_id", "year"):
                 if s.startswith(f"{key}:") and s[len(key) + 1:].strip():
                     filters[key] = s[len(key) + 1:].strip()
+        # Play-Control context menu (MENU-02): a SqueezePlay tap on a row
+        # sends `useContextMenu:1` + `xmlbrowserPlayControl:<itemIndex>`
+        # (merged from the row's playControlParams). Perl answers with the
+        # Add / Play-next / Play menu for that row instead of the list
+        # (Slim/Control/XMLBrowser.pm:805-830).
+        useContext_p = next((str(a)[14:] for a in args
+                             if str(a).startswith("useContextMenu:")
+                             and str(a)[14:].strip() not in ("", "0")), "")
+        play_ctl = next((str(a)[22:] for a in args
+                         if str(a).startswith("xmlbrowserPlayControl:")), "")
+        is_menu = any(str(a) == "menu:1" for a in args)
         try:
             rows, total, plural, kind = await self._library_rows(
                 mode, start, count, search, filters or None)
@@ -2383,10 +2394,15 @@ class JSONRPCAPI:
         # and drills via base.actions.go + each item's commonParams — a
         # numeric 'window' or a missing base made the list crash / taps
         # navigate nowhere ("Alben leer, keine Lieder").
-        if any(str(a) == "menu:1" for a in args):
-            menu = self._browselibrary_menu_items(kind, rows, mode, search)
+        if is_menu:
+            if useContext_p and play_ctl.isdigit() and kind == "tracks":
+                return self._playcontrol_context_menu(rows, start,
+                                                      int(play_ctl))
+            menu = self._browselibrary_menu_items(kind, rows, mode, search,
+                                                  start)
             return {
-                "base": {"actions": self._browselibrary_menu_actions(kind)},
+                "base": {"actions": self._browselibrary_menu_actions(
+                    kind, filters, start, count)},
                 "count": int(total or len(menu)),
                 "offset": start,
                 "window": {"windowStyle": "icon_list"},
@@ -2455,12 +2471,16 @@ class JSONRPCAPI:
 
     @staticmethod
     def _browselibrary_menu_items(kind: str, rows: list, mode: str,
-                                  search: str = "") -> list:
+                                  search: str = "", start: int = 0) -> list:
         """Build the SqueezePlay/Jive MENU shape for browselibrary items
         (request token menu:1) — Perl Slim::Menu::BrowseLibrary parity:
         text/type/commonParams instead of the OpenSqueeze loop_loop shape.
         SqueezePlay drills into an entry through commonParams.<id>, so a
-        missing menu shape makes taps navigate nowhere ("no songs")."""
+        missing menu shape makes taps navigate nowhere ("no songs").
+
+        ``start`` is the absolute index of the first row (paging), used for
+        the track rows' ``xmlbrowserPlayControl`` / ``play_index``
+        (Perl :1003 ``$itemIndex = $start - 1``)."""
         out: list[dict] = []
         ids = []
         for r in rows:
@@ -2489,7 +2509,27 @@ class JSONRPCAPI:
                 db.close()
             except Exception:  # noqa: BLE001
                 pass
-        for r in rows:
+        # Track rows carry presetParams (the preset/favorite base actions
+        # read presetParams), which need the file URL. Looked up separately
+        # and defensively: minimal/test DBs may expose tracks without url.
+        track_urls: dict = {}
+        if kind == "tracks":
+            tids = [r["id"] for r in rows if r.get("id") is not None]
+            if tids:
+                try:
+                    import sqlite3
+                    db = sqlite3.connect(
+                        f"file:{_library_db_path()}?mode=ro", uri=True)
+                    db.row_factory = sqlite3.Row
+                    marks = ",".join("?" * len(tids))
+                    for row in db.execute(
+                            f"SELECT id, url FROM tracks WHERE id IN ({marks})",
+                            tids).fetchall():
+                        track_urls[row["id"]] = row["url"]
+                    db.close()
+                except Exception:  # noqa: BLE001
+                    pass
+        for pos, r in enumerate(rows):
             item: dict = {"type": "playlist"}
             if kind == "albums":
                 title = r["title"] or ""
@@ -2509,10 +2549,24 @@ class JSONRPCAPI:
                 item["text"] = str(r["year"])
                 item["commonParams"] = {"year": int(r["year"])}
             elif kind == "tracks":
-                # Album/artist drill target: one row per song.
+                # Album/artist drill target: one row per song. Perl gives
+                # every audio row goAction=playControl + playControlParams so
+                # a tap opens the play-control context menu for THAT row
+                # instead of re-opening the list (XMLBrowser.pm:1270-1271).
                 item["type"] = "audio"
                 item["text"] = r["title"] or ""
+                item["goAction"] = "playControl"
+                item["playControlParams"] = {
+                    "xmlbrowserPlayControl": str(start + pos)}
+                item["playallParams"] = {"play_index": start + pos}
                 item["commonParams"] = {"track_id": int(r["id"])}
+                url = track_urls.get(r["id"])
+                if url:
+                    item["presetParams"] = {
+                        "favorites_url": str(url),
+                        "favorites_type": "audio",
+                        "favorites_title": r["title"] or "",
+                    }
             elif kind == "folder":
                 item["text"] = r["name"] or ""
                 ident = str(r["id"])
@@ -2524,33 +2578,31 @@ class JSONRPCAPI:
         return out
 
     @staticmethod
-    def _browselibrary_menu_actions(kind: str) -> dict:
+    def _browselibrary_menu_actions(kind: str, filters: dict | None = None,
+                                    start: int = 0,
+                                    count: int = 1) -> dict:
         """Perl base.actions for a browselibrary menu window — SqueezePlay
         uses 'go' to drill (album→mode:tracks, artist→mode:albums, …) and
         'play'/'add' to load the commonParams item into the playlist.
         For a TRACK list the plain go must NOT drill (tracks are leaves):
         Perl marks it context-only (window.isContextMenu), otherwise every
-        single tap on a song re-opens the same list (infinite recursion)."""
+        single tap on a song re-opens the same list (infinite recursion).
+
+        ``filters``/``start``/``count`` are echoed into the context action's
+        params, like Perl's ``$request->getParamsCopy()``
+        (Slim/Control/XMLBrowser.pm:978): the tap's follow-up request repeats
+        them merged with the row's playControlParams, and without the drill
+        filter it would list the whole library instead of the tapped album."""
         go_mode = {"albums": "tracks", "artists": "albums",
                    "genres": "albums", "years": "albums",
                    "folder": "bmf", "tracks": "tracks"}.get(kind, "albums")
         go_params: dict = {"mode": go_mode, "menu": 1}
         if kind == "artists":
             go_params["menu_mode"] = "artists"
-        go_action: dict = {"player": 0, "cmd": ["browselibrary", "items"],
-                           "itemsParams": "commonParams",
-                           "params": go_params}
-        if kind in ("tracks", "folder"):
-            # Context-menu only (press-and-hold) — a plain tap on an audio
-            # row or folder child must not re-open the same list.
-            go_action = {"player": 0, "cmd": ["browselibrary", "items"],
-                         "itemsParams": "playControlParams",
-                         "window": {"isContextMenu": 1},
-                         "params": {"mode": go_mode, "menu": 1,
-                                    "useContextMenu": 1,
-                                    "_index": 0, "_quantity": 1}}
         actions: dict = {
-            "go": go_action,
+            "go": {"player": 0, "cmd": ["browselibrary", "items"],
+                   "itemsParams": "commonParams",
+                   "params": go_params},
             "play": {"player": 0, "cmd": ["playlistcontrol"],
                      "itemsParams": "commonParams",
                      "params": {"cmd": "load", "menu": 1},
@@ -2559,7 +2611,68 @@ class JSONRPCAPI:
                     "itemsParams": "commonParams",
                     "params": {"cmd": "add", "menu": 1}},
         }
+        if kind in ("tracks", "folder"):
+            # Context-menu only (press-and-hold) — a plain tap on an audio
+            # row or folder child must not re-open the same list.
+            cm_params: dict = {"mode": go_mode, "menu": 1,
+                               "useContextMenu": 1,
+                               "_index": start, "_quantity": count}
+            if kind == "tracks":
+                cm_params.update(filters or {})
+            cm_action: dict = {"player": 0, "cmd": ["browselibrary", "items"],
+                               "itemsParams": "playControlParams",
+                               "window": {"isContextMenu": 1},
+                               "params": cm_params}
+            # 'go' and 'playControl' are identical in Perl (XMLBrowser.pm:973):
+            # SqueezePlay rewrites a tap's action name onto the row's
+            # goAction ('playControl') and then looks that key up in
+            # base.actions (SlimBrowserApplet.lua:1846-1913) — without
+            # base.actions.playControl the tap aborts with EVENT_UNUSED.
+            actions["go"] = cm_action
+            actions["playControl"] = cm_action
         return actions
+
+    @staticmethod
+    def _playcontrol_context_menu(rows: list, start: int,
+                                  index: int) -> dict:
+        """Answer a SqueezePlay tap on an audio row with the play-control
+        context menu (MENU-02) — Perl ``_playlistControlContextMenu``
+        (Slim/Control/XMLBrowser.pm:1811) reached via the
+        ``xmlbrowserPlayControl`` branch (:805-830).
+
+        ``index`` is the absolute row index from the request
+        (``$xmlbrowserPlayControl - $subFeed->{'offset'}``), so a paged
+        request addresses the right row.
+
+        Texts/styles/actions mirror the real Perl response for
+        ``… menu:1 mode:tracks album_id:45 useContextMenu:1
+        xmlbrowserPlayControl:0`` (tests/fixtures/perl_browselibrary_
+        playcontrol_tap.json): Add to end / Play next / Play, each a
+        ``playlistcontrol`` cmd on that track. Play-all is omitted because
+        Perl only adds it for multi-item windows (there: ``count 1``).
+        """
+        window = {"windowStyle": "text_list"}
+        pos = index - start
+        if pos < 0 or pos >= len(rows):
+            return {"window": window, "offset": 0, "count": 0,
+                    "item_loop": []}
+        track_id = str(rows[pos]["id"])
+
+        def entry(cmd: str, next_window: str) -> dict:
+            return {"player": 0, "cmd": ["playlistcontrol"],
+                    "params": {"cmd": cmd, "track_id": track_id, "menu": 1},
+                    "nextWindow": next_window}
+
+        item_loop = [
+            {"text": "Am Ende hinzufügen", "style": "item_add",
+             "actions": {"go": entry("add", "parentNoRefresh")}},
+            {"text": "Als nächstes wiedergeben", "style": "itemNoAction",
+             "actions": {"go": entry("insert", "parentNoRefresh")}},
+            {"text": "Wiedergabe", "style": "item_play",
+             "actions": {"go": entry("load", "nowPlaying")}},
+        ]
+        return {"window": window, "offset": 0, "count": len(item_loop),
+                "item_loop": item_loop}
 
     async def _library_rows(self, mode: str, start: int, count: int,
                             search: str = "", filters: dict | None = None):
