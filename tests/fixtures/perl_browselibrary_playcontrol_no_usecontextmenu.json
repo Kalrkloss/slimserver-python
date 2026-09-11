@@ -1,0 +1,80 @@
+{
+ "id": 1,
+ "method": "slim.request",
+ "params": [
+  "1c:87:2c:47:fc:36",
+  [
+   "browselibrary",
+   "items",
+   "0",
+   "1",
+   "menu:1",
+   "mode:tracks",
+   "album_id:45",
+   "xmlbrowserPlayControl:0"
+  ]
+ ],
+ "result": {
+  "count": 3,
+  "item_loop": [
+   {
+    "actions": {
+     "go": {
+      "cmd": [
+       "playlistcontrol"
+      ],
+      "nextWindow": "parentNoRefresh",
+      "params": {
+       "cmd": "add",
+       "menu": 1,
+       "track_id": 51102
+      },
+      "player": 0
+     }
+    },
+    "style": "item_add",
+    "text": "Am Ende hinzufügen"
+   },
+   {
+    "actions": {
+     "go": {
+      "cmd": [
+       "playlistcontrol"
+      ],
+      "nextWindow": "parentNoRefresh",
+      "params": {
+       "cmd": "insert",
+       "menu": 1,
+       "track_id": 51102
+      },
+      "player": 0
+     }
+    },
+    "style": "itemNoAction",
+    "text": "Als nächstes wiedergeben"
+   },
+   {
+    "actions": {
+     "go": {
+      "cmd": [
+       "playlistcontrol"
+      ],
+      "nextWindow": "nowPlaying",
+      "params": {
+       "cmd": "load",
+       "menu": 1,
+       "track_id": 51102
+      },
+      "player": 0
+     }
+    },
+    "style": "item_play",
+    "text": "Wiedergabe"
+   }
+  ],
+  "offset": 0,
+  "window": {
+   "windowStyle": "text_list"
+  }
+ }
+}

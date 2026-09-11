@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 from typing import Any, Callable, Optional
 
@@ -61,6 +62,17 @@ def _db_query(sql: str, params: tuple = ()) -> list[dict]:
         return [dict(r) for r in con.execute(sql, params).fetchall()]
     finally:
         con.close()
+
+
+def _playctl_index(value: str) -> int:
+    """Coerce the ``xmlbrowserPlayControl`` token the way Perl does.
+
+    Perl feeds the raw param into arithmetic (``$i = $xmlbrowserPlayControl
+    - $subFeed->{offset}``, Slim/Control/XMLBrowser.pm:808): a leading
+    number is used, anything else becomes 0, so ``"abc"`` addresses item 0
+    and ``"-1"`` stays negative (→ out of range)."""
+    m = re.match(r"\s*([+-]?\d+)", str(value))
+    return int(m.group(1)) if m else 0
 
 
 def _genre_id_to_text(genre_id) -> str:
@@ -2374,13 +2386,15 @@ class JSONRPCAPI:
         # Play-Control context menu (MENU-02): a SqueezePlay tap on a row
         # sends `useContextMenu:1` + `xmlbrowserPlayControl:<itemIndex>`
         # (merged from the row's playControlParams). Perl answers with the
-        # Add / Play-next / Play menu for that row instead of the list
-        # (Slim/Control/XMLBrowser.pm:805-830).
-        useContext_p = next((str(a)[14:] for a in args
-                             if str(a).startswith("useContextMenu:")
-                             and str(a)[14:].strip() not in ("", "0")), "")
+        # Add / Play-next / Play (+ Play-all) menu for that row whenever the
+        # browser is in MENU mode and the xmlbrowserPlayControl token is
+        # present — the value is used numerically, so an empty or
+        # non-numeric token still taps item 0, and useContextMenu is not
+        # required (Slim/Control/XMLBrowser.pm:805 `if ($menuMode &&
+        # defined $xmlbrowserPlayControl)`).
         play_ctl = next((str(a)[22:] for a in args
-                         if str(a).startswith("xmlbrowserPlayControl:")), "")
+                         if str(a).startswith("xmlbrowserPlayControl:")),
+                        None)
         is_menu = any(str(a) == "menu:1" for a in args)
         try:
             rows, total, plural, kind = await self._library_rows(
@@ -2395,9 +2409,14 @@ class JSONRPCAPI:
         # numeric 'window' or a missing base made the list crash / taps
         # navigate nowhere ("Alben leer, keine Lieder").
         if is_menu:
-            if useContext_p and play_ctl.isdigit() and kind == "tracks":
+            # Perl serves the tap menu for every audio feed (tracks,
+            # albums, artists, genres, years — live probes); folder/search
+            # items are not audio and keep the plain list.
+            if play_ctl is not None and kind in ("tracks", "albums",
+                                                 "artists", "genres", "years"):
                 return self._playcontrol_context_menu(rows, start,
-                                                      int(play_ctl))
+                                                      _playctl_index(play_ctl),
+                                                      kind, filters)
             menu = self._browselibrary_menu_items(kind, rows, mode, search,
                                                   start)
             return {
@@ -2517,17 +2536,14 @@ class JSONRPCAPI:
             tids = [r["id"] for r in rows if r.get("id") is not None]
             if tids:
                 try:
-                    import sqlite3
-                    db = sqlite3.connect(
-                        f"file:{_library_db_path()}?mode=ro", uri=True)
-                    db.row_factory = sqlite3.Row
                     marks = ",".join("?" * len(tids))
-                    for row in db.execute(
+                    for row in _db_query(
                             f"SELECT id, url FROM tracks WHERE id IN ({marks})",
-                            tids).fetchall():
+                            tuple(tids)):
                         track_urls[row["id"]] = row["url"]
-                    db.close()
                 except Exception:  # noqa: BLE001
+                    # _db_query closes its connection in a finally block, so
+                    # a missing `url` column cannot leak a sqlite handle.
                     pass
         for pos, r in enumerate(rows):
             item: dict = {"type": "playlist"}
@@ -2561,12 +2577,15 @@ class JSONRPCAPI:
                 item["playallParams"] = {"play_index": start + pos}
                 item["commonParams"] = {"track_id": int(r["id"])}
                 url = track_urls.get(r["id"])
+                # Perl always ships presetParams on audio items (the
+                # base.actions.set-preset-* entries read them); emit at
+                # least the title/type so the item shape stays usable when
+                # the library has no (or an empty) file URL.
+                preset = {"favorites_type": "audio",
+                          "favorites_title": r["title"] or ""}
                 if url:
-                    item["presetParams"] = {
-                        "favorites_url": str(url),
-                        "favorites_type": "audio",
-                        "favorites_title": r["title"] or "",
-                    }
+                    preset["favorites_url"] = str(url)
+                item["presetParams"] = preset
             elif kind == "folder":
                 item["text"] = r["name"] or ""
                 ident = str(r["id"])
@@ -2634,7 +2653,8 @@ class JSONRPCAPI:
 
     @staticmethod
     def _playcontrol_context_menu(rows: list, start: int,
-                                  index: int) -> dict:
+                                  index: int, kind: str = "tracks",
+                                  filters: dict | None = None) -> dict:
         """Answer a SqueezePlay tap on an audio row with the play-control
         context menu (MENU-02) — Perl ``_playlistControlContextMenu``
         (Slim/Control/XMLBrowser.pm:1811) reached via the
@@ -2642,35 +2662,72 @@ class JSONRPCAPI:
 
         ``index`` is the absolute row index from the request
         (``$xmlbrowserPlayControl - $subFeed->{'offset'}``), so a paged
-        request addresses the right row.
+        request addresses the right row; an index outside the fetched
+        window (negative, e.g. ``-1``) yields Perl's empty menu.
 
-        Texts/styles/actions mirror the real Perl response for
-        ``… menu:1 mode:tracks album_id:45 useContextMenu:1
-        xmlbrowserPlayControl:0`` (tests/fixtures/perl_browselibrary_
-        playcontrol_tap.json): Add to end / Play next / Play, each a
-        ``playlistcontrol`` cmd on that track. Play-all is omitted because
-        Perl only adds it for multi-item windows (there: ``count 1``).
+        Texts/styles/actions mirror the real Perl responses
+        (tests/fixtures/perl_browselibrary_playcontrol_*.json):
+
+        * one-item window (``items 0 1``) → Add to end / Play next / Play;
+        * window with more than one item → the third text switches to
+          "Diesen Titel wiedergeben" and a fourth "Alle Titel wiedergeben"
+          entry is appended. Perl's condition is
+          ``playalbum && defined subItemId && @{$subFeed->{items}} > 1 &&
+          (subFeed/item playall)`` (:1839-1844), i.e. the *window size*, not
+          the request's total ``count``.
+
+        The per-mode target params come from the feed item action
+        variables (:1623 ``_makePlayAction``; live probes: ``mode:albums`` →
+        album_id + performance, ``mode:artists`` → artist_id + menu_mode,
+        ``mode:genres`` → genre_id + role_id, ``mode:years`` → year,
+        ``mode:tracks`` → track_id).
         """
         window = {"windowStyle": "text_list"}
         pos = index - start
         if pos < 0 or pos >= len(rows):
             return {"window": window, "offset": 0, "count": 0,
                     "item_loop": []}
-        track_id = str(rows[pos]["id"])
+        row = rows[pos]
+        if kind == "tracks":
+            target: dict = {"track_id": str(row["id"])}
+        elif kind == "artists":
+            target = {"artist_id": str(row["id"]), "menu_mode": "artists"}
+        elif kind == "genres":
+            target = {"genre_id": str(row["id"]), "role_id": "ALBUMARTIST"}
+        elif kind == "years":
+            target = {"year": int(row["year"])}
+        else:  # albums
+            target = {"album_id": str(row["id"]), "performance": ""}
 
         def entry(cmd: str, next_window: str) -> dict:
+            params = {"cmd": cmd, "menu": 1}
+            params.update(target)
             return {"player": 0, "cmd": ["playlistcontrol"],
-                    "params": {"cmd": cmd, "track_id": track_id, "menu": 1},
-                    "nextWindow": next_window}
+                    "params": params, "nextWindow": next_window}
 
+        # Play-all needs >1 item in the current window (Perl); it replays
+        # the request's drill filter and the tapped absolute index
+        # (probe: params {cmd: load, menu: 1, play_index: 5,
+        # sort: "albumtrack", album_id: "45"}).
+        play_all = kind == "tracks" and len(rows) > 1
         item_loop = [
             {"text": "Am Ende hinzufügen", "style": "item_add",
              "actions": {"go": entry("add", "parentNoRefresh")}},
             {"text": "Als nächstes wiedergeben", "style": "itemNoAction",
              "actions": {"go": entry("insert", "parentNoRefresh")}},
-            {"text": "Wiedergabe", "style": "item_play",
+            {"text": "Diesen Titel wiedergeben" if play_all else "Wiedergabe",
+             "style": "item_play",
              "actions": {"go": entry("load", "nowPlaying")}},
         ]
+        if play_all:
+            all_params: dict = {"cmd": "load", "menu": 1, "play_index": index,
+                                "sort": "albumtrack"}
+            all_params.update(filters or {})
+            item_loop.append({
+                "text": "Alle Titel wiedergeben", "style": "itemNoAction",
+                "actions": {"go": {"player": 0, "cmd": ["playlistcontrol"],
+                                   "params": all_params,
+                                   "nextWindow": "nowPlaying"}}})
         return {"window": window, "offset": 0, "count": len(item_loop),
                 "item_loop": item_loop}
 
