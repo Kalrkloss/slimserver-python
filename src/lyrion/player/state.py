@@ -34,9 +34,18 @@ class PlayerState:
     power: bool = False
     volume: int = 50
     mode: Literal["stop", "play", "pause", "loading"] = "stop"
-    # True between a pause command (strm 'q' stop-workaround) and the
-    # player's STAT stop-ack: the ack must NOT flip mode back to "stop".
+    # True between a pause command and a STAT stop-ack: the ack must NOT
+    # flip mode back to "stop". A real pause is `strm 'p'`
+    # (Squeezebox.pm:197-204) and normally has no stop-ack; the flag still
+    # protects against a stray one.
     pause_requested: bool = False
+    # Playback position (seconds) frozen at the moment of the pause. Perl
+    # keeps it as the controller's ``resumeTime``
+    # (Slim/Player/StreamingController.pm:64, set in ``_Pause`` :1555,
+    # returned by ``playingSongElapsed`` :1719-1724 while paused) — the
+    # status ``time`` reports THIS while paused and resume continues here.
+    # A zero STAT (or a flush) must never overwrite it.
+    pause_time: float = 0.0
     current_track_id: Optional[int] = None
     # Track id of the last strm frame actually written to the player (used
     # by the send-idempotency guard; NOT current_track_id, which the caller

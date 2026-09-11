@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import struct
 import time
 from datetime import datetime
 from typing import Optional
@@ -709,26 +708,27 @@ class PlayerManager:
             player.last_activity = time.time()
         return ok
 
-    @staticmethod
-    def _current_is_stream(player) -> bool:
-        """True if the player is (or was last) playing a live stream URL
-        rather than a local track — live streams cannot be paused in
-        place (LMS stops them on pause and restarts on resume)."""
-        if player.current_track_id is None:
-            return True
-        pl = getattr(player, "playlist", [])
-        pos = getattr(player, "playlist_position", 0)
-        return bool(pl and 0 <= pos < len(pl) and isinstance(pl[pos], str))
-
     async def pause_player(self, player_id: str, pause: bool) -> bool:
-        """Pause (or resume) playback on a player.
+        """Pause (True) / resume (False) playback — NOT a stop+restart.
 
-        Squeezelite (this build, 2.0.0-1584) does NOT honour the strm 'p'
-        pause frame (interval 0) — the output keeps playing. So pause =
-        STOP (strm 'q'); resume restarts the current item (stream URL or
-        track). This matches the LMS behaviour for live streams
-        ('Stopping remote stream upon full buffer when paused') and is
-        the only reliable pause for this player firmware.
+        Perl parity (read from the pinned clone, public/9.2):
+          * pause  = ``strm 'p'``: ``sub pause { $client->stream('p');
+            $client->playPoint(undef); $client->SUPER::pause(); }``
+            — Slim/Player/Squeezebox.pm:197-204. The player holds its
+            output buffers; nothing is flushed, the stream socket stays
+            open, so the position is preserved.
+          * resume = ``strm 'u'``: ``sub resume { $client->stream('u', ...);
+            $client->SUPER::resume(); }`` — Slim/Player/Squeezebox2.pm:1104-1110.
+            The output continues; the file is NOT re-streamed.
+          * stop   = ``strm 'q'`` — Squeezebox.pm:206-216 (the OTHER cmd).
+          * replay-gain field: ``'p'`` carries ``int(interval*1000)`` (ms),
+            ``'u'`` the interval directly — Squeezebox.pm:1080-1094.
+
+        Position handling: on pause the position is frozen in the state
+        (``PlayerState.pause_time``, Perl's ``resumeTime`` —
+        StreamingController.pm:64/1555/1719-1724) and the strm idempotency
+        guard is deliberately NOT reset: the player still holds the stream,
+        so a resume must not trigger a second ``/stream.mp3`` GET.
         """
         player = self.get_player(player_id)
         if player is None:
@@ -737,38 +737,25 @@ class PlayerManager:
         if handler is None:
             return False
         if pause:
-            ok = await handler.send_stop_to_player(player.mac)
+            # Freeze the position in the state machine (Perl _Pause:
+            # resumeTime = playingSongElapsed, StreamingController.pm:1555).
+            player.pause_time = float(getattr(player, "elapsed", 0) or 0)
+            ok = await handler.send_pause_to_player(player.mac)
             if ok:
                 player.mode = "pause"
-                # The player answers the stop with a STAT stop event that
-                # must NOT overwrite the pause state (see protocol.py).
+                # Kept so a stray STAT stop-ack cannot flip mode to "stop".
                 player.pause_requested = True
                 player.last_activity = time.time()
             return ok
-        # resume — restart the current item, then restore the position
-        player.pause_requested = False
-        saved = float(getattr(player, "elapsed", 0) or 0)
-        is_stream = self._current_is_stream(player)
-        if is_stream:
-            url = getattr(player, "current_url", None) or ""
-            if not url:
-                pl = getattr(player, "playlist", [])
-                pos = getattr(player, "playlist_position", 0)
-                if pl and 0 <= pos < len(pl) and isinstance(pl[pos], str):
-                    url = pl[pos]
-            title = getattr(player, "current_title", "") or ""
-            ok = await self.play_url(player_id, url, title)
-        elif player.current_track_id is not None:
-            ok = await self.play_track(player_id, player.current_track_id)
-        else:
-            ok = False
+        # resume — continue the paused output in place, never re-stream
+        ok = await handler.send_unpause_to_player(player.mac)
         if ok:
             player.mode = "play"
+            player.pause_requested = False
+            # The displayed position continues at the pause point
+            # (Perl _JumpOrResume jumps to resumeTime, StreamingController.pm:1605-1614).
+            player.elapsed = float(getattr(player, "pause_time", 0.0) or 0.0)
             player.last_activity = time.time()
-            # Restore the pre-pause position for local tracks (live streams
-            # cannot be seeked and restart from the beginning).
-            if saved > 0 and not is_stream:
-                await self.seek_to(player_id, int(saved))
         return ok
 
     # ------------------------------------------------------------------

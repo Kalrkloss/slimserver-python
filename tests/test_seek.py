@@ -3,6 +3,11 @@
 Regression: the skip-ahead frame was a 13-byte stub (instead of the
 Perl 24-byte strm body with the skip interval in milliseconds in the
 replay-gain field), and resume restarted a track from position zero.
+
+The pause path itself is Perl ``strm 'p'`` / resume ``strm 'u'``
+(Squeezebox.pm:197-204, Squeezebox2.pm:1104-1110) — the stream is not
+re-fetched and the position is kept in the state, see
+``tests/test_pause_resume.py``.
 """
 
 import asyncio
@@ -32,6 +37,8 @@ class _FakeHandler:
         self.started = []   # track ids sent via send_strm_to_player
         self.skips = []     # seconds sent via send_skip_to_player
         self.stopped = []
+        self.paused = []
+        self.unpaused = []
 
     async def send_strm_to_player(self, mac, track_id):
         self.started.append(track_id)
@@ -42,6 +49,14 @@ class _FakeHandler:
 
     async def send_stop_to_player(self, mac):
         self.stopped.append(mac)
+        return True
+
+    async def send_pause_to_player(self, mac, pause_ms=0):
+        self.paused.append(mac)
+        return True
+
+    async def send_unpause_to_player(self, mac):
+        self.unpaused.append(mac)
         return True
 
     async def send_skip_to_player(self, mac, seconds):
@@ -97,7 +112,11 @@ def test_seek_to_forwards_to_skip_ahead():
     assert pm._protocol_handler.skips == [15]
 
 
-def test_resume_restores_position():
+def test_resume_continues_at_pause_position_without_restart():
+    """Perl resume() = ``strm 'u'`` (Squeezebox2.pm:1104-1110): the output
+    continues in place and the displayed position resumes at ``resumeTime``
+    (StreamingController.pm:1605-1614). The file must NOT be re-streamed
+    (no second /stream.mp3 GET) and no forward seek is issued."""
     pm = _fresh_pm()
     p = _player(pm)
     p.playlist = [1]
@@ -110,8 +129,14 @@ def test_resume_restores_position():
     async def run():
         assert await pm.pause_player(p.mac, True) is True
         assert p.mode == "pause"
+        assert p.pause_time == 60.0
         assert await pm.pause_player(p.mac, False) is True
 
     asyncio.run(run())
-    assert 1 in h.started        # track restarted
-    assert 60 in h.skips         # position restored via forward seek
+    assert p.mode == "play"
+    assert p.elapsed == 60.0          # continues at the pause point
+    assert h.paused == [p.mac]
+    assert h.unpaused == [p.mac]
+    assert h.started == []            # no restart → no second stream GET
+    assert h.skips == []              # no seek needed
+    assert h.stopped == []            # pause is not a stop

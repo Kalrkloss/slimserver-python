@@ -2391,7 +2391,18 @@ class SlimProtoClient:
                     # 'time' uses elapsed; prefer the ms field as Perl does
                     # (`elapsed_milliseconds / 1000`, Slimproto.pm:811-814).
                     try:
-                        player.elapsed = stat["elapsed_seconds_precise"]
+                        _elapsed = stat["elapsed_seconds_precise"]
+                        # A pause is NOT a stop: while paused the status must
+                        # keep reporting the frozen position (Perl
+                        # `playingSongElapsed` returns `resumeTime` when
+                        # paused, StreamingController.pm:1719-1724; the
+                        # playpoint is only extrapolated while isPlaying(1),
+                        # Squeezebox2.pm:456). So while the player is paused —
+                        # or is acking a pause (STMp/pause) — a STAT that
+                        # reports 0 must not zero the position.
+                        _pausing = event in ("STMp", "pause")
+                        if _elapsed or not (player.mode == "pause" or _pausing):
+                            player.elapsed = _elapsed
                     except Exception:
                         pass
                     # signal_strength follows Perl's rule (Slimproto.pm:468-478
@@ -2481,10 +2492,12 @@ class SlimProtoClient:
                         else:
                             player.pause_requested = False  # pause-ack
                     elif event == "STMp":
-                        # PAUSE ack. This firmware is paused with strm 'q'
-                        # (see manager.pause_player), i.e. its buffers are
-                        # gone — a resume MUST re-stream, so drop the guard.
-                        player.strm_sent_track = None
+                        # PAUSE ack. The player merely holds its output: the
+                        # stream (and the idempotency guard) stays valid, so
+                        # resume continues in place (strm 'u',
+                        # Squeezebox2.pm:1104-1110). The guard must only be
+                        # dropped where the player demonstrably lost the
+                        # stream (stop/track end/STMf/STMn).
                         player.mode = "pause"
                         player.pause_requested = False
                     elif event == "STMr":
@@ -2514,7 +2527,9 @@ class SlimProtoClient:
                             player.strm_sent_track = None
                             asyncio.create_task(_advance_after_track(pm, mac_str))
                     elif event == "pause":
-                        player.strm_sent_track = None
+                        # Player-initiated pause (the user pressed pause on
+                        # the device): the output is held, not closed — keep
+                        # mode and the guard so a resume does not re-stream.
                         player.mode = "pause"
                         player.pause_requested = False
                     elif event == "stop":

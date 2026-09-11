@@ -13,9 +13,19 @@ from lyrion.player.state import PlayerState
 class _FakeHandler:
     def __init__(self):
         self.stopped = []
+        self.paused = []
+        self.unpaused = []
 
     async def send_stop_to_player(self, mac):
         self.stopped.append(mac)
+        return True
+
+    async def send_pause_to_player(self, mac, pause_ms=0):
+        self.paused.append(mac)
+        return True
+
+    async def send_unpause_to_player(self, mac):
+        self.unpaused.append(mac)
         return True
 
     async def send_remote_stream(self, mac, url, codec):
@@ -70,8 +80,8 @@ def test_power_off_sends_stop_frame():
 
 
 def test_pause_sets_intent_that_stop_ack_must_not_overwrite():
-    """Pause = strm 'q' (firmware workaround); the player's STAT stop-ack
-    must keep mode 'pause' (protocol.py consumes pause_requested)."""
+    """Pause = strm 'p' (Squeezebox.pm:197-204); a stray STAT stop-ack must
+    keep mode 'pause' (protocol.py consumes pause_requested)."""
 
     async def run():
         pm = _fresh_pm()
