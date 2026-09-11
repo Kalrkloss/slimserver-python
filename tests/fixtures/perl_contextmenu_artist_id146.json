@@ -1,0 +1,238 @@
+{
+ "id": 1,
+ "method": "slim.request",
+ "params": [
+  "24:0a:c4:29:77:90",
+  [
+   "contextmenu",
+   0,
+   200,
+   "artist_id:146",
+   "menu:artist"
+  ]
+ ],
+ "result": {
+  "base": {
+   "actions": {
+    "go": {
+     "params": {
+      "menu": "artistinfo"
+     },
+     "itemsParams": "params",
+     "cmd": [
+      "artistinfo",
+      "items"
+     ]
+    },
+    "add": {
+     "itemsParams": "params",
+     "params": {
+      "menu": "artistinfo"
+     },
+     "player": 0,
+     "cmd": [
+      "artistinfo",
+      "playlist",
+      "add"
+     ]
+    },
+    "play": {
+     "itemsParams": "params",
+     "params": {
+      "menu": "artistinfo"
+     },
+     "nextWindow": "nowPlaying",
+     "player": 0,
+     "cmd": [
+      "artistinfo",
+      "playlist",
+      "play"
+     ]
+    },
+    "more": {
+     "params": {
+      "menu": "artistinfo"
+     },
+     "itemsParams": "params",
+     "window": {
+      "isContextMenu": 1
+     },
+     "cmd": [
+      "artistinfo",
+      "items"
+     ],
+     "player": 0
+    },
+    "add-hold": {
+     "params": {
+      "menu": "artistinfo"
+     },
+     "itemsParams": "params",
+     "cmd": [
+      "artistinfo",
+      "playlist",
+      "insert"
+     ],
+     "player": 0
+    },
+    "playControl": {
+     "cmd": [
+      "artistinfo",
+      "items"
+     ],
+     "player": 0,
+     "window": {
+      "isContextMenu": 1
+     },
+     "params": {
+      "_index": "0",
+      "_quantity": "200",
+      "artist_id": "146",
+      "menu": "artist"
+     },
+     "itemsParams": "playControlParams"
+    }
+   }
+  },
+  "window": {
+   "windowStyle": "text_list"
+  },
+  "count": 4,
+  "item_loop": [
+   {
+    "type": "text",
+    "actions": {
+     "play": {
+      "player": 0,
+      "cmd": [
+       "playlistcontrol"
+      ],
+      "params": {
+       "cmd": "add",
+       "artist_id": 146
+      },
+      "nextWindow": "parent"
+     },
+     "go": {
+      "player": 0,
+      "cmd": [
+       "playlistcontrol"
+      ],
+      "params": {
+       "cmd": "add",
+       "artist_id": 146
+      },
+      "nextWindow": "parent"
+     },
+     "add": {
+      "player": 0,
+      "cmd": [
+       "playlistcontrol"
+      ],
+      "params": {
+       "cmd": "add",
+       "artist_id": 146
+      },
+      "nextWindow": "parent"
+     }
+    },
+    "addAction": "go",
+    "style": "item_add",
+    "text": "Am Ende hinzufügen"
+   },
+   {
+    "text": "Als nächstes wiedergeben",
+    "style": "item_insert",
+    "type": "text",
+    "actions": {
+     "add": {
+      "nextWindow": "parent",
+      "params": {
+       "cmd": "insert",
+       "artist_id": 146
+      },
+      "cmd": [
+       "playlistcontrol"
+      ],
+      "player": 0
+     },
+     "go": {
+      "nextWindow": "parent",
+      "params": {
+       "cmd": "insert",
+       "artist_id": 146
+      },
+      "cmd": [
+       "playlistcontrol"
+      ],
+      "player": 0
+     },
+     "play": {
+      "nextWindow": "parent",
+      "params": {
+       "cmd": "insert",
+       "artist_id": 146
+      },
+      "cmd": [
+       "playlistcontrol"
+      ],
+      "player": 0
+     }
+    },
+    "addAction": "go"
+   },
+   {
+    "addAction": "go",
+    "actions": {
+     "play": {
+      "player": 0,
+      "cmd": [
+       "playlistcontrol"
+      ],
+      "params": {
+       "artist_id": 146,
+       "cmd": "load"
+      },
+      "nextWindow": "nowPlaying"
+     },
+     "go": {
+      "player": 0,
+      "cmd": [
+       "playlistcontrol"
+      ],
+      "params": {
+       "artist_id": 146,
+       "cmd": "load"
+      },
+      "nextWindow": "nowPlaying"
+     }
+    },
+    "type": "text",
+    "style": "itemplay",
+    "text": "Wiedergabe"
+   },
+   {
+    "text": "In Favoriten speichern",
+    "style": "item_fav",
+    "actions": {
+     "go": {
+      "player": 0,
+      "cmd": [
+       "jivefavorites",
+       "add"
+      ],
+      "params": {
+       "isContextMenu": 1,
+       "url": "db:contributor.name=Kein%20Interpret",
+       "title": "Kein Interpret"
+      }
+     }
+    },
+    "addAction": "go",
+    "type": "text"
+   }
+  ],
+  "title": "Kein Interpret",
+  "offset": 0
+ }
+}

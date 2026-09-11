@@ -1,0 +1,284 @@
+{
+ "id": 1,
+ "method": "slim.request",
+ "params": [
+  "24:0a:c4:29:77:90",
+  [
+   "contextmenu",
+   0,
+   200,
+   "playlist_index:0",
+   "menu:track",
+   "useContextMenu:1"
+  ]
+ ],
+ "result": {
+  "window": {
+   "windowStyle": "text_list"
+  },
+  "base": {
+   "actions": {
+    "add": {
+     "player": 0,
+     "cmd": [
+      "trackinfo",
+      "playlist",
+      "add"
+     ],
+     "itemsParams": "params",
+     "params": {
+      "url": "http://hirschmilch.de:7000/chillout.mp3",
+      "menu": "trackinfo",
+      "track_id": "-94115167819792"
+     }
+    },
+    "go": {
+     "cmd": [
+      "trackinfo",
+      "items"
+     ],
+     "params": {
+      "url": "http://hirschmilch.de:7000/chillout.mp3",
+      "menu": "trackinfo",
+      "track_id": "-94115167819792"
+     },
+     "itemsParams": "params"
+    },
+    "playControl": {
+     "window": {
+      "isContextMenu": 1
+     },
+     "player": 0,
+     "cmd": [
+      "trackinfo",
+      "items"
+     ],
+     "itemsParams": "playControlParams",
+     "params": {
+      "url": "http://hirschmilch.de:7000/chillout.mp3",
+      "playlist_index": "0",
+      "track_id": "-94115167819792",
+      "menu": "track",
+      "_index": "0",
+      "_quantity": "200",
+      "useContextMenu": "1"
+     }
+    },
+    "add-hold": {
+     "params": {
+      "url": "http://hirschmilch.de:7000/chillout.mp3",
+      "menu": "trackinfo",
+      "track_id": "-94115167819792"
+     },
+     "itemsParams": "params",
+     "cmd": [
+      "trackinfo",
+      "playlist",
+      "insert"
+     ],
+     "player": 0
+    },
+    "more": {
+     "window": {
+      "isContextMenu": 1
+     },
+     "player": 0,
+     "cmd": [
+      "trackinfo",
+      "items"
+     ],
+     "itemsParams": "params",
+     "params": {
+      "url": "http://hirschmilch.de:7000/chillout.mp3",
+      "menu": "trackinfo",
+      "track_id": "-94115167819792"
+     }
+    },
+    "play": {
+     "nextWindow": "nowPlaying",
+     "params": {
+      "url": "http://hirschmilch.de:7000/chillout.mp3",
+      "menu": "trackinfo",
+      "track_id": "-94115167819792"
+     },
+     "itemsParams": "params",
+     "cmd": [
+      "trackinfo",
+      "playlist",
+      "play"
+     ],
+     "player": 0
+    }
+   }
+  },
+  "offset": 0,
+  "title": "Hirschmilch Chillout",
+  "item_loop": [
+   {
+    "text": "Am Ende hinzufügen",
+    "style": "item_add",
+    "addAction": "go",
+    "actions": {
+     "play": {
+      "cmd": [
+       "playlistcontrol"
+      ],
+      "player": 0,
+      "params": {
+       "track_id": "-94115167819792",
+       "cmd": "add"
+      },
+      "nextWindow": "parent"
+     },
+     "add": {
+      "cmd": [
+       "playlistcontrol"
+      ],
+      "player": 0,
+      "params": {
+       "track_id": "-94115167819792",
+       "cmd": "add"
+      },
+      "nextWindow": "parent"
+     },
+     "go": {
+      "cmd": [
+       "playlistcontrol"
+      ],
+      "player": 0,
+      "params": {
+       "track_id": "-94115167819792",
+       "cmd": "add"
+      },
+      "nextWindow": "parent"
+     }
+    },
+    "type": "text"
+   },
+   {
+    "type": "text",
+    "actions": {
+     "play": {
+      "player": 0,
+      "cmd": [
+       "playlistcontrol"
+      ],
+      "nextWindow": "parent",
+      "params": {
+       "track_id": "-94115167819792",
+       "cmd": "insert"
+      }
+     },
+     "add": {
+      "player": 0,
+      "cmd": [
+       "playlistcontrol"
+      ],
+      "nextWindow": "parent",
+      "params": {
+       "track_id": "-94115167819792",
+       "cmd": "insert"
+      }
+     },
+     "go": {
+      "player": 0,
+      "cmd": [
+       "playlistcontrol"
+      ],
+      "nextWindow": "parent",
+      "params": {
+       "track_id": "-94115167819792",
+       "cmd": "insert"
+      }
+     }
+    },
+    "addAction": "go",
+    "text": "Als nächstes wiedergeben",
+    "style": "item_insert"
+   },
+   {
+    "type": "text",
+    "actions": {
+     "play": {
+      "player": 0,
+      "cmd": [
+       "playlistcontrol"
+      ],
+      "nextWindow": "nowPlaying",
+      "params": {
+       "track_id": "-94115167819792",
+       "cmd": "load"
+      }
+     },
+     "go": {
+      "player": 0,
+      "cmd": [
+       "playlistcontrol"
+      ],
+      "nextWindow": "nowPlaying",
+      "params": {
+       "track_id": "-94115167819792",
+       "cmd": "load"
+      }
+     }
+    },
+    "addAction": "go",
+    "style": "itemplay",
+    "text": "Wiedergabe"
+   },
+   {
+    "style": "item_fav",
+    "text": "Favorit löschen",
+    "addAction": "go",
+    "actions": {
+     "go": {
+      "params": {
+       "title": "Hirschmilch Chillout",
+       "url": "http://hirschmilch.de:7000/chillout.mp3",
+       "isContextMenu": 1,
+       "item_id": "0.0"
+      },
+      "player": 0,
+      "cmd": [
+       "jivefavorites",
+       "delete"
+      ]
+     }
+    },
+    "type": "text"
+   },
+   {
+    "style": "itemNoAction",
+    "text": "Interpret: Substan",
+    "action": "none",
+    "type": "text"
+   },
+   {
+    "actions": {
+     "go": {
+      "cmd": [
+       "trackinfo",
+       "items"
+      ],
+      "params": {
+       "url": "http://hirschmilch.de:7000/chillout.mp3",
+       "track_id": "-94115167819792",
+       "menu": "trackinfo",
+       "item_id": "e7c5660f.5",
+       "isContextMenu": 1
+      }
+     }
+    },
+    "addAction": "go",
+    "text": "Weitere Infos"
+   },
+   {
+    "type": "text",
+    "style": "itemNoAction",
+    "text": "Titel: Chasing The Light",
+    "action": "none"
+   }
+  ],
+  "count": 7
+ }
+}

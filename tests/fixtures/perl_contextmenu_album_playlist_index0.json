@@ -1,0 +1,15 @@
+{
+ "id": 1,
+ "method": "slim.request",
+ "params": [
+  "24:0a:c4:29:77:90",
+  [
+   "contextmenu",
+   0,
+   200,
+   "playlist_index:0",
+   "menu:album"
+  ]
+ ],
+ "result": {}
+}

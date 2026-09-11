@@ -1,0 +1,23 @@
+{
+ "id": 1,
+ "method": "slim.request",
+ "params": [
+  "24:0a:c4:29:77:90",
+  [
+   "contextmenu",
+   0,
+   200,
+   "playlist_index:0",
+   "menu:track",
+   "useContextMenu:1",
+   "xmlbrowserPlayControl:0"
+  ]
+ ],
+ "result": {
+  "offset": 0,
+  "count": 0,
+  "window": {
+   "windowStyle": "text_list"
+  }
+ }
+}

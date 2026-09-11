@@ -1,0 +1,282 @@
+{
+ "id": 1,
+ "method": "slim.request",
+ "params": [
+  "24:0a:c4:29:77:90",
+  [
+   "contextmenu",
+   0,
+   200,
+   "genre_id:2",
+   "menu:genre"
+  ]
+ ],
+ "result": {
+  "base": {
+   "actions": {
+    "go": {
+     "cmd": [
+      "genreinfo",
+      "items"
+     ],
+     "params": {
+      "menu": "genreinfo"
+     },
+     "itemsParams": "params"
+    },
+    "add": {
+     "player": 0,
+     "cmd": [
+      "genreinfo",
+      "playlist",
+      "add"
+     ],
+     "itemsParams": "params",
+     "params": {
+      "menu": "genreinfo"
+     }
+    },
+    "add-hold": {
+     "player": 0,
+     "cmd": [
+      "genreinfo",
+      "playlist",
+      "insert"
+     ],
+     "itemsParams": "params",
+     "params": {
+      "menu": "genreinfo"
+     }
+    },
+    "more": {
+     "cmd": [
+      "genreinfo",
+      "items"
+     ],
+     "player": 0,
+     "window": {
+      "isContextMenu": 1
+     },
+     "params": {
+      "menu": "genreinfo"
+     },
+     "itemsParams": "params"
+    },
+    "play": {
+     "itemsParams": "params",
+     "nextWindow": "nowPlaying",
+     "params": {
+      "menu": "genreinfo"
+     },
+     "player": 0,
+     "cmd": [
+      "genreinfo",
+      "playlist",
+      "play"
+     ]
+    },
+    "playControl": {
+     "window": {
+      "isContextMenu": 1
+     },
+     "cmd": [
+      "genreinfo",
+      "items"
+     ],
+     "player": 0,
+     "params": {
+      "_quantity": "200",
+      "_index": "0",
+      "menu": "genre",
+      "genre_id": "2"
+     },
+     "itemsParams": "playControlParams"
+    }
+   }
+  },
+  "window": {
+   "windowStyle": "text_list"
+  },
+  "count": 5,
+  "item_loop": [
+   {
+    "text": "Am Ende hinzufügen",
+    "style": "item_add",
+    "type": "text",
+    "actions": {
+     "play": {
+      "params": {
+       "cmd": "add",
+       "genre_id": 2
+      },
+      "nextWindow": "parent",
+      "cmd": [
+       "playlistcontrol"
+      ],
+      "player": 0
+     },
+     "add": {
+      "params": {
+       "cmd": "add",
+       "genre_id": 2
+      },
+      "nextWindow": "parent",
+      "cmd": [
+       "playlistcontrol"
+      ],
+      "player": 0
+     },
+     "go": {
+      "params": {
+       "cmd": "add",
+       "genre_id": 2
+      },
+      "nextWindow": "parent",
+      "cmd": [
+       "playlistcontrol"
+      ],
+      "player": 0
+     }
+    },
+    "addAction": "go"
+   },
+   {
+    "type": "text",
+    "actions": {
+     "play": {
+      "nextWindow": "parent",
+      "params": {
+       "cmd": "insert",
+       "genre_id": 2
+      },
+      "player": 0,
+      "cmd": [
+       "playlistcontrol"
+      ]
+     },
+     "go": {
+      "nextWindow": "parent",
+      "params": {
+       "cmd": "insert",
+       "genre_id": 2
+      },
+      "player": 0,
+      "cmd": [
+       "playlistcontrol"
+      ]
+     },
+     "add": {
+      "nextWindow": "parent",
+      "params": {
+       "cmd": "insert",
+       "genre_id": 2
+      },
+      "player": 0,
+      "cmd": [
+       "playlistcontrol"
+      ]
+     }
+    },
+    "addAction": "go",
+    "text": "Als nächstes wiedergeben",
+    "style": "item_insert"
+   },
+   {
+    "style": "itemplay",
+    "text": "Wiedergabe",
+    "type": "text",
+    "actions": {
+     "play": {
+      "nextWindow": "nowPlaying",
+      "params": {
+       "genre_id": 2,
+       "cmd": "load"
+      },
+      "player": 0,
+      "cmd": [
+       "playlistcontrol"
+      ]
+     },
+     "go": {
+      "nextWindow": "nowPlaying",
+      "params": {
+       "genre_id": 2,
+       "cmd": "load"
+      },
+      "player": 0,
+      "cmd": [
+       "playlistcontrol"
+      ]
+     }
+    },
+    "addAction": "go"
+   },
+   {
+    "type": "play",
+    "actions": {
+     "go": {
+      "params": {
+       "menu": 1,
+       "genres": "Keine%20Stilrichtung"
+      },
+      "nextWindow": "nowPlaying",
+      "cmd": [
+       "randomplay",
+       "track"
+      ],
+      "player": 0
+     },
+     "play": {
+      "player": 0,
+      "cmd": [
+       "randomplay",
+       "track"
+      ],
+      "nextWindow": "nowPlaying",
+      "params": {
+       "menu": 1,
+       "genres": "Keine%20Stilrichtung"
+      }
+     }
+    },
+    "addAction": "go",
+    "text": "Zufallsmix Stilrichtung Titel Keine Stilrichtung",
+    "style": "itemplay"
+   },
+   {
+    "type": "play",
+    "actions": {
+     "go": {
+      "player": 0,
+      "cmd": [
+       "randomplay",
+       "album"
+      ],
+      "nextWindow": "nowPlaying",
+      "params": {
+       "menu": 1,
+       "genres": "Keine%20Stilrichtung"
+      }
+     },
+     "play": {
+      "params": {
+       "menu": 1,
+       "genres": "Keine%20Stilrichtung"
+      },
+      "nextWindow": "nowPlaying",
+      "cmd": [
+       "randomplay",
+       "album"
+      ],
+      "player": 0
+     }
+    },
+    "addAction": "go",
+    "style": "itemplay",
+    "text": "Zufallsmix Stilrichtung Alben Keine Stilrichtung"
+   }
+  ],
+  "title": "Keine Stilrichtung",
+  "offset": 0
+ }
+}

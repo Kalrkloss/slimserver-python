@@ -1244,6 +1244,15 @@ class JSONRPCAPI:
         if cmd == "browselibrary":
             return await self._json_browselibrary(cmd, args)
 
+        # ── contextmenu (SqueezePlay press-and-hold context menus) ─────
+        # Perl parity: a *wrapper* around '<menu>info items <index> <qty>
+        # <params>' (Slim/Control/Queries.pm:6171 contextMenuQuery). Without
+        # this the modal window opened empty (black dialog, only X).
+        # See lyrion/web/contextmenu.py.
+        if cmd == "contextmenu":
+            from lyrion.web.contextmenu import handle_contextmenu
+            return await handle_contextmenu(self, pm, pid, args)
+
         # ── displaystatus (Squeezer subscribes with a request) ──────
         # Squeezer's parseDisplayStatus does getDataAsMap() — an
         # 'unknown command' list response crashes it. Empty map is fine.

@@ -1,0 +1,603 @@
+{
+ "id": 1,
+ "method": "slim.request",
+ "params": [
+  "24:0a:c4:29:77:90",
+  [
+   "contextmenu",
+   0,
+   200,
+   "track_id:51102",
+   "menu:track"
+  ]
+ ],
+ "result": {
+  "offset": 0,
+  "title": "007(Molotow Soda)",
+  "item_loop": [
+   {
+    "text": "Am Ende hinzufügen",
+    "style": "item_add",
+    "type": "text",
+    "actions": {
+     "go": {
+      "params": {
+       "track_id": 51102,
+       "cmd": "add"
+      },
+      "nextWindow": "parent",
+      "cmd": [
+       "playlistcontrol"
+      ],
+      "player": 0
+     },
+     "add": {
+      "params": {
+       "track_id": 51102,
+       "cmd": "add"
+      },
+      "nextWindow": "parent",
+      "cmd": [
+       "playlistcontrol"
+      ],
+      "player": 0
+     },
+     "play": {
+      "params": {
+       "track_id": 51102,
+       "cmd": "add"
+      },
+      "nextWindow": "parent",
+      "cmd": [
+       "playlistcontrol"
+      ],
+      "player": 0
+     }
+    },
+    "addAction": "go"
+   },
+   {
+    "text": "Als nächstes wiedergeben",
+    "style": "item_insert",
+    "type": "text",
+    "addAction": "go",
+    "actions": {
+     "go": {
+      "cmd": [
+       "playlistcontrol"
+      ],
+      "player": 0,
+      "params": {
+       "track_id": 51102,
+       "cmd": "insert"
+      },
+      "nextWindow": "parent"
+     },
+     "add": {
+      "cmd": [
+       "playlistcontrol"
+      ],
+      "player": 0,
+      "params": {
+       "track_id": 51102,
+       "cmd": "insert"
+      },
+      "nextWindow": "parent"
+     },
+     "play": {
+      "cmd": [
+       "playlistcontrol"
+      ],
+      "player": 0,
+      "params": {
+       "track_id": 51102,
+       "cmd": "insert"
+      },
+      "nextWindow": "parent"
+     }
+    }
+   },
+   {
+    "style": "itemplay",
+    "text": "Wiedergabe",
+    "actions": {
+     "go": {
+      "cmd": [
+       "playlistcontrol"
+      ],
+      "player": 0,
+      "params": {
+       "cmd": "load",
+       "track_id": 51102
+      },
+      "nextWindow": "nowPlaying"
+     },
+     "play": {
+      "cmd": [
+       "playlistcontrol"
+      ],
+      "player": 0,
+      "params": {
+       "cmd": "load",
+       "track_id": 51102
+      },
+      "nextWindow": "nowPlaying"
+     }
+    },
+    "addAction": "go",
+    "type": "text"
+   },
+   {
+    "type": "text",
+    "actions": {
+     "go": {
+      "player": 0,
+      "cmd": [
+       "jivefavorites",
+       "add"
+      ],
+      "params": {
+       "url": "file:///mnt/media/Musik/Metal/S/Sampler/PUNK/007(Molotow%20Soda).mp3",
+       "title": "007(Molotow Soda)",
+       "isContextMenu": 1
+      }
+     }
+    },
+    "addAction": "go",
+    "style": "item_fav",
+    "text": "In Favoriten speichern"
+   },
+   {
+    "presetParams": {
+     "favorites_url": "not a valid URL, but needed to make the ip3k UI work...",
+     "favorites_title": "Kein Interpret",
+     "favorites_type": "playlist"
+    },
+    "actions": {
+     "play": {
+      "nextWindow": "nowPlaying",
+      "params": {
+       "cmd": "load",
+       "artist_id": 146,
+       "library_id": "",
+       "menu": 1
+      },
+      "player": 0,
+      "cmd": [
+       "playlistcontrol"
+      ]
+     },
+     "more": {
+      "player": 0,
+      "cmd": [
+       "artistinfo",
+       "items"
+      ],
+      "window": {
+       "isContextMenu": 1
+      },
+      "params": {
+       "menu": 1,
+       "library_id": "",
+       "artist_id": 146
+      }
+     },
+     "add-hold": {
+      "cmd": [
+       "playlistcontrol"
+      ],
+      "player": 0,
+      "params": {
+       "cmd": "insert",
+       "library_id": "",
+       "menu": 1,
+       "artist_id": 146
+      }
+     },
+     "add": {
+      "player": 0,
+      "cmd": [
+       "playlistcontrol"
+      ],
+      "params": {
+       "cmd": "add",
+       "artist_id": 146,
+       "library_id": "",
+       "menu": 1
+      }
+     },
+     "go": {
+      "params": {
+       "artist_id": 146,
+       "menu": 1,
+       "library_id": "",
+       "mode": "albums"
+      },
+      "player": 0,
+      "cmd": [
+       "browselibrary",
+       "items"
+      ]
+     }
+    },
+    "type": "playlist",
+    "text": "Interpret: Kein Interpret"
+   },
+   {
+    "type": "playlist",
+    "presetParams": {
+     "favorites_url": "blabla",
+     "favorites_type": "playlist",
+     "favorites_title": "Kein Album"
+    },
+    "actions": {
+     "go": {
+      "params": {
+       "mode": "tracks",
+       "album_id": 45,
+       "menu": 1,
+       "library_id": ""
+      },
+      "player": 0,
+      "cmd": [
+       "browselibrary",
+       "items"
+      ]
+     },
+     "add": {
+      "params": {
+       "cmd": "add",
+       "library_id": "",
+       "menu": 1,
+       "album_id": 45
+      },
+      "cmd": [
+       "playlistcontrol"
+      ],
+      "player": 0
+     },
+     "more": {
+      "cmd": [
+       "albuminfo",
+       "items"
+      ],
+      "player": 0,
+      "window": {
+       "isContextMenu": 1
+      },
+      "params": {
+       "album_id": 45,
+       "library_id": "",
+       "menu": 1
+      }
+     },
+     "play": {
+      "player": 0,
+      "cmd": [
+       "playlistcontrol"
+      ],
+      "params": {
+       "album_id": 45,
+       "library_id": "",
+       "menu": 1,
+       "cmd": "load"
+      },
+      "nextWindow": "nowPlaying"
+     },
+     "add-hold": {
+      "params": {
+       "menu": 1,
+       "library_id": "",
+       "album_id": 45,
+       "cmd": "insert"
+      },
+      "player": 0,
+      "cmd": [
+       "playlistcontrol"
+      ]
+     }
+    },
+    "text": "Album: Kein Album"
+   },
+   {
+    "text": "Stilrichtung: Keine Stilrichtung",
+    "type": "playlist",
+    "actions": {
+     "go": {
+      "params": {
+       "mode": "artists",
+       "menu": 1,
+       "genre_id": 2,
+       "library_id": ""
+      },
+      "cmd": [
+       "browselibrary",
+       "items"
+      ],
+      "player": 0
+     },
+     "add": {
+      "params": {
+       "cmd": "add",
+       "menu": 1,
+       "library_id": "",
+       "genre_id": 2
+      },
+      "cmd": [
+       "playlistcontrol"
+      ],
+      "player": 0
+     },
+     "add-hold": {
+      "params": {
+       "cmd": "insert",
+       "genre_id": 2,
+       "library_id": "",
+       "menu": 1
+      },
+      "cmd": [
+       "playlistcontrol"
+      ],
+      "player": 0
+     },
+     "more": {
+      "params": {
+       "library_id": "",
+       "genre_id": 2,
+       "menu": 1
+      },
+      "window": {
+       "isContextMenu": 1
+      },
+      "cmd": [
+       "genreinfo",
+       "items"
+      ],
+      "player": 0
+     },
+     "play": {
+      "cmd": [
+       "playlistcontrol"
+      ],
+      "player": 0,
+      "params": {
+       "menu": 1,
+       "library_id": "",
+       "genre_id": 2,
+       "cmd": "load"
+      },
+      "nextWindow": "nowPlaying"
+     }
+    },
+    "presetParams": {
+     "favorites_url": "blabla",
+     "favorites_title": "Keine Stilrichtung",
+     "favorites_type": "playlist"
+    }
+   },
+   {
+    "text": "Plattenhülle anzeigen",
+    "type": "text",
+    "showBigArtwork": 1,
+    "actions": {
+     "go": {
+      "cmd": [
+       "trackinfo",
+       "items"
+      ],
+      "params": {
+       "track_id": "51102",
+       "menu": "trackinfo"
+      }
+     },
+     "do": {
+      "cmd": [
+       "artwork",
+       51102
+      ]
+     }
+    },
+    "addAction": "go"
+   },
+   {
+    "addAction": "go",
+    "actions": {
+     "go": {
+      "params": {
+       "isContextMenu": 1,
+       "item_id": "da4344e9.8",
+       "menu": "trackinfo",
+       "track_id": "51102"
+      },
+      "cmd": [
+       "trackinfo",
+       "items"
+      ]
+     }
+    },
+    "text": "Weitere Infos"
+   }
+  ],
+  "count": 9,
+  "window": {
+   "windowStyle": "text_list"
+  },
+  "base": {
+   "actions": {
+    "set-preset-2": {
+     "itemsParams": "presetParams",
+     "player": 0,
+     "cmd": [
+      "jivefavorites",
+      "set_preset",
+      "key:2"
+     ]
+    },
+    "set-preset-7": {
+     "cmd": [
+      "jivefavorites",
+      "set_preset",
+      "key:7"
+     ],
+     "player": 0,
+     "itemsParams": "presetParams"
+    },
+    "more": {
+     "window": {
+      "isContextMenu": 1
+     },
+     "cmd": [
+      "trackinfo",
+      "items"
+     ],
+     "player": 0,
+     "params": {
+      "menu": "trackinfo",
+      "track_id": "51102"
+     },
+     "itemsParams": "params"
+    },
+    "set-preset-3": {
+     "itemsParams": "presetParams",
+     "cmd": [
+      "jivefavorites",
+      "set_preset",
+      "key:3"
+     ],
+     "player": 0
+    },
+    "set-preset-4": {
+     "cmd": [
+      "jivefavorites",
+      "set_preset",
+      "key:4"
+     ],
+     "player": 0,
+     "itemsParams": "presetParams"
+    },
+    "set-preset-9": {
+     "itemsParams": "presetParams",
+     "cmd": [
+      "jivefavorites",
+      "set_preset",
+      "key:9"
+     ],
+     "player": 0
+    },
+    "play": {
+     "cmd": [
+      "trackinfo",
+      "playlist",
+      "play"
+     ],
+     "player": 0,
+     "nextWindow": "nowPlaying",
+     "params": {
+      "menu": "trackinfo",
+      "track_id": "51102"
+     },
+     "itemsParams": "params"
+    },
+    "add-hold": {
+     "player": 0,
+     "cmd": [
+      "trackinfo",
+      "playlist",
+      "insert"
+     ],
+     "itemsParams": "params",
+     "params": {
+      "menu": "trackinfo",
+      "track_id": "51102"
+     }
+    },
+    "add": {
+     "cmd": [
+      "trackinfo",
+      "playlist",
+      "add"
+     ],
+     "player": 0,
+     "params": {
+      "menu": "trackinfo",
+      "track_id": "51102"
+     },
+     "itemsParams": "params"
+    },
+    "go": {
+     "itemsParams": "params",
+     "params": {
+      "menu": "trackinfo",
+      "track_id": "51102"
+     },
+     "cmd": [
+      "trackinfo",
+      "items"
+     ]
+    },
+    "set-preset-0": {
+     "itemsParams": "presetParams",
+     "cmd": [
+      "jivefavorites",
+      "set_preset",
+      "key:0"
+     ],
+     "player": 0
+    },
+    "set-preset-8": {
+     "itemsParams": "presetParams",
+     "cmd": [
+      "jivefavorites",
+      "set_preset",
+      "key:8"
+     ],
+     "player": 0
+    },
+    "set-preset-6": {
+     "player": 0,
+     "cmd": [
+      "jivefavorites",
+      "set_preset",
+      "key:6"
+     ],
+     "itemsParams": "presetParams"
+    },
+    "set-preset-5": {
+     "player": 0,
+     "cmd": [
+      "jivefavorites",
+      "set_preset",
+      "key:5"
+     ],
+     "itemsParams": "presetParams"
+    },
+    "playControl": {
+     "itemsParams": "playControlParams",
+     "params": {
+      "_index": "0",
+      "_quantity": "200",
+      "track_id": "51102",
+      "menu": "track"
+     },
+     "player": 0,
+     "cmd": [
+      "trackinfo",
+      "items"
+     ],
+     "window": {
+      "isContextMenu": 1
+     }
+    },
+    "set-preset-1": {
+     "itemsParams": "presetParams",
+     "player": 0,
+     "cmd": [
+      "jivefavorites",
+      "set_preset",
+      "key:1"
+     ]
+    }
+   }
+  }
+ }
+}
