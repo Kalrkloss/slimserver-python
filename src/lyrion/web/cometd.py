@@ -24,7 +24,6 @@ import itertools
 import json
 import logging
 import time
-import uuid
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -45,6 +44,41 @@ class CometdClient:
 # Module-level manager singleton — lets the slimproto layer wake
 # /slim/serverstatus subscribers when players connect/disconnect.
 _manager: Optional["CometdManager"] = None
+
+
+def _is_glob(pattern: str) -> bool:
+    """True when ``pattern`` is a Bayeux channel pattern, not a channel.
+
+    SqueezePlay/jive registers the catch-all ``/<clientId>/**`` via
+    /meta/subscribe (Comet.lua:702) in addition to its targeted
+    /slim/subscribe response channels. A pattern is only a channel
+    *matcher* — it must never be dispatched as a query.
+    """
+    return pattern in ("**", "/**") or pattern.endswith("/**") \
+        or pattern.endswith("/*")
+
+
+def _channel_matches(pattern: str, channel: str) -> bool:
+    """Bayeux channel matching, mirroring Perl
+    Slim::Web::Cometd::Manager::add_channels:
+
+    - ``/foo/**`` -> ``^/foo/``  (matches /foo/bar, /foo/bar/boo, not /foo)
+    - ``/foo/*``  -> ``^/foo/[^/]+``
+    - anything else matches the channel exactly.
+
+    The bare ``**`` / ``/**`` forms match every channel (SqueezePlay's
+    catch-all; Perl stores them as-is and RegexpHash matches them).
+    """
+    if pattern == channel:
+        return True
+    if pattern in ("**", "/**"):
+        return True
+    if pattern.endswith("/**"):
+        return channel.startswith(pattern[:-len("/**")] + "/")
+    if pattern.endswith("/*"):
+        head = pattern[:-1]  # '/foo/'
+        return channel.startswith(head) and len(channel) > len(head)
+    return False
 
 
 def _set_manager(mgr: "CometdManager") -> None:
@@ -110,6 +144,29 @@ class CometdManager:
     def remove(self, client_id: str) -> None:
         self._clients.pop(client_id, None)
 
+    def _matched_channels(self, client: CometdClient,
+                          base_channels: list[str]) -> dict[str, dict]:
+        """Return {concrete_event_channel: stored_subscription_data}.
+
+        ``base_channels`` are the real channels an event can be sent on,
+        most-specific first (e.g. ``/<cid>/slim/serverstatus`` then
+        ``/slim/serverstatus``). A client is included when any of its
+        subscriptions matches one of them — exact channels and Bayeux
+        globs alike. An exact subscription wins over a glob for the same
+        channel so the stored request (pagination/subscribe:N/tags) is
+        preserved. Result is de-duplicated, so a client holding both
+        ``/<cid>/**`` and the targeted channel gets the event exactly
+        once (Perl delivers to the matched channel, not per-channel).
+        """
+        matched: dict[str, dict] = {}
+        for sub, data in list(client.subscriptions.items()):
+            for channel in base_channels:
+                if sub == channel or _channel_matches(sub, channel):
+                    if channel not in matched or sub == channel:
+                        matched[channel] = data if isinstance(data, dict) else {}
+                    break
+        return matched
+
     def push(self, client_id: str, event: dict) -> None:
         client = self._clients.get(client_id)
         if client is None:
@@ -118,21 +175,26 @@ class CometdManager:
         client.notify.set()
 
     async def notify_server_status(self) -> None:
-        """Push a fresh serverstatus to all /slim/serverstatus subscribers.
+        """Push a fresh serverstatus to all serverstatus subscribers.
 
         Called when players connect/disconnect so subscribed controllers
         (Jive/SqueezeCtrl/ioBroker) see the player list change.
+
+        Routing is glob-aware: a client registered for ``/<cid>/**``
+        (SqueezePlay's catch-all) receives the event on the concrete
+        ``/<cid>/slim/serverstatus`` channel, matching Perl's
+        manager->deliver_events() channel matching.
         """
         for client in list(self._clients.values()):
-            for sub, data in list(client.subscriptions.items()):
-                if "serverstatus" not in sub:
-                    continue
+            base = [f"/{client.client_id}/slim/serverstatus",
+                    "/slim/serverstatus"]
+            for channel, data in self._matched_channels(client, base).items():
                 try:
                     request = (data.get("request") if isinstance(data, dict)
                                else None) or ["", ["serverstatus", "0", "100"]]
                     result = await self._dispatch(request)
                     self.push(client.client_id, {
-                        "channel": sub,
+                        "channel": channel,
                         "data": result,
                         "id": 0,
                     })
@@ -144,28 +206,42 @@ class CometdManager:
 
         Called by the slimproto layer on every STAT change so the
         Android controllers (SqueezeCtrl, Orange Squeeze, Squeezer) get
-        the new state immediately instead of on their next poll.
+        the new state immediately instead of on their next poll. This is
+        the push that moves SqueezePlay's play/pause icon, so it must
+        fire exactly once per subscription and on the subscribed channel.
         """
         for client in list(self._clients.values()):
-            for sub in list(client.subscriptions.keys()):
-                if "playerstatus" not in sub and "status/" not in sub:
-                    continue
-                parts = sub.split("/")
-                sub_player = parts[-1] if len(parts) >= 2 else ""
-                # Match the changed player. The /null/... and
-                # 00:00:00:00:00:00 forms (SqueezeCtrl) are app-chosen and
-                # player-agnostic — deliver to them for ANY player change.
-                if sub_player and sub_player not in (
-                        player_id, "null", "00:00:00:00:00:00", ""):
-                    continue
+            targets: dict[str, dict] = {}
+            base = [f"/{client.client_id}/slim/playerstatus/{player_id}",
+                    f"/slim/playerstatus/{player_id}"]
+            for sub, data in list(client.subscriptions.items()):
+                if _is_glob(sub):
+                    # e.g. /<cid>/** or /<cid>/slim/playerstatus/* — deliver
+                    # on the concrete channel the pattern matches.
+                    for channel in base:
+                        if _channel_matches(sub, channel):
+                            targets.setdefault(channel, data)
+                elif "playerstatus" in sub or "status/" in sub:
+                    parts = sub.split("/")
+                    sub_player = parts[-1] if len(parts) >= 2 else ""
+                    # Match the changed player. The /null/... and
+                    # 00:00:00:00:00:00 forms (SqueezeCtrl) are app-chosen
+                    # and player-agnostic — deliver to them for ANY player
+                    # change.
+                    if sub_player and sub_player not in (
+                            player_id, "null", "00:00:00:00:00:00", ""):
+                        continue
+                    targets.setdefault(sub, data)
+            for channel, data in targets.items():
                 try:
                     # Re-dispatch the ORIGINAL stored request (pagination/
                     # menu/tags preserved) instead of a fixed short one.
-                    data = client.subscriptions.get(sub) or {}
-                    request = data.get("request") or [player_id, ["playerstatus", "-", "1"]]
+                    request = (data.get("request") if isinstance(data, dict)
+                               else None) or [player_id,
+                                              ["playerstatus", "-", "1"]]
                     result = await self._dispatch(request)
                     self.push(client.client_id, {
-                        "channel": sub,
+                        "channel": channel,
                         "data": result,
                         "id": 0,
                     })
@@ -296,7 +372,15 @@ class CometdManager:
                     # SqueezeCtrl subscribes to /slim/serverstatus WITHOUT
                     # a request — deliver the player list anyway.
                     request = data.get("request") or []
-                    if not request and "serverstatus" in subscription:
+                    if not request and _is_glob(subscription):
+                        # A pure Bayeux pattern (jive's /<cid>/** via
+                        # /meta/subscribe) registers the channel ONLY —
+                        # Perl's add_channels() never dispatches a query
+                        # for a pattern, and dispatching one emitted a
+                        # junk event on the pattern channel that Jive
+                        # logged as "event we aren't subscribed to".
+                        request = []
+                    elif not request and "serverstatus" in subscription:
                         request = ["", ["serverstatus", "0", "100", "subscribe:60"]]
                     elif not request and "menustatus" in subscription:
                         # Squeezer subscribes to /<cid>/slim/menustatus/*
@@ -312,14 +396,15 @@ class CometdManager:
                         parts = subscription.split("/")
                         sub_player = parts[-1] if len(parts) >= 2 else ""
                         request = [sub_player, ["playerstatus", "-", "1"]]
-                    result = await self._dispatch(request)
-                    self.push(cid, {
-                        "channel": subscription,
-                        "data": result,
-                        # SqueezeClient's Message class requires id: Int
-                        # — a missing id breaks the whole array parse.
-                        "id": msg.get("id", ""),
-                    })
+                    if request:
+                        result = await self._dispatch(request)
+                        self.push(cid, {
+                            "channel": subscription,
+                            "data": result,
+                            # SqueezeClient's Message class requires id: Int
+                            # — a missing id breaks the whole array parse.
+                            "id": msg.get("id", ""),
+                        })
                 reply.update({"successful": client is not None, "error": None})
                 # libcometd (SqueezeClient) requires the subscription
                 # field in the ack — otherwise 'Subscription response
@@ -398,16 +483,6 @@ class CometdManager:
         events = client.events
         client.events = []
         return events
-
-    async def peek_events(self, client_id: str) -> list[dict]:
-        """Return queued events WITHOUT clearing them. Jive clients
-        expect request results in the POST reply, while SqueezeClient
-        receives them via the open stream — so the native server sends
-        them in the reply AND leaves them queued for the push_task."""
-        client = self.get(client_id)
-        if client is None:
-            return []
-        return list(client.events)
 
     async def _dispatch(self, request: list) -> dict:
         """Dispatch a slim.request payload and return the result dict.

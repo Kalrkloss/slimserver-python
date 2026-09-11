@@ -216,14 +216,23 @@ async def _handle_connection(manager, reader: asyncio.StreamReader,
                                             if isinstance(m, dict)
                                             and m.get("channel") == "/meta/connect"]
                                 if nconnect:
-                                    # new connect while streaming — answer
-                                    # inline (events flow via push_task)
+                                    # New connect while streaming — answer as
+                                    # a proper CHUNK (the connection body is
+                                    # Transfer-Encoding: chunked; a bare JSON
+                                    # write would corrupt the frame). Keep the
+                                    # acks from the same batch so a pipelined
+                                    # subscribe/request is not left
+                                    # unacknowledged; result events themselves
+                                    # flow via push_task (exactly once).
                                     nc = nconnect[0]
-                                    writer.write(json.dumps([
-                                        {"channel": "/meta/connect",
-                                         "successful": True,
-                                         "clientId": nc.get("clientId", ""),
-                                         "id": nc.get("id", "")}]).encode())
+                                    payload = list(nreplies) + [{
+                                        "channel": "/meta/connect",
+                                        "successful": True,
+                                        "clientId": nc.get("clientId", ""),
+                                        "id": nc.get("id", "")}]
+                                    nchunk = json.dumps(payload).encode("utf-8")
+                                    writer.write(f"{len(nchunk):x}\r\n".encode()
+                                                 + nchunk + b"\r\n")
                                     await writer.drain()
                                 else:
                                     # Non-connect POSTs (slim/request
