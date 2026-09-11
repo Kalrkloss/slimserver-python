@@ -52,6 +52,8 @@ NO_UCM_FIXTURE = "perl_browselibrary_playcontrol_no_usecontextmenu.json"
 ALBUM_TAP_FIXTURE = "perl_browselibrary_playcontrol_albums.json"
 OUT_OF_RANGE_FIXTURE = "perl_browselibrary_playcontrol_index_out_of_range.json"
 NON_NUMERIC_FIXTURE = "perl_browselibrary_playcontrol_index_non_numeric.json"
+UNICODE_DIGIT_FIXTURE = "perl_browselibrary_playcontrol_index_unicode_digit.json"
+EXPONENT_FIXTURE = "perl_browselibrary_playcontrol_index_exponent.json"
 
 # Temp-DB rows (NOT Perl data): album_id:45 → tracks 10 then 11, ordered by
 # tracknum. The Perl library's album 45 ("Kein Album", 6143 tracks) starts
@@ -355,13 +357,15 @@ def test_tap_on_album_row_serves_the_menu(_lib_db):
 
 
 def test_negative_index_returns_empty_menu(_lib_db):
-    """P3: Perl computes ``$i = -1 - offset < 0`` → count 0, empty menu."""
+    """P3/P4: Perl computes ``$i = -1 - offset < 0`` → count 0 and **omits
+    the ``item_loop`` key entirely** (the fixture's result has exactly the
+    keys count/offset/window; live probe 192.168.1.90:9000 confirms)."""
     args = TAP_ARGS + ["xmlbrowserPlayControl:-1"]
     res = _browse(args)
     perl = _perl_result(OUT_OF_RANGE_FIXTURE, args)
 
-    assert res == {"window": perl["window"], "offset": 0, "count": 0,
-                   "item_loop": []}
+    assert res == {"window": perl["window"], "offset": 0, "count": 0}
+    assert set(res) == set(perl) == {"count", "offset", "window"}
     assert perl["count"] == 0
 
 
@@ -446,3 +450,125 @@ def test_slim_request_dispatch_reaches_the_play_control_menu(_lib_db):
     assert [it["text"] for it in res["item_loop"]] == MENU_TEXTS_3
     assert {it["actions"]["go"]["params"]["track_id"]
             for it in res["item_loop"]} == {"10"}
+
+
+# ---------------------------------------------------------------------------
+# R0.5-menu-FIX — Perl number semantics of xmlbrowserPlayControl, numeric
+# genre_id, and the omitted item_loop key.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("token,expected", [
+    # Perl: $i = 0 + $token (XMLBrowser.pm:808, ``$xmlbrowserPlayControl -
+    # $subFeed->{offset}``). Verified locally:
+    #   perl -e 'no warnings; print 0 + $s'
+    ("0", 0),
+    ("abc", 0),
+    ("", 0),
+    ("+", 0),
+    ("-", 0),
+    ("-1", -1),
+    ("  3x", 3),          # leading whitespace skipped, stops at 'x'
+    ("+7", 7),
+    ("2.9", 2),           # fraction kept, int use truncates toward zero
+    (".5", 0),
+    ("1.", 1),
+    ("010", 10),          # not octal
+    ("0x10", 0),          # Perl stops at 'x' → 0
+    ("\u0662", 0),        # Arabic-Indic ٢ is NOT an ASCII digit → 0
+    ("1\u0662", 1),       # ASCII prefix wins, stops at the Unicode digit
+    ("1e3", 1000),        # Perl accepts exponent notation
+    ("-2.5e1", -25),
+])
+def test_playctl_index_follows_perl_numification(token, expected):
+    """P3 (R0.5): the token is fed into arithmetic, so the longest leading
+    *ASCII* number wins and everything else is 0. Python's ``\\d`` used to
+    accept Unicode digits (``٢`` → 2) and the regex missed exponents."""
+    assert api_mod._playctl_index(token) == expected
+
+
+def test_playctl_index_huge_token_is_out_of_range_not_an_error():
+    """P3 (R0.5): Perl keeps the value as a double, so a token longer than a
+    double overflows to ±Inf (``perl -e 'print 0 + "9"x5000'`` → ``Inf``) —
+    out of range, not an error. The old ``int()`` raised at 4300 digits,
+    turning the request into a JSON-RPC ``-32603`` instead of ``count 0``."""
+    huge = api_mod._playctl_index("9" * 5000)
+    assert isinstance(huge, int) and huge > 10 ** 6
+    assert api_mod._playctl_index("-" + "9" * 5000) < -10 ** 6
+
+
+def test_unicode_digit_index_addresses_item_zero(_lib_db):
+    """P3 (R0.5): ``xmlbrowserPlayControl:٢`` → Perl ``0 + "٢" == 0`` → the
+    tap addresses item 0 (3-item menu). Fixture = live Perl probe
+    192.168.1.90:9000. Python's ``\\d`` used to match the Unicode digit and
+    address row 2 → empty menu."""
+    args = TAP_ARGS + ["xmlbrowserPlayControl:\u0662"]
+    res = _browse(args)
+    perl = _perl_result(UNICODE_DIGIT_FIXTURE, args)
+
+    assert res["count"] == perl["count"] == 3
+    assert [it["text"] for it in res["item_loop"]] == MENU_TEXTS_3
+    assert [it["style"] for it in res["item_loop"]] == \
+        [it["style"] for it in perl["item_loop"]]
+    assert {i["actions"]["go"]["params"]["track_id"]
+            for i in res["item_loop"]} == {"10"}
+
+
+def test_exponent_index_is_out_of_range_and_omits_item_loop(_lib_db):
+    """P3+P4 (R0.5): ``xmlbrowserPlayControl:1e3`` → Perl ``0 + "1e3" ==
+    1000`` → out of range: count 0 and **no** ``item_loop`` key. Fixture =
+    live Perl probe 192.168.1.90:9000."""
+    args = TAP_ARGS + ["xmlbrowserPlayControl:1e3"]
+    res = _browse(args)
+    perl = _perl_result(EXPONENT_FIXTURE, args)
+
+    assert res["count"] == perl["count"] == 0
+    assert "item_loop" not in res
+    assert set(res) == set(perl) == {"count", "offset", "window"}
+
+
+def test_huge_playcontrol_token_renders_empty_menu_without_rpc_error(_lib_db):
+    """P3+P4 (R0.5): a 5000-digit token must answer ``count 0`` without an
+    ``item_loop`` — not raise (Python ``int()`` digit limit) into a JSON-RPC
+    ``-32603``. Live Perl probe: count 0, no item_loop."""
+    token = "xmlbrowserPlayControl:" + "9" * 5000
+    res = _browse(TAP_ARGS + [token])
+    assert res["count"] == 0
+    assert "item_loop" not in res
+    # …and through the real JSON-RPC entry (this used to raise → -32603):
+    out = asyncio.run(JSONRPCAPI()._slim_request(
+        "1c:87:2c:47:fc:36",
+        ["browselibrary", "items", "0", "1", "menu:1", "mode:tracks",
+         "album_id:45", "useContextMenu:1", token]))
+    assert out["count"] == 0
+    assert "item_loop" not in out
+
+
+def test_genre_menu_uses_numeric_stable_ids(_lib_db):
+    """P3 (R0.5): Perl sends a NUMERIC ``genre_id`` (live probe: the genres
+    menu carries ``commonParams.genre_id "497"``, the tap params
+    ``{genre_id: "497", role_id: "ALBUMARTIST"}``). Our ``genres`` table is
+    empty (LIB-10/R5), so the id is the **index into the sorted DISTINCT
+    genre-text list** — numeric and stable, and the exact index
+    ``_genre_id_to_text``/``_library_rows``/``_expand_track_ids`` resolve.
+    Documented divergence: it is NOT Perl's real genre id."""
+    res = _browse(["items", "0", "10", "menu:1", "mode:genres"])
+    ids = [it["commonParams"]["genre_id"] for it in res["item_loop"]]
+    # temp DB DISTINCT genres sorted NOCASE: Jazz (0), Rock (1)
+    assert ids == ["0", "1"]
+    assert all(str(g).isdigit() for g in ids)
+
+    # tap on genre row 0 → numeric genre_id + role_id (Perl shape)
+    tap = _browse(["items", "0", "1", "menu:1", "mode:genres",
+                   "useContextMenu:1", "xmlbrowserPlayControl:0"])
+    params = {i["actions"]["go"]["params"]["genre_id"]
+              for i in tap["item_loop"]}
+    assert params == {"0"}
+    assert {i["actions"]["go"]["params"]["role_id"]
+            for i in tap["item_loop"]} == {"ALBUMARTIST"}
+
+    # the numeric id roundtrips: genre_id:0 → Jazz → album 46 (track 12)
+    drill = _browse(["items", "0", "10", "menu:1", "mode:albums",
+                     "genre_id:0"])
+    assert [it["commonParams"]["album_id"] for it in drill["item_loop"]] == \
+        ["46"]

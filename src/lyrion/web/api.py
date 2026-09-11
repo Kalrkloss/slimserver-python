@@ -66,15 +66,56 @@ def _db_query(sql: str, params: tuple = ()) -> list[dict]:
         con.close()
 
 
+# Perl's numeric conversion of a string (``0 + $str``): skip leading
+# whitespace, then the longest leading ASCII number — optional sign,
+# integer/fraction part and exponent (``"1e3"`` → 1000, ``"2.9"`` → 2.9,
+# ``"010"`` → 10, ``"0x10"`` stops at 'x' → 0). A Unicode digit is NOT a
+# digit (``"٢"`` → 0) and anything without a leading number is 0.
+_PLAYCTL_NUM_RE = re.compile(
+    r"[ \t]*([+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?)")
+# Perl holds the value as a double, so a token longer than a double
+# overflows to ±Inf and is out of range. Keep that as a plain int sentinel
+# (never a float, never a Python ``int()`` digit-limit error).
+_PLAYCTL_INF = 1 << 62
+
+
 def _playctl_index(value: str) -> int:
     """Coerce the ``xmlbrowserPlayControl`` token the way Perl does.
 
     Perl feeds the raw param into arithmetic (``$i = $xmlbrowserPlayControl
-    - $subFeed->{offset}``, Slim/Control/XMLBrowser.pm:808): a leading
-    number is used, anything else becomes 0, so ``"abc"`` addresses item 0
-    and ``"-1"`` stays negative (→ out of range)."""
-    m = re.match(r"\s*([+-]?\d+)", str(value))
-    return int(m.group(1)) if m else 0
+    - $subFeed->{offset}``, Slim/Control/XMLBrowser.pm:808), so the token
+    numifies exactly like ``0 + $str``: a leading number is used, anything
+    else becomes 0 (``"abc"`` → item 0, ``"-1"`` stays negative → out of
+    range). Two divergences from naive ``int()``/``\\d`` are deliberate and
+    live-probed against Perl 9.1.1:
+
+    * ``"٢"`` (Arabic-Indic 2) is *not* an ASCII digit → 0 (item 0), while
+      Python's ``\\d`` matched it and addressed row 2;
+    * a very long number (5000 digits) overflows a double to ``Inf`` →
+      out of range (``count 0``, no ``item_loop``), while Python ``int()``
+      raised and turned the request into JSON-RPC ``-32603``.
+    """
+    m = _PLAYCTL_NUM_RE.match(str(value))
+    if not m:
+        return 0
+    text = m.group(1)
+    try:
+        # Perl keeps plain integer tokens exact (IV/UV). Python's only limit
+        # is the int/str digit cap (~4300) — beyond that (and for any
+        # exponent form, which is not an int literal) fall through to the
+        # double path below.
+        return int(text)
+    except ValueError:
+        pass
+    try:
+        num = float(text)
+    except ValueError:  # cannot happen for the matched ASCII form
+        return 0
+    if num == float("inf"):
+        return _PLAYCTL_INF
+    if num == float("-inf"):
+        return -_PLAYCTL_INF
+    return int(num)  # int use truncates toward zero, like Perl
 
 
 def _genre_id_to_text(genre_id) -> str:
@@ -3053,8 +3094,12 @@ class JSONRPCAPI:
         window = {"windowStyle": "text_list"}
         pos = index - start
         if pos < 0 or pos >= len(rows):
-            return {"window": window, "offset": 0, "count": 0,
-                    "item_loop": []}
+            # Perl only adds item_loop inside the in-range branch
+            # (XMLBrowser.pm:813-830); out of range it returns just
+            # window/offset/count (live probe + fixture: keys are exactly
+            # ['count', 'offset', 'window']). Clients read item_loop via
+            # ``.get``, so omitting the key is safe.
+            return {"window": window, "offset": 0, "count": 0}
         row = rows[pos]
         if kind == "tracks":
             target: dict = {"track_id": str(row["id"])}
@@ -3201,12 +3246,23 @@ class JSONRPCAPI:
                              "AND tc.role = 1")
             return rows, total, "artists_loop", "artists"
         if mode == "genres":
-            # The genres table is not populated by the importer — use the
-            # track genre text, and expose it as a string id so the renderer
-            # (which reads r["id"]) never hits a KeyError.
-            rows = q("SELECT DISTINCT genre AS genre, genre AS id FROM tracks "
-                     "WHERE genre != '' ORDER BY genre COLLATE NOCASE "
-                     "LIMIT ? OFFSET ?", count, start)
+            # The genres table is not populated by the importer (LIB-10/R5),
+            # so there is no real numeric genre id to hand out. Perl sends a
+            # NUMERIC ``genre_id`` (live probe 192.168.1.90: the genre row is
+            # ``commonParams.genre_id "497"``; the tap params
+            # ``{genre_id: "497", role_id: "ALBUMARTIST"}``). We expose the
+            # index into the sorted DISTINCT genre-text list instead: NUMERIC
+            # and STABLE, derived from the DB (ROW_NUMBER over the same
+            # ``ORDER BY genre COLLATE NOCASE`` used by _genre_id_to_text and
+            # the genre drill filters), so ``genre_id:<n>`` round-trips to
+            # exactly that genre text. DOCUMENTED DIVERGENCE: this is not
+            # Perl's real genre id, only a stable local id.
+            rows = q("SELECT genre, "
+                     "ROW_NUMBER() OVER (ORDER BY genre COLLATE NOCASE) - 1 "
+                     "AS id FROM (SELECT DISTINCT genre FROM tracks "
+                     "WHERE genre != '') "
+                     "ORDER BY genre COLLATE NOCASE LIMIT ? OFFSET ?",
+                     count, start)
             total = total_of("SELECT COUNT(DISTINCT genre) FROM tracks "
                              "WHERE genre != ''")
             return rows, total, "genres_loop", "genres"

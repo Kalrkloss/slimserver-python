@@ -1,0 +1,25 @@
+{
+ "params": [
+  "1c:87:2c:47:fc:36",
+  [
+   "browselibrary",
+   "items",
+   "0",
+   "1",
+   "menu:1",
+   "mode:tracks",
+   "album_id:45",
+   "useContextMenu:1",
+   "xmlbrowserPlayControl:1e3"
+  ]
+ ],
+ "id": 1,
+ "method": "slim.request",
+ "result": {
+  "offset": 0,
+  "count": 0,
+  "window": {
+   "windowStyle": "text_list"
+  }
+ }
+}
