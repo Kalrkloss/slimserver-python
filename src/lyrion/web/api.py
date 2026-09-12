@@ -591,6 +591,9 @@ _JIVE_STRINGS: dict[str, str] = {
     "JIVE_OVERWRITE_PRESET_X": "Replace %s?",              # :22445
     "ADD": "Add",                                          # :11263
     "DELETE": "Delete",                                    # :16045
+    # Plugin-Tabelle (Favorites/strings.txt:3, DE „Favoriten“) und HOME (:3140)
+    "FAVORITES": "Favorites",
+    "HOME": "Home",                                        # :3140
 }
 
 #: Perl-Defaults der Helligkeits-Prefs je Displayklasse
@@ -617,13 +620,15 @@ _JIVE_QUERY_COMMANDS = frozenset({
 def _jive_string(key: str) -> str:
     """Perl ``$client->string($key)`` (Slim/Utils/Strings.pm:525-536).
 
-    Perl macht ``uc($token)`` vor dem Lookup ('light' → 'LIGHT'); ohne
-    geladene Übersetzungstabelle liefert die Registry den englischen Fallback
-    aus strings.txt (Default des Aufrufs).
+    Perl macht ``uc($token)`` vor dem Lookup ('light' → 'LIGHT'). Die aktive
+    Sprache kommt aus dem Server-Pref ``language`` (Strings.pm:622-624); ein
+    fehlender DE-Key fällt auf die Failsafe-Sprache EN zurück
+    (Strings.pm:414-416) und danach auf unser bisheriges englisches Literal.
     """
-    from lyrion.utils.strings import get_string
+    from lyrion.i18n import get_string, resolve_language
     token = str(key).upper()
-    return get_string(token, default=_JIVE_STRINGS.get(token, token))
+    return get_string(token, lang=resolve_language(),
+                      default=_JIVE_STRINGS.get(token, token))
 
 
 def _jive_params(args, names: list[str]) -> tuple[dict, dict]:
@@ -1664,7 +1669,7 @@ class JSONRPCAPI:
                     loop, playcontrol_params=tagged)
             resp = self._browse_response(loop)
             # LMS reference: 'title' on the response level.
-            resp["title"] = "Favorites"
+            resp["title"] = _jive_string("FAVORITES")
             return resp
         except Exception:
             from lyrion.web import favorites_menu
@@ -1672,7 +1677,7 @@ class JSONRPCAPI:
                    for a in (rest or [])):
                 return favorites_menu.render_favorites_menu([])
             resp = self._browse_response([])
-            resp["title"] = "Favorites"
+            resp["title"] = _jive_string("FAVORITES")
             return resp
 
     async def _displaystatus(self, pid: str | None, args: list[str]) -> dict:
@@ -1942,8 +1947,8 @@ class JSONRPCAPI:
                 "count": len(items),
                 # SqueezeClient's JiveHomeItemListResponse requires offset
                 "offset": start,
-                "base": {"id": "", "name": "Home"},
-                "title": "Home",
+                "base": {"id": "", "name": _jive_string("HOME")},
+                "title": _jive_string("HOME"),
             }
 
         # ── menustatus (Squeezer format: [?, items, directive, player]) ──
