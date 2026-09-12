@@ -133,11 +133,13 @@ def test_proxy_get_reports_a_dead_web_app():
     assert b"502" in asyncio.run(go())
 
 
-def test_proxy_get_announces_the_close_to_the_client():
-    """Jive pools the thumbnail socket: closing it silently made the next
-    request die as '_getArtworkThumbSink(...) error: keep-alive timeout'
-    (live client log). The proxied response must say Connection: close and
-    must not forward the upstream's keep-alive headers."""
+def test_proxy_get_keeps_the_client_connection_reusable():
+    """Jive POOLS the thumbnail socket and drops every queued request when
+    we close it (live client log: '_getArtworkThumbSink(...) error:
+    keep-alive timeout', only placeholder icons). The proxied response must
+    therefore NOT announce a close and must not forward the upstream's
+    connection headers — the client frames the body itself (Content-Length
+    or chunked)."""
 
     async def origin(reader, writer):
         await reader.readuntil(b"\r\n\r\n")
@@ -164,6 +166,7 @@ def test_proxy_get_announces_the_close_to_the_client():
 
     data = asyncio.run(go())
     head = data.split(b"\r\n\r\n", 1)[0].lower()
-    assert b"connection: close" in head
+    assert b"connection:" not in head, "must not close the pooled connection"
     assert b"keep-alive" not in head
+    assert b"content-length: 5" in head, "client must be able to frame the body"
     assert data.endswith(b"COVER")

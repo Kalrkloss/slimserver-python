@@ -152,11 +152,16 @@ async def _proxy_get(method: str, target: bytes, headers: dict,
         block, _, rest = head.partition(b"\r\n\r\n")
         lines = block.split(b"\r\n")
         status_line = lines[0] if lines else b"HTTP/1.1 502 Bad Gateway"
+        # Jive POOLS the thumbnail connection and drops every queued
+        # request when we close it (live symptom: '_getArtworkThumbSink(
+        # /music/3079/cover_40x40_m) error: keep-alive timeout' and only
+        # placeholder icons). Keep the client side reusable: drop the
+        # upstream keep-alive/close headers, keep Content-Length or
+        # Transfer-Encoding so the client can frame the body itself.
         keep = [ln for ln in lines[1:]
                 if b":" in ln and ln.split(b":", 1)[0].strip().lower()
                 not in (b"connection", b"keep-alive")]
-        out = b"\r\n".join([status_line, *keep, b"Connection: close",
-                            b"", b""])
+        out = b"\r\n".join([status_line, *keep, b"", b""])
         writer.write(out)
         if rest:
             writer.write(rest)
@@ -254,7 +259,9 @@ async def _handle_connection(manager, reader: asyncio.StreamReader,
                     request["method"], request["target"],
                     request["headers"], writer, web_port,
                 )
-                break
+                # Keep the connection: Jive pools it and reuses it for the
+                # next thumbnail. Only the upstream side closes per request.
+                continue
             path = (request["headers"].get(b"host", b"") and b"")
             body = request["body"]
 
