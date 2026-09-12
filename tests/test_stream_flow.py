@@ -1,9 +1,11 @@
 """Flow control + stream-switch cancellation for /stream.mp3 (LIVE-08).
 
-Without pacing our handler flushed a whole 11.7 MB track into the socket in
-0.40 s; the player then sat on a full buffer and never opened a new
-``GET /stream.mp3`` when the user tapped another track (elapsed frozen at
-62.202 s, out_fullness pinned at 3525496/3528000).
+A player stream is written UNTHROTTLED: no artificial rate limit, flow
+control comes from the socket/ASGI backpressure. An explicit 1x-realtime
+pacer (with an up-front burst) was removed on 2026-09-12: jive buffers
+1 MB before it starts decoding lossless/PCM formats (Playback.lua:914-925),
+so a realtime-paced FLAC stayed silent for ~30 s (live: track 470,
+735 kbit/s) — Perl has no such delay.
 
 Perl parcel (citations: /tmp/lms-ref, public/9.2 @ d1d0a683d):
 
@@ -21,11 +23,10 @@ Perl parcel (citations: /tmp/lms-ref, public/9.2 @ d1d0a683d):
 * ``cont`` exists ONLY as a server→player frame
   (``Slim/Player/Squeezebox2.pm:724``); there is no client→server ``cont``
   handler anywhere in the Perl tree, so an incoming ``cont`` must NOT be
-  wired as "send more".
+  wired as "send more" (that flow control is the socket's).
 
-These tests are in-process: no server, no real waiting. The pacer's clock
-(``_now``) and sleep (``_sleep``) hooks are monkeypatched so pacing is
-measured deterministically.
+These tests are in-process: no server, no real waiting. ``asyncio.sleep``
+is spied on to prove nothing paces the response.
 """
 
 from __future__ import annotations
@@ -61,22 +62,28 @@ def _bitrate_stub(bps: int | None):
 
 def _run_stream(tmp_path, *, content: bytes, query: str,
                 range_value: bytes | None = None, bitrate: int | None = 128000,
-                fake_clock=None, on_sleep=None):
+                on_chunk=None):
     """Run stream_track against a temp file with a fake ``send``.
 
-    Returns (sent_events, sleeps, clock) — ``sleeps`` is only recorded when
-    a clock is injected (the fake ``_sleep`` advances it instantly).
+    Returns (sent_events, body_chunk_sizes). ``on_chunk(n)`` (optional, sync
+    or async) fires after the n-th body chunk was handed to ``send``.
     """
     f = tmp_path / "audio.mp3"
     f.write_bytes(content)
     sent: list[dict] = []
-    sleeps: list[float] = []
+    chunks: list[int] = []
 
     async def receive():
         return {"type": "http.request", "body": b"", "more_body": False}
 
     async def send(event):
         sent.append(event)
+        if event["type"] == "http.response.body" and event.get("body"):
+            chunks.append(len(event["body"]))
+            if on_chunk is not None:
+                result = on_chunk(len(chunks))
+                if asyncio.iscoroutine(result):
+                    await result
 
     headers = [(b"range", range_value)] if range_value else []
     scope = {
@@ -88,36 +95,20 @@ def _run_stream(tmp_path, *, content: bytes, query: str,
     async def run():
         original_load = stream_mod._load_track
         original_bitrate = stream_mod._stream_bitrate_bps
-        original_now = stream_mod._now
-        original_sleep = stream_mod._sleep
 
         async def _fake_load(track_id):
             return f, "audio/mpeg"
 
-        async def _fake_sleep(delay):
-            sleeps.append(delay)
-            if fake_clock is not None:
-                fake_clock["t"] += delay
-            if on_sleep is not None:
-                result = on_sleep(len(sleeps))
-                if asyncio.iscoroutine(result):
-                    await result
-
         stream_mod._load_track = _fake_load
         stream_mod._stream_bitrate_bps = _bitrate_stub(bitrate)
-        if fake_clock is not None:
-            stream_mod._now = lambda: fake_clock["t"]
-            stream_mod._sleep = _fake_sleep
         try:
             await stream_mod.stream_track(scope, receive, send)
         finally:
             stream_mod._load_track = original_load
             stream_mod._stream_bitrate_bps = original_bitrate
-            stream_mod._now = original_now
-            stream_mod._sleep = original_sleep
 
     asyncio.run(run())
-    return sent, sleeps
+    return sent, chunks
 
 
 def _body(sent) -> bytes:
@@ -125,43 +116,45 @@ def _body(sent) -> bytes:
                     if e["type"] == "http.response.body" and e["body"])
 
 
-# ── (a) pacer: burst then ~1x realtime ────────────────────────────────────
+# ── (a) no artificial throttle: chunks go out as fast as the socket ───────
 
-def test_pacer_bursts_then_throttles_to_realtime(tmp_path, monkeypatch):
-    # The pacing MECHANICS are tested with a small burst; the production
-    # burst (BURST_SECONDS) is asserted separately below.
-    monkeypatch.setattr(stream_mod, "BURST_SECONDS", 3.0)
-    monkeypatch.setattr(stream_mod, "BURST_MIN_BYTES", 0)
+def _sleep_spy(monkeypatch) -> list[float]:
+    """Record every ``asyncio.sleep`` the handler performs."""
+    sleeps: list[float] = []
+    real_sleep = asyncio.sleep
+
+    async def _spy(delay, *args, **kwargs):
+        sleeps.append(delay)
+        return await real_sleep(0)
+
+    monkeypatch.setattr(asyncio, "sleep", _spy)
+    return sleeps
+
+
+def test_stream_is_not_throttled(tmp_path, monkeypatch):
+    """Perl never rate-limits a player stream (HTTP.pm:61, :2143,
+    :2152-2439) — flow control is the socket, and in our ASGI stack that is
+    ``await send(...)``, which blocks while uvicorn's transport is
+    write-paused (uvicorn/protocols/http/h11_impl.py ``flow.drain``)."""
+    sleeps = _sleep_spy(monkeypatch)
     content = bytes(range(256)) * 1563          # ~400 KB
-    clock = {"t": 0.0}
-    sent, sleeps = _run_stream(
-        tmp_path, content=content,
-        query=f"id=7&player={MAC}", bitrate=128000, fake_clock=clock,
+    sent, chunks = _run_stream(
+        tmp_path, content=content, query=f"id=7&player={MAC}", bitrate=128000,
     )
 
-    # every byte still arrives, in order
-    assert _body(sent) == content
+    assert _body(sent) == content               # every byte arrives, in order
     assert sent[-1]["more_body"] is False
-
-    burst = stream_mod.BURST_SECONDS * (128000 // 8)      # 3 s @128 kbit/s
-    expected = (len(content) - burst) / (128000 / 8)
-    assert sleeps, "a 400 KB track must not be written unthrottled"
-    assert abs(sum(sleeps) - expected) < 1.0, (
-        f"pacing {sum(sleeps):.2f}s for {len(content)} bytes, "
-        f"expected ~{expected:.2f}s"
+    assert chunks and all(n == stream_mod.PERL_MAXCHUNKSIZE for n in chunks[:-1])
+    assert sleeps == [], (
+        "the stream path must not pace: jive waits for 1 MB before it starts "
+        "a lossless track (Playback.lua:914-925), so throttling to realtime "
+        "delays playback by tens of seconds"
     )
-    # the fast start survives: the first pace delay is ≤ one poll slice
-    assert max(sleeps) <= stream_mod.CANCEL_POLL_SECONDS + 1e-6
 
 
-def test_pacer_default_bitrate_is_conservative(tmp_path, monkeypatch):
-    # no bitrate in the DB → conservative 128 kbit/s default
-    # (burst mechanics pinned low here; the production burst is asserted in
-    # test_burst_is_at_least_the_player_start_threshold)
-    monkeypatch.setattr(stream_mod, "BURST_MIN_BYTES", 0)
-    pacer = stream_mod.StreamPacer.from_bitrate(None)
-    assert pacer.bytes_per_sec == stream_mod.DEFAULT_BITRATE_BPS // 8
-    assert pacer.burst_bytes == int(pacer.bytes_per_sec * stream_mod.BURST_SECONDS)
+def test_chunk_size_is_perls_maxchunksize():
+    # Slim/Web/HTTP.pm:61 MAXCHUNKSIZE = 32768
+    assert stream_mod.PERL_MAXCHUNKSIZE == 32768
 
 
 # ── bitrate source: tracks.bitrate is bits/s, not kbit/s ──────────────────
@@ -212,43 +205,23 @@ def test_absurd_duration_estimate_falls_back(monkeypatch):
     assert asyncio.run(stream_mod._stream_bitrate_bps(4, 4_000_000)) == 320000
 
 
-def test_pacer_schedule_is_zero_inside_the_burst():
-    clock = {"t": 0.0}
-    original_now = stream_mod._now
-    stream_mod._now = lambda: clock["t"]
-    try:
-        pacer = stream_mod.StreamPacer(16000, 32000)   # 2 s @128k burst
-        pacer.start()
-        assert pacer.schedule(16000) == 0.0
-        assert pacer.schedule(16000) == 0.0
-        assert pacer.schedule(16000) > 0.0        # past the burst
-        clock["t"] += 10.0                        # plenty of time elapsed
-        assert pacer.schedule(16000) == 0.0       # already ahead of realtime
-    finally:
-        stream_mod._now = original_now
-
-
 # ── (b) cancel stops a running response and cleans the registry ───────────
 
-def test_cancel_active_stream_stops_the_running_response(tmp_path, monkeypatch):
-    monkeypatch.setattr(stream_mod, "BURST_SECONDS", 3.0)
-    monkeypatch.setattr(stream_mod, "BURST_MIN_BYTES", 0)
+def test_cancel_active_stream_stops_the_running_response(tmp_path):
     content = b"z" * (256 * 1024)
-    clock = {"t": 0.0}
-    asleep: list[float] = []
+    triggered = {"n": 0}
 
-    def _on_sleep(count):
-        if count == 2:
+    def _on_chunk(count):
+        if count == 3:
+            triggered["n"] = count
             assert stream_mod.cancel_active_stream(MAC) is True
 
-    sent, sleeps = _run_stream(
+    sent, _chunks = _run_stream(
         tmp_path, content=content,
-        query=f"id=7&player={MAC}", bitrate=128000,
-        fake_clock=clock, on_sleep=_on_sleep,
+        query=f"id=7&player={MAC}", bitrate=128000, on_chunk=_on_chunk,
     )
-    asleep.extend(sleeps)
 
-    assert len(asleep) >= 2, "cancel never reached the running handler"
+    assert triggered["n"] == 3, "cancel never reached the running handler"
     assert 0 < len(_body(sent)) < len(content), (
         "a cancelled stream must stop early, not deliver the whole file"
     )
@@ -257,18 +230,15 @@ def test_cancel_active_stream_stops_the_running_response(tmp_path, monkeypatch):
     )
 
 
-def test_handler_registers_itself_and_unregisters_on_completion(tmp_path, monkeypatch):
-    monkeypatch.setattr(stream_mod, "BURST_SECONDS", 3.0)
-    monkeypatch.setattr(stream_mod, "BURST_MIN_BYTES", 0)
+def test_handler_registers_itself_and_unregisters_on_completion(tmp_path):
     seen = {}
 
-    def _on_sleep(_count):
+    def _on_chunk(_count):
         seen.setdefault("macs", list(stream_mod._active_streams))
 
-    content = bytes(range(256)) * 313   # ~80 KB → several paced chunks
-    clock = {"t": 0.0}
+    content = bytes(range(256)) * 313   # ~80 KB → several chunks
     _run_stream(tmp_path, content=content, query=f"id=7&player={MAC}",
-                bitrate=64000, fake_clock=clock, on_sleep=_on_sleep)
+                bitrate=64000, on_chunk=_on_chunk)
     assert seen.get("macs") == [MAC_CLEAN]
     assert stream_mod._active_streams == {}
 
@@ -337,31 +307,29 @@ def test_new_remote_stream_cancels_the_previous_stream():
     asyncio.run(run())
 
 
-# ── (d) range requests stay byte-exact and unpaced ────────────────────────
+# ── (d) range requests stay byte-exact and unthrottled ────────────────────
 
-def test_range_request_is_not_paced_and_not_cancelled(tmp_path):
+def test_range_request_is_not_paced_and_not_cancelled(tmp_path, monkeypatch):
+    sleeps = _sleep_spy(monkeypatch)
     content = bytes(range(256)) * 64          # 16 KB
-    clock = {"t": 0.0}
-    sent, sleeps = _run_stream(
+    sent, _chunks = _run_stream(
         tmp_path, content=content, query=f"id=7&player={MAC}",
-        range_value=b"bytes=100-199", fake_clock=clock,
+        range_value=b"bytes=100-199",
     )
     start = sent[0]
     headers = {k.decode(): v.decode() for k, v in start["headers"]}
     assert start["status"] == 206
     assert headers["content-range"] == f"bytes 100-199/{len(content)}"
     assert _body(sent) == content[100:200]
-    assert sleeps == [], "range/seek responses must keep the old behaviour"
+    assert sleeps == []
     assert stream_mod._active_streams == {}, "range requests must not register"
 
 
-def test_unthrottled_request_without_player_is_unchanged(tmp_path):
-    content = b"q" * 4096
-    _sent, sleeps = _run_stream(
-        tmp_path, content=content, query="id=7",
-        fake_clock={"t": 0.0},
-    )
+def test_stream_without_player_is_never_registered(tmp_path, monkeypatch):
+    sleeps = _sleep_spy(monkeypatch)
+    _sent, _chunks = _run_stream(tmp_path, content=b"q" * 4096, query="id=7")
     assert sleeps == []
+    assert stream_mod._active_streams == {}
 
 
 # ── (e) cancelling one player must not touch another ──────────────────────
@@ -394,21 +362,17 @@ def test_registering_a_new_stream_replaces_and_cancels_the_old_one():
     asyncio.run(run())
 
 
-def test_burst_is_at_least_the_player_start_threshold():
-    """The burst must fill the player's start threshold, which the strm
-    frame declares as `bufferThreshold` — Perl default 255 KB
-    (Player.pm:65), remote 20 KB / int(bitrate/8)*bufferSecs/1000 with
-    bufferSecs = 3 (Squeezebox.pm:160-179). Perl itself never rate-limits
-    the stream (HTTP.pm:2152 ff.); the burst we need to start fast is
-    therefore the threshold, not an invented duration."""
-    assert stream_mod.BURST_MIN_BYTES == 255 * 1024
-    assert stream_mod.BURST_SECONDS == 3.0            # Perl bufferSecs
-
-    slow = stream_mod.StreamPacer.from_bitrate(128000)   # 16 KB/s < 255 KB
-    assert slow.burst_bytes == 255 * 1024
-
-    fast = stream_mod.StreamPacer.from_bitrate(2_000_000)  # 250 KB/s * 3 s
-    assert fast.burst_bytes == int(250_000 * 3.0)
-
-    small = stream_mod.StreamPacer.from_bitrate(128000, burst_seconds=0.5)
-    assert small.burst_bytes == stream_mod.BURST_MIN_BYTES
+def test_no_rate_limiter_is_reintroduced():
+    """Regression guard: the stream handler must not grow an artificial
+    pacer again. Perl writes MAXCHUNKSIZE chunks as fast as the socket
+    accepts them (HTTP.pm:61, :2143, :2152-2439); flow control is the
+    socket. An invented 1x-realtime limit (with a "burst") cost ~30 s of
+    silence at the start of every lossless track (jive waits for 1 MB,
+    Playback.lua:914-925) — live 2026-09-12, FLAC track 470."""
+    for gone in ("StreamPacer", "BURST_SECONDS", "BURST_MIN_BYTES",
+                 "PACED_CHUNK_SIZE", "_sleep_or_cancel"):
+        assert not hasattr(stream_mod, gone), (
+            f"{gone} is back — flow control belongs to the socket, not to an "
+            "invented rate limit"
+        )
+    assert stream_mod.PERL_MAXCHUNKSIZE == 32768       # HTTP.pm:61

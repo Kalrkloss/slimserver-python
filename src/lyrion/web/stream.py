@@ -11,7 +11,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
@@ -276,10 +275,10 @@ async def _load_track(track_id: int):
 #   is only invoked when the socket is writable (``addWrite(...)``, line
 #   2143); a partial write / EWOULDBLOCK requeues the unsent remainder
 #   (2387-2405). Python's ``await send(...)`` supplies the same TCP
-#   backpressure, but the kernel/uvicorn buffers swallow a whole 11 MB
-#   track in 0.40 s — the player then sits on a full buffer and never opens
-#   a new ``GET /stream.mp3`` on a track switch. So the pace becomes
-#   explicit: a short burst (fast start), then ~1x realtime.
+#   backpressure (uvicorn pauses the transport and ``send`` drains — see
+#   PERL_MAXCHUNKSIZE below). The earlier explicit 1x-realtime pacer was
+#   WRONG: it stretched the start of lossless tracks to ~30 s (jive buffers
+#   1 MB before it starts, Playback.lua:914-925).
 # * ``Slim/Web/HTTP.pm:2136`` + ``2185-2199``: every streaming socket is
 #   registered as ``$client->streamingsocket``; the callback closes any
 #   socket that is no longer the client's current one → the old stream dies
@@ -294,21 +293,23 @@ async def _load_track(track_id: int):
 # handler, so an incoming ``cont`` is logged only and must not be wired as
 # "send more" (flow control is socket-level).
 
-DEFAULT_BITRATE_BPS = 128_000   # conservative fallback (bits/s)
-# Up-front burst before throttling to 1x realtime.
+PERL_MAXCHUNKSIZE = 32 * 1024                # Perl MAXCHUNKSIZE (HTTP.pm:61)
+# Chunked writes, NO artificial rate limit.
 #
 # Perl does NOT rate-limit a player stream: it writes MAXCHUNKSIZE (32768)
-# chunks whenever the socket is writable (Slim/Web/HTTP.pm:61, :2126-2128,
-# :2152 ff.) and lets TCP backpressure pace. Our artificial 1x limit needs a
-# burst large enough to fill the player's start threshold, which is carried
-# in the strm frame: `bufferThreshold` default 255 KB (Player.pm:65), remote
-# 20 KB or int(bitrate/8)*bufferSecs/1000 with bufferSecs = 3
-# (Squeezebox.pm:160-179). So: 3 s of audio, but never less than the 255 KB
-# threshold — otherwise SqueezePlay waits ~17 s before it starts decoding.
-BURST_SECONDS = 3.0                          # Perl `bufferSecs` default
-BURST_MIN_BYTES = 255 * 1024                 # Perl `bufferThreshold` default
-PACED_CHUNK_SIZE = 32 * 1024                 # Perl MAXCHUNKSIZE (HTTP.pm:61)
-CANCEL_POLL_SECONDS = 0.25      # max delay before a cancel is noticed
+# byte chunks whenever the socket is writable (Slim/Web/HTTP.pm:61,
+# :2126-2128 sets SO_SNDBUF, :2152 ff. sendStreamingResponse /
+# tryStreamingLater) and lets TCP pace. Our ASGI layer gives the same
+# backpressure: uvicorn's h11 implementation awaits ``flow.drain()`` while the
+# transport is write-paused (``FlowControl.pause_writing`` fires when the
+# write buffer is full), so ``await send(...)`` blocks under a slow reader
+# instead of buffering the whole track in memory.
+#
+# This is not cosmetic — an artificial 1x-realtime throttle delayed the START:
+# jive raises its own start threshold to 1 MB for lossless/PCM formats
+# (Playback.lua:914-925), which at 735 kbit/s took ~11-30 s to fill. Live
+# finding 2026-09-12: FLAC track silent ~30 s, then started.
+PERL_MAXCHUNKSIZE = 32 * 1024                # Perl MAXCHUNKSIZE (HTTP.pm:61)
 
 
 @dataclass
@@ -361,69 +362,6 @@ def cancel_active_stream(mac: str) -> bool:
         return False
     handle.cancel_event.set()
     return True
-
-
-def _now() -> float:
-    """Monotonic clock — a module hook so tests can fake time."""
-    return time.monotonic()
-
-
-async def _sleep(delay: float) -> None:
-    """Sleep hook (tests replace this to keep pacing deterministic)."""
-    await asyncio.sleep(delay)
-
-
-class StreamPacer:
-    """Rate limiter for ``/stream.mp3``: burst, then ~1x realtime."""
-
-    def __init__(self, bytes_per_sec: int, burst_bytes: int) -> None:
-        self.bytes_per_sec = max(1, int(bytes_per_sec))
-        self.burst_bytes = max(0, int(burst_bytes))
-        self._start = 0.0
-        self._sent = 0
-
-    @classmethod
-    def from_bitrate(cls, bitrate_bps: int | None,
-                     burst_seconds: float | None = None) -> StreamPacer:
-        # Resolve the module constant at CALL time: a default argument
-        # would freeze the value at import and make the burst untestable.
-        if burst_seconds is None:
-            burst_seconds = BURST_SECONDS
-        bps = int(bitrate_bps) if bitrate_bps and bitrate_bps > 0 \
-            else DEFAULT_BITRATE_BPS
-        per_sec = max(1, bps // 8)
-        # Never burst less than the player's start threshold (Perl
-        # bufferThreshold default 255 KB) — see the constants above.
-        burst = max(BURST_MIN_BYTES, int(per_sec * max(0.0, burst_seconds)))
-        return cls(per_sec, burst)
-
-    def start(self) -> None:
-        self._start = _now()
-        self._sent = 0
-
-    def schedule(self, sent_bytes: int) -> float:
-        """Delay to wait after this write so the stream stays ≤ realtime
-        (once the burst is exhausted). 0.0 inside the burst."""
-        self._sent += max(0, int(sent_bytes))
-        if self._sent <= self.burst_bytes:
-            return 0.0
-        target = (self._sent - self.burst_bytes) / self.bytes_per_sec
-        delay = target - (_now() - self._start)
-        return delay if delay > 0 else 0.0
-
-
-async def _sleep_or_cancel(handle: ActiveStream | None, delay: float) -> bool:
-    """Sleep ``delay`` seconds, waking early (returns True) if the stream
-    was cancelled by a track switch. Sliced so a cancel is noticed within
-    CANCEL_POLL_SECONDS instead of after a whole multi-second delay."""
-    remaining = delay
-    while remaining > 0:
-        if handle is not None and handle.cancel_event.is_set():
-            return True
-        step = remaining if remaining < CANCEL_POLL_SECONDS else CANCEL_POLL_SECONDS
-        await _sleep(step)
-        remaining -= step
-    return handle is not None and handle.cancel_event.is_set()
 
 
 _MIN_BITRATE_BPS = 16_000        # sanity clamp (16 kbit/s)
@@ -652,12 +590,13 @@ async def stream_track(scope: dict, receive, send) -> None:
         "headers": response_headers,
     })
 
-    # ── Flow control + switch-abort (LIVE-08) ───────────────────────────
-    # Only a full-body response (200) to a known player is paced and
-    # registered. Range/seek responses (206) keep the previous behaviour
-    # byte for byte and are never cancelled.
+    # ── Switch-abort (LIVE-08) ──────────────────────────────────────────
+    # Only a full-body response (200) to a known player is registered.
+    # Range/seek responses (206) keep the previous behaviour byte for byte
+    # and are never cancelled. No rate limiting: chunks go out as fast as
+    # the socket accepts them (Perl MAXCHUNKSIZE + TCP backpressure — see
+    # PERL_MAXCHUNKSIZE above).
     handle: ActiveStream | None = None
-    pacer: StreamPacer | None = None
     if status == 200 and player_mac:
         handle = register_active_stream(player_mac)
         if pcm_info is not None:
@@ -665,15 +604,12 @@ async def stream_track(scope: dict, receive, send) -> None:
             bitrate = pcm_info["rate"] * pcm_info["channels"] * pcm_info["bits"]
         else:
             bitrate = await _stream_bitrate_bps(track_id, length)
-        pacer = StreamPacer.from_bitrate(bitrate)
-        pacer.start()
         logger.info(
-            "Stream %s: pacing %d bit/s (burst %.1fs, %d B)",
-            handle.mac, pacer.bytes_per_sec * 8,
-            pacer.burst_bytes / pacer.bytes_per_sec, pacer.burst_bytes,
+            "Stream %s: unthrottled, %s bit/s, %d B chunks",
+            handle.mac, bitrate if bitrate else "unknown", PERL_MAXCHUNKSIZE,
         )
 
-    chunk_size = PACED_CHUNK_SIZE if pacer is not None else CHUNK_SIZE
+    chunk_size = PERL_MAXCHUNKSIZE
 
     # Stream the file in chunks (async via to_thread — no aiofiles needed)
     import asyncio as _asyncio
@@ -694,16 +630,10 @@ async def stream_track(scope: dict, receive, send) -> None:
                 if not chunk:
                     break
                 remaining -= len(chunk)
+                # ``send`` blocks while uvicorn's transport is write-paused,
+                # which is our flow control (no artificial sleep).
                 await send({"type": "http.response.body", "body": chunk,
                             "more_body": remaining > 0})
-                if pacer is not None and handle is not None:
-                    delay = pacer.schedule(len(chunk))
-                    if delay > 0 and await _sleep_or_cancel(handle, delay):
-                        logger.info(
-                            "Stream %s cancelled during pacing — closing response",
-                            handle.mac,
-                        )
-                        break
     except (ConnectionError, BrokenPipeError, asyncio.CancelledError):
         # Player disconnected (stop/next) — this is normal.
         pass
