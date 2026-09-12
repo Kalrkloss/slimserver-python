@@ -6,6 +6,8 @@ with the project's async/await model.
 """
 from __future__ import annotations
 
+from pathlib import Path
+
 import logging
 from typing import Callable, Optional
 
@@ -297,7 +299,7 @@ def _cover_cache_put(key, data: bytes, mime) -> None:
 
 
 _COVER_PATH_RE = _re.compile(
-    r"^/music/(\d+)/(?:"
+    r"^/music/(\d+|current)/(?:"
     r"cover\.(?:jpg|png)"                          # plain: cover.jpg
     # LMS sized form. Jive omits the extension when it fetches a browser
     # thumbnail (fetchArtwork without imgFormat) — SqueezePlay asked for
@@ -307,8 +309,16 @@ _COVER_PATH_RE = _re.compile(
 )
 
 
-def _parse_cover_path(path: str) -> tuple[int, tuple[int, int] | None] | None:
-    """Album id + optional (w, h) from an LMS artwork URL.
+def _parse_cover_path(path: str) -> tuple[int | str, tuple[int, int] | None] | None:
+    """Album id (or the literal ``"current"``) + optional (w, h) from an URL.
+
+    ``/music/current/cover.jpg?player=<mac>`` is the form Material Skin's
+    Now-Playing widget uses (``html/material/html/js/currentcover.js:102``:
+    "Use players current cover ... Need to add extra params so that the URL is
+    different between tracks"). Perl special-cases it in
+    ``Slim/Web/Graphics.pm:155-172``: the id becomes the currently playing
+    track's coverid. We answered 404 before, so the browser kept the previous
+    cover image and never showed a placeholder for cover-less tracks.
 
     Perl's ImageProxy accepts ``/music/<albumid>/cover.jpg`` and the
     size-encoded form Jive/SqueezePlay use from their ``artworkspec``
@@ -319,7 +329,8 @@ def _parse_cover_path(path: str) -> tuple[int, tuple[int, int] | None] | None:
     m = _COVER_PATH_RE.match(path)
     if not m:
         return None
-    album_id = int(m.group(1))
+    raw_id = m.group(1)
+    album_id: int | str = raw_id if raw_id == "current" else int(raw_id)
     if m.group(2) and m.group(3):
         return album_id, (int(m.group(2)), int(m.group(3)))
     return album_id, None
@@ -348,6 +359,136 @@ def _resize_cover(data: bytes, size: tuple[int, int]) -> bytes:
             return out.getvalue()
     except Exception:  # noqa: BLE001 - never break artwork on a bad file
         return data
+
+
+# Wurzel der ausgelieferten html/-Dateien (setzt create_app); enthaelt den
+# generischen Cover-Platzhalter, den Perl fuer Alben ohne Bild ausliefert.
+_STATIC_ROOT: Path | None = None
+
+
+def _set_static_root(path: str | Path | None) -> None:
+    global _STATIC_ROOT
+    _STATIC_ROOT = Path(path) if path else None
+
+
+def _static_root() -> Path | None:
+    if _STATIC_ROOT is not None:
+        return _STATIC_ROOT
+    # Wie __main__: Paket-, Checkout- oder CWD-Layout.
+    try:
+        import lyrion as _pkg
+
+        pkg = Path(_pkg.__file__).resolve().parent
+        for cand in (pkg / "html", pkg.parent.parent / "html", Path.cwd() / "html"):
+            if cand.is_dir():
+                return cand
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
+def _placeholder_cover(size: tuple[int, int] | None = None) -> tuple[bytes, str] | None:
+    """Perl's generic cover — ``html/images/cover.png``.
+
+    Perl reports this image wherever a track/album has no artwork
+    (``Slim/Control/XMLBrowser.pm:1603``, ``Commands.pm:2151``) and its
+    artwork endpoint answers it with HTTP 200 instead of 404 (live probe
+    2026-09-12: ``/music/2/cover.jpg`` -> 200 image/png 13113 B). Material
+    Skin then shows the generic symbol instead of keeping the old cover.
+    """
+    root = _static_root()
+    if root is None:
+        return None
+    p = root / "html" / "images" / "cover.png"
+    if not p.is_file():
+        return None
+    try:
+        data = p.read_bytes()
+    except OSError:
+        return None
+    if size is not None:
+        # The sized form is re-encoded as JPEG, matching Perl's answer for
+        # /music/current/cover_40x40_m.jpg (live: 200 image/jpeg).
+        data = _resize_cover(data, size)
+        return data, "image/jpeg"
+    return data, "image/png"      # unsized: Perl serves cover.png as-is
+
+
+async def _send_placeholder_cover(send, size: tuple[int, int] | None = None) -> None:
+    """Send the generic cover (200) — or 404 if even it is missing."""
+    res = _placeholder_cover(size)
+    if res is None:
+        await send({
+            "type": "http.response.start",
+            "status": 404,
+            "headers": [(b"Content-Type", b"text/plain")],
+        })
+        await send({"type": "http.response.body", "body": b"no artwork"})
+        return
+    data, mime = res
+    await send({
+        "type": "http.response.start",
+        "status": 200,
+        "headers": [
+            (b"Content-Type", mime.encode()),
+            (b"Cache-Control", b"max-age=86400"),
+        ],
+    })
+    await send({"type": "http.response.body", "body": data})
+
+
+def _current_album_id(scope: dict) -> int | None:
+    """Album id for ``/music/current/...`` (Perl Graphics.pm:155-172).
+
+    Resolves the player from the ``player`` query param (Material sends the
+    MAC) and returns the album of its current track. Material also appends
+    ``album_id``/``album``/``artist``/``year`` as hints; ``album_id`` is used
+    when the server has no current track.
+    """
+    from urllib.parse import parse_qs
+
+    qs = parse_qs((scope.get("query_string") or b"").decode("utf-8", "replace"))
+    mac = (qs.get("player") or [""])[0]
+    try:
+        from lyrion.player.manager import PlayerManager
+
+        pm = PlayerManager()
+        player = pm.get_player(mac) if mac else None
+        if player is None:
+            players = pm.get_all_players()
+            player = players[0] if players else None
+        track_id = getattr(player, "current_track_id", None) if player else None
+        if track_id:
+            album_id = _album_id_for_track(int(track_id))
+            if album_id:
+                return album_id
+    except Exception:  # noqa: BLE001 — nie die Cover-Auslieferung sprengen
+        pass
+    hint = (qs.get("album_id") or [""])[0]
+    if hint.isdigit():
+        return int(hint)
+    return None
+
+
+def _album_id_for_track(track_id: int) -> int | None:
+    """Album id of a track (read-only; eigener Loop wie _load_sync_factory)."""
+    def _run() -> int | None:
+        import asyncio as _aio
+
+        async def _q() -> int | None:
+            from lyrion.database.sqlite_helper import db_session
+            from lyrion.database.schema import Track
+
+            async with db_session() as session:
+                track = await session.get(Track, track_id)
+                return int(track.album_id) if track and track.album_id else None
+
+        return _aio.run(_q())
+
+    try:
+        return _run()
+    except Exception:  # noqa: BLE001
+        return None
 
 
 async def _serve_album_cover(album_id: int, send, size: tuple[int, int] | None = None) -> None:
@@ -383,12 +524,10 @@ async def _serve_album_cover(album_id: int, send, size: tuple[int, int] | None =
         if data:
             _cover_cache_put(cache_key, data, mime)
     if not data:
-        await send({
-            "type": "http.response.start",
-            "status": 404,
-            "headers": [(b"Content-Type", b"text/plain")],
-        })
-        await send({"type": "http.response.body", "body": b"no artwork"})
+        # Perl answers the generic cover with 200 here (live: /music/2/cover.jpg
+        # -> 200 image/png 13113 B), not a 404 — Material Skin relies on it to
+        # switch away from the previous album's cover.
+        await _send_placeholder_cover(send, size)
         return
     await send({
         "type": "http.response.start",
@@ -451,6 +590,7 @@ def create_app(
 
     if static_dir:
         api_handler.set_static_dir(static_dir)
+        _set_static_root(static_dir)
 
     async def app(scope: dict, receive, send) -> None:
         """ASGI application entry point."""
@@ -475,7 +615,16 @@ def create_app(
         if path.startswith("/music/") and method == "GET":
             parsed = _parse_cover_path(path)
             if parsed is not None:
-                await _serve_album_cover(parsed[0], send, parsed[1])
+                cover_id, cover_size = parsed
+                if cover_id == "current":
+                    # /music/current/cover.jpg?player=<mac> — cover of the
+                    # current track, else the generic image (Perl Graphics.pm
+                    # :155-172 plus the /html/images/cover.png fallback).
+                    cover_id = _current_album_id(scope)
+                    if cover_id is None:
+                        await _send_placeholder_cover(send, cover_size)
+                        return
+                await _serve_album_cover(cover_id, send, cover_size)
                 return
 
         # Cometd (Jive controllers + Material Skin). libcometd sends the
