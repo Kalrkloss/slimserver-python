@@ -3082,13 +3082,22 @@ class JSONRPCAPI:
                     f"file:{_library_db_path()}?mode=ro", uri=True)
                 db.row_factory = sqlite3.Row
                 marks = ",".join("?" * len(ids))
+                # The album's artist line comes from the ALBUM's contributors
+                # (albums_contributors — the album→artist relation Perl's
+                # BrowseLibrary items use), NOT from aggregating every track's
+                # contributors. The track-level join planned as
+                # "SEARCH tc USING INDEX idx_tc_role (role=?)" and scanned all
+                # 60k role rows for 200 albums: 2281 ms per page vs 1 ms here
+                # (measured 2026-09-12). That made every album page ~2.4 s and
+                # delayed playback by ~20 s (jive pages the list and opens the
+                # stream afterwards).
                 art = db.execute(
-                    "SELECT ta.album AS aid, COUNT(DISTINCT c.id) AS n, "
-                    "MIN(c.name) AS name FROM tracks_albums ta "
-                    "JOIN tracks_contributors tc ON tc.track = ta.track "
-                    "AND tc.role = 1 JOIN contributors c ON c.id = tc.contributor "
-                    f"WHERE ta.album IN ({marks}) "
-                    "GROUP BY ta.album", ids).fetchall()
+                    "SELECT ac.album AS aid, COUNT(DISTINCT c.id) AS n, "
+                    "MIN(c.name) AS name FROM albums_contributors ac "
+                    "JOIN contributors c ON c.id = ac.contributor "
+                    "WHERE ac.role = 1 AND "
+                    f"ac.album IN ({marks}) "
+                    "GROUP BY ac.album", ids).fetchall()
                 for row in art:
                     if row["n"] == 1:
                         artist_line[row["aid"]] = row["name"] or ""
