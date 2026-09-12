@@ -11,6 +11,25 @@ from typing import Any, Callable, Optional
 
 logger = logging.getLogger(__name__)
 
+# SqueezePlay sends locally maintained parameters (volume, power) with a
+# `seq_no:<N>` param and expects the same number back in the playerstatus
+# (`seq_no`) and in the audg frame. Perl stores it per client
+# (Slim/Player/Client.pm:208-210, Commands.pm:559-562 mixer and
+# :2586-2589 power) and emits it in the status (Queries.pm:4196).
+# Player.lua:1223-1333 treats a mismatch as "out of sync", reverts the
+# volume and re-sends — an unbroken seq_no makes the client loop forever.
+_SEQ_NO_RE = re.compile(r"^seq_no:(\d+)$")
+
+
+def _seq_no_from_args(args) -> int | None:
+    """Extract the client's `seq_no:<N>` param, if present."""
+    for a in args or ():
+        if isinstance(a, str):
+            m = _SEQ_NO_RE.match(a)
+            if m:
+                return int(m.group(1))
+    return None
+
 # Global operational notice shown in the web Status bar (e.g. a missing
 # ffmpeg). Set via set_server_notice(); read in the serverstatus response.
 _SERVER_NOTICE: dict[str, str] = {"text": ""}
@@ -996,7 +1015,10 @@ class JSONRPCAPI:
                     "canpoweroff": 1 if getattr(p, "can_power_off", True) else 0,
                     "connected": 1 if p.connected else 0,
                     "power": 1 if p.power else 0,
-                    "seq_no": 0,
+                    # Perl emits the client's stored sequence number
+                    # (Queries.pm:2637) — SqueezePlay needs its own value
+                    # back to consider volume/power in sync.
+                    "seq_no": int(getattr(p, "seq_no", 0) or 0),
                 }
                 for i, p in enumerate(players[start:start + count])
             ]
@@ -1122,7 +1144,7 @@ class JSONRPCAPI:
                     "connected": 1 if p.connected else 0,
                     "power": 1 if p.power else 0,
                     "displaytype": "None",
-                    "seq_no": 0,
+                    "seq_no": int(getattr(p, "seq_no", 0) or 0),
                 }
                 for i, p in enumerate(players)
             ]
@@ -1678,7 +1700,10 @@ class JSONRPCAPI:
             "digital_volume_control": 1,
             "use_volume_control": 1,
             "signalstrength": 0,
-            "seq_no": int(getattr(player, "_seq_no", 0) or 0),
+            # Echo the client's last seq_no param (Perl Queries.pm:4196):
+            # Player.lua:1223-1333 compares it and re-sends volume/power
+            # forever when it does not match.
+            "seq_no": int(getattr(player, "seq_no", 0) or 0),
             "playlist_timestamp": time.time(),
             "playlist_loop": item_loop,
         }
@@ -2266,6 +2291,18 @@ class JSONRPCAPI:
             pid = players[0].mac if players else None
         if not pid:
             return
+
+        # Record the client's sequence number for the locally maintained
+        # parameters (volume/power) — Perl does this in mixerCommand
+        # (Commands.pm:559-562) and powerCommand (:2586-2589) and echoes the
+        # value in the status/audg frame. Without it SqueezePlay sees
+        # "out of sync" and re-sends the command forever.
+        if cmd in ("power", "mixer"):
+            seq_no = _seq_no_from_args(args)
+            if seq_no is not None:
+                p = pm.get_player(pid)
+                if p is not None:
+                    p.seq_no = seq_no
 
         def send(cmd_str: str) -> None:
             try:

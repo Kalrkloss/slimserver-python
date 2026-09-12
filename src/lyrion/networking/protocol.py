@@ -2164,7 +2164,16 @@ class SlimProtoClient:
         """Send an 'audg' volume frame to a player.
 
         audg_packet: opcode(4) old_gainL(4) old_gainR(4) adjust(1) preamp(1)
-        gainL(4) gainR(4) — gains are 0..65536 (0-100% * 655.36), BE.
+        gainL(4) gainR(4) sequenceNumber(4) — gains are 0..65536
+        (0-100% * 655.36), BE.
+
+        The trailing sequence number is the client's last `seq_no` param
+        (Client.pm:208-210, set in Commands.pm:559-562/:2586-2589). Perl
+        always sends the 7-field form because the property defaults to 0
+        and is therefore always defined (Squeezebox2.pm:312-317) — SqueezePlay
+        compares it against its own counter to decide whether a locally
+        maintained parameter (volume/power) is in sync (Player.lua:1223-1333);
+        without it the client reverts the volume and re-sends forever.
         """
         mac = mac.upper().replace(":", "")
         writer = self._player_writers.get(mac)
@@ -2172,6 +2181,12 @@ class SlimProtoClient:
             return False
         volume = max(0, min(100, int(volume)))
         gain = int(volume * 655.36)
+        try:
+            from lyrion.player.manager import PlayerManager
+            pstate = PlayerManager().get_player(mac)
+        except Exception:
+            pstate = None
+        seq_no = int(getattr(pstate, "seq_no", 0) or 0)
         payload = b"".join([
             b"audg",
             struct.pack(">I", 0),     # old_gainL
@@ -2180,6 +2195,7 @@ class SlimProtoClient:
             bytes([0]),               # preamp
             struct.pack(">I", gain),  # gainL
             struct.pack(">I", gain),  # gainR
+            struct.pack(">I", seq_no),  # sequenceNumber (Squeezebox2.pm:313)
         ])
         frame = struct.pack(">H", len(payload)) + payload
         try:
