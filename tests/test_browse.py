@@ -131,3 +131,41 @@ def _lib_db(tmp_path):
     con.commit()
     con.close()
     return str(db)
+
+
+def test_album_items_carry_hex_icon_id_for_artwork(tmp_path, monkeypatch):
+    """Jive only asks for artwork when `icon-id` is a hex id and `icon` is
+    the RELATIVE Perl form — it builds '/music/' .. iconId .. '/cover' ..
+    size itself (share/jive/jive/slim/SlimServer.lua:1188-1190; a URL or a
+    leading slash falls into the remote-URL branch and no cover is ever
+    fetched, leaving every album row on the generic disc icon)."""
+    db = tmp_path / "lib.db"
+    con = sqlite3.connect(db)
+    con.executescript(
+        """
+        CREATE TABLE tracks (id INTEGER PRIMARY KEY, title TEXT, url TEXT);
+        CREATE TABLE albums (id INTEGER PRIMARY KEY, title TEXT, artwork TEXT);
+        CREATE TABLE contributors (id INTEGER PRIMARY KEY, name TEXT);
+        CREATE TABLE tracks_contributors (track INTEGER, contributor INTEGER, role INTEGER);
+        CREATE TABLE tracks_albums (track INTEGER, album INTEGER);
+        INSERT INTO albums (id, title, artwork) VALUES (5237, 'Some Album', '/covers/x.jpg');
+        INSERT INTO tracks (id, title) VALUES (1, 'Song A');
+        INSERT INTO tracks_albums (track, album) VALUES (1, 5237);
+        """
+    )
+    con.commit()
+    con.close()
+    monkeypatch.setattr(api_mod, "_library_db_path", lambda: str(db))
+
+    api = JSONRPCAPI()
+    r = asyncio.run(api._json_browselibrary(
+        False, ["items", "0", "5", "menu:1", "mode:albums", "useContextMenu:1"]))
+    items = r.get("item_loop") or []
+    assert items, "album list must not be empty"
+    item = items[0]
+    icon_id = item.get("icon-id")
+    assert icon_id, "album items need icon-id or SqueezePlay shows placeholders"
+    assert icon_id.isalnum() and all(c in "0123456789abcdefABCDEF-" for c in icon_id), (
+        f"icon-id must be hex-shaped for Jive's artwork URL, got {icon_id!r}"
+    )
+    assert item.get("icon") == f"music/{icon_id}/cover"

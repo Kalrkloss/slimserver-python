@@ -1556,7 +1556,11 @@ class JSONRPCAPI:
             if _art:
                 item["icon"] = _art
             elif info.get("cover"):
-                item["icon-id"] = f"/music/{info['cover']}/cover.jpg"
+                # Jive builds '/music/' .. iconId .. '/cover' .. size from
+                # `icon-id`/`icon` (SlimServer.lua:1189) — a URL here would
+                # be concatenated into garbage and the cover never loads.
+                item["icon-id"] = str(info["cover"])
+                item["icon"] = f"music/{info['cover']}/cover"
             elif tid_local is None:
                 item["icon-id"] = "/html/images/favorites.png"
             loop.append(item)
@@ -3036,7 +3040,14 @@ class JSONRPCAPI:
                 item["text"] = f"{title}\n{artist}" if artist else title
                 item["commonParams"] = {"album_id": str(r["id"])}
                 if r.get("artwork"):
-                    item["icon"] = f"/music/{r['id']}/cover.jpg"
+                    # Jive builds '/music/' .. iconId .. '/cover' .. size
+                    # (SlimServer.lua:1189 fetchArtwork) from these fields —
+                    # `icon-id` must be the id OUR /music/<id>/cover endpoint
+                    # accepts (the album id), and `icon` stays in Perl's
+                    # relative form. Without them SqueezePlay never requests
+                    # artwork and every album row shows the generic disc.
+                    item["icon-id"] = str(r["id"])
+                    item["icon"] = f"music/{r['id']}/cover"
             elif kind == "artists":
                 item["text"] = r["name"] or ""
                 item["commonParams"] = {"artist_id": str(r["id"])}
