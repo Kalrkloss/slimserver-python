@@ -329,18 +329,16 @@ class DiscoveryService:
                 pass
         try:
             from lyrion.config import get_config
-            # Advertise the REAL HTTP port (same as serverport / the ASGI
-            # web app). Jive resolves EVERY server URL against this port —
-            # artwork (/music/<id>/cover_*.jpg), /html/... and the Cometd
-            # endpoint. Advertising the native Cometd port (9080) made
-            # SqueezePlay fetch covers from 9080, where only the Cometd
-            # server listens: it drops those requests ("unerwartete Zeile")
-            # and the album list spins forever with empty cover slots.
-            # Perl parity: one port serves web UI, artwork, stream and
-            # Cometd (Slim/Web/HTTP.pm + Slim/Web/Cometd.pm share it).
-            http_port = int(get_config().get("serverport", 9000) or 9000)
+            # Advertise the native Cometd streaming port (9080): Jive apps
+            # (SqueezePlay, Orange Squeeze) run their Bayeux session against
+            # it and it is the path proven to work with them. Jive builds
+            # EVERY other URL from this address too (artwork /music/...,
+            # /html/...), so the native server answers non-Cometd GETs with
+            # a 302 redirect to the real web port — that keeps cover art
+            # working without moving the Cometd endpoint.
+            http_port = int(get_config().get("cometd_stream_port") or 9080)
         except Exception:
-            http_port = 9000
+            http_port = 9080
 
         hostname = _socket.gethostname()[:16]
         values = {

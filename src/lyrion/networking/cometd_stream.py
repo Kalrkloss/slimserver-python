@@ -38,6 +38,27 @@ async def _read_http_request(reader: asyncio.StreamReader) -> dict | None:
     if not line:
         return None
     if not line.startswith(b"POST"):
+        # Jive builds EVERY server URL from the advertised (Cometd) port:
+        # artwork (/music/<album>/cover_*.jpg), /html/... and /stream.mp3.
+        # Only the /cometd POSTs belong here, so answer any other request
+        # with a 302 redirect to the real web port — otherwise SqueezePlay
+        # gets nothing for its cover requests and the lists spin forever.
+        parts = line.split()
+        method = parts[0] if parts else b""
+        target = parts[1] if len(parts) > 1 else b"/"
+        headers: dict[bytes, bytes] = {}
+        while True:
+            hline = await reader.readline()
+            if hline in (b"\r\n", b"\n", b""):
+                break
+            if b":" in hline:
+                k, _, v = hline.partition(b":")
+                headers[k.strip().lower()] = v.strip()
+        if method in (b"GET", b"HEAD"):
+            logger.info("NativeCometd: redirecting %s to the web port",
+                        target.decode("ascii", "replace")[:60])
+            return {"method": method.decode(), "target": target,
+                    "headers": headers}
         logger.info("NativeCometd: unerwartete Zeile: %.60r", line[:60])
         # Only POSTs expected; drain and ignore others.
         while line and line not in (b"\r\n", b"\n"):
@@ -155,6 +176,23 @@ async def _handle_connection(manager, reader: asyncio.StreamReader,
             request = await _read_http_request(reader)
             if request is None:
                 break
+            if request.get("method") in ("GET", "HEAD"):
+                # Jive resolves every non-Cometd URL against the advertised
+                # port — send it to the real web port instead of dropping it.
+                host_hdr = request["headers"].get(b"host", b"").decode(
+                    "ascii", "replace")
+                host_only = host_hdr.split(":")[0] or "127.0.0.1"
+                location = (
+                    f"http://{host_only}:{web_port}"
+                    f"{request['target'].decode('ascii', 'replace')}"
+                )
+                writer.write(
+                    b"HTTP/1.1 302 Found\r\n"
+                    + f"Location: {location}\r\n".encode()
+                    + b"Content-Length: 0\r\nConnection: close\r\n\r\n"
+                )
+                await writer.drain()
+                continue
             path = (request["headers"].get(b"host", b"") and b"")
             body = request["body"]
 
