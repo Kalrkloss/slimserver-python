@@ -106,3 +106,20 @@ def test_sized_static_image_falls_back_to_unsized(tmp_path):
     status2, _, _ = asyncio.run(
         handler._handle_static("/html/images/nope_40x40_m.png", "GET"))
     assert status2 == 404
+
+
+def test_asgi_static_falls_back_to_unsized(tmp_path):
+    """The ASGI app serves /html/ through JSONRPCAPI._serve_static (not the
+    legacy WebServer) — the size-suffix fallback must live there."""
+    from lyrion.web.api import JSONRPCAPI, WebAPIHandler
+
+    (tmp_path / "images").mkdir(parents=True)
+    (tmp_path / "images" / "albums.png").write_bytes(b"PNGDATA")
+    api = WebAPIHandler()
+    api.set_static_dir(str(tmp_path))
+
+    status, _headers, body = api._serve_static("/html/images/albums_40x40_m.png")
+    assert status == 200, body
+    assert body == b"PNGDATA"
+    assert api._serve_static("/html/images/nope_40x40_m.png")[0] == 404
+    assert api._serve_static("/html/images/albums.png")[0] == 200

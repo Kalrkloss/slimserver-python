@@ -3893,7 +3893,27 @@ class WebAPIHandler:
             return 403, {}, b"Forbidden"
 
         if not file_path.is_file():
-            return 404, {}, b"Not found"
+            # Jive asks for LMS size-encoded static images
+            # ('/html/images/albums_40x40_m.png', 'genres_40x40_m.png', …)
+            # after its 'artworkspec add 40x40_m squeezeplayskin'. We ship
+            # only the base files, so a missing sized name must fall back to
+            # the unsized one — otherwise those list icons 404 (live client
+            # log: '_getArtworkThumbSink(/html/images/genres_40x40_m.png)
+            # error: HTTP/1.1 404 Not Found').
+            import re as _re_static
+
+            m = _re_static.match(
+                r"^(?P<base>.+?)_(\d+)x(\d+)(?:_[a-z])?(?P<ext>\.(?:png|jpe?g|gif))$",
+                file_path.name,
+            )
+            if m:
+                unsized = file_path.with_name(m.group("base") + m.group("ext"))
+                if unsized.is_relative_to(base) and unsized.is_file():
+                    file_path = unsized
+                else:
+                    return 404, {}, b"Not found"
+            else:
+                return 404, {}, b"Not found"
 
         import mimetypes
         mime, _ = mimetypes.guess_type(str(file_path))
