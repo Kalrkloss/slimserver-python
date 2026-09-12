@@ -110,7 +110,7 @@ import asyncio
 import logging
 import re
 import struct
-from collections.abc import Coroutine
+from collections.abc import Coroutine, Sequence
 from dataclasses import dataclass, field
 from enum import IntFlag
 from typing import Any, Callable
@@ -350,6 +350,33 @@ CMD_META = 0x11  # ask the player to report stream metadata (StreamTitle → STM
 # ("$duration = $args->{'duration'} || 1; # duration - default to 1 second").
 # The displaytexttimeout pref is 1 as well (Slim/Utils/Prefs.pm:169).
 DISPLAY_DURATION_DEFAULT = 1
+
+# ── Display frames: visu / vfdc / grfb / grfe-framebuffer (PROT-18) ───────
+# Every frame here is built the Perl way: the payload is concatenated in
+# Perl and handed to sendFrame, which wraps it as
+# `pack('n', length($data) + 4) . $type . $data`
+# (Slim/Player/Squeezebox.pm:1159 — the 2-byte BE length INCLUDES the four
+# opcode bytes).
+#
+# Visualiser types — Slim/Display/Squeezebox2.pm:67-70 ($VISUALIZER_*).
+VISU_NONE = 0                # :67
+VISU_VUMETER = 1             # :68
+VISU_SPECTRUM_ANALYZER = 2   # :69
+VISU_WAVEFORM = 3            # :70
+# Brightness maps, indexed by brightness 0..maxBrightness
+# (maxBrightness = $#map, Slim/Display/Graphics.pm:511-516). The u16 value
+# goes out verbatim in 'grfb'.
+BRIGHTNESS_MAP_SQUEEZEBOX2 = (65535, 0, 1, 3, 4)   # Squeezebox2.pm:209-211
+BRIGHTNESS_MAP_SQUEEZEBOXG = (0, 1, 4, 16, 30)     # SqueezeboxG.pm:135-137
+# drawFrameBuf's default transition character — Squeezebox2.pm:234.
+DISPLAY_TRANSITION_DEFAULT = "c"
+# TextVFD invariants: TextVFD.pm:359-362 logdies on an odd byte count
+# ("Odd vfddata") and on more than 500 bytes ("VFDData too long").
+VFD_MAX_BYTES = 500
+# One framebuffer for the 320x32 SB2 panel: 4 bytes/column × 320 columns
+# (Squeezebox2.pm:180-182 bytesPerColumn + :188-190 displayWidth = 1-bit
+# 320x32 = 1280 bytes).
+DISPLAY_FRAMEBUF_BYTES_SB2 = 1280
 
 # ── Perl slimproto opcode table (4 ASCII bytes) ───────────────────────────
 # Slim/Networking/Slimproto.pm:52-72 `%message_handlers`. The opcode is the
@@ -2683,6 +2710,14 @@ class SlimProtoClient:
         ``$duration = $args->{'duration'} || 1;  # duration - default to
         1 second`` (the ``displaytexttimeout`` pref is 1 as well,
         ``Slim/Utils/Prefs.pm:169``). Was an invented 3 s.
+
+        Note: this is the software-player text-screen form of 'grfe'.
+        Perl's own ``grfe`` sender is the graphic framebuffer form — offset,
+        transition, param, bits (``Squeezebox2.pm:243-248``) — which lives in
+        :meth:`send_display_framebuffer`; ``sendFrame('grfe', ...)`` appears
+        nowhere else in this Perl tree (``Slim/Display/*.pm`` +
+        ``Slim/Player/Squeezebox.pm``), so a caller that wants the Perl bytes
+        must use the framebuffer sender.
         """
         mac = mac.upper().replace(":", "")
         writer = self._player_writers.get(mac)
@@ -2702,6 +2737,287 @@ class SlimProtoClient:
             logger.info("Sent grfe to %s", mac)
             return True
         except (ConnectionError, OSError, RuntimeError):
+            return False
+
+    # ── Display frames (PROT-18): visu / vfdc / grfb / grfe-framebuffer ──
+
+    async def send_visu(self, mac: str, params: Sequence[int]) -> bool:
+        """Send a 'visu' visualiser frame to a player.
+
+        Perl ``Slim/Display/Squeezebox2.pm:259-291`` (``visualizer``)::
+
+            my @params = @{$paramsref};
+            my $which = shift @params;
+            my $count = scalar(@params);
+            my $parambytes = pack "CC", $which, $count;
+            for my $param (@params) { $parambytes .= pack "N", $param; }
+            $client->sendFrame('visu', \\$parambytes);
+            $display->lastVisMode($paramsref);
+
+        Payload: ``which``(1) + ``count``(1) + ``count`` × u32 BE, i.e.
+        exactly ``[which, param0, param1, …]``. ``which`` is the visualiser
+        type — 0 none, 1 vumeter, 2 spectrum analyser, 3 waveform
+        (``:67-70``) — and the remaining values are the mode parameters
+        documented at ``:42-65`` for the mode table at ``:72-129`` (e.g.
+        mode 3 = ``[1, 0, 0, 280, 18, 302, 18]`` → ``01 06`` + six u32).
+        A hidden visualiser is ``[0]`` → ``00 00`` (``:266-268``,
+        ``Buttons/Power.pm:52``).
+
+        Perl builds both leading bytes with ``pack "CC"`` and each parameter
+        with ``pack "N"``; neither checks its range, both truncate modulo
+        2**8 / 2**32 (verified: ``pack("CC", 300, -1)`` = ``2c ff``,
+        ``pack("N", -1)`` = ``ff ff ff ff``). The same truncation is applied
+        here so the bytes match for any input.
+
+        Callers (Perl): ``drawFrameBuf`` (:241), ``updateScreen`` (:225),
+        ``scrollInit`` (:325), ``scrollUpdateBackground`` (:334) and once on
+        connect/reconnect — ``Player/Squeezebox.pm:134``
+        ``$client->display->visualizer(1) if ($client->display->isa(
+        'Slim::Display::Squeezebox2'))``. It returns early when the mode is
+        unchanged and ``$forceSend`` is false (:274-276), so in practice one
+        frame goes out per mode switch, not per redraw.
+
+        Recipients: only displays derived from ``Slim::Display::Squeezebox2``
+        — device id ``squeezebox2``/``softsqueeze`` (``Slimproto.pm:1038-1042``,
+        ``:1083-1086``), ``boom`` (:1048-1051), ``transporter`` (:1053-1056).
+        ``squeezeplay``/``controller`` (squeezelite) get
+        ``Slim::Display::NoDisplay`` (:1103-1106) and their emulated SB2
+        display stubs ``visualizer`` out (``EmulatedSqueezebox2.pm:25-32``).
+        """
+        mac = mac.upper().replace(":", "")
+        writer = self._player_writers.get(mac)
+        if writer is None or writer.is_closing():
+            logger.debug("send_visu: no writer for player %s", mac)
+            return False
+        values = list(params)
+        if not values:
+            logger.warning("send_visu: empty params for %s — Perl shifts "
+                           "undef for $which; sending 0/0", mac)
+            which, rest = VISU_NONE, []
+        else:
+            which, rest = values[0], values[1:]
+        # pack "CC" → one byte each, truncated mod 256 like Perl.
+        payload = b"visu" + bytes([which & 0xFF, len(rest) & 0xFF])
+        payload += b"".join(struct.pack(">I", p & 0xFFFFFFFF) for p in rest)
+        frame = struct.pack(">H", len(payload)) + payload
+        try:
+            writer.write(frame)
+            await writer.drain()
+            logger.info("Sent visu which=%d params=%s to %s",
+                        which & 0xFF, rest, mac)
+            return True
+        except (ConnectionError, OSError, RuntimeError) as exc:
+            logger.warning("send_visu to %s failed: %s", mac, exc)
+            return False
+
+    async def send_vfdc(self, mac: str, data: bytes) -> bool:
+        """Send a 'vfdc' (VFD/character display) frame to a player.
+
+        Perl ``Slim/Player/Squeezebox.pm:495-502``::
+
+            sub vfd {
+                my $client = shift;
+                my $data = shift;
+                if ($client->opened()) {
+                    $client->sendFrame('vfdc', \\$data);
+                }
+            }
+
+        The payload is the VFD byte stream produced by the text display
+        library, passed through unchanged — this sender does not encode
+        anything: ``Slim/Display/Lib/TextVFD.pm:312-357`` (``vfdUpdate``)
+        builds it and ends with ``$client->vfd($vfddata)`` (:357). It is a
+        Noritake/Futaba command stream: alternating code/argument bytes
+        (``$vfdCodeCmd`` = 0x02, ``$vfdCodeChar`` = 0x03, ``:29-31``), the
+        brightness prelude (``$noritakeBrightPrelude``, :51-55), custom
+        character definitions (:323-330), ``$vfdReset`` (:56) then the
+        escaped text (:337-342) and the cursor commands (:344-355).
+
+        Perl enforces two invariants on that stream before sending (:359-362):
+        the byte count must be even ("Odd vfddata") and ≤ 500
+        ("VFDData too long"). Both are logged here as a warning — our own
+        diagnostic, Perl dies — because the bytes are forwarded verbatim.
+
+        ``Slim/Player/Squeezebox.pm:504-514`` is Perl's ``opened`` check:
+        with no live socket ``vfd`` silently does nothing, which is our
+        missing-writer/``is_closing`` early return.
+
+        Recipients: ``Slim::Display::Text`` players —
+        ``squeezeslave`` (``Slimproto.pm:1098-1101``), SB1 without bitmap
+        (:1058-1070) — and anything else inheriting
+        ``Slim::Player::Squeezebox::vfd``. SLIMP3 does NOT use this frame:
+        it overrides ``vfd`` to send a UDP datagram
+        (``Slim/Player/SLIMP3.pm:289-297``,
+        ``'l                 ' . $data``).
+        """
+        mac = mac.upper().replace(":", "")
+        writer = self._player_writers.get(mac)
+        if writer is None or writer.is_closing():
+            logger.debug("send_vfdc: no writer for player %s", mac)
+            return False
+        if len(data) % 2 or len(data) > VFD_MAX_BYTES:
+            logger.warning(
+                "send_vfdc: %d bytes to %s violates Perl's TextVFD "
+                "invariants (even, <= %d; TextVFD.pm:361-362)",
+                len(data), mac, VFD_MAX_BYTES)
+        payload = b"vfdc" + bytes(data)
+        frame = struct.pack(">H", len(payload)) + payload
+        try:
+            writer.write(frame)
+            await writer.drain()
+            logger.info("Sent vfdc (%d bytes) to %s", len(data), mac)
+            return True
+        except (ConnectionError, OSError, RuntimeError) as exc:
+            logger.warning("send_vfdc to %s failed: %s", mac, exc)
+            return False
+
+    async def send_grfb(self, mac: str, brightness_code: int) -> bool:
+        """Send a 'grfb' (display brightness) frame to a player.
+
+        Perl ``Slim/Display/Graphics.pm:496-509``::
+
+            my $brightness = $display->SUPER::brightness($delta);
+            if (defined($delta)) {
+                my @brightnessMap = $display->brightnessMap;
+                my $brightnesscode = pack('n', $brightnessMap[$brightness]);
+                $display->client->sendFrame('grfb', \\$brightnesscode);
+            }
+
+        Payload: one u16 BE — ``brightnessMap[brightness]``, the raw 16-bit
+        code, not a percentage. The maps:
+
+        * Squeezebox2/Boom/Transporter → ``(65535, 0, 1, 3, 4)``
+          (``Squeezebox2.pm:209-211``; ``Transporter.pm`` and ``Boom.pm``
+          inherit it — only ``SqueezeboxG.pm:135-137`` and
+          ``Boom.pm:180-196`` override it, Boom's is sensor-derived), indexed
+          0..``maxBrightness`` = ``$#map`` = 4
+          (``Graphics.pm:511-516``), so full brightness on an SB2 is
+          ``0xFFFF`` and "off" is ``0x0000``;
+        * SqueezeboxG (bitmapped SB1) → ``(0, 1, 4, 16, 30)``.
+
+        The frame goes out only when ``$delta`` is defined; a
+        read-only/initial call does not reach the player
+        (``Graphics.pm:502``; the base ``Display.pm:378-398`` does not send
+        anything). ``pack('n', …)`` truncates modulo 2**16, so the same
+        masking is applied here.
+
+        Callers (Perl): ``Player/brightness`` → ``display->brightness``
+        (``Player.pm:162``), invoked on connect
+        (``Squeezebox.pm:127``), on power on/off (``Player.pm:119``,
+        ``:257``, ``:287``), for the idle/screensaver dim
+        (``Squeezebox.pm:368``, ``:409-410``) and per ``showBriefly``
+        brightness (``Display.pm:307-312``, ``:336-337``).
+
+        Recipients: the Graphics displays of ``Squeezebox2.pm:25``
+        (SB2/SB3, softsqueeze), ``Boom.pm:25``, ``Transporter.pm:26``,
+        ``SqueezeboxG.pm:25`` — i.e. real Logitech hardware.
+        ``squeezeplay``/``controller`` (squeezelite/jive) have
+        ``NoDisplay`` (``Slimproto.pm:1103-1106``), a class with no
+        ``brightnessMap``, so nothing is ever sent to them.
+        """
+        mac = mac.upper().replace(":", "")
+        writer = self._player_writers.get(mac)
+        if writer is None or writer.is_closing():
+            logger.debug("send_grfb: no writer for player %s", mac)
+            return False
+        payload = b"grfb" + struct.pack(">H", int(brightness_code) & 0xFFFF)
+        frame = struct.pack(">H", len(payload)) + payload
+        try:
+            writer.write(frame)
+            await writer.drain()
+            logger.info("Sent grfb brightness=0x%04X to %s",
+                        int(brightness_code) & 0xFFFF, mac)
+            return True
+        except (ConnectionError, OSError, RuntimeError) as exc:
+            logger.warning("send_grfb to %s failed: %s", mac, exc)
+            return False
+
+    async def send_display_framebuffer(
+        self, mac: str, framebuffer: bytes, offset: int = 0,
+        transition: str = DISPLAY_TRANSITION_DEFAULT, param: int = 0
+    ) -> bool:
+        """Send a graphic 'grfe' framebuffer frame to a player.
+
+        Perl ``Slim/Display/Squeezebox2.pm:230-250`` (``drawFrameBuf``)::
+
+            my $framebuf = pack('n', $offset) .    # offset [transporter
+                                                   # screen 2 = offset of 640]
+                            $transition .          # transition
+                            pack('c', $param) .    # param byte
+                            $$framebufref;
+            $client->sendFrame('grfe', \\$framebuf);
+
+        Header: offset(u16 BE) + transition(1 ASCII char, default ``'c'``
+        at ``:234``) + param(1 signed byte, default 0 at ``:235``), then the
+        bitmap. ``scrollHeader`` (``:338-341``) is exactly that 4-byte
+        header — ``pack('n', 0) . 'c' . pack('c', 0)`` = ``00 00 63 00`` —
+        which is the fastest proof of the layout; ``Graphics.pm:542``
+        prepends it for client-side scrolling and calls the same
+        ``sendFrame($display->graphicCommand, …)``, with ``graphicCommand``
+        = ``'grfe'`` (``Squeezebox2.pm:213-214``). SqueezeboxG's bitmapped
+        SB1 uses ``'grfd'`` (``SqueezeboxG.pm:139-141``, its own
+        ``drawFrameBuf`` at :149-167) and is intentionally not this method.
+
+        Bitmap size for the SB2 panel: 4 bytes/column × 320 columns = 1280
+        bytes (``Squeezebox2.pm:180-182`` + ``:188-190``;
+        :meth:`DISPLAY_FRAMEBUF_BYTES_SB2`). The 320x32 SB2 has one screen,
+        the Transporter two — screen 2 sits at offset 640
+        (``Transporter.pm:206-209``, ``:276-286``).
+
+        Bounds, all Perl ``pack`` semantics (no range check, truncation):
+        ``offset`` mod 2**16, ``param`` mod 2**8 as a signed byte
+        (verified: ``pack("c", -1)`` = ``ff``, ``pack("c", 300)`` = ``2c``).
+        ``transition`` must be exactly one byte long — Perl just
+        concatenates the string, so a longer one would silently produce a
+        5-byte header and a corrupt frame; that ValueError is our guard, not
+        Perl's (Perl has none).
+
+        Callers (Perl): ``updateScreen`` (:218-227, screen change), the
+        push/bump animations (:401-417) which pass ``'r'``/``'l'``/``'u'``/
+        ``'d'``/``'L'``/``'R'``/``'U'``/``'D'`` plus the screen extent as
+        ``param``, and Transporter's two-screen update. Recipients are the
+        ``Squeezebox2`` family (``Squeezebox2.pm:213-214``): SB2/SB3,
+        softsqueeze, Boom, Transporter. ``squeezeplay``/``controller``
+        (squeezelite/jive) get ``NoDisplay`` (``Slimproto.pm:1103-1106``);
+        their emulated SB2 display has ``drawFrameBuf {}``
+        (``EmulatedSqueezebox2.pm:25-26``), so the framebuffer never reaches
+        a soft player.
+        """
+        mac = mac.upper().replace(":", "")
+        writer = self._player_writers.get(mac)
+        if writer is None or writer.is_closing():
+            logger.debug("send_display_framebuffer: no writer for player %s",
+                         mac)
+            return False
+        if isinstance(transition, bytes):
+            transition_bytes = transition
+        else:
+            transition_bytes = transition.encode("latin-1", "replace")
+        if len(transition_bytes) != 1:
+            raise ValueError(
+                "grfe transition must be exactly one byte "
+                f"(Perl Squeezebox2.pm:234), got {transition!r}"
+            )
+        payload = (
+            b"grfe"
+            + struct.pack(">H", int(offset) & 0xFFFF)
+            + transition_bytes
+            + bytes([int(param) & 0xFF])
+            + bytes(framebuffer)
+        )
+        frame = struct.pack(">H", len(payload)) + payload
+        try:
+            writer.write(frame)
+            await writer.drain()
+            logger.info(
+                "Sent grfe framebuffer offset=%d transition=%r param=%d "
+                "(%d bitmap bytes) to %s",
+                int(offset) & 0xFFFF, transition_bytes, int(param) & 0xFF,
+                len(framebuffer), mac)
+            return True
+        except (ConnectionError, OSError, RuntimeError) as exc:
+            logger.warning("send_display_framebuffer to %s failed: %s",
+                           mac, exc)
             return False
 
     def _handle_bye_frame(self, mac_str: str, payload: bytes) -> None:
