@@ -616,6 +616,18 @@ _JIVE_QUERY_COMMANDS = frozenset({
     "jivealbumsortsettings", "date",
 })
 
+#: ``<feed>info`` → the contextmenu.py ``menu:<name>`` entity it maps onto.
+#: Perl's ``contextmenu`` command is a wrapper that forwards to exactly this
+#: feed (Slim/Control/Queries.pm:6196-6200), so both entry points share the
+#: builder.  ``yearinfo`` is handled separately (menus.year_info_menu) —
+#: ``folderinfo``/``systeminfo``/``playlistinfo`` stay unknown for now.
+_INFO_FEED_MENUS = {
+    "trackinfo": "track",
+    "albuminfo": "album",
+    "artistinfo": "artist",
+    "genreinfo": "genre",
+}
+
 
 def _jive_string(key: str) -> str:
     """Perl ``$client->string($key)`` (Slim/Utils/Strings.pm:525-536).
@@ -1936,7 +1948,8 @@ class JSONRPCAPI:
         # LMS 'menu <start> <count> [direct:1]' returns the root browse
         # items in item_loop. Apps hang on 'Loading Menus…' without it.
         if cmd == "menu":
-            items = self._home_menu()
+            client = pm.get_player(pid) if (pm is not None and pid) else None
+            items = self._home_menu(client)
             start = int(args[0]) if args and str(args[0]).isdigit() else 0
             count = int(args[1]) if len(args) > 1 and str(args[1]).isdigit() else 512
             loop = items[start:start + count]
@@ -1956,7 +1969,8 @@ class JSONRPCAPI:
         # array, data[2] = menu directive — items are only added when
         # the directive is "add" (MenuStatusMessage.ADD)!
         if cmd == "menustatus":
-            return [None, self._home_menu(), "add", pid or ""]
+            client = pm.get_player(pid) if (pm is not None and pid) else None
+            return [None, self._home_menu(client), "add", pid or ""]
 
         # ── Jive-Settings-/Menü-Queries (Slim/Control/Jive.pm) ─────
         # SqueezePlay/Controller rufen sie für ihre Einstellungsmenüs auf
@@ -2163,6 +2177,17 @@ class JSONRPCAPI:
         if cmd == "contextmenu":
             from lyrion.web.contextmenu import handle_contextmenu
             return await handle_contextmenu(self, pm, pid, args)
+
+        # ── *info feeds (the target of Jive's "more" action, MENU-03) ───
+        # Perl dispatches ['<feed>info', 'items', '_index', '_quantity']
+        # (Slim/Menu/AlbumInfo.pm:32-37, TrackInfo.pm:32, ArtistInfo/GenreInfo/
+        # YearInfo/FolderInfo) and a long-press on a browse item sends exactly
+        # this (base.actions.more → cmd [<feed>info, 'items']).  The
+        # track/album/artist/genre feeds are served by our context-menu
+        # builder (contextmenu.py — Perl forwards ``contextmenu`` there too,
+        # Queries.pm:6196-6200), the year feed by ``menus.year_info_menu``.
+        if cmd in _INFO_FEED_MENUS or cmd == "yearinfo":
+            return await self._info_feed(cmd, pm, pid, args)
 
         # ── displaystatus (Squeezer subscribes with a request) ──────
         # Squeezer's parseDisplayStatus does getDataAsMap() — an
@@ -3454,7 +3479,7 @@ class JSONRPCAPI:
             # Squeezer's parseMenuStatus expects 'menu' to be the item
             # ARRAY directly ((Object[]) record.get("menu")) — not an
             # object with item_loop.
-            menu_block = self._home_menu()
+            menu_block = self._home_menu(player)
 
         # P4-1: sync fields (only when synced) + optional status fields
         sync_fields: dict[str, str] = {}
@@ -3662,65 +3687,70 @@ class JSONRPCAPI:
             start = 0
         return start, min(start + qty - 1, last)
 
-    def _home_menu(self) -> list[dict]:
-        """The root browse menu (Home), matching the real LMS item shape
-        that SqueezePlay/SqueezeClient/Squeezer reliably render.
+    def _home_menu(self, player: Any = None) -> list[dict]:
+        """The root browse menu (Home) — Perl ``mainMenu``
+        (Slim/Control/Jive.pm:261-320).
 
         The controllers recognise the canonical item ids (myMusic, favorites,
-        radios, myMusicMusicFolder...), the node values (home/myMusic) and
-        the browselibrary navigation command. Items with isANode become
+        radios, myMusicMusicFolder...), the node values (home/myMusic/settings)
+        and the browselibrary navigation command.  Items with isANode become
         expandable nodes; the myMusic children are emitted in the SAME
         item_loop and nested under the myMusic node by the controller.
+
+        ``player`` is the connected client the menu is built for (Perl's
+        ``mainMenu($client)``): with it the player-bound items (``playerpower``
+        and the ``settings`` entries, Jive.pm:2239-2275 / :1395-1600) are
+        emitted — without it (tests, disconnected clients) the menu stays the
+        library-only subset.  Titles are localized via ``menus.menu_title``.
         """
+        from lyrion.web import menus
+
         def _go(cmd: list[str], params: dict | None = None) -> dict:
             go: dict = {"player": 0, "cmd": cmd}
             if params:
                 go["params"] = params
             return {"go": go, "do": go}
 
-        def _my_item(iid: str, name: str, node: str, weight: int,
-                     mode: str, icon: str = "") -> dict:
-            """A My Music child that browses the library by mode."""
-            it = {
-                "id": iid,
-                "text": name,
-                "node": node,
-                "weight": weight,
-                "actions": _go(["browselibrary", "items"],
-                               {"menu": 1, "mode": mode}),
-            }
-            if icon:
-                it["icon"] = icon
-            return it
-
-        my_children = [
-            _my_item("myMusicArtistsAllArtists", "Alle Interpreten", "myMusic",
-                     11, "artists", "html/images/artists.png"),
-            _my_item("myMusicAlbums", "Alben", "myMusic", 20,
-                     "albums", "html/images/albums.png"),
-            _my_item("myMusicGenres", "Stilrichtung", "myMusic", 30,
-                     "genres", "html/images/genres.png"),
-            _my_item("myMusicYears", "Jahrgang", "myMusic", 40, "years"),
-            _my_item("myMusicMusicFolder", "Musikordner", "myMusic", 70,
-                     "bmf", "html/images/musicfolder.png"),
-            _my_item("myMusicSearch", "Suchen", "myMusic", 90, "search"),
-        ]
-
-        return [
+        items: list[dict] = [
             # My Music node — SqueezePlay expands it into the myMusic
             # children (which share this item_loop, node=myMusic).
-            {"id": "myMusic", "text": "Eigene Musik", "node": "home",
-             "isANode": 1, "weight": 11, "hasitems": 1},
-            {"id": "favorites", "text": "Favoriten", "node": "home",
-             "weight": 100, "actions": _go(["favorites", "items"],
-                                           {"menu": "favorites"})},
-            {"id": "radios", "text": "Radio", "node": "home", "weight": 20,
-             "actions": _go(["radios"], {"menu": "radio"})},
-            *my_children,
-            # Jive.pm:316 hängt ``recentSearchMenu($client, 1)`` ans Home-Menü
-            # (nur bei genau einem gecachten Such-Eintrag, Jive.pm:2728).
-            *_jive_recent_search_menu(),
+            {"id": "myMusic", "text": menus.menu_title("MY_MUSIC"),
+             "node": "home", "isANode": 1, "weight": 11, "hasitems": 1},
+            {"id": "favorites", "text": _jive_string("FAVORITES"),
+             "node": "home", "weight": 100,
+             "actions": _go(["favorites", "items"], {"menu": "favorites"})},
         ]
+
+        if player is not None:
+            # mainMenu order: playerPower and playerSettingsMenu come after
+            # the favorites entry and before internetRadioMenu (Jive.pm:281-291).
+            items.append(menus.power_node(
+                getattr(player, "name", "") or getattr(player, "mac", ""),
+                bool(getattr(player, "power", False))))
+            items.extend(menus.settings_nodes(
+                player_name=getattr(player, "name", "") or "",
+                power_on=bool(getattr(player, "power", False)),
+                repeat=int(getattr(player, "repeat", 0) or 0),
+                shuffle=int(getattr(player, "shuffle", 0) or 0)))
+
+        items.append(
+            # internetRadioMenu (Jive.pm:1360-1393): Perl only emits it when
+            # the radios query returns a non-empty list; menuStyle 'album'.
+            {"id": "radios", "text": menus.menu_title("RADIO"), "node": "home",
+             "weight": 20, "window": {"menuStyle": "album"},
+             "actions": _go(["radios"], {"menu": "radio"})})
+
+        # myMusicMenu(1, $client) (Jive.pm:316) → BrowseLibrary nodes.
+        # The Perl per-node conditions are mirrored by the flags: this port
+        # has no unified-artists pref, no works model and no playlist store,
+        # so only the Album-Artists/All-Artists pair is emitted (exactly what
+        # the live Perl menu with default prefs shows).
+        items.extend(menus.my_music_nodes())
+
+        # Jive.pm:316 hängt ``recentSearchMenu($client, 1)`` ans Home-Menü
+        # (nur bei genau einem gecachten Such-Eintrag, Jive.pm:2728).
+        items.extend(_jive_recent_search_menu())
+        return items
 
     @staticmethod
     def _alarm_to_item(index: int, alarm) -> dict:
@@ -4333,13 +4363,17 @@ class JSONRPCAPI:
                             await pm.set_volume(pid, new)
 
         elif cmd == "playlistcontrol":
-            # SqueezePlay's My-Music play/add (base.actions → cmd
-            # playlistcontrol cmd:load|add + the item's commonParams ids).
-            # Route onto the playlist command with the same filter tokens.
+            # SqueezePlay's My-Music play/add/insert (base.actions → cmd
+            # playlistcontrol cmd:load|add|insert + the item's commonParams
+            # ids). Route onto the playlist command with the same filter
+            # tokens.  Perl's allowed cmds: load|insert|add|delete
+            # (Slim/Control/Commands.pm:1887); MENU-04 is the 'insert' path —
+            # before this it fell through to 'add' and appended instead of
+            # playing next.
             tokens = [str(a) for a in args]
             op = next((t.split(":", 1)[1] for t in tokens
                        if t.startswith("cmd:")), "load")
-            sub = "play" if op == "load" else "add"
+            sub = {"load": "play", "insert": "insert"}.get(op, "add")
             rest = [t for t in tokens
                     if not t.startswith(("cmd:", "menu:", "useContextMenu"))]
             await self._json_control(pm, pid, "playlist", [sub] + rest)
@@ -4405,6 +4439,46 @@ class JSONRPCAPI:
                     if pending:
                         player.playlist.append(pending)
                     player.playlist_total = len(player.playlist)
+            elif sub == "insert" and rest:
+                # MENU-04: Perl's "play next" (``playlistcontrol cmd:insert``).
+                # Perl appends the new tracks and then moves that block to
+                # ``playingSongIndex + 1`` (Slim/Player/Playlist.pm
+                # ``addTracks``/``_insert_done``:992-1050) — the rows land
+                # directly after the currently playing song, not at the end.
+                player = pm.get_player(pid)
+                if player is not None:
+                    tagged = {}
+                    for _a in rest:
+                        _s = str(_a)
+                        if ":" in _s:
+                            _k, _, _v = _s.partition(":")
+                            tagged[_k] = _v
+                    new_ids: list = []
+                    if any(k in tagged for k in
+                           ("album_id", "artist_id", "year", "genre_id",
+                            "folder_id")):
+                        try:
+                            new_ids = list(_expand_track_ids(tagged))
+                        except Exception:  # noqa: BLE001
+                            new_ids = []
+                    else:
+                        for item in rest:
+                            low = str(item).lower()
+                            if low.startswith(("track_id:", "item_id:")):
+                                _tid = low.split(":", 1)[1]
+                                if _tid.isdigit():
+                                    new_ids.append(int(_tid))
+                            elif str(item).isdigit():
+                                new_ids.append(int(item))
+                    if new_ids:
+                        playlist = list(player.playlist or [])
+                        pos = int(player.playlist_position or 0) + 1
+                        pos = max(0, min(pos, len(playlist)))
+                        playlist[pos:pos] = new_ids
+                        player.playlist = playlist
+                        player.playlist_total = len(playlist)
+                        player.last_activity = time.time()
+                        return
             elif sub == "index" and rest:
                 idx = rest[0]
                 player = pm.get_player(pid)
@@ -4819,6 +4893,52 @@ class JSONRPCAPI:
         except Exception:  # noqa: BLE001
             return self._browse_response([])
 
+    async def _info_feed(self, cmd: str, pm, pid: str | None,
+                         args: list) -> dict:
+        """Answer ``<feed>info items <index> <quantity> <params…>`` — the
+        long-press context menu (MENU-03's ``more`` action target).
+
+        Perl: ``Slim/Menu/AlbumInfo.pm:32-37`` etc. dispatch
+        ``['<feed>info', 'items', '_index', '_quantity']`` and route into the
+        shared OPML menu builder (``Slim/Menu/Base.pm``).  Our port answers
+        the track/album/artist/genre feeds from the verified context-menu
+        builder (``contextmenu.py``) and the year feed from
+        ``menus.year_info_menu`` — both shapes copied from live Perl
+        answers.
+
+        Only the ``items`` sub-command is served; a missing feed context
+        (no id token) yields ``{}`` like Perl's bad dispatch.
+        """
+        from lyrion.web import menus
+
+        if not args or str(args[0]) != "items":
+            return {}
+        index = args[1] if len(args) > 1 else "0"
+        quantity = args[2] if len(args) > 2 else "20"
+        rest = list(args[3:])
+        if cmd == "yearinfo":
+            year = next((str(a)[5:] for a in rest
+                         if str(a).startswith("year:")), None)
+            if not year:
+                return {}
+            try:
+                qty = int(str(quantity))
+            except (TypeError, ValueError):
+                qty = 20
+            try:
+                idx = int(str(index))
+            except (TypeError, ValueError):
+                idx = 0
+            return menus.year_info_menu(year, idx, qty)
+        entity = _INFO_FEED_MENUS.get(cmd)
+        if entity is None:
+            return {}
+        from lyrion.web.contextmenu import handle_contextmenu
+
+        tokens = [t for t in rest if not str(t).startswith("menu:")]
+        return await handle_contextmenu(
+            self, pm, pid, [index, quantity, f"menu:{entity}"] + tokens)
+
     async def _json_browselibrary(self, cmd: str, args: list[str]) -> dict:
         """browselibrary items <start> <count> mode:<albums|artists|genres|
         years|bmf|search> — the My-Music children navigation.
@@ -4893,9 +5013,12 @@ class JSONRPCAPI:
                                                       kind, filters)
             menu = self._browselibrary_menu_items(kind, rows, mode, search,
                                                   start)
+            # Perl's $presetFavSet: _jivePresetBase runs only when an item
+            # carried presetParams (XMLBrowser.pm:1131-1135,1427).
+            preset_fav_set = any("presetParams" in it for it in menu)
             return {
                 "base": {"actions": self._browselibrary_menu_actions(
-                    kind, filters, start, count)},
+                    kind, filters, start, count, preset_fav_set)},
                 "count": int(total or len(menu)),
                 "offset": start,
                 "window": {"windowStyle": "icon_list"},
@@ -5067,16 +5190,54 @@ class JSONRPCAPI:
                     # artwork and every album row shows the generic disc.
                     item["icon-id"] = str(r["id"])
                     item["icon"] = f"music/{r['id']}/cover"
+                # presetParams (MENU-05) — live Perl albums item:
+                # {favorites_url:"db:album.title=-&contributor.name=blamstrain",
+                #  favorites_type:"playlist", favorites_title:"-",
+                #  icon:"music/<id>/cover"} (icon only when artwork exists).
+                # favorites_url is Perl's db: query (BrowseLibrary.pm:1597,
+                # XMLBrowser.pm:1892 _favoritesParams); the % escapes come
+                # from Perl's _tagsToParams (uri_escape).
+                from urllib.parse import quote as _q
+                fav_url = f"db:album.title={_q(title)}"
+                if artist:
+                    fav_url += f"&contributor.name={_q(artist)}"
+                preset: dict = {"favorites_url": fav_url,
+                                "favorites_type": "playlist",
+                                "favorites_title": title}
+                if r.get("artwork"):
+                    preset["icon"] = f"music/{r['id']}/cover"
+                item["presetParams"] = preset
             elif kind == "artists":
                 item["text"] = r["name"] or ""
                 item["commonParams"] = {"artist_id": str(r["id"])}
                 item["icon"] = "html/images/artists.png"
+                # Live Perl artists item: {icon:"html/images/artists.png",
+                # favorites_url:"db:contributor.name=%3F",
+                # favorites_title:"?", favorites_type:"playlist"}.
+                from urllib.parse import quote as _q
+                item["presetParams"] = {
+                    "favorites_url": f"db:contributor.name={_q(r['name'] or '')}",
+                    "favorites_type": "playlist",
+                    "favorites_title": r["name"] or "",
+                    "icon": "html/images/artists.png",
+                }
             elif kind == "genres":
                 item["text"] = r["genre"] or ""
                 item["commonParams"] = {"genre_id": str(r["id"])}
+                # No presetParams for genres — live Perl genres base.actions
+                # carry no set-preset-* (no item has favorites_url), so
+                # Perl's $presetFavSet stays 0 (XMLBrowser.pm:1131-1135).
             elif kind == "years":
                 item["text"] = str(r["year"])
                 item["commonParams"] = {"year": int(r["year"])}
+                # Live Perl years item: {favorites_url:"db:year.id=2026",
+                # favorites_type:"playlist", favorites_title:2026} — the
+                # title is the NUMBER (Perl numifies it).
+                item["presetParams"] = {
+                    "favorites_url": f"db:year.id={int(r['year'])}",
+                    "favorites_type": "playlist",
+                    "favorites_title": int(r["year"]),
+                }
             elif kind == "tracks":
                 # Album/artist drill target: one row per song. Perl gives
                 # every audio row goAction=playControl + playControlParams so
@@ -5149,10 +5310,13 @@ class JSONRPCAPI:
     @staticmethod
     def _browselibrary_menu_actions(kind: str, filters: dict | None = None,
                                     start: int = 0,
-                                    count: int = 1) -> dict:
+                                    count: int = 1,
+                                    preset_fav_set: bool = False) -> dict:
         """Perl base.actions for a browselibrary menu window — SqueezePlay
-        uses 'go' to drill (album→mode:tracks, artist→mode:albums, …) and
-        'play'/'add' to load the commonParams item into the playlist.
+        uses 'go' to drill (album→mode:tracks, artist→mode:albums, …),
+        'play'/'add' to load the commonParams item into the playlist,
+        'add-hold' to insert it (MENU-04), 'more' to open its context menu
+        (MENU-03) and 'set-preset-0..9' to store it as a preset (MENU-05).
         For a TRACK list the plain go must NOT drill (tracks are leaves):
         Perl marks it context-only (window.isContextMenu), otherwise every
         single tap on a song re-opens the same list (infinite recursion).
@@ -5161,45 +5325,16 @@ class JSONRPCAPI:
         params, like Perl's ``$request->getParamsCopy()``
         (Slim/Control/XMLBrowser.pm:978): the tap's follow-up request repeats
         them merged with the row's playControlParams, and without the drill
-        filter it would list the whole library instead of the tapped album."""
-        go_mode = {"albums": "tracks", "artists": "albums",
-                   "genres": "albums", "years": "albums",
-                   "folder": "bmf", "tracks": "tracks"}.get(kind, "albums")
-        go_params: dict = {"mode": go_mode, "menu": 1}
-        if kind == "artists":
-            go_params["menu_mode"] = "artists"
-        actions: dict = {
-            "go": {"player": 0, "cmd": ["browselibrary", "items"],
-                   "itemsParams": "commonParams",
-                   "params": go_params},
-            "play": {"player": 0, "cmd": ["playlistcontrol"],
-                     "itemsParams": "commonParams",
-                     "params": {"cmd": "load", "menu": 1},
-                     "nextWindow": "nowPlaying"},
-            "add": {"player": 0, "cmd": ["playlistcontrol"],
-                    "itemsParams": "commonParams",
-                    "params": {"cmd": "add", "menu": 1}},
-        }
-        if kind in ("tracks", "folder"):
-            # Context-menu only (press-and-hold) — a plain tap on an audio
-            # row or folder child must not re-open the same list.
-            cm_params: dict = {"mode": go_mode, "menu": 1,
-                               "useContextMenu": 1,
-                               "_index": start, "_quantity": count}
-            if kind == "tracks":
-                cm_params.update(filters or {})
-            cm_action: dict = {"player": 0, "cmd": ["browselibrary", "items"],
-                               "itemsParams": "playControlParams",
-                               "window": {"isContextMenu": 1},
-                               "params": cm_params}
-            # 'go' and 'playControl' are identical in Perl (XMLBrowser.pm:973):
-            # SqueezePlay rewrites a tap's action name onto the row's
-            # goAction ('playControl') and then looks that key up in
-            # base.actions (SlimBrowserApplet.lua:1846-1913) — without
-            # base.actions.playControl the tap aborts with EVENT_UNUSED.
-            actions["go"] = cm_action
-            actions["playControl"] = cm_action
-        return actions
+        filter it would list the whole library instead of the tapped album.
+
+        ``preset_fav_set`` mirrors Perl's ``$presetFavSet``
+        (XMLBrowser.pm:1131-1135,1427) — the caller sets it when at least one
+        item of the window carried ``presetParams`` (live Perl:
+        albums/artists/years/tracks yes, genres no).  The shapes live in
+        ``lyrion/web/menus.py``."""
+        from lyrion.web import menus
+
+        return menus.base_actions(kind, filters, start, count, preset_fav_set)
 
     @staticmethod
     def _playcontrol_context_menu(rows: list, start: int,
