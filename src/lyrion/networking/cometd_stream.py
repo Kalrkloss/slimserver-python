@@ -108,6 +108,51 @@ async def _push_events(manager, cid: str, writer: asyncio.StreamWriter) -> None:
         pass
 
 
+async def _proxy_get(method: str, target: bytes, headers: dict,
+                     writer, port: int) -> None:
+    """Serve a non-Cometd request by proxying it to the web app (port 9000).
+
+    Jive builds artwork/image/static URLs from the advertised (Cometd) port
+    and does NOT follow redirects — the 302 we tried produced no follow-up
+    request, so the cover slots stayed empty. Forward the raw request and
+    pipe the upstream response (status line, headers, body) back verbatim,
+    then close the client connection.
+    """
+    try:
+        reader, up = await asyncio.open_connection("127.0.0.1", port)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("NativeCometd GET proxy failed (%s): %s", target[:40], exc)
+        writer.write(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
+        await writer.drain()
+        return
+    try:
+        req = (
+            f"{method} {target.decode('ascii', 'replace')} HTTP/1.1\r\n"
+            f"Host: 127.0.0.1:{port}\r\n"
+            "Connection: close\r\n"
+        )
+        for key in (b"accept", b"accept-encoding", b"if-modified-since",
+                    b"user-agent", b"range"):
+            if key in headers:
+                req += f"{key.decode()}: {headers[key].decode('latin-1')}\r\n"
+        up.write(req.encode("latin-1") + b"\r\n")
+        await up.drain()
+        while True:
+            chunk = await reader.read(65536)
+            if not chunk:
+                break
+            writer.write(chunk)
+            await writer.drain()
+    except (ConnectionError, OSError, RuntimeError,
+            asyncio.IncompleteReadError):
+        pass
+    finally:
+        try:
+            up.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+
 async def _proxy_jsonrpc(body: bytes, port: int) -> tuple[bytes, bytes]:
     """Proxy a /jsonrpc.js POST to the main web server (port 9000)."""
     try:
@@ -178,21 +223,14 @@ async def _handle_connection(manager, reader: asyncio.StreamReader,
                 break
             if request.get("method") in ("GET", "HEAD"):
                 # Jive resolves every non-Cometd URL against the advertised
-                # port — send it to the real web port instead of dropping it.
-                host_hdr = request["headers"].get(b"host", b"").decode(
-                    "ascii", "replace")
-                host_only = host_hdr.split(":")[0] or "127.0.0.1"
-                location = (
-                    f"http://{host_only}:{web_port}"
-                    f"{request['target'].decode('ascii', 'replace')}"
+                # port — artwork (/music/<album>/cover_*.jpg), /html/... —
+                # and it does NOT follow redirects, so the bytes must come
+                # from here: proxy the request to the real web app.
+                await _proxy_get(
+                    request["method"], request["target"],
+                    request["headers"], writer, web_port,
                 )
-                writer.write(
-                    b"HTTP/1.1 302 Found\r\n"
-                    + f"Location: {location}\r\n".encode()
-                    + b"Content-Length: 0\r\nConnection: close\r\n\r\n"
-                )
-                await writer.drain()
-                continue
+                break
             path = (request["headers"].get(b"host", b"") and b"")
             body = request["body"]
 
