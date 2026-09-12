@@ -294,3 +294,26 @@ def test_empty_playlist_omits_item_loop(tmp_path, monkeypatch):
 
     assert "item_loop" not in r, "an empty item_loop crashes Jive's artwork sink"
     assert r.get("playlist_tracks") == 0
+
+
+# ----------------------------------------------------------------------
+# Perl status constants: `rate` only with a song, `playlist mode` = 'off'
+# ----------------------------------------------------------------------
+def test_rate_is_one_and_only_present_while_a_song_plays():
+    """Perl Queries.pm:4086-4097 — `rate` lives inside the playingSong()
+    branch and is the hardcoded value 1 (older SBC firmware)."""
+    playing = _status(_player([11, 12], 0, mode="play", elapsed=3.0))
+    assert playing["rate"] == 1
+
+    stopped = _status(_player([11, 12], 0, mode="stop"))
+    assert "rate" not in stopped, "Perl emits no rate when nothing plays"
+
+
+def test_playlist_mode_is_always_off():
+    """Perl Queries.pm:4192-4193 — 'playlist mode' is the constant 'off'
+    ("Backwards compatibility - now obsolete"); repeat state lives in
+    `playlist repeat` only."""
+    for repeat in (0, 1, 2):
+        r = _status(_player([11, 12], 0, mode="play", repeat=repeat))
+        assert r["playlist mode"] == "off"
+        assert r["playlist repeat"] == repeat

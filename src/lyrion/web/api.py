@@ -1692,10 +1692,15 @@ class JSONRPCAPI:
             # SqueezePlay does tonumber(event.data.playlist_cur_index).
             "playlist_cur_index": str(int(cur)),
             "time": elapsed,
-            "rate": 1 if player.mode == "play" else 0,
-            # Perl parity: 'playlist mode' mirrors the repeat state
-            # (off/repeat/repeat-one), randomplay mirrors shuffle.
-            "playlist mode": ("off", "repeat", "repeat-one")[min(2, int(getattr(player, "repeat", 0) or 0))],
+            # Perl: `rate` is a hardcoded 1 and is emitted ONLY inside
+            # `if (my $song = $client->playingSong())` (Queries.pm:4086-4097,
+            # "backward compatibility with older SBC firmware"). No song →
+            # no field, and never 0.
+            "rate": 1,
+            # Perl: `playlist mode` is the constant string 'off'
+            # (Queries.pm:4192-4193 "Backwards compatibility - now obsolete");
+            # the repeat state lives in `playlist repeat` only.
+            "playlist mode": "off",
             "randomplay": int(getattr(player, "shuffle", 0) or 0),
             "digital_volume_control": 1,
             "use_volume_control": 1,
@@ -1707,6 +1712,10 @@ class JSONRPCAPI:
             "playlist_timestamp": time.time(),
             "playlist_loop": item_loop,
         }
+        # Perl only adds `rate` inside the playingSong() branch
+        # (Queries.pm:4086-4097); a stopped player has no such field.
+        if player.mode == "stop":
+            result.pop("rate", None)
         # Jive/SqueezePlay Now Playing reads the current_* fields (not
         # 'title'): a radio stream shows its StreamTitle, a local track its
         # title/artist/album. SqueezePlay otherwise shows a blank line.

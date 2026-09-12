@@ -138,6 +138,11 @@ logger = logging.getLogger(__name__)
 BUFFER_THRESHOLD_KB = 255
 REMOTE_BUFFER_THRESHOLD_KB = 20
 REMOTE_BUFFER_SECS = 3
+# Player liveness poll interval. Perl: Slim/Networking/Slimproto.pm:40
+# `my $check_all_clients_time = 5` — every 5 s each client gets
+# requestStatus() (= `stream 't'`), and a player that fails to answer for
+# 3 intervals is disconnected (:199-241).
+KEEPALIVE_SECONDS = 5.0
 
 
 # ── audg volume → gain (logarithmic, Perl parity) ────────────────────────
@@ -1236,23 +1241,25 @@ class SlimProtoClient:
         writer: asyncio.StreamWriter,
         mac_str: str,
     ) -> None:
-        """Send a 'setd' keepalive frame every 10s.
+        """Perl's player heartbeat: `strm 't'` every 5 s.
 
-        Squeezelite's slimproto_run declares the connection dead after ~35s
-        without any message from the server ("No messages from server -
-        connection dead") and reconnects. Real LMS sends periodic frames.
-        A 'setd' frame with display id > 0 is ignored by squeezelite builds
-        without display support, but every received message resets its
-        timeout counter — exactly what we need.
+        Perl polls every client with ``requestStatus()`` — which is exactly
+        ``stream('t')`` (Squeezebox2.pm:383-385) — from the
+        ``check_all_clients`` timer, which runs every
+        ``$check_all_clients_time = 5`` seconds and drops a player that has
+        not answered for 3 intervals (Slimproto.pm:40, :199-241). The frame
+        body is the generic ``stream($command)`` layout with replayGain 0
+        (Squeezebox.pm:1089-1091, :1096-1114).
+
+        The previous implementation wrote ``setd`` id=1 every 10 s. That is
+        NOT a heartbeat in Perl: firmwareid 1 is `digitalOutputEncoding`
+        (Squeezebox2.pm:916-919), i.e. we were pushing value 0 into a real
+        player setting. A `strm 't'` frame cannot change any setting.
         """
-        # Frame: pack('n', len+4) + "setd" + id(1) + data(1).
-        # NOTE: squeezelite's setd_packet is { opcode[4]; u8 id; data[] } —
-        # there is NO 4-byte length field inside the payload (unlike HELO).
-        # Sending a length field would shift the id to 0 → player name query.
-        keepalive_frame = struct.pack(">H", 4 + 2) + b"setd" + b"\x01\x00"
+        keepalive_frame = self._build_strm_control_frame("t")
         try:
             while True:
-                await asyncio.sleep(10)
+                await asyncio.sleep(KEEPALIVE_SECONDS)
                 if writer.is_closing():
                     break
                 writer.write(keepalive_frame)
