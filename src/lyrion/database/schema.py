@@ -232,6 +232,10 @@ class Album(Base):
     musicbrainz_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
     artwork: Mapped[str | None] = mapped_column(String(1000), nullable=True)
     artwork_front: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+    # ReplayGain des Albums (Perl albums.replay_gain/-peak,
+    # gefüllt aus REPLAYGAIN_ALBUM_GAIN/PEAK, Schema.pm:1299-1322).
+    replay_gain: Mapped[float | None] = mapped_column(Float, nullable=True)
+    replay_peak: Mapped[float | None] = mapped_column(Float, nullable=True)
     # Counters (denormalized for performance)
     numtracks: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     numdiscs: Mapped[int] = mapped_column(Integer, nullable=False, default=1)

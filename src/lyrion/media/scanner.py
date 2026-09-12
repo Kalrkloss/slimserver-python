@@ -214,6 +214,12 @@ class ScanResult:
     sample_rate: int = 0
     channels: int = 0
     artwork_path: Path | None = None
+    # ReplayGain-Tags (Perl Schema.pm:2915-2945 gemungt). Track-Werte gehören
+    # an tracks.replay_gain/-peak, Album-Werte an albums.replay_gain/-peak.
+    replay_gain: float | None = None
+    replay_peak: float | None = None
+    album_replay_gain: float | None = None
+    album_replay_peak: float | None = None
     last_modified: datetime = field(default_factory=datetime.now)
     added_time: datetime = field(default_factory=datetime.now)
     checksum: str = ""
@@ -390,12 +396,14 @@ class MediaScanner:
         """
         title = artist = album = genre = ""
         year = track = duration = bitrate = sample_rate = channels = 0
+        rg_gain = rg_peak = rg_album_gain = rg_album_peak = None
         try:
             audio_file = MutagenFile(file_path)
             if audio_file is None:
                 logger.warning("No audio metadata for %s", file_path)
                 return (title, artist, album, genre, year, track,
-                        duration, bitrate, sample_rate, channels)
+                        duration, bitrate, sample_rate, channels,
+                        rg_gain, rg_peak, rg_album_gain, rg_album_peak)
             try:
                 tags = getattr(audio_file, "tags", None)
                 info = getattr(audio_file, "info", None)
@@ -420,6 +428,11 @@ class MediaScanner:
                     m = re.search(r"\d+", track_str)
                     if m:
                         track = int(m.group(0))
+                # ReplayGain (Perl Schema.pm:2915-2945 über die Tabellen der
+                # Formatklassen, s. lyrion/media/replaygain.py).
+                from lyrion.media.replaygain import extract_replaygain
+
+                (rg_gain, rg_peak, rg_album_gain, rg_album_peak) = extract_replaygain(tags)
                 if info is not None:
                     duration = int(getattr(info, "length", 0) * 1000) or 0
                     bitrate = int(getattr(info, "bitrate", 0) or 0)
@@ -434,7 +447,8 @@ class MediaScanner:
         except Exception as e:
             logger.warning("Failed to extract metadata from %s: %s", file_path, e)
         return (title, artist, album, genre, year, track,
-                duration, bitrate, sample_rate, channels)
+                duration, bitrate, sample_rate, channels,
+                rg_gain, rg_peak, rg_album_gain, rg_album_peak)
 
     async def _process_file(self, file_path: Path) -> ScanResult | None:
         """Process a single music file."""
@@ -459,7 +473,9 @@ class MediaScanner:
         # the GIL while parsing, so run the extraction in a worker thread
         # — the 8 concurrent scan workers then parallelize for real.
         (title, artist, album, genre, year, track,
-         duration, bitrate, sample_rate, channels) = (
+         duration, bitrate, sample_rate, channels,
+         replay_gain, replay_peak,
+         album_replay_gain, album_replay_peak) = (
             await asyncio.to_thread(self._extract_tags, file_path))
 
         # Metadata heuristics: fill gaps from folder structure and the
@@ -514,6 +530,10 @@ class MediaScanner:
             sample_rate=sample_rate,
             channels=channels,
             artwork_path=artwork_path,
+            replay_gain=replay_gain,
+            replay_peak=replay_peak,
+            album_replay_gain=album_replay_gain,
+            album_replay_peak=album_replay_peak,
             last_modified=datetime.fromtimestamp(stat.st_mtime),
             added_time=datetime.fromtimestamp(stat.st_ctime),
             checksum=checksum,

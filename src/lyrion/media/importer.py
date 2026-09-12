@@ -457,6 +457,9 @@ class MusicImporter:
         duration = duration_ms / 1000.0
         genre = getattr(info, "genre", None) or ""
         year = getattr(info, "year", 0) or 0
+        # ReplayGain (Perl Schema.pm:2915-2945, aus den Track-Tags gemungt).
+        rg_gain = getattr(info, "replay_gain", None)
+        rg_peak = getattr(info, "replay_peak", None)
 
         track = track_by_url.get(url)
         if track is None:
@@ -476,6 +479,8 @@ class MusicImporter:
                 tracknum=tracknum,
                 disc=disc,
                 comment=comment,
+                replay_gain=rg_gain,
+                replay_peak=rg_peak,
                 lastscanned=datetime.utcnow(),
                 audio=1,
                 video=0,
@@ -497,6 +502,12 @@ class MusicImporter:
             track.year = year or track.year
             track.genre = genre or track.genre
             track.tracknum = tracknum or track.tracknum
+            # Perl (Schema.pm:2925) schreibt nur, wenn der Tag existiert; ein
+            # entfernter Tag löscht den DB-Wert also nicht.
+            if rg_gain is not None:
+                track.replay_gain = rg_gain
+            if rg_peak is not None:
+                track.replay_peak = rg_peak
             track.lastscanned = datetime.utcnow()
             await session.flush()
 
@@ -516,6 +527,10 @@ class MusicImporter:
         compilation = bool(getattr(info, "compilation", False))
         artist_key = "various artists" if compilation else _sort_string(artist)
         key = (_sort_string(album_name), artist_key)
+        # Album-ReplayGain (Perl Schema.pm:1299-1322; Kommentar dort: "we do
+        # want to update album gain tags if they are changed").
+        album_rg = getattr(info, "album_replay_gain", None)
+        album_peak = getattr(info, "album_replay_peak", None)
 
         album = album_by_key.get(key)
         if album is None:
@@ -530,17 +545,26 @@ class MusicImporter:
                 compilation=1 if compilation else 0,
                 artwork=str(artwork) if artwork else None,
                 artwork_front=str(artwork) if artwork else None,
+                replay_gain=album_rg,
+                replay_peak=album_peak,
             )
             session.add(album)
             await session.flush()
             album_by_key[key] = album
-        elif not album.artwork:
-            # Album existed without artwork (e.g. imported before this
-            # column was filled) — backfill from this track's folder.
-            artwork = getattr(info, "artwork_path", None)
-            if artwork:
-                album.artwork = str(artwork)
-                album.artwork_front = str(artwork)
+        else:
+            if not album.artwork:
+                # Album existed without artwork (e.g. imported before this
+                # column was filled) — backfill from this track's folder.
+                artwork = getattr(info, "artwork_path", None)
+                if artwork:
+                    album.artwork = str(artwork)
+                    album.artwork_front = str(artwork)
+            # Album-Gain aktualisieren, wenn ein Tag vorhanden ist
+            # (Perl Schema.pm:1306-1310).
+            if album_rg is not None:
+                album.replay_gain = album_rg
+            if album_peak is not None:
+                album.replay_peak = album_peak
         # Retag cleanup: drop a stale album link (track re-tagged to a
         # different album) — otherwise the old album keeps listing the track.
         await session.execute(

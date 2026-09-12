@@ -145,7 +145,11 @@ async def migrate_legacy_db(engine: AsyncEngine) -> list[str]:
                 sync_conn.exec_driver_sql("PRAGMA table_info(albums)")]
         if "albumartist_sort" not in cols:
             sync_conn.exec_driver_sql(
-                "ALTER TABLE albums ADD COLUMN albumartist_sort VARCHAR(255)")
+                "ALTER TABLE albums ADD COLUMN albumartist_sort VARCHAR(255)"),
+            # ReplayGain des Albums (Schema.pm:1299-1322); Bestands-DBs haben
+            # die Spalten nicht, SQLite kann sie nur additiv nachziehen.
+            "ALTER TABLE albums ADD COLUMN replay_gain FLOAT",
+            "ALTER TABLE albums ADD COLUMN replay_peak FLOAT",
             return True
         return False
 
