@@ -113,6 +113,9 @@ class PlayerState:
     can_sync: bool = True
     can_multi_sync: bool = True
     digital_volume_control: bool = True
+    # Player.pm:39 defaultPrefs 'preampVolumeControl' => 0; der audg-Frame
+    # rechnet daraus preamp = 255 - int(2*value) (Squeezebox2.pm:302).
+    preamp_volume_control: int = 0
     max_volume: int = 100
     signal_strength: int = 0
     display_width: int = 320

@@ -1241,6 +1241,12 @@ async def cmd_playerpref(
         # Set form: value may be multi-word (join the rest)
         value = " ".join(str(a) for a in args[1:])
         prefs[key] = value
+        # Wie Perls setChange-Callbacks (Player.pm:79): die Werte, die unsere
+        # Frames lesen (digitalVolumeControl/preampVolumeControl, Mixer-Werte),
+        # sofort auf den PlayerState anwenden.
+        from lyrion.player.playerprefs import apply_player_pref
+
+        apply_player_pref(player, key, value)
         return [f"playerpref {key}: {value}", ""]
     except Exception as e:  # noqa: BLE001
         return [f"cli error: {e}", ""]

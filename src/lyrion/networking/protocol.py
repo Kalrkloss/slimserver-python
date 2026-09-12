@@ -2614,7 +2614,19 @@ class SlimProtoClient:
         # dvc = digitalVolumeControl pref, preamp = 255 - 2*preampVolumeControl
         # (Squeezebox2.pm:283-303, defaults Player.pm:38-39). Balance is not
         # applied (default 0 → left/right factor 1, Squeezebox2.pm:305-307).
-        dvc = 1 if getattr(pstate, "digital_volume_control", True) else 0
+        # Perl liest beide Werte aus den Client-Prefs (Squeezebox2.pm:283-303):
+        #   $dvc    = $prefs->client($client)->get('digitalVolumeControl')
+        #   $preamp = 255 - int(2 * ($prefs->client($client)->get('preampVolumeControl') || 0))
+        # playerpref schreibt genau diese Prefs — die Prefs haben Vorrang vor
+        # dem State-Feld, damit ein playerpref sofort im audg-Frame wirkt.
+        _prefs = getattr(pstate, "playerprefs", None) or {}
+        if "digitalVolumeControl" in _prefs:
+            try:
+                dvc = 0 if int(float(str(_prefs["digitalVolumeControl"]))) == 0 else 1
+            except (TypeError, ValueError):
+                dvc = 1 if getattr(pstate, "digital_volume_control", True) else 0
+        else:
+            dvc = 1 if getattr(pstate, "digital_volume_control", True) else 0
         # The gain must come from THIS player's curve: jive compares it against
         # its own table and reverts/retries the volume otherwise.
         model = getattr(pstate, "model", "") or "squeezebox2"
@@ -2625,7 +2637,8 @@ class SlimProtoClient:
             struct.pack(">I", old_gain),  # old_gainL (Squeezebox2.pm:285/:309)
             struct.pack(">I", old_gain),  # old_gainR
             bytes([dvc]),                 # adjust: digitalVolumeControl pref
-            bytes([audg_preamp()]),       # preamp 255 with the default pref
+            # preamp: Player.pm:39 default 0 → 255; playerpref kann ihn ändern.
+            bytes([audg_preamp(int(getattr(pstate, "preamp_volume_control", 0) or 0))]),
             struct.pack(">I", gain),      # gainL (dB curve, not linear!)
             struct.pack(">I", gain),      # gainR
             struct.pack(">I", seq_no),  # sequenceNumber (Squeezebox2.pm:313)

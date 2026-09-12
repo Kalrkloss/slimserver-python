@@ -3004,6 +3004,35 @@ class JSONRPCAPI:
                 pm.set_power(pid, player.power)
             else:
                 send(f"power {val}")
+        elif cmd == "playerpref":
+            # Perl prefCommand (Commands.pm:2631-2677): '_prefname' ist der
+            # Token nach dem Kommando, der Wert kommt als 'value'/'_newvalue'
+            # (das valtag der Jive-Action), ein 'value:'-Präfix wird entfernt;
+            # für playerpref ist ein Client Pflicht (sonst bad dispatch).
+            # Die Wirkung entsteht über die setChange-Callbacks (Player.pm:79)
+            # — bei uns apply_player_pref() (audg-Bytes, Mixer-Werte).
+            from lyrion.player.playerprefs import apply_player_pref
+
+            want = None
+            if args:
+                want = str(args[0])
+                if want.startswith("value:"):
+                    want = want[6:]
+            player = pm.get_player(pid)
+            if player is None or not want:
+                return
+            value = None
+            for token in args[1:]:
+                t = str(token)
+                if t.startswith("value:"):
+                    value = t[6:]
+                    break
+            if value is None and len(args) > 1:
+                value = str(args[1])
+            if value is None:
+                return
+            result = apply_player_pref(player, want, value)
+            logger.debug("playerpref %s=%s -> %s", want, value, result)
         elif cmd == "pause":
             player = pm.get_player(pid)
             if player is None:
