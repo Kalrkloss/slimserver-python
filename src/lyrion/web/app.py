@@ -607,6 +607,15 @@ def create_app(
             await _respond_401(send)
             return
 
+        # Web-Settings-Seiten: /settings/<bereich>/<seite>.html.
+        # Perl: Dispatch über den pageFunction-Regexp-Hash
+        # (Slim/Web/HTTP.pm:1160-1176) in den Basis-Handler
+        # Slim/Web/Settings.pm:135-287 (pref_<name> → set()).
+        from .settings import handle_settings_request, is_settings_path
+        if is_settings_path(path):
+            await handle_settings_request(scope, receive, send)
+            return
+
         # Audio streaming gets a dedicated path (needs chunked body sends).
         if path.startswith("/stream") and method == "GET":
             from .stream import stream_track
