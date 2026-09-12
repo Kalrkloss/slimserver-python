@@ -833,12 +833,20 @@ class PlayerManager:
         player.playlist = [url]
         player.playlist_position = 0
         player.playlist_total = 1
-        # Guess the source codec from the URL so the strm frame tells the
-        # player the real format (an AAC stream announced as 'm' makes
-        # squeezelite decode AAC with the MP3 decoder → heavy distortion).
+        # Determine the source codec the way Perl does: read the stream's
+        # HTTP headers and map the content type (Slim/Utils/Scanner/Remote.pm:
+        # 333-390). The URL suffix alone lies — an AAC station without ".aac"
+        # in its URL was announced as 'm', so the client decoded AAC with the
+        # MP3 decoder ("AAC radio stream geht nicht", live 2026-09-12). The
+        # suffix guess stays as the fallback when the probe fails.
         from lyrion.networking.protocol import SlimProtoClient
+        from lyrion.formats.stream_probe import codec_for_stream_url
 
-        codec = SlimProtoClient._guess_codec_from_url(url)
+        suffix_codec = SlimProtoClient._guess_codec_from_url(url)
+        codec = await codec_for_stream_url(url, fallback=suffix_codec)
+        if codec != suffix_codec:
+            logger.info("Stream codec from headers: %s (suffix said '%s')",
+                        codec, suffix_codec)
         ok = await handler.send_remote_stream(player.mac, url, codec)
         if ok:
             logger.info("play_url codec guess: %s -> '%s'", url[:60], codec)
