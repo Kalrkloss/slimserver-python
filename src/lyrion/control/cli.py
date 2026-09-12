@@ -103,6 +103,11 @@ class CLIContext:
     subscribed_player: Optional[str] = None
     subscribe_interval: int = 0  # seconds between keep-alive status pushes
     command: str = ""  # the command name actually invoked (for aliases)
+    # Antwort-Terminator dieser Verbindung. Perl startet mit LF und übernimmt
+    # dann den Terminator, den der CLIENT benutzt hat (Slim/Plugin/CLI/Plugin.pm
+    # :260 ``= $LF``, :388-409 "Remember the terminator used"); jede Antwort
+    # endet mit genau EINEM Terminator (:698).
+    terminator: bytes = b"\n"
 
 
 # ---------------------------------------------------------------------------
@@ -275,6 +280,7 @@ class CLIHandler:
     async def read_commands(
         self,
         reader: asyncio.StreamReader,
+        ctx: "CLIContext | None" = None,
     ) -> AsyncIterator[tuple[str, list[str]]]:
         """
         Yield (command_name, args_list) tuples from the wire.
@@ -297,8 +303,18 @@ class CLIHandler:
                 )
                 if term == -1:
                     break
+                # Wie viele Terminator-Bytes? (Perl: /[\r|\n|\r\n|\x00]+/,
+                # Plugin/CLI/Plugin.pm:390 — der Treffer wird für die Antwort
+                # dieser Verbindung gemerkt, :404-406.)
+                tlen = 1
+                while term + tlen < len(buf) and buf[term + tlen:term + tlen + 1] in (b"\r", b"\n"):
+                    tlen += 1
+                if ctx is not None:
+                    used = buf[term:term + tlen]
+                    if used and used != ctx.terminator:
+                        ctx.terminator = used
                 line = buf[:term]
-                buf = buf[term + 1:]
+                buf = buf[term + tlen:]
                 line = line.strip()
                 if not line:
                     continue
@@ -416,10 +432,14 @@ class CLIHandler:
         The wait is bounded, so the client can still send commands
         (e.g. 'unsubscribe') between pushes.
         """
+        # Ein Terminator pro Antwort, und zwar der des Clients
+        # (Slim/Plugin/CLI/Plugin.pm:698 ``$output . $terminator``). Vorher
+        # schickten wir "<zeile>\n" plus REQUEST_END ("\n\n") — also drei
+        # Zeilenumbrüche statt einem (Live-Diff gegen Perl, 2026-09-12).
+        term = getattr(ctx, "terminator", None) or self.LINE_END
         for line in lines:
-            data = line.encode(ctx.charset, errors="replace") + self.LINE_END
+            data = line.encode(ctx.charset, errors="replace") + term
             writer.write(data)
-        writer.write(self.REQUEST_END)
         await writer.drain()
 
         player_id = ctx.subscribed_player
@@ -439,9 +459,9 @@ class CLIHandler:
             if not ctx.player_id:
                 ctx.player_id = player_id  # bind subscribed player for the push
             status_lines = await self.dispatch(ctx, ("status", ["-", "1"]))
+            term = getattr(ctx, "terminator", None) or self.LINE_END
             for line in status_lines:
-                writer.write(line.encode(ctx.charset, errors="replace") + self.LINE_END)
-            writer.write(self.REQUEST_END)
+                writer.write(line.encode(ctx.charset, errors="replace") + term)
             await writer.drain()
         except Exception:  # noqa: BLE001
             pass

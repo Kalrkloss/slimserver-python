@@ -52,7 +52,7 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
         await handler._dispatcher.start()
     try:
         async with handler.connect(reader, writer) as ctx:
-            async for cmd, args in handler.read_commands(reader):
+            async for cmd, args in handler.read_commands(reader, ctx):
                 if cmd in ("exit", "quit"):
                     break
                 lines = await handler.dispatch(ctx, (cmd, args))
