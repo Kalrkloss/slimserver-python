@@ -69,7 +69,8 @@ def _db(tmp_path):
         VALUES
             (11, 'First Song', 'file:///music/first.mp3', 180.0, 'Rock', 1, NULL, 0, 'mp3'),
             (12, 'Second Song', 'file:///music/second.mp3', 245.5, 'Rock', 2, NULL, 0, 'mp3'),
-            (13, 'Third Song', 'file:///music/third.mp3', 300.25, 'Rock', 3, NULL, 0, 'mp3');
+            (13, 'Third Song', 'file:///music/third.mp3', 300.25, 'Rock', 3, NULL, 0, 'mp3'),
+            (14, 'Ape Song', 'file:///music/ape.ape', 120.0, 'Rock', 4, NULL, 0, 'ape');
         INSERT INTO contributors (id, name) VALUES (7, 'The Artist');
         INSERT INTO tracks_contributors (track, contributor, role)
         VALUES (11, 7, 1), (12, 7, 1), (13, 7, 1);
@@ -317,3 +318,29 @@ def test_playlist_mode_is_always_off():
         r = _status(_player([11, 12], 0, mode="play", repeat=repeat))
         assert r["playlist mode"] == "off"
         assert r["playlist repeat"] == repeat
+
+
+# ----------------------------------------------------------------------
+# can_seek: only when Perl's format class implements canSeek
+# ----------------------------------------------------------------------
+def test_can_seek_for_a_local_mp3(tmp_path, monkeypatch):
+    """Perl Queries.pm:4104-4107 adds can_seek when the song can seek; for a
+    local file that means the format class implements canSeek (File.pm:403-415)
+    — MP3.pm:476 does."""
+    monkeypatch.setattr(api_mod, "_library_db_path", lambda: _db(tmp_path))
+    r = _status(_player([11, 12, 13], 0, mode="play", elapsed=5.0))
+    assert r["can_seek"] == 1
+
+
+def test_no_can_seek_without_a_playing_song(tmp_path, monkeypatch):
+    monkeypatch.setattr(api_mod, "_library_db_path", lambda: _db(tmp_path))
+    r = _status(_player([11, 12, 13], 0, mode="stop"))
+    assert "can_seek" not in r
+
+
+def test_no_can_seek_for_a_format_without_a_perl_canSeek_class(tmp_path, monkeypatch):
+    """APE/Musepack/WavPack have no canSeek in Slim/Formats — Perl sends no
+    can_seek field for them."""
+    monkeypatch.setattr(api_mod, "_library_db_path", lambda: _db(tmp_path))
+    r = _status(_player([14], 0, mode="play", elapsed=1.0))
+    assert "can_seek" not in r

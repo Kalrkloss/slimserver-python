@@ -20,6 +20,32 @@ logger = logging.getLogger(__name__)
 # volume and re-sends — an unbroken seq_no makes the client loop forever.
 _SEQ_NO_RE = re.compile(r"^seq_no:(\d+)$")
 
+# Formats whose Perl format class implements canSeek, i.e. local files the
+# player may seek in. Perl path: Queries.pm:4104-4107 (adds `can_seek` only
+# when true) → Slim::Music::Info::canSeek (Info.pm:1147-1151) →
+# Slim::Player::Song::canSeek/canDoSeek (Song.pm:839-865) →
+# Slim::Player::Protocols::File::canSeek (File.pm:403-415: the format class
+# must implement canSeek). Classes that do: MP3.pm:476, FLAC.pm:1011,
+# Ogg.pm:333, OggOpus.pm:148, Wav.pm:118, AIFF.pm:126, DSD.pm:52 (dsf/dff),
+# WMA.pm, Movie.pm:249 — and Formats.pm:63-64 maps aac/mp4/mp4x to
+# Slim::Formats::Movie. APE/Musepack/WavPack have NO canSeek.
+# Remote (HTTP) is a different rule: Protocols::HTTP::canSeek:1150-1155
+# requires a KNOWN bitrate and duration.
+SEEKABLE_FORMATS = frozenset({
+    "mp3", "flac", "ogg", "oga", "ogf", "opus", "wav", "aif", "aiff",
+    "wma", "dsf", "dff", "aac", "mp4", "m4a", "mp4x",
+})
+
+
+def _local_format_from_url(url: str) -> str:
+    """File extension (lowercase, no dot) of a local track URL."""
+    try:
+        from urllib.parse import urlparse
+        name = urlparse(str(url)).path.rsplit("/", 1)[-1]
+        return name.rsplit(".", 1)[1].lower() if "." in name else ""
+    except Exception:
+        return ""
+
 
 def _seq_no_from_args(args) -> int | None:
     """Extract the client's `seq_no:<N>` param, if present."""
@@ -1712,6 +1738,16 @@ class JSONRPCAPI:
             "playlist_timestamp": time.time(),
             "playlist_loop": item_loop,
         }
+        # Perl adds `can_seek` inside the playingSong() branch and only when
+        # the song can actually seek (Queries.pm:4086/4104-4107): for a local
+        # file the format class must implement canSeek (File.pm:403-415), for
+        # a remote URL the bitrate AND duration must be known
+        # (HTTP.pm:1150-1155 — we do not know a live stream's duration, so no
+        # field for radio).
+        if player.mode != "stop" and cur_local is not None:
+            fmt = _local_format_from_url(str(cur_info.get("url") or ""))
+            if fmt in SEEKABLE_FORMATS:
+                result["can_seek"] = 1
         # Perl only adds `rate` inside the playingSong() branch
         # (Queries.pm:4086-4097); a stopped player has no such field.
         if player.mode == "stop":
