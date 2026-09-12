@@ -207,17 +207,38 @@ TOTAL_VOLUME_RANGE_DB = -50     # Squeezebox2.pm:234
 STEP_POINT = -1                 # Squeezebox2.pm:235
 STATIC_GAIN = 65536             # 100 % = 16.16 fixed point 1.0
 
+# Per-class volume curves (totalVolumeRange, stepPoint, stepFraction,
+# maximumVolume). Whichever curve the player class declares is the one the
+# CLIENT compares the audg gain against — sending another one makes jive log
+# "server sequence # out of sync" and re-send the volume forever.
+#   * classic Squeezebox2/3 family: Squeezebox2.pm:229-239 (-50 dB, -1, 1)
+#   * SqueezePlay + Boom:           SqueezePlay.pm:219-226 and Boom.pm:131-139
+#     (-74 dB, stepPoint 25, stepFraction 0.5) — jive hardcodes this table in
+#     share/jive/jive/audio/Playback.lua (_defaultVolumeToGain, "Squeezeplay.pm
+#     uses Boom curve"; the SB2 curve sits commented out right below it).
+VOLUME_PARAMS_SQUEEZEBOX2 = (-50.0, -1.0, 1.0, 0.0)
+VOLUME_PARAMS_BOOM = (-74.0, 25.0, 0.5, 0.0)      # SqueezePlay/Boom curve
 
-def get_volume_db(volume: float) -> float:
+
+def volume_params_for(model: str):
+    """Volume curve parameters of a player class (Perl getVolumeParameters)."""
+    m = (model or "").lower()
+    if m in ("squeezeplay", "controller", "boom", "softboom"):
+        return VOLUME_PARAMS_BOOM
+    return VOLUME_PARAMS_SQUEEZEBOX2
+
+
+def get_volume_db(volume: float, params=VOLUME_PARAMS_SQUEEZEBOX2) -> float:
     """Volume 0..100 → dB (Perl getVolume, Squeezebox2.pm:241-275)."""
-    step_db = TOTAL_VOLUME_RANGE_DB * 1        # stepFraction 1 (:236)
-    max_volume_db = 0                          # no maximumVolume pref (:248)
-    if volume > STEP_POINT:                    # always true for 0..100
-        slope = (max_volume_db - step_db) / (100 - STEP_POINT)
+    total_range, step_point, step_fraction, maximum = params
+    step_db = total_range * step_fraction
+    max_volume_db = maximum
+    if volume > step_point:
+        slope = (max_volume_db - step_db) / (100 - step_point)
         x1, y1 = 100, max_volume_db
     else:
-        slope = (step_db - TOTAL_VOLUME_RANGE_DB) / (STEP_POINT - 0)
-        x1, y1 = 0, TOTAL_VOLUME_RANGE_DB
+        slope = (step_db - total_range) / (step_point - 0)
+        x1, y1 = 0, total_range
     return slope * (volume - x1) + y1
 
 
@@ -230,12 +251,17 @@ def db_to_fixed(db: float) -> int:
     return int(floatmult * (1 << 16) + 0.5)
 
 
-def audg_gain(volume: int) -> int:
-    """Perl newGain for a volume 0..100 (Squeezebox2.pm:283-295)."""
+def audg_gain(volume: int, model: str = "squeezebox2") -> int:
+    """Perl newGain for a volume 0..100 (Squeezebox2.pm:283-295).
+
+    ``model`` selects the player class's volume curve — SqueezePlay/Boom use
+    the -74 dB two-ramp curve (VOLUME_PARAMS_BOOM), everything else the
+    Squeezebox2 curve. See ``volume_params_for``.
+    """
     volume = max(0, min(100, int(volume)))
     if volume <= 0:                 # negative/zero volume = muting
         return 0
-    return db_to_fixed(get_volume_db(volume))
+    return db_to_fixed(get_volume_db(volume, volume_params_for(model)))
 
 
 def audg_old_gain(volume: int) -> int:
@@ -2562,7 +2588,10 @@ class SlimProtoClient:
         # (Squeezebox2.pm:283-303, defaults Player.pm:38-39). Balance is not
         # applied (default 0 → left/right factor 1, Squeezebox2.pm:305-307).
         dvc = 1 if getattr(pstate, "digital_volume_control", True) else 0
-        gain = audg_gain(volume)
+        # The gain must come from THIS player's curve: jive compares it against
+        # its own table and reverts/retries the volume otherwise.
+        model = getattr(pstate, "model", "") or "squeezebox2"
+        gain = audg_gain(volume, model)
         old_gain = audg_old_gain(volume)
         payload = b"".join([
             b"audg",
