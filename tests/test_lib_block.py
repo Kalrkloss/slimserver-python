@@ -340,3 +340,21 @@ def test_genres_search_uses_perls_word_prefix(monkeypatch):
     sql, params = seen[0]
     assert "ROCK" in params or "ROC%" in params
     assert any(p in ("ROC%", "% ROC%") for p in params)
+
+
+def test_genres_search_patterns_are_joined_with_or(monkeypatch):
+    """Perl verknüpft die Muster EINES Suchbegriffs mit OR (Queries.pm:1817).
+
+    Regression: die Muster von ``searchStringSplit`` wurden mit AND verknüpft,
+    dadurch lieferte jede Mehrwortsuche (und in der Praxis auch
+    ``genres 0 5 search:roc``) immer 0 Treffer.
+    """
+    seen = _capture_query_db(monkeypatch, [
+        {"id": 1727, "name": "Rock", "namesort": "rock"},
+    ])
+    _dispatch("genres", ["0", "5", "search:alt rock"])
+    sql, params = seen[-1]
+    # Ein Suchbegriff mit zwei Mustern → EINE OR-verknüpfte Bedingung
+    assert " OR " in sql.upper()
+    assert sql.upper().count(" LIKE ") >= 2
+    assert len([p for p in (params or []) if isinstance(p, str) and "%" in p]) >= 2

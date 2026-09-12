@@ -3838,11 +3838,17 @@ async def cmd_genres(
     search = filters.get("search", "")
     if search:
         # No FTS path for genres (Plugin.pm:3516): Perl matches the
-        # namesearch column with searchStringSplit word prefixes
-        # (Queries.pm:1814-1823).
-        for pattern in search_string_split(search):
-            conds.append("g.namespell LIKE ?")
-            params.append(pattern)
+        # namesearch column with searchStringSplit word prefixes. Die Muster
+        # EINES Suchbegriffs werden mit OR zu EINER Bedingung verknüpft:
+        # `push @{$w}, '(' . join(' OR ', map { 'genres.namesearch LIKE ?' } ...)
+        # . ')'` (Queries.pm:1814-1823, vgl. :1817); die äußeren Bedingungen
+        # (z. B. genre_id) hängen weiter mit AND dran. Vorher stand hier ein
+        # AND je Muster → jede Mehrwortsuche lieferte 0 Treffer.
+        patterns = search_string_split(search)
+        if patterns:
+            conds.append("(" + " OR ".join("g.namespell LIKE ?" for _ in patterns)
+                         + ")")
+            params.extend(patterns)
     genre_id = filters.get("genre_id", "")
     if genre_id:
         conds.append("g.id = ?")

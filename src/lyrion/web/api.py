@@ -4792,9 +4792,23 @@ class JSONRPCAPI:
             "AND tc.role = 1 WHERE c.name LIKE ?", (like,))
         al_count = _db_query(
             "SELECT COUNT(*) AS n FROM albums WHERE title LIKE ?", (like,))
-        g_count = _db_query(
-            "SELECT COUNT(DISTINCT genre) AS n FROM tracks WHERE genre LIKE ?",
-            (like,))
+        # LIB-10: echte Genre-IDs aus der genres-Tabelle (Perls
+        # ``genres_loop`` trägt sie, Queries.pm:1971-1973). Solange die
+        # Tabelle leer ist (kein Rescan seit ihrer Einführung), bleibt es beim
+        # Textpfad — dann wird ``genre_id`` bewusst NICHT erfunden.
+        g_rows = _db_query(
+            "SELECT id, name FROM genres WHERE namespell LIKE ? "
+            "ORDER BY namesort", (like,))
+        if g_rows:
+            g_count = [{"n": len(g_rows)}]
+        else:
+            g_count = _db_query(
+                "SELECT COUNT(DISTINCT genre) AS n FROM tracks "
+                "WHERE genre LIKE ?", (like,))
+            g_rows = _db_query(
+                "SELECT NULL AS id, genre AS name FROM tracks "
+                "WHERE genre LIKE ? GROUP BY genre", (like,))
+        genres = g_rows          # Loop-Quelle: echte IDs, wenn vorhanden
         t_count = _db_query(
             "SELECT COUNT(*) AS n FROM tracks WHERE title LIKE ?", (like,))
         # Perl parity for the search loops: the Perl LMS returns MINIMAL
@@ -4819,8 +4833,13 @@ class JSONRPCAPI:
                                   for r in artists],
             "albums_loop": [{"album": r["title"] or "",
                              "album_id": r["id"]} for r in albums],
-            "genres_loop": [{"genre": r["name"] or "",
-                             "genre_id": i + 1} for i, r in enumerate(genres)],
+            "genres_loop": [
+                # genre_id nur, wenn die genres-Tabelle ihn liefert
+                # (Perl-Feld, Queries.pm:1971-1973).
+                ({"genre": r["name"] or "", "genre_id": r["id"]}
+                 if r.get("id") is not None
+                 else {"genre": r["name"] or ""})
+                for r in genres],
             "tracks_loop": [{"track": r["title"] or "",
                              "track_id": r["id"]} for r in tracks],
         }
@@ -5557,25 +5576,30 @@ class JSONRPCAPI:
                              "AND tc.role = 1")
             return rows, total, "artists_loop", "artists"
         if mode == "genres":
-            # The genres table is not populated by the importer (LIB-10/R5),
-            # so there is no real numeric genre id to hand out. Perl sends a
-            # NUMERIC ``genre_id`` (live probe 192.168.1.90: the genre row is
-            # ``commonParams.genre_id "497"``; the tap params
-            # ``{genre_id: "497", role_id: "ALBUMARTIST"}``). We expose the
-            # index into the sorted DISTINCT genre-text list instead: NUMERIC
-            # and STABLE, derived from the DB (ROW_NUMBER over the same
-            # ``ORDER BY genre COLLATE NOCASE`` used by _genre_id_to_text and
-            # the genre drill filters), so ``genre_id:<n>`` round-trips to
-            # exactly that genre text. DOCUMENTED DIVERGENCE: this is not
-            # Perl's real genre id, only a stable local id.
-            rows = q("SELECT genre, "
-                     "ROW_NUMBER() OVER (ORDER BY genre COLLATE NOCASE) - 1 "
-                     "AS id FROM (SELECT DISTINCT genre FROM tracks "
-                     "WHERE genre != '') "
-                     "ORDER BY genre COLLATE NOCASE LIMIT ? OFFSET ?",
-                     count, start)
-            total = total_of("SELECT COUNT(DISTINCT genre) FROM tracks "
-                             "WHERE genre != ''")
+            # LIB-10: the importer now fills the genres table (id/name/
+            # namesort/namespell), so the real numeric genre id that Perl
+            # sends is available (``genres_loop`` items carry it; live Perl
+            # 9.1.1 ``genres 0 2`` → ids 1727/1728; SQL
+            # Queries.pm:1910-1911 ORDER BY namesort). Degradation only for a
+            # database that has not been rescanned since the genres table was
+            # added (table empty): fall back to the old stable DISTINCT-text
+            # index, which _genre_id_to_text and the drill filters understand.
+            rows, total = [], 0
+            try:
+                rows = q("SELECT id, name AS genre FROM genres "
+                         "ORDER BY namesort LIMIT ? OFFSET ?", count, start)
+                total = total_of("SELECT COUNT(*) FROM genres")
+            except Exception as exc:  # noqa: BLE001 — ältere DBs ohne Tabelle
+                logger.debug("genres table unavailable, falling back: %s", exc)
+            if not rows and not total:
+                rows = q("SELECT genre, "
+                         "ROW_NUMBER() OVER (ORDER BY genre COLLATE NOCASE) - 1 "
+                         "AS id FROM (SELECT DISTINCT genre FROM tracks "
+                         "WHERE genre != '') "
+                         "ORDER BY genre COLLATE NOCASE LIMIT ? OFFSET ?",
+                         count, start)
+                total = total_of("SELECT COUNT(DISTINCT genre) FROM tracks "
+                                 "WHERE genre != ''")
             return rows, total, "genres_loop", "genres"
         if mode == "years":
             rows = q("SELECT DISTINCT year FROM tracks WHERE year > 0 "
