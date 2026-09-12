@@ -271,6 +271,28 @@ _MIME_BY_EXT = {
 
 
 import re as _re
+from collections import OrderedDict
+
+_COVER_CACHE_MAX = 512
+_cover_cache: "OrderedDict[tuple, tuple[bytes, str]]" = OrderedDict()
+
+
+def _cover_cache_get(key):
+    """LRU read for served covers (returns (bytes, mime) or None)."""
+    hit = _cover_cache.get(key)
+    if hit is None:
+        return None
+    _cover_cache.move_to_end(key)
+    return hit
+
+
+def _cover_cache_put(key, data: bytes, mime) -> None:
+    """LRU write; evicts the oldest entry beyond ``_COVER_CACHE_MAX``."""
+    _cover_cache[key] = (data, mime or "image/jpeg")
+    _cover_cache.move_to_end(key)
+    while len(_cover_cache) > _COVER_CACHE_MAX:
+        _cover_cache.popitem(last=False)
+
 
 _COVER_PATH_RE = _re.compile(
     r"^/music/(\d+)/(?:"
@@ -332,14 +354,32 @@ async def _serve_album_cover(album_id: int, send, size: tuple[int, int] | None =
     Reads the image file in a thread (SMB reads block) and streams it with
     long-lived cache headers — covers never change for an album id. Falls
     back to 404 when the album has no artwork or the file vanished.
+
+    Results are memoised in-process: SqueezePlay requests a whole album
+    list worth of thumbnails at once, and without the cache every one
+    re-read the file over SMB and re-ran Pillow — slow enough that the
+    client logged ``_getArtworkThumbSink(...) error: keep-alive timeout``
+    and showed only the one cover that won the race.
     """
     import asyncio as _asyncio
 
-    try:
-        loop = _asyncio.get_running_loop()
-        data, mime = await loop.run_in_executor(None, _load_sync_factory(album_id))
-    except Exception:
-        data, mime = None, None
+    cache_key = (album_id, size)
+    cached = _cover_cache_get(cache_key)
+    if cached is not None:
+        data, mime = cached
+    else:
+        try:
+            loop = _asyncio.get_running_loop()
+            data, mime = await loop.run_in_executor(None, _load_sync_factory(album_id))
+        except Exception:
+            data, mime = None, None
+        if data and size is not None:
+            data = await _asyncio.get_running_loop().run_in_executor(
+                None, _resize_cover, data, size
+            )
+            mime = "image/jpeg"
+        if data:
+            _cover_cache_put(cache_key, data, mime)
     if not data:
         await send({
             "type": "http.response.start",
@@ -348,11 +388,6 @@ async def _serve_album_cover(album_id: int, send, size: tuple[int, int] | None =
         })
         await send({"type": "http.response.body", "body": b"no artwork"})
         return
-    if size is not None and data:
-        data = await _asyncio.get_running_loop().run_in_executor(
-            None, _resize_cover, data, size
-        )
-        mime = "image/jpeg"
     await send({
         "type": "http.response.start",
         "status": 200,

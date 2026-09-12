@@ -1,3 +1,4 @@
+import asyncio
 """LMS artwork URLs — the size-encoded cover form Jive/SqueezePlay use.
 
 Live regression this locks down (log 2026-09-12, earlier on the mis-advertised
@@ -66,3 +67,42 @@ def test_sized_cover_without_extension_is_accepted():
     assert _parse_cover_path("/music/2441/cover_40x40_m") == (2441, (40, 40))
     assert _parse_cover_path("/music/2441/cover_300x300_f") == (2441, (300, 300))
     assert _parse_cover_path("/music/2441/cover_40x40_m.png") == (2441, (40, 40))
+
+
+def test_cover_cache_is_lru_bounded():
+    """A whole album list's thumbnails are requested at once; each miss
+    re-read the SMB file and re-ran Pillow, so the client hit keep-alive
+    timeouts and showed only one cover. The cache must memoise and stay
+    bounded."""
+    from lyrion.web import app as app_mod
+
+    app_mod._cover_cache.clear()
+    for i in range(app_mod._COVER_CACHE_MAX + 5):
+        app_mod._cover_cache_put((i, (40, 40)), b"x", "image/jpeg")
+    assert len(app_mod._cover_cache) == app_mod._COVER_CACHE_MAX
+    # the oldest entries were evicted, the newest are present
+    assert app_mod._cover_cache_get((0, (40, 40))) is None
+    assert app_mod._cover_cache_get(
+        (app_mod._COVER_CACHE_MAX + 4, (40, 40))) == (b"x", "image/jpeg")
+    app_mod._cover_cache.clear()
+
+
+def test_sized_static_image_falls_back_to_unsized(tmp_path):
+    """Jive requests '/html/images/genres_40x40_m.png' (its artworkspec);
+    we only ship 'genres.png', so the sized name must resolve to it."""
+    from lyrion.web.server import WebServer
+
+    root = tmp_path
+    (root / "html" / "images").mkdir(parents=True)
+    (root / "html" / "images" / "genres.png").write_bytes(b"PNGDATA")
+
+    handler = WebServer.__new__(WebServer)
+    handler.html_root = root
+    status, headers, body = asyncio.run(
+        handler._handle_static("/html/images/genres_40x40_m.png", "GET"))
+    assert status == 200, body
+    assert body == b"PNGDATA"
+    # an unknown sized name still 404s
+    status2, _, _ = asyncio.run(
+        handler._handle_static("/html/images/nope_40x40_m.png", "GET"))
+    assert status2 == 404

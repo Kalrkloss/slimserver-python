@@ -218,7 +218,27 @@ class WebServer:
             return 404, [], b"Not found"
 
         if not target.exists():
-            return 404, [], b"Not found"
+            # Jive asks for LMS size-encoded static images
+            # ('/html/images/genres_40x40_m.png', '/html/images/albums_40x40_m.png')
+            # after its 'artworkspec add 40x40_m squeezeplayskin'. We only
+            # ship the base files, so a missing sized name must fall back to
+            # the unsized one — otherwise those list icons 404 (live client
+            # log: '_getArtworkThumbSink(/html/images/genres_40x40_m.png)
+            # error: HTTP/1.1 404 Not Found').
+            import re as _re_static
+
+            m = _re_static.match(
+                r"^(?P<base>.+?)_(\d+)x(\d+)(?:_[a-z])?(?P<ext>\.(?:png|jpe?g|gif))$",
+                target.name,
+            )
+            if m:
+                unsized = target.with_name(m.group("base") + m.group("ext"))
+                if unsized.exists():
+                    target = unsized
+                else:
+                    return 404, [], b"Not found"
+            else:
+                return 404, [], b"Not found"
 
         # Determine MIME type
         mime_type, _ = mimetypes.guess_type(str(target))
