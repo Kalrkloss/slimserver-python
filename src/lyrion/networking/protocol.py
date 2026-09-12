@@ -140,6 +140,80 @@ REMOTE_BUFFER_THRESHOLD_KB = 20
 REMOTE_BUFFER_SECS = 3
 
 
+# ── audg volume → gain (logarithmic, Perl parity) ────────────────────────
+#
+# Perl sends the player's gain as a 16.16 fixed-point value derived from a
+# dB curve, NOT linearly from the 0..100 volume. Linear is ~18 dB too loud
+# at mid volume (vol 50: Perl 3840 vs. linear 32768).
+#   Slim/Player/Squeezebox2.pm:200-211  @volume_map — old-style gain value
+#   Squeezebox2.pm:229-239              getVolumeParameters: totalVolumeRange
+#                                       -50 dB, stepPoint -1, stepFraction 1
+#   Squeezebox2.pm:241-275              getVolume: y = m*(x - x1) + y1
+#   Squeezebox2.pm:213-228              dBToFixed: 16.16 fixed point with 8
+#                                       extra bits of accuracy for -30..0 dB
+#   Squeezebox2.pm:283-295              volume(): oldGain from the map,
+#                                       newGain from the dB curve, 0 when muted
+#   Squeezebox2.pm:302-303              preamp = 255 - int(2*preampVolumeControl)
+#   Slim/Player/Player.pm:38-39         defaults: digitalVolumeControl 1,
+#                                       preampVolumeControl 0 (→ preamp 255)
+VOLUME_MAP: tuple[int, ...] = (
+    0, 1, 1, 1, 2, 2, 2, 3, 3, 4,
+    5, 5, 6, 6, 7, 8, 9, 9, 10, 11,
+    12, 13, 14, 15, 16, 16, 17, 18, 19, 20,
+    22, 23, 24, 25, 26, 27, 28, 29, 30, 32,
+    33, 34, 35, 37, 38, 39, 40, 42, 43, 44,
+    46, 47, 48, 50, 51, 53, 54, 56, 57, 59,
+    60, 61, 63, 65, 66, 68, 69, 71, 72, 74,
+    75, 77, 79, 80, 82, 84, 85, 87, 89, 90,
+    92, 94, 96, 97, 99, 101, 103, 104, 106, 108, 110,
+    112, 113, 115, 117, 119, 121, 123, 125, 127, 128,
+)
+TOTAL_VOLUME_RANGE_DB = -50     # Squeezebox2.pm:234
+STEP_POINT = -1                 # Squeezebox2.pm:235
+STATIC_GAIN = 65536             # 100 % = 16.16 fixed point 1.0
+
+
+def get_volume_db(volume: float) -> float:
+    """Volume 0..100 → dB (Perl getVolume, Squeezebox2.pm:241-275)."""
+    step_db = TOTAL_VOLUME_RANGE_DB * 1        # stepFraction 1 (:236)
+    max_volume_db = 0                          # no maximumVolume pref (:248)
+    if volume > STEP_POINT:                    # always true for 0..100
+        slope = (max_volume_db - step_db) / (100 - STEP_POINT)
+        x1, y1 = 100, max_volume_db
+    else:
+        slope = (step_db - TOTAL_VOLUME_RANGE_DB) / (STEP_POINT - 0)
+        x1, y1 = 0, TOTAL_VOLUME_RANGE_DB
+    return slope * (volume - x1) + y1
+
+
+def db_to_fixed(db: float) -> int:
+    """dB → 16.16 fixed point gain (Perl dBToFixed, Squeezebox2.pm:213-228)."""
+    floatmult = 10 ** (db / 20)
+    if -30 <= db <= 0:
+        # 8 extra bits of accuracy to avoid rounding errors
+        return int(floatmult * (1 << 8) + 0.5) * (1 << 8)
+    return int(floatmult * (1 << 16) + 0.5)
+
+
+def audg_gain(volume: int) -> int:
+    """Perl newGain for a volume 0..100 (Squeezebox2.pm:283-295)."""
+    volume = max(0, min(100, int(volume)))
+    if volume <= 0:                 # negative/zero volume = muting
+        return 0
+    return db_to_fixed(get_volume_db(volume))
+
+
+def audg_old_gain(volume: int) -> int:
+    """Old-style gain for the audg `oldGain` fields (Squeezebox2.pm:285)."""
+    volume = max(0, min(100, int(volume)))
+    return VOLUME_MAP[volume] if volume > 0 else 0
+
+
+def audg_preamp(preamp_volume_control: int = 0) -> int:
+    """Perl preamp byte (Squeezebox2.pm:302; pref default 0, Player.pm:39)."""
+    return 255 - int(2 * (preamp_volume_control or 0))
+
+
 def stream_buffer_threshold(filesize: int | None = None, *,
                             remote: bool = False,
                             bitrate_bps: int | None = None) -> int:
@@ -2180,28 +2254,35 @@ class SlimProtoClient:
         if writer is None or writer.is_closing():
             return False
         volume = max(0, min(100, int(volume)))
-        gain = int(volume * 655.36)
         try:
             from lyrion.player.manager import PlayerManager
             pstate = PlayerManager().get_player(mac)
         except Exception:
             pstate = None
         seq_no = int(getattr(pstate, "seq_no", 0) or 0)
+        # Perl volume(): newGain from the dB curve, oldGain from @volume_map,
+        # dvc = digitalVolumeControl pref, preamp = 255 - 2*preampVolumeControl
+        # (Squeezebox2.pm:283-303, defaults Player.pm:38-39). Balance is not
+        # applied (default 0 → left/right factor 1, Squeezebox2.pm:305-307).
+        dvc = 1 if getattr(pstate, "digital_volume_control", True) else 0
+        gain = audg_gain(volume)
+        old_gain = audg_old_gain(volume)
         payload = b"".join([
             b"audg",
-            struct.pack(">I", 0),     # old_gainL
-            struct.pack(">I", 0),     # old_gainR
-            bytes([1]),               # adjust: apply gainL/gainR
-            bytes([0]),               # preamp
-            struct.pack(">I", gain),  # gainL
-            struct.pack(">I", gain),  # gainR
+            struct.pack(">I", old_gain),  # old_gainL (Squeezebox2.pm:285/:309)
+            struct.pack(">I", old_gain),  # old_gainR
+            bytes([dvc]),                 # adjust: digitalVolumeControl pref
+            bytes([audg_preamp()]),       # preamp 255 with the default pref
+            struct.pack(">I", gain),      # gainL (dB curve, not linear!)
+            struct.pack(">I", gain),      # gainR
             struct.pack(">I", seq_no),  # sequenceNumber (Squeezebox2.pm:313)
         ])
         frame = struct.pack(">H", len(payload)) + payload
         try:
             writer.write(frame)
             await writer.drain()
-            logger.info("Sent audg volume=%d to %s", volume, mac)
+            logger.info("Sent audg volume=%d gain=%d old=%d preamp=%d to %s",
+                        volume, gain, old_gain, audg_preamp(), mac)
             return True
         except (ConnectionError, OSError, RuntimeError):
             return False
