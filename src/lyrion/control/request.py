@@ -243,8 +243,32 @@ class RequestDispatcher:
         self._default_player = player_id
 
     def get_default_player(self) -> Optional[str]:
-        """Return the server's default player ID."""
-        return self._default_player
+        """Return the player a command without a player token binds to.
+
+        Perl picks the FIRST connected client whenever a CLI command names no
+        player — ``Slim/Player/Client.pm:411-415`` ``clientRandom()`` returns
+        ``(clients())[0]`` ("the randomness of this is limited to the hashing
+        mysteries"), called from ``Slim/Control/Stdio.pm:82-86`` ("If we don't
+        have a player specified, just pick one"), and the answer is prefixed
+        with that client's id (``Stdio.pm:131``). Live probe 2026-09-12 on
+        :9090: ``mixer volume ?`` → ``24:0a:c4:29:77:90 mixer volume 23``,
+        while player-independent commands (``players 0 1``, ``player count ?``)
+        carry no prefix.
+
+        We only ever returned the never-set ``_default_player``, so every
+        player-bound CLI command answered "no player selected".
+        """
+        if self._default_player:
+            return self._default_player
+        try:
+            from lyrion.player.manager import PlayerManager
+
+            players = PlayerManager().get_all_players()
+            if players:
+                return players[0].mac
+        except Exception:  # noqa: BLE001 — CLI darf daran nicht scheitern
+            pass
+        return None
 
     def set_db(self, db: Any) -> None:
         """Set the database layer reference."""
