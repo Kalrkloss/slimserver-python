@@ -399,8 +399,12 @@ def _placeholder_cover(size: tuple[int, int] | None = None) -> tuple[bytes, str]
     root = _static_root()
     if root is None:
         return None
-    p = root / "html" / "images" / "cover.png"
-    if not p.is_file():
+    # Zwei Konventionen im Projekt: static_dir IST das html-Verzeichnis
+    # (__main__.py:233-238) bzw. ist sein Elternverzeichnis
+    # (server.py:205-209 haengt selbst "html/" an). Beide abdecken.
+    candidates = (root / "images" / "cover.png", root / "html" / "images" / "cover.png")
+    p = next((c for c in candidates if c.is_file()), None)
+    if p is None:
         return None
     try:
         data = p.read_bytes()
