@@ -3095,6 +3095,23 @@ class JSONRPCAPI:
     # slim.request JSON helpers
     # ─────────────────────────────────────────────────────────────
 
+    async def _album_replaygain(self, album_id: int):
+        """(replay_gain, replay_peak) eines Albums aus der DB (oder None)."""
+        try:
+            from lyrion.database.sqlite_helper import db_session
+            from sqlalchemy import text as _sql_text
+
+            async with db_session() as session:
+                row = (await session.execute(
+                    _sql_text("SELECT replay_gain, replay_peak FROM albums "
+                              "WHERE id = :aid"), {"aid": int(album_id)},
+                )).fetchone()
+                if row and (row[0] is not None or row[1] is not None):
+                    return row[0], row[1]
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("album replaygain lookup failed: %s", exc)
+        return None
+
     async def _json_player_status(self, pm, pid: str | None, args: list[str]) -> dict:
         """Build a player status dict (LMS 'status' command)."""
         from lyrion.player.manager import PlayerManager
@@ -3402,6 +3419,31 @@ class JSONRPCAPI:
             fmt = _local_format_from_url(str(cur_info.get("url") or ""))
             if fmt in SEEKABLE_FORMATS:
                 result["can_seek"] = 1
+        # Perl: `my $trackGain = $song->replayGain(); if (defined $trackGain)
+        # { addResult('replay_gain', $trackGain) }` (Queries.pm:4109-4112). Der
+        # Wert ist das Ergebnis von ReplayGain->fetchGainMode (ReplayGain.pm:
+        # 22-79), das der StreamingController beim Start ablegt
+        # (StreamingController.pm:1282-1284); Modus 0 (Default) → Feld fehlt.
+        try:
+            from lyrion.player.replaygain import fetch_gain_mode
+
+            _prefs = getattr(player, "playerprefs", None) or {}
+            _tg = cur_info.get("replay_gain") if isinstance(cur_info, dict) else None
+            _tp = cur_info.get("replay_peak") if isinstance(cur_info, dict) else None
+            _ag = _ap = None
+            if isinstance(cur_info, dict) and cur_info.get("album_id"):
+                _al = await self._album_replaygain(int(cur_info["album_id"]))
+                if _al:
+                    _ag, _ap = _al
+            _gain = fetch_gain_mode(
+                _prefs, track_gain=_tg, track_peak=_tp,
+                album_gain=_ag, album_peak=_ap,
+                remote=bool(getattr(player, "remote", 0)),
+            )
+            if _gain is not None:
+                result["replay_gain"] = _gain
+        except Exception as exc:  # noqa: BLE001 — RG ist optional
+            logger.debug("status replay_gain failed: %s", exc)
         # Perl only adds `rate` inside the playingSong() branch
         # (Queries.pm:4086-4097); a stopped player has no such field.
         if player.mode == "stop":

@@ -1611,6 +1611,71 @@ class SlimProtoClient:
             return format_extension(perl_type) in formats
         return SlimProtoClient._codec_to_extension(codec) in formats
 
+    def _replay_gain_fixed(self, mac: str, track_id: int) -> int:
+        """dBToFixed des anzuwendenden ReplayGain für einen lokalen Track.
+
+        Perl-Kette: ``StreamingController.pm:1282-1284`` holt
+        ``ReplayGain->fetchGainMode($client, $song)`` und reicht den Wert an
+        den strm-Frame (``Squeezebox.pm:914`` → ``canDoReplayGain`` →
+        ``dBToFixed``, ``Squeezebox2.pm:888-898``). Modus 0 (Default,
+        ``Squeezebox2.pm:47``) heißt „aus" → 0.
+        """
+        try:
+            from lyrion.player.manager import PlayerManager
+            from lyrion.player.replaygain import fetch_gain_mode
+
+            player = PlayerManager().get_player(mac)
+            if player is None:
+                return 0
+            prefs = getattr(player, "playerprefs", None) or {}
+            mode_raw = prefs.get("replayGainMode", 0)
+            try:
+                if not int(float(str(mode_raw))):
+                    return 0                      # Modus 0 = ReplayGain aus
+            except (TypeError, ValueError):
+                return 0
+            track_gain = track_peak = album_gain = album_peak = None
+            neighbours_same_album = False
+            album_id = None
+            try:
+                import sqlite3
+
+                from lyrion.player.manager import PlayerManager as _PM
+
+                db_path = _PM()._players_db_path().replace("players.db", "lyrion.db")
+                db = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+                try:
+                    row = db.execute(
+                        "SELECT replay_gain, replay_peak FROM tracks WHERE id = ?",
+                        (int(track_id),)).fetchone()
+                    if row:
+                        track_gain, track_peak = row[0], row[1]
+                    alb = db.execute(
+                        "SELECT album FROM tracks_albums WHERE track = ? LIMIT 1",
+                        (int(track_id),)).fetchone()
+                    if alb:
+                        album_id = alb[0]
+                        arow = db.execute(
+                            "SELECT replay_gain, replay_peak FROM albums WHERE id = ?",
+                            (album_id,)).fetchone()
+                        if arow:
+                            album_gain, album_peak = arow[0], arow[1]
+                finally:
+                    db.close()
+            except Exception as exc:  # noqa: BLE001 — RG ist optional
+                logger.debug("ReplayGain lookup failed for %s: %s", track_id, exc)
+            gain = fetch_gain_mode(
+                prefs, track_gain=track_gain, track_peak=track_peak,
+                album_gain=album_gain, album_peak=album_peak,
+                remote=False, neighbours_same_album=neighbours_same_album,
+            )
+            if gain is None:
+                return 0
+            return db_to_fixed(gain)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("ReplayGain for %s failed: %s", track_id, exc)
+            return 0
+
     @staticmethod
     def _build_stream_frame(
         *,
@@ -1623,6 +1688,7 @@ class SlimProtoClient:
         threshold: int = BUFFER_THRESHOLD_KB,
         samplerate: int | None = None,
         pcm_params: tuple[str, str, str, str] | None = None,
+        replay_gain: int = 0,
     ) -> bytes:
         """Build the 24-byte LMS ``strm`` packet plus its HTTP request.
 
@@ -1668,7 +1734,10 @@ class SlimProtoClient:
             bytes([flags & 0xFF]),
             bytes([output_threshold(codec, samplerate)]),
             bytes([0]),               # proxy slaves
-            struct.pack(">I", 0),
+            # replayGain: Perl setzt hier ``$client->canDoReplayGain(
+            # $params->{replay_gain})`` = ``dBToFixed($gain)``
+            # (Squeezebox.pm:914/:1093, Squeezebox2.pm:888-898); 0 = aus.
+            struct.pack(">I", max(0, int(replay_gain)) & 0xFFFFFFFF),
             struct.pack(">H", server_port),
             struct.pack(">I", server_ip),
             request,
@@ -2104,6 +2173,7 @@ class SlimProtoClient:
             server_port=self.web_port,
             pcm_params=pcm_params,
             threshold=threshold,
+            replay_gain=self._replay_gain_fixed(mac, track_id),
         )
         # Perl's switch sequence: stop the player (``stream('q')`` —
         # _StopGetNext/_Stop/_stopClient, StreamingController.pm:599-627 →
