@@ -1561,13 +1561,18 @@ class JSONRPCAPI:
                 item["icon-id"] = "/html/images/favorites.png"
             loop.append(item)
 
-        cur = player.playlist_position or 0
-        cur_local = _local_id(playlist_ids[cur]) if cur < len(playlist_ids) else None
+        # A negative/absent position must never index the list (-1 would hit
+        # the LAST entry, an empty playlist raises IndexError). A stopped
+        # player with an empty queue is the normal case after the client
+        # starts — it must still answer with a valid status.
+        cur = player.playlist_position if player.playlist_position is not None else 0
+        cur_valid = 0 <= cur < len(playlist_ids)
+        cur_local = _local_id(playlist_ids[cur]) if cur_valid else None
         if cur_local is not None:
             cur_info = track_rows.get(cur_local, {})
         else:
             cur_info = {}
-        if cur < len(playlist_ids) and cur_local is None:
+        if cur_valid and cur_local is None:
             # Radio stream: title = station name (current_title if set,
             # else host) — never the full URL.
             url_str = str(playlist_ids[cur])
@@ -1582,7 +1587,7 @@ class JSONRPCAPI:
         # line — a local track's title comes from the DB row (a stale radio
         # StreamTitle must not linger over local tracks).
         if (getattr(player, "current_title", "")
-                and cur < len(playlist_ids)
+                and cur_valid
                 and cur_local is None):
             cur_info["title"] = player.current_title
 
@@ -1733,7 +1738,16 @@ class JSONRPCAPI:
             if dur <= 0:
                 dur = 1.0
             result["duration"] = dur
-            result["item_loop"] = item_loop
+            # Never emit an EMPTY item_loop: Jive's `_whatsPlaying`
+            # (share/jive/jive/slim/Player.lua:272-273) does
+            # `if obj.item_loop then obj.item_loop[1].params ...` — with an
+            # empty array `item_loop[1]` is nil and Lua raises
+            # "attempt to index field '?' (a nil value)", which aborts the
+            # artwork/now-playing sink (seen live as a missing cover and
+            # `RequestHttp.lua:71 Response sink` error). Perl omits the key
+            # in that case.
+            if item_loop:
+                result["item_loop"] = item_loop
         result |= sync_fields
         if remote_meta:
             result["remoteMeta"] = remote_meta

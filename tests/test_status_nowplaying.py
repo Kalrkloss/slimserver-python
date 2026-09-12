@@ -276,3 +276,21 @@ def test_numeric_string_playlist_entry_is_a_local_track(tmp_path, monkeypatch):
     assert item["trackType"] == "local"
     assert item["params"]["track_id"] == 12
     assert item["title"] == "Second Song"
+
+
+# ----------------------------------------------------------------------
+# (i) an EMPTY item_loop must be OMITTED (Jive Lua crash guard)
+# ----------------------------------------------------------------------
+def test_empty_playlist_omits_item_loop(tmp_path, monkeypatch):
+    """Jive's `_whatsPlaying` indexes `item_loop[1].params` unguarded
+    (share/jive/jive/slim/Player.lua:272-273). An EMPTY array makes
+    `item_loop[1]` nil and Lua raises "attempt to index field '?' (a nil
+    value)" — the artwork/now-playing sink dies (live: missing covers,
+    `RequestHttp.lua:71 Response sink` error). Perl omits the key."""
+    monkeypatch.setattr(api_mod, "_library_db_path", lambda: _db(tmp_path))
+    player = _player([], -1, mode="stop", elapsed=0.0)
+
+    r = _status(player)
+
+    assert "item_loop" not in r, "an empty item_loop crashes Jive's artwork sink"
+    assert r.get("playlist_tracks") == 0
