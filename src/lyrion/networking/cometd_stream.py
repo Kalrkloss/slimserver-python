@@ -137,6 +137,30 @@ async def _proxy_get(method: str, target: bytes, headers: dict,
                 req += f"{key.decode()}: {headers[key].decode('latin-1')}\r\n"
         up.write(req.encode("latin-1") + b"\r\n")
         await up.drain()
+        # Forward the UPSTREAM header block, but make the close explicit:
+        # Jive pools the thumbnail connection and, when we close it without
+        # saying so, the next request on that socket dies as
+        # '_getArtworkThumbSink(...) error: keep-alive timeout' (live).
+        head = b""
+        while b"\r\n\r\n" not in head:
+            chunk = await reader.read(4096)
+            if not chunk:
+                break
+            head += chunk
+            if len(head) > 65536:      # runaway header block — give up
+                break
+        block, _, rest = head.partition(b"\r\n\r\n")
+        lines = block.split(b"\r\n")
+        status_line = lines[0] if lines else b"HTTP/1.1 502 Bad Gateway"
+        keep = [ln for ln in lines[1:]
+                if b":" in ln and ln.split(b":", 1)[0].strip().lower()
+                not in (b"connection", b"keep-alive")]
+        out = b"\r\n".join([status_line, *keep, b"Connection: close",
+                            b"", b""])
+        writer.write(out)
+        if rest:
+            writer.write(rest)
+        await writer.drain()
         while True:
             chunk = await reader.read(65536)
             if not chunk:

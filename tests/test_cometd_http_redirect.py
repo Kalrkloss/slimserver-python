@@ -131,3 +131,39 @@ def test_proxy_get_reports_a_dead_web_app():
         return writer.data
 
     assert b"502" in asyncio.run(go())
+
+
+def test_proxy_get_announces_the_close_to_the_client():
+    """Jive pools the thumbnail socket: closing it silently made the next
+    request die as '_getArtworkThumbSink(...) error: keep-alive timeout'
+    (live client log). The proxied response must say Connection: close and
+    must not forward the upstream's keep-alive headers."""
+
+    async def origin(reader, writer):
+        await reader.readuntil(b"\r\n\r\n")
+        payload = b"COVER"
+        writer.write(
+            b"HTTP/1.1 200 OK\r\nContent-Type: image/jpeg\r\n"
+            b"Connection: keep-alive\r\nKeep-Alive: timeout=5\r\n"
+            + f"Content-Length: {len(payload)}\r\n\r\n".encode()
+            + payload
+        )
+        await writer.drain()
+        writer.close()
+
+    async def go():
+        server = await asyncio.start_server(origin, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        writer = _FakeWriter()
+        try:
+            await _proxy_get("GET", b"/music/1/cover.jpg", {}, writer, port)
+        finally:
+            server.close()
+            await server.wait_closed()
+        return writer.data
+
+    data = asyncio.run(go())
+    head = data.split(b"\r\n\r\n", 1)[0].lower()
+    assert b"connection: close" in head
+    assert b"keep-alive" not in head
+    assert data.endswith(b"COVER")
