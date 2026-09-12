@@ -19,18 +19,77 @@ logger = logging.getLogger(__name__)
 _COMMON_FORMATS = {"mp3", "flac", "aac", "ogg", "wav", "aiff", "pcm"}
 
 
+def _perl_model_formats(model: str) -> set[str] | None:
+    """Perl's static ``formats()`` list per player class.
+
+    Citations (/tmp/lms-ref): SqueezePlay.pm:59 ``ogg flc aif pcm mp3``,
+    Squeezebox2.pm:137 (SB2/SB3/Boom/Transporter) ``wma ogg flc aif pcm
+    mp3``, Squeezebox1.pm:282 ``aif pcm mp3``, SoftSqueeze.pm:43-52,
+    SLIMP3.pm:285-287 ``mp3``, HTTP.pm:68 ``mp3``, Disconnected.pm:57 none.
+
+    These are only the FALLBACK: a modern player declares its codecs as
+    capability tokens and Perl then uses exactly those
+    (SqueezePlay.pm:170-200 "if we have capabilities then all CODECs must be
+    declared that way") — see ``formats_from_capabilities``.
+    """
+    from lyrion.formats.lms_types import format_extension
+
+    m = (model or "").lower()
+    if m.startswith("squeezeplay") or m.startswith("core"):
+        perl = ("ogg", "flc", "aif", "pcm", "mp3")
+    elif m.startswith("squeezebox1") or m.startswith("squeezeboxclassic"):
+        perl = ("aif", "pcm", "mp3")
+    elif m.startswith("slimp3") or m.startswith("http") or m == "web":
+        perl = ("mp3",)
+    elif m.startswith("softsqueeze"):
+        perl = ("ogg", "flc", "aif", "pcm", "mp3")
+    elif (m.startswith("squeezebox2") or m.startswith("squeezebox3")
+          or m.startswith("squeezebox") or m.startswith("boom")
+          or m.startswith("transporter") or m.startswith("receiver")):
+        perl = ("wma", "ogg", "flc", "aif", "pcm", "mp3")
+    else:
+        # Unknown / squeezelite-class client WITHOUT capability tokens: use
+        # the Squeezebox2 base list (Squeezebox2.pm:137). Anything outside it
+        # is transcoded, so this can only cost CPU, never correctness.
+        perl = ("wma", "ogg", "flc", "aif", "pcm", "mp3")
+    return {format_extension(p) for p in perl}
+
+
+def formats_from_capabilities(capabilities: str | None,
+                              model: str = "") -> set[str]:
+    """Codec set a player declares in its HELO capability string.
+
+    Perl SqueezePlay.pm:170-200 (``updateCapabilities``): *"if we have
+    capabilities then all CODECs must be declared that way"* — every comma
+    separated token matching ``/^[a-z][a-z0-9]{1,4}$/`` is a format, e.g.
+    the live SqueezePlay sends
+    ``alc,aac,ogg,ogf,flc,aif,pcm,mp3,MaxSampleRate=384000,...``.
+    Tokens that map to no known format (``test``, ``tone``, ...) are kept
+    as-is so nothing is silently invented.
+
+    Without codec tokens the model's static Perl list is the fallback.
+    """
+    from lyrion.formats.lms_types import FORMAT_TO_EXTENSION
+
+    codecs: set[str] = set()
+    if capabilities:
+        for token in capabilities.split(","):
+            token = token.strip()
+            if not token or len(token) < 2 or len(token) > 5:
+                continue
+            if not (token[0].islower() and token[0].isalpha()):
+                continue
+            if not all(c.islower() or c.isdigit() for c in token):
+                continue
+            codecs.add(FORMAT_TO_EXTENSION.get(token, token))
+    if codecs:
+        return codecs
+    return _perl_model_formats(model) or set(_COMMON_FORMATS)
+
+
 def _formats_for_model(model: str) -> set[str]:
     """Return the set of audio extensions ``model`` plays natively."""
-    m = (model or "").lower()
-    if m.startswith("squeezelite") or m.startswith("squeezeplay"):
-        return set(_COMMON_FORMATS)
-    if m in ("squeezebox", "squeezebox2", "squeezebox3", "squeezeboxclassic"):
-        # Classic hardware: MP3, FLAC, WAV, AIFF, OGG, PCM — but no AAC/ALAC.
-        return {"mp3", "flac", "wav", "aiff", "ogg", "pcm"}
-    if m.startswith("squeezeboxradio") or m.startswith("squeezeboxtouch"):
-        return {"mp3", "flac", "aac", "wav", "aiff", "ogg", "pcm"}
-    # Unknown model: assume the modern set (never blindly force a transcode).
-    return set(_COMMON_FORMATS)
+    return _perl_model_formats(model) or set(_COMMON_FORMATS)
 
 
 class PlayerManager:

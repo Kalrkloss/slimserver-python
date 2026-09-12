@@ -117,6 +117,13 @@ from typing import Any, Callable
 from urllib.parse import urlparse
 import time
 
+from lyrion.formats.lms_types import (
+    describe_type,
+    format_byte,
+    format_extension,
+    pcm_samplesize_for,
+)
+
 # Install uvloop as the default event loop policy at import time.
 try:
     import uvloop
@@ -899,6 +906,12 @@ class SlimProtoClient:
                     "HELO from %s: model=%s display=%s mac=%s len=%d caps=%s",
                     peer, model, display_name, mac_str, length_be, cap_text[:80]
                 )
+                # Full capability string at debug level: the codec list the
+                # player declares lives here (Perl parses it)
+                # SqueezePlay.pm:170-200 — every comma-separated token that
+                # matches /^[a-z][a-z0-9]{1,4}$/ is a format it can decode.
+                logger.debug("HELO caps (full, %d chars): %s",
+                             len(cap_text), cap_text)
 
                 # ── Server response: binary 'vers' frame (NOT text!) ──
                 # Server → player framing (from LMS Slim/Player/Squeezebox.pm sendFrame):
@@ -950,7 +963,10 @@ class SlimProtoClient:
 
                 # Register with PlayerManager
                 try:
-                    from lyrion.player.manager import PlayerManager, _formats_for_model
+                    from lyrion.player.manager import (
+                        PlayerManager,
+                        formats_from_capabilities,
+                    )
                     peer_ip = peer[0] if peer else "unknown"
                     reg_name = display_name or model
                     # A ModelName that merely repeats the device type
@@ -965,7 +981,11 @@ class SlimProtoClient:
                         mac=mac_str, name=reg_name, ip=peer_ip,
                         port=peer[1] if peer else 0, model=model, firmware="2.0.0",
                         name_source=src, can_https=can_https,
-                        supported_formats=_formats_for_model(model),
+                        # The player DECLARES its codecs in the HELO caps
+                        # string (Perl SqueezePlay.pm:170-200); fall back to
+                        # the model's static list only when it declares none.
+                        supported_formats=formats_from_capabilities(
+                            cap_text, model),
                     )
                     # Reconnect: cancel any pending forget-disconnected timer
                     # so the player's state (playlist/volume/position) survives.
@@ -1140,6 +1160,8 @@ class SlimProtoClient:
                     port=player_port,
                     model=model_name,
                     firmware=hello.revision.strip(),
+                    # Legacy binary HELO (SB1-era hardware): no codec caps
+                    # string in the frame, so the model's Perl list applies.
                     supported_formats=_formats_for_model(model_name),
                 )
                 logger.info("Player registered via SlimProto: %s (%s)", mac_formatted, player_ip)
@@ -1368,14 +1390,23 @@ class SlimProtoClient:
         return "m"
 
     @staticmethod
-    def _player_can_decode(player, codec: str) -> bool:
-        """True if ``player`` natively decodes a source of the given codec
-        char (''/no supported_formats ⇒ assume the common set)."""
+    def _player_can_decode(player, codec: str, perl_type: str | None = None) -> bool:
+        """True if ``player`` natively decodes the given source.
+
+        The decision is made on the SOURCE format (Perl type from
+        types.conf), not on the strm byte: a Musepack file is streamed with
+        the mp3 fallback byte but is still not decodable. Mirrors Perl's
+        ``CapabilitiesHelper::supportedFormats`` (Slim/Player/Song.pm:443-470
+        "Is format supported by all players?"), which compares the scanned
+        format against ``$client->formats()``.
+        """
         if player is None:
             return True
         formats = getattr(player, "supported_formats", None)
         if not formats:
             return True  # unknown model: assume transcode is unnecessary
+        if perl_type:
+            return format_extension(perl_type) in formats
         return SlimProtoClient._codec_to_extension(codec) in formats
 
     @staticmethod
@@ -1741,6 +1772,7 @@ class SlimProtoClient:
         # Load track metadata for codec
         mime = None
         track_path = None
+        track_url = ""
         try:
             from sqlalchemy import select
             from lyrion.database.schema import Track
@@ -1752,23 +1784,40 @@ class SlimProtoClient:
                 if track is not None:
                     mime = track.content_type
                     if track.url:
+                        track_url = track.url
                         from lyrion.web.stream import _track_path_from_url
                         track_path = _track_path_from_url(track.url)
         except Exception as exc:  # noqa: BLE001
             logger.warning("Could not load track %d for codec: %s", track_id, exc)
 
-        codec = self._codec_char(mime)
+        # Perl decides the source format from the FILE SUFFIX first, MIME
+        # second (Slim/Music/Info.pm typeFromSuffix + types.conf). Our DB's
+        # content_type is unreliable (.opus stored as audio/ogg, .mpc as
+        # chemical/x-mopac-input), and the suffix decides the strm format
+        # byte in Slim/Player/Squeezebox.pm:546-770.
+        perl_type = describe_type(track_url, mime)
+        codec = format_byte(perl_type)
         pcm_params = None  # (sample_size, rate, chan, endian) ASCII codes
         transcode_requested = False
 
-        # ── Format fallback: if the player cannot decode this codec, run an
+        # mp4/aac: the pcmsamplesize field carries the AAC container type
+        # (Squeezebox.pm:712-717) — '5' mp4ff for .mp4/.m4a, '2' adts for
+        # a raw .aac stream. Without it the player cannot demux the file.
+        if perl_type in ("mp4", "aac"):
+            pcm_params = (pcm_samplesize_for(perl_type), "?", "?", "?")
+
+        # ── Format fallback: if the player cannot decode this format, run an
         # ffmpeg transcode to raw PCM (strm codec 'p') instead of streaming
-        # the source. If ffmpeg is missing, fall back to the direct stream
-        # (the LMS must keep working) and surface a Status-bar notice.
+        # the source. Perl asks the player's declared formats
+        # (CapabilitiesHelper::supportedFormats → $client->formats(), which
+        # SqueezePlay.pm:170-200 fills from the HELO caps). If ffmpeg is
+        # missing, fall back to the direct stream (the LMS must keep
+        # working) and surface a Status-bar notice.
         try:
             from lyrion.player.manager import PlayerManager
             player = PlayerManager().get_player(mac)
-            if player is not None and not SlimProtoClient._player_can_decode(player, codec):
+            if player is not None and not SlimProtoClient._player_can_decode(
+                    player, codec, perl_type=perl_type):
                 from lyrion.web.stream import ffmpeg_available, ffprobe_audio_info, _set_server_notice
                 if not ffmpeg_available():
                     _set_server_notice("ffmpeg not found - transcoding not possible")
@@ -1785,14 +1834,14 @@ class SlimProtoClient:
                             "bits": info["bits"], "rate": info["rate"],
                             "channels": info["channels"], "bigendian": False,
                         })
+                        logger.info(
+                            "track %d format %s (%s) not natively decodable by %s — "
+                            "transcoding to PCM via ffmpeg (%d/%d/%d)",
+                            track_id, perl_type, codec, mac, info["bits"],
+                            info["rate"], info["channels"],
+                        )
                         codec = "p"
                         transcode_requested = True
-                        logger.info(
-                            "track %d codec %s not natively decodable by %s — "
-                            "transcoding to PCM via ffmpeg (%d/%d/%d)",
-                            track_id, codec, mac, info["bits"], info["rate"],
-                            info["channels"],
-                        )
                     else:
                         logger.warning(
                             "track %d codec %s not decodable, ffprobe failed; "
