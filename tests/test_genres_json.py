@@ -339,3 +339,25 @@ def test_legacy_genre_id_still_roundtrips_the_text_list(tmp_path, monkeypatch):
     res = _genres(tmp_path, monkeypatch, ["0", "2", "genre_id:1"], legacy=True)
     assert res["count"] == 1
     assert res["genres_loop"][0]["genre"] == "Rock"
+
+
+def test_genres_query_orders_by_our_sortkey_not_perls_namesort():
+    """Regression: die ``genres``-Tabelle hat ``sortkey``, nicht ``namesort``.
+
+    Ein roher Perl-Spaltenname in der Query ließ ``OperationalError: no such
+    column: namesort`` fliegen — im JSON-Suchpfad führte das zu einer leeren
+    Antwort ({}), im Browse-Pfad still zur Degradation. Perl ordnet nach
+    ``namesort`` (Queries.pm:1910-1911), unsere Entsprechung ist ``sortkey``
+    (importer.py:88-95, gefüllt beim Import).
+    """
+    import inspect
+
+    from lyrion.web import api
+
+    src = inspect.getsource(api)
+    # kein roher Perl-Spaltenname in einer SQL-Zeichenkette
+    for line in src.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            continue
+        assert "ORDER BY namesort" not in line, line

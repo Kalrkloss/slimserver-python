@@ -4796,9 +4796,17 @@ class JSONRPCAPI:
         # ``genres_loop`` trägt sie, Queries.pm:1971-1973). Solange die
         # Tabelle leer ist (kein Rescan seit ihrer Einführung), bleibt es beim
         # Textpfad — dann wird ``genre_id`` bewusst NICHT erfunden.
-        g_rows = _db_query(
-            "SELECT id, name FROM genres WHERE namespell LIKE ? "
-            "ORDER BY namesort", (like,))
+        try:
+            # Unsere Spalte heißt ``sortkey`` (Perls ``namesort``,
+            # importer.py:88-95/_sort_string; die ``genres``-Tabelle hat KEIN
+            # ``namesort`` — hier stand faelschlich der Perl-Spaltenname, was
+            # die gesamte Suchantwort auf {} fallen liess).
+            g_rows = _db_query(
+                "SELECT id, name FROM genres WHERE namespell LIKE ? "
+                "ORDER BY sortkey", (like,))
+        except Exception as exc:  # noqa: BLE001 — Legacy-DB ohne Spalte
+            logger.debug("genres search unavailable, text fallback: %s", exc)
+            g_rows = []
         if g_rows:
             g_count = [{"n": len(g_rows)}]
         else:
@@ -5587,7 +5595,7 @@ class JSONRPCAPI:
             rows, total = [], 0
             try:
                 rows = q("SELECT id, name AS genre FROM genres "
-                         "ORDER BY namesort LIMIT ? OFFSET ?", count, start)
+                         "ORDER BY sortkey LIMIT ? OFFSET ?", count, start)
                 total = total_of("SELECT COUNT(*) FROM genres")
             except Exception as exc:  # noqa: BLE001 — ältere DBs ohne Tabelle
                 logger.debug("genres table unavailable, falling back: %s", exc)
