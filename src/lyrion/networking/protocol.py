@@ -320,6 +320,89 @@ CMD_ANIC = 0x09
 CMD_GRFB = 0x0A
 CMD_META = 0x11  # ask the player to report stream metadata (StreamTitle → STMu)
 
+# ── Perl slimproto opcode table (4 ASCII bytes) ───────────────────────────
+# Slim/Networking/Slimproto.pm:52-72 `%message_handlers`. The opcode is the
+# RAW 4-byte name ('IR  ' is space padded), and Perl looks it up in a hash —
+# so the comparison is case sensitive. Our old dispatch lower-cased the
+# opcode and compared against "bye", which is why a real `BYE!` frame from a
+# player fell through to the debug branch (audit B1).
+PERL_MESSAGE_HANDLERS = frozenset({
+    "ANIC",  # :56  _animation_complete_handler
+    "BODY",  # :57  _http_body_handler
+    "BUTN",  # :58  _button_handler
+    "BYE!",  # :59  _bye_handler
+    "DBUG",  # :60  _debug_handler
+    "DSCO",  # :61  _disco_handler
+    "IR  ",  # :62  _ir_handler (space padded!)
+    "KNOB",  # :63  _knob_handler
+    "META",  # :64  _http_metadata_handler
+    "RAWI",  # :65  _raw_ir_handler
+    "RESP",  # :66  _http_response_handler
+    "SETD",  # :67  _settings_handler
+    "STAT",  # :68  _stat_handler
+    "UREQ",  # :69  _update_request_handler
+    "ALSS",  # :70  _ambient_light_sensor_handler
+    "SHUT",  # :71  _shut_handler (slimprox only)
+})
+
+# Perl closes the socket in exactly one handler: Slimproto.pm:939-942
+# (``slimproto_close($client->tcpsock)``).
+PERL_CLOSE_OPCODES = frozenset({"SHUT"})
+
+# ... and it explicitly does NOT close for these two: BYE! only reacts to a
+# firmware-upgrade payload (Slimproto.pm:921-937), DSCO reports a data-channel
+# disconnect and keeps the control connection (Slimproto.pm:599-679).
+PERL_KEEP_OPEN_OPCODES = frozenset({"BYE!", "DSCO"})
+
+# DSCO disconnect reasons, verbatim from Slimproto.pm:603-609.
+DISCO_REASONS = {
+    0: "Connection closed normally",               # TCP_CLOSE_FIN
+    1: "Connection reset by local host",           # TCP_CLOSE_LOCAL_RST
+    2: "Connection reset by remote host",          # TCP_CLOSE_REMOTE_RST
+    3: "Connection is no longer able to work",     # TCP_CLOSE_UNREACHABLE
+    4: "Connection timed out",                     # TCP_CLOSE_LOCAL_TIMEOUT
+}
+
+# Perl handler -> human readable, for the frames whose full semantics are
+# still a separate task (IR/BUTN/KNOB = PROT-19 in the parity plan).
+PERL_HANDLER_NAMES = {
+    "ANIC": "_animation_complete_handler",
+    "BODY": "_http_body_handler",
+    "BUTN": "_button_handler",
+    "DBUG": "_debug_handler",
+    "IR  ": "_ir_handler",
+    "KNOB": "_knob_handler",
+    "RAWI": "_raw_ir_handler",
+    "UREQ": "_update_request_handler",
+    "ALSS": "_ambient_light_sensor_handler",
+}
+
+
+def classify_opcode(op_raw: str) -> str:
+    """Classify a player frame opcode exactly like Perl's handler lookup.
+
+    ``op_raw`` is the raw 4-byte ASCII opcode (no lower-casing — that is what
+    broke ``BYE!``). Returns one of:
+
+    * ``"close"``   — Perl closes the socket here (``SHUT``)
+    * ``"bye"``     — ``BYE!``: never closes, may request a firmware upgrade
+    * ``"dsco"``    — data-channel disconnect notice, connection stays open
+    * ``"helo"``    — (re)handshake
+    * ``"handler"`` — a Perl message handler we dispatch explicitly
+    * ``"unknown"`` — Perl logs ``Unknown slimproto op`` and keeps the socket
+    """
+    if op_raw in PERL_CLOSE_OPCODES:
+        return "close"
+    if op_raw == "BYE!":
+        return "bye"
+    if op_raw == "DSCO":
+        return "dsco"
+    if op_raw.upper() == "HELO":
+        return "helo"
+    if op_raw in PERL_MESSAGE_HANDLERS:
+        return "handler"
+    return "unknown"
+
 
 # ---------------------------------------------------------------------------
 # Enums / flags
@@ -1028,7 +1111,12 @@ class SlimProtoClient:
                         logger.warning("Oversized frame from %s: op=%r len=%d", peer, opcode_raw, plen)
                         break
                     payload = await reader.readexactly(plen) if plen else b""
-                    op = opcode_raw.decode("ascii", errors="replace").lower()
+                    # Perl looks the opcode up in %message_handlers as the RAW
+                    # 4-byte name (case sensitive, 'IR  ' space padded). Keep
+                    # the raw form for that lookup; the lower-case form serves
+                    # the text-HELO aliases of our own client.
+                    op_raw = opcode_raw.decode("ascii", errors="replace")
+                    op = op_raw.lower()
                     if op == "stat":
                         self._handle_stat_frame(mac_str, payload)
                     elif op == "resp":
@@ -1062,21 +1150,36 @@ class SlimProtoClient:
                                         PlayerManager().rename_player(mac_str, new_name)
                                     except Exception as exc:
                                         logger.warning("SETD rename failed for %s: %s", mac_str, exc)
-                    elif op in ("bye", "dsco", "quit"):
-                        if op == "dsco":
-                            # DSCO = end-of-stream notification: Squeezelite
-                            # sends it whenever the current stream disconnects
-                            # (e.g. after EOF — for fast local files that is
-                            # right after the strm, because the whole file is
-                            # buffered instantly). The real LMS treats DSCO
-                            # as end-of-stream and KEEPS BOTH the player AND
-                            # the control connection open — the player keeps
-                            # sending STAT frames on this same socket while
-                            # the buffered audio plays out. Closing here
-                            # forces a reconnect mid-playback (squeezelite:
-                            # "error reading from socket: closed").
+                    elif op in ("bye", "dsco", "quit") or op_raw in PERL_KEEP_OPEN_OPCODES \
+                            or op_raw in PERL_CLOSE_OPCODES or op_raw in PERL_HANDLER_NAMES:
+                        # Perl's dispatch: the opcode is looked up in
+                        # %message_handlers as the RAW 4-byte name
+                        # (Slimproto.pm:425-434). Behaviour per handler:
+                        #   SHUT  -> slimproto_close (:939-942)  = close
+                        #   BYE!  -> firmware-upgrade request, NO close (:921-937)
+                        #   DSCO  -> data-channel disconnect, NO close (:599-679)
+                        #   IR  /BUTN/KNOB/RAWI/ANIC/ALSS/UREQ/DBUG/BODY -> handler,
+                        #           connection stays open
+                        kind = classify_opcode(op_raw)
+                        if kind == "dsco" or op == "dsco":
+                            self._handle_dsco_frame(mac_str, payload)
                             keep_registered = True
                             continue
+                        if kind == "bye":
+                            self._handle_bye_frame(mac_str, payload)
+                            keep_registered = True
+                            continue
+                        if kind == "close":
+                            logger.info(
+                                "Player %s sent SHUT — closing (Perl _shut_handler)",
+                                mac_str)
+                            break
+                        if kind == "handler":
+                            self._handle_player_event_frame(mac_str, op_raw, payload)
+                            keep_registered = True
+                            continue
+                        # our text-protocol extras (no Perl counterpart:
+                        # audit B3/B4 — the text path of our own client)
                         logger.info("Player %s sent '%s' — closing connection", mac_str, op)
                         break
                     elif op == "helo":
@@ -1084,7 +1187,10 @@ class SlimProtoClient:
                         writer.write(server_frame)
                         await writer.drain()
                     else:
-                        logger.debug("Frame '%s' from %s (%d bytes)", op, mac_str, plen)
+                        # Perl Slimproto.pm:432 "Unknown slimproto op" — and it
+                        # keeps the socket open.
+                        logger.warning("Unknown slimproto op: %r from %s (%d bytes)",
+                                       op_raw, mac_str, plen)
                 return
             
             # ── Binary SlimProto HELO ──
@@ -2505,6 +2611,60 @@ class SlimProtoClient:
             return True
         except (ConnectionError, OSError, RuntimeError):
             return False
+
+    def _handle_bye_frame(self, mac_str: str, payload: bytes) -> None:
+        """Perl ``_bye_handler`` — ``Slim/Networking/Slimproto.pm:921-937``.
+
+        The comment in Perl is "THIS IS ONLY FOR THE OLD SDK4.X UPDATER": a
+        payload of ``chr(1)`` asks the server to put the player into
+        firmware-upgrade mode (Perl: ``sleep(2); unblock();
+        upgradeFirmware()``). Perl never closes the control connection here —
+        closing on ``BYE!`` was our own invention (audit B1, live: the frame
+        went to the debug branch because we compared a lower-cased opcode
+        against ``"bye"``). We have no firmware image, so the request is
+        logged and the player keeps streaming.
+        """
+        logger.info("Player %s sent BYE! ('Saying goodbye')", mac_str)
+        if payload == b"\x01":
+            logger.info(
+                "Player %s requests a firmware upgrade (BYE! chr(1)) — no "
+                "firmware image available, connection stays open", mac_str)
+
+    def _handle_dsco_frame(self, mac_str: str, payload: bytes) -> None:
+        """Perl ``_disco_handler`` — ``Slim/Networking/Slimproto.pm:599-679``.
+
+        The data channel reported a disconnect. Perl logs the reason byte
+        (0..4, ``%reasons`` at :603-609), warns on a non-zero reason, resets
+        ``connecting``/``readyToStream`` if the player never finished
+        connecting, and KEEPS the control connection open so the buffered
+        audio plays out (squeezelite sends DSCO right after the strm for fast
+        local files, because the whole file is buffered instantly).
+        """
+        reason = payload[0] if payload else 0
+        text = DISCO_REASONS.get(reason, f"unknown reason {reason}")
+        logger.info("Squeezebox got disconnection on the data channel: %s (%s)",
+                    text, mac_str)
+        if reason:
+            logger.warning("Unexpected data stream disconnect type: %s", text)
+        # Perl: if ($client->connecting()) { connecting(0); readyToStream(1) }
+        # Our equivalent of "the player can accept a stream again" is clearing
+        # the strm idempotency guard, so a replay of the same track is sent.
+        SlimProtoClient._reset_strm_guard(mac_str, "DSCO")
+
+    def _handle_player_event_frame(self, mac_str: str, op_raw: str,
+                                   payload: bytes) -> None:
+        """Recognise the remaining Perl message handlers (socket stays open).
+
+        ``Slim/Networking/Slimproto.pm:52-72``: IR/BUTN/KNOB/RAWI map buttons
+        and infrared codes (PROT-19 in the parity plan), ANIC/ALSS/UREQ/DBUG/
+        BODY are display, ambient-light, firmware-update, debug and
+        HTTP-body frames. Perl runs the handler and keeps the connection;
+        until the button/IR semantics land, each frame is logged with its
+        Perl handler name so it is visible instead of silently swallowed.
+        """
+        handler = PERL_HANDLER_NAMES.get(op_raw, "?")
+        logger.debug("Player %s frame %r -> Perl %s (%d bytes)",
+                     mac_str, op_raw, handler, len(payload))
 
     def _handle_resp_frame(self, mac_str: str, payload: bytes) -> None:
         """Handle a RESP frame: the player forwards the source's HTTP
