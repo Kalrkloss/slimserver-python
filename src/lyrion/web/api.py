@@ -2420,7 +2420,7 @@ class JSONRPCAPI:
                     if curmode == "pause":
                         await pm.pause_player(pid, False)   # Perl's 'resume'
                     elif curmode == "stop":
-                        player.power = True
+                        await pm.power_on_for_playback(player)
                         pm.set_mode(pid, "play")
                         await self._play_playlist_item(
                             pm, player, player.playlist_position or 0
@@ -2428,7 +2428,7 @@ class JSONRPCAPI:
         elif cmd == "play":
             player = pm.get_player(pid)
             if player is not None:
-                player.power = True
+                await pm.power_on_for_playback(player)
                 player.mode = "play"
                 pm.set_mode(pid, "play")
                 await self._play_playlist_item(pm, player, player.playlist_position or 0)
@@ -2677,9 +2677,9 @@ class JSONRPCAPI:
             handler = getattr(pm, "_protocol_handler", None)
             if handler is None:
                 return
-            # Playing implies power-on (like real LMS)
-            if not player.power:
-                player.power = True
+            # Playing implies power-on (like real LMS, which also switches
+            # the audio outputs on: Player.pm:268 -> aude(1)).
+            await pm.power_on_for_playback(player)
             # Set the mode SYNCHRONOUSLY BEFORE the (async) stream send, so
             # player.status reports 'playing' immediately after a play command
             # (real LMS does this). Otherwise a remote/stream start lags and a

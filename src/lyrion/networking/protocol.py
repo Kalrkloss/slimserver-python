@@ -1123,6 +1123,13 @@ class SlimProtoClient:
                 except Exception as exc:
                     logger.warning("Volume sync failed for %s: %s", mac_str, exc)
 
+                # ── Audio outputs enable ('aude'), same Perl HELO block ──
+                # Slimproto.pm:1265 audio_outputs_enable($client->power())
+                try:
+                    await self._send_aude_state(mac_str)
+                except Exception as exc:
+                    logger.warning("aude state failed for %s: %s", mac_str, exc)
+
                 # ── Read loop: binary slimproto frames from player ──
                 # Player → server framing (from LMS Slim/Networking/Slimproto.pm
                 # client_readable): 4-byte ASCII opcode + 4-byte BE length + payload.
@@ -1316,6 +1323,13 @@ class SlimProtoClient:
                                 pstate.volume, mac_formatted)
             except Exception as exc:
                 logger.warning("Volume sync failed for %s: %s", mac_formatted, exc)
+
+            # ── Audio outputs enable ('aude') — same Perl HELO block ──
+            # Slimproto.pm:1265 audio_outputs_enable($client->power())
+            try:
+                await self._send_aude_state(mac_formatted)
+            except Exception as exc:
+                logger.warning("aude state failed for %s: %s", mac_formatted, exc)
 
             # Read loop for this player
             while True:
@@ -2570,25 +2584,39 @@ class SlimProtoClient:
         except (ConnectionError, OSError, RuntimeError):
             return False
 
-    async def send_aude(self, mac: str, spdif: bool = False, dac: bool = True) -> bool:
-        """Send an 'aude' frame (enable/disable audio outputs).
+    async def send_aude(self, mac: str, enabled: bool = True) -> bool:
+        """Enable/disable the player's audio outputs ('aude' frame).
 
-        aude_packet: opcode(4) spdif(1) dac(1) — 1 = output enabled.
-        Squeezebox hardware uses this to route audio; software players
-        (squeezelite/jive) ignore it.
+        Perl ``Squeezebox2.pm:900-906`` sets BOTH bytes from one flag::
+
+            my $data = pack('CC', $enabled, $enabled);   # spdif + dac
+            $client->sendFrame('aude', \\$data);
+
+        Frame (server→player): 2-byte BE length (opcode included!) + the
+        4 ASCII bytes 'aude' + spdif(1) + dac(1).
+
+        Callers (Perl): power off ``Player.pm:253`` → (0), power on
+        ``Player.pm:268`` → (1), and once per HELO with the client's current
+        power state ``Slimproto.pm:1265``. The base class is a no-op
+        (``Player.pm:358``), so only the Squeezebox2 family (incl.
+        squeezelite/jive) understands it.
         """
         mac = mac.upper().replace(":", "")
         writer = self._player_writers.get(mac)
         if writer is None or writer.is_closing():
+            logger.debug("send_aude: no writer for player %s", mac)
             return False
-        payload = b"aude" + bytes([1 if spdif else 0, 1 if dac else 0])
+        byte = 1 if enabled else 0
+        payload = b"aude" + bytes([byte, byte])
         frame = struct.pack(">H", len(payload)) + payload
         try:
             writer.write(frame)
             await writer.drain()
-            logger.info("Sent aude spdif=%d dac=%d to %s", spdif, dac, mac)
+            logger.info("Sent aude (enabled=%d, spdif=%d, dac=%d) to %s",
+                        byte, byte, byte, mac)
             return True
-        except (ConnectionError, OSError, RuntimeError):
+        except (ConnectionError, OSError, RuntimeError) as exc:
+            logger.warning("send_aude to %s failed: %s", mac, exc)
             return False
 
     async def send_ir_to_player(self, mac: str, button_code: int) -> bool:
@@ -3189,6 +3217,22 @@ class SlimProtoClient:
     async def send_stat(self, stat: StatMessage) -> None:
         """Send a STAT message to the server."""
         await self._send_frame(CMD_STAT, stat.to_bytes())
+
+    async def _send_aude_state(self, mac_str: str) -> None:
+        """Send 'aude' with the player's current power state (Perl HELO path).
+
+        ``Slimproto.pm:1262-1266`` runs on every HELO::
+
+            $client->audio_outputs_enable($client->power());
+            $client->volume($client->volume(), defined($client->tempVolume()));
+        """
+        try:
+            from lyrion.player.manager import PlayerManager
+            pstate = PlayerManager().get_player(mac_str)
+            power = bool(pstate.power) if pstate is not None else True
+        except Exception:  # noqa: BLE001
+            power = True
+        await self.send_aude(mac_str, power)
 
     async def send_cli(self, mac: str, command: str) -> bool:
         """Send a CLI command to a connected player over its TCP channel."""

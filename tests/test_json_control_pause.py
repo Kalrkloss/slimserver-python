@@ -44,6 +44,7 @@ class _FakePM:
         self.pause_calls = []
         self.modes = []
         self.started = []
+        self.aude_calls = []
 
     def get_player(self, mac):
         return self.player if mac == self.player.mac else None
@@ -62,6 +63,16 @@ class _FakePM:
 
     def set_power(self, mac, on):
         self.player.power = bool(on)
+
+    async def power_on_for_playback(self, player):
+        # Perl powers the client on before playback and thereby switches its
+        # audio outputs on (Player.pm:268 → aude(1), Squeezebox2.pm:900-906).
+        await self.send_audio_outputs(player.mac, True)
+        player.power = True
+
+    async def send_audio_outputs(self, mac, enabled):
+        self.aude_calls.append((mac, bool(enabled)))
+        return True
 
     def send_command(self, mac, cmd):
         raise AssertionError(f"unexpected raw send: {cmd}")

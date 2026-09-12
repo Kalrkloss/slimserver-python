@@ -518,6 +518,15 @@ class PlayerManager:
             return
         player.power = on
         player.update_activity()
+        # Perl switches the player's audio outputs together with power:
+        # Player.pm:253 ``$client->audio_outputs_enable(0)`` on power-off and
+        # Player.pm:268 ``audio_outputs_enable(1)`` on power-on (the frame is
+        # 'aude' with pack('CC', $enabled, $enabled), Squeezebox2.pm:900-906).
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(self.send_audio_outputs(mac, on))
+        except RuntimeError:
+            pass  # no running loop — state-only fallback
         if not on:
             # Power off = stop playback (SlimProto strm 'q') + standby. The
             # stop-frame send is async; schedule it on the running loop (all
@@ -530,6 +539,35 @@ class PlayerManager:
             except RuntimeError:
                 pass  # no running loop — state-only fallback
         logger.debug("Player %s power: %s", mac, "on" if on else "off")
+
+    async def power_on_for_playback(self, player: PlayerState) -> None:
+        """Power a player on because playback starts (Perl powers it on first).
+
+        Perl's power-on path switches the audio outputs on as well
+        (``Player.pm:268`` → ``audio_outputs_enable(1)`` → 'aude' with
+        ``pack('CC', 1, 1)``, Squeezebox2.pm:900-906). Sending it only on an
+        actual transition keeps a plain play on a powered player silent.
+        """
+        if player.power:
+            return
+        player.power = True
+        await self.send_audio_outputs(player.mac, True)
+
+    async def send_audio_outputs(self, mac: str, enabled: bool) -> bool:
+        """Perl ``audio_outputs_enable`` — 'aude' frame (spdif + dac).
+
+        Perl: Squeezebox2.pm:900-906, called from Player.pm:253 (power off)
+        and Player.pm:268 (power on).
+        """
+        handler = self._protocol_handler
+        send = getattr(handler, "send_aude", None) if handler is not None else None
+        if send is None:
+            return False
+        try:
+            return bool(await send(mac, enabled))
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("send_audio_outputs(%s, %s) failed: %s", mac, enabled, exc)
+            return False
 
     async def set_volume(self, mac: str, volume: int) -> bool:
         """Set player volume (sends audg frame via the protocol handler).
@@ -744,7 +782,8 @@ class PlayerManager:
 
         ok = await handler.send_strm_to_player(player.mac, track_id)
         if ok:
-            player.power = True  # playing implies power-on
+            # Playing implies power-on (Perl enables the audio outputs then).
+            await self.power_on_for_playback(player)
             player.mode = "play"
             player.current_track_id = track_id
             player.remote = 0  # local track: never a "live stream" flag
@@ -804,7 +843,8 @@ class PlayerManager:
         if ok:
             logger.info("play_url codec guess: %s -> '%s'", url[:60], codec)
         if ok:
-            player.power = True  # playing implies power-on
+            # Playing implies power-on (Perl enables the audio outputs then).
+            await self.power_on_for_playback(player)
             player.current_title = title or url
             player.current_url = url
             player.current_track_id = None
