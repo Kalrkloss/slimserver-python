@@ -16,7 +16,13 @@ from lyrion.control.cli import (
     ResponseFormat,
     register_command,
 )
-from lyrion.control.queries import query_params, render_line
+from lyrion.control.queries import (
+    fulltext_weight,
+    query_params,
+    render_line,
+    search_string_split,
+    search_tokens,
+)
 
 if TYPE_CHECKING:
     from lyrion.control.request import RequestDispatcher
@@ -2682,17 +2688,25 @@ async def _search_lms(
 ) -> list[str]:
     """LMS grouped search: 'search <start> <count> term:<begriff>' — ONE line.
 
-    ``searchQuery`` (``Slim/Control/Queries.pm:3472-3560``) runs the search for
-    each entity and, per entity, adds ``<type>s_count`` (:3526) and the unrolled
-    ``<type>s_loop`` with the keys ``<type>_id`` and ``<type>`` (:3546/:3549);
-    the final ``count`` is the sum over all entities (:3586).  The entities are
-    contributor, album, work, genre and track (:3577-3581) — we have no 'work'
+    ``searchQuery`` (``Slim/Control/Queries.pm:3472-3659``) runs the search for
+    each entity and, per entity, adds ``<type>s_count`` (:3595) and the unrolled
+    ``<type>s_loop`` with the keys ``<type>_id`` and ``<type>`` (:3622/:3625);
+    the final ``count`` is the sum over all entities (:3657).  The entities are
+    contributor, album, work, genre and track (:3649-3653) — we have no 'work'
     table, so we cover the other four.
+
+    The term is tokenized (``parseSearchTerm``, Plugin.pm:345-457: AND of the
+    tokens, ``-word`` = NOT) and the hits are ranked by Perl's
+    ``fulltextweight`` (``_getWeight``, Plugin.pm:486-503;
+    ``ORDER BY quickSearch.fulltextweight DESC``, Queries.pm:3597).  Genres
+    have no FTS path (Plugin.pm:3516) and keep the ``namesort`` order
+    (Queries.pm:1911).
 
     Everything is appended to the same line by renderAsArray
     (``Slim/Control/Request.pm:2264-2281``); live Perl 9.1.1, read-only,
     2026-09-12: ``search 0 3 term:night`` → ``search 0 3 term%3Anight
-    rescan%3A1`` (the scan guard, :3496) with empty result sets while scanning.
+    rescan%3A1`` (the scan guard, :3495-3497) with empty result sets while
+    scanning.
     """
     nums = [int(a) for a in args if str(a).isdigit()]
     start = nums[0] if nums else 0
@@ -2700,42 +2714,68 @@ async def _search_lms(
     term = next((str(a)[5:] for a in args if str(a).startswith("term:")), "")
     if not term:
         return _command_line(["search"], args, ["_index", "_quantity"])
-    like = f"%{term}%"
+    tokens = search_tokens(term)
+    if not tokens:
+        return _command_line(["search"], args, ["_index", "_quantity"])
+
+    def _where(exprs: list[str]) -> tuple[str, tuple]:
+        conds, params = _search_conditions(tokens, exprs)
+        return ((" WHERE " + " AND ".join(conds)) if conds else "", tuple(params))
+
+    cw, cp = _where(["c.name"])
+    aw, ap = _where(["al.title"])
+    gw, gp = _where(["g.namespell"])
+    track_pred, track_params = _track_search_predicate(tokens, "tracks")
+    # Perl's non-FTS fallback searches the entity's own title column
+    # (`me.title` LIKE, Queries.pm:3570/:1814) and the FTS path additionally
+    # matches album, artist and genre (Plugin.pm:31-47).  The unaliased
+    # `FROM tracks WHERE title LIKE` shape of the fallback is kept as the first
+    # term; the widening UNION is OR'ed in.
+    tw = " WHERE title LIKE ?"
+    tp: tuple = (f"%{term}%",)
+    if track_pred:
+        tw += f" OR {track_pred}"
+        tp = tp + tuple(track_params)
+
     try:
         contributors = await _query_db(
             "SELECT DISTINCT c.id, c.name FROM contributors c "
-            "JOIN tracks_contributors tc ON tc.contributor = c.id AND tc.role = 1 "
-            "WHERE c.name LIKE ? ORDER BY c.name COLLATE NOCASE LIMIT ? OFFSET ?",
-            (like, count, start),
-        )
+            "JOIN tracks_contributors tc ON tc.contributor = c.id AND tc.role = 1"
+            + cw + " ORDER BY c.id LIMIT ? OFFSET ?", cp + (count, start))
         albums = await _query_db(
-            "SELECT id, title FROM albums WHERE title LIKE ? "
-            "ORDER BY title COLLATE NOCASE LIMIT ? OFFSET ?",
-            (like, count, start),
-        )
+            "SELECT al.id, al.title, al.year FROM albums al"
+            + aw + " ORDER BY al.id LIMIT ? OFFSET ?", ap + (count, start))
         genres = await _query_db(
-            "SELECT DISTINCT genre AS name FROM tracks WHERE genre LIKE ? "
-            "ORDER BY genre COLLATE NOCASE LIMIT ? OFFSET ?",
-            (like, count, start),
-        )
+            "SELECT g.id, g.name, g.sortkey FROM genres g"
+            + gw + " ORDER BY g.sortkey COLLATE NOCASE LIMIT ? OFFSET ?",
+            gp + (count, start))
         tracks = await _query_db(
-            "SELECT id, title FROM tracks WHERE title LIKE ? "
-            "ORDER BY title COLLATE NOCASE LIMIT ? OFFSET ?",
-            (like, count, start),
-        )
+            "SELECT DISTINCT tracks.id, tracks.title, tracks.genre"
+            + _track_weight_cols("tracks")
+            + " FROM tracks" + tw + " ORDER BY tracks.id LIMIT ? OFFSET ?",
+            tp + (count, start))
         c_total = await _query_db(
             "SELECT COUNT(DISTINCT c.id) AS n FROM contributors c "
-            "JOIN tracks_contributors tc ON tc.contributor = c.id AND tc.role = 1 "
-            "WHERE c.name LIKE ?", (like,))
+            "JOIN tracks_contributors tc ON tc.contributor = c.id AND tc.role = 1"
+            + cw, cp)
         al_total = await _query_db(
-            "SELECT COUNT(*) AS n FROM albums WHERE title LIKE ?", (like,))
+            "SELECT COUNT(*) AS n FROM albums al" + aw, ap)
         g_total = await _query_db(
-            "SELECT COUNT(DISTINCT genre) AS n FROM tracks WHERE genre LIKE ?",
-            (like,))
+            "SELECT COUNT(*) AS n FROM genres g" + gw, gp)
         t_total = await _query_db(
-            "SELECT COUNT(*) AS n FROM tracks WHERE title LIKE ?", (like,))
+            "SELECT COUNT(DISTINCT tracks.id) AS n FROM tracks" + tw, tp)
     except Exception:  # noqa: BLE001
         return _command_line(["search"], args, ["_index", "_quantity"])
+
+    # Relevance order per entity (Queries.pm:3597); genres keep namesort.
+    contributors = _rank_search_rows(contributors, tokens, title_key="name",
+                                     w1_keys=())
+    albums = _rank_search_rows(albums, tokens, title_key="title", w5_keys=("year",),
+                               w3_keys=("artist_name",))
+    tracks = _rank_search_rows(tracks, tokens, title_key="title",
+                               w5_keys=("album_title", "genre"),
+                               w3_keys=("artist_name", "comment"))
+
     c_n = c_total[0]["n"] if c_total else 0
     al_n = al_total[0]["n"] if al_total else 0
     g_n = g_total[0]["n"] if g_total else 0
@@ -2743,16 +2783,17 @@ async def _search_lms(
 
     results: list[tuple[str, Any]] = [
         ("contributors_count", c_n),
-        ("contributors_loop", [{"contributor_id": r["id"], "contributor": r["name"]}
+        ("contributors_loop", [{"contributor_id": r.get("id"),
+                                "contributor": r.get("name") or ""}
                                for r in contributors]),
         ("albums_count", al_n),
-        ("albums_loop", [{"album_id": r["id"], "album": r["title"]}
+        ("albums_loop", [{"album_id": r.get("id"), "album": r.get("title") or ""}
                          for r in albums]),
         ("genres_count", g_n),
-        ("genres_loop", [{"genre_id": r["name"], "genre": r["name"]}
+        ("genres_loop", [{"genre_id": r.get("id"), "genre": r.get("name") or ""}
                          for r in genres]),
         ("tracks_count", t_n),
-        ("tracks_loop", [{"track_id": r["id"], "track": r["title"]}
+        ("tracks_loop", [{"track_id": r.get("id"), "track": r.get("title") or ""}
                          for r in tracks]),
         ("count", c_n + al_n + g_n + t_n),
     ]
@@ -3451,14 +3492,76 @@ async def _write_db(sql: str, params: tuple = ()) -> bool:
         return False
 
 
-def _browse_where(filters: dict[str, str], cols: dict[str, str]) -> tuple[str, tuple]:
+def _search_conditions(tokens: list[str], exprs: list[str]) -> tuple[list[str], list[str]]:
+    """AND of per-token ``(col LIKE ? OR col LIKE ? …)`` conditions.
+
+    Perl's full-text search ANDs the tokens (``parseSearchTerm`` joins them
+    with ``AND``, Plugin.pm:454) and a ``-`` prefixed token becomes ``NOT``
+    (:457).  Candidate matching is a case-folded substring LIKE here; the
+    ranking that follows is Perl's ``fulltextweight`` (see
+    :func:`lyrion.control.queries.fulltext_weight`).
+    """
+    conds: list[str] = []
+    params: list[str] = []
+    included = [t for t in tokens if not t.startswith("-")]
+    excluded = [t[1:] for t in tokens if t.startswith("-")]
+    for token in included:
+        if not token:
+            continue
+        conds.append("(" + " OR ".join(f"UPPER({e}) LIKE ?" for e in exprs) + ")")
+        params.extend(f"%{token}%" for _ in exprs)
+    for token in excluded:
+        if not token:
+            continue
+        conds.append("(" + " AND ".join(f"UPPER({e}) NOT LIKE ?" for e in exprs) + ")")
+        params.extend(f"%{token}%" for _ in exprs)
+    return conds, params
+
+
+def _rank_search_rows(
+    rows: list[dict],
+    tokens: list[str],
+    *,
+    title_key: str,
+    w5_keys: tuple[str, ...] = (),
+    w3_keys: tuple[str, ...] = (),
+    w1_keys: tuple[str, ...] = (),
+) -> list[dict]:
+    """Order candidate rows by Perl's ``fulltextweight`` (descending).
+
+    ``searchQuery`` orders every entity by ``fulltextweight DESC``
+    (``Slim/Control/Queries.pm:3597``); the weight is ``_getWeight``
+    (``Slim/Plugin/FullTextSearch/Plugin.pm:486-503``) — see
+    :func:`lyrion.control.queries.fulltext_weight`.  Python's sort is stable,
+    so equal-weight rows keep the DB order, like SQLite does for ties.
+    """
+    included = [t for t in tokens if not t.startswith("-")]
+    if not included:
+        return rows
+
+    def weight(row: dict) -> int:
+        return fulltext_weight(
+            included,
+            w10=str(row.get(title_key) or ""),
+            w5=tuple(str(row.get(k) or "") for k in w5_keys),
+            w3=tuple(str(row.get(k) or "") for k in w3_keys),
+            w1=tuple(str(row.get(k) or "") for k in w1_keys),
+        )
+
+    return sorted(rows, key=weight, reverse=True)
+
+
+def _browse_where(filters: dict[str, str], cols: dict[str, Any]) -> tuple[str, tuple]:
     """Build WHERE clause + params for library browse queries.
 
     cols maps a filter name to an SQL expression, e.g.
     {"search": "t.title", "year": "t.year", "genre": "t.genre",
      "track_id": "t.id", "album_id": "ta.album", "artist_id": "tc.contributor"}.
-    genre_id is intentionally not supported: the genres table is not
-    populated, tracks carry the genre as text — use genre:<text>.
+    ``search`` may be a list of expressions — Perl's search spans several
+    columns (``searchQuery`` searches title, artist and album, Queries.pm:3653).
+
+    ``genre_id`` resolves against the (now populated) ``genres`` table;
+    ``genre`` keeps the text match for callers that pass a genre name.
     """
     conds: list[str] = []
     params: list[str] = []
@@ -3467,8 +3570,11 @@ def _browse_where(filters: dict[str, str], cols: dict[str, str]) -> tuple[str, t
         if not val:
             continue
         if key == "search":
-            conds.append(f"{expr} LIKE ?")
-            params.append(f"%{val}%")
+            exprs = [expr] if isinstance(expr, str) else list(expr)
+            token_conds, token_params = _search_conditions(
+                search_tokens(str(val)), exprs)
+            conds.extend(token_conds)
+            params.extend(token_params)
         elif key == "genre":
             conds.append(f"{expr} LIKE ?")
             params.append(f"%{val}%")
@@ -3476,6 +3582,59 @@ def _browse_where(filters: dict[str, str], cols: dict[str, str]) -> tuple[str, t
             conds.append(f"{expr} = ?")
             params.append(val)
     return (" WHERE " + " AND ".join(conds)) if conds else "", tuple(params)
+
+
+def _track_search_predicate(tokens: list[str], alias: str = "t") -> tuple[str, list[str]]:
+    """WHERE fragment + params for a tokenized track search.
+
+    Perl's FTS indexes a track's title (w10), its album title + genre (w5) and
+    its contributors (w3) — ``Slim/Plugin/FullTextSearch/Plugin.pm:31-47`` — and
+    a record matches when every token hits at least one of those columns
+    (``MATCH 'type:track token1 AND token2'``, :329).  We have no FTS index, so
+    each token becomes a ``UNION`` over the four cheap per-table scans instead
+    of one 60k-row scan with correlated sub-selects (which is minutes on a real
+    library).  A ``-`` token is a ``NOT IN`` (Plugin.pm:454-457).
+    """
+    def _union(like: str, table: str) -> str:
+        return (
+            f"SELECT {table}2.id FROM tracks {table}2 "
+            f"WHERE UPPER({table}2.title) LIKE ? OR UPPER({table}2.genre) LIKE ? "
+            f"UNION SELECT ta2.track FROM tracks_albums ta2 "
+            f"JOIN albums al2 ON al2.id = ta2.album WHERE UPPER(al2.title) LIKE ? "
+            f"UNION SELECT tc2.track FROM tracks_contributors tc2 "
+            f"JOIN contributors c2 ON c2.id = tc2.contributor "
+            f"WHERE UPPER(c2.name) LIKE ? AND tc2.role = 1")
+
+    frags: list[str] = []
+    params: list[str] = []
+    for token in tokens:
+        if not token or token.startswith("-"):
+            continue
+        frags.append(f"{alias}.id IN ({_union(token, alias)})")
+        params.extend([f"%{token}%"] * 4)
+    for token in tokens:
+        if not token.startswith("-") or len(token) < 2:
+            continue
+        frags.append(f"{alias}.id NOT IN ({_union(token[1:], alias)})")
+        params.extend([f"%{token[1:]}%"] * 4)
+    return " AND ".join(frags), params
+
+
+def _track_weight_cols(alias: str = "t") -> str:
+    """SELECT suffix for Perl's track relevance columns.
+
+    ``Slim/Plugin/FullTextSearch/Plugin.pm:31-47``: the album title is w5, the
+    contributor tuples are w3 and the track title is w10.  The correlated
+    sub-selects only run for rows already matched by the candidate predicate
+    (:func:`_track_search_predicate`), so they stay cheap.
+    """
+    return (
+        f", (SELECT GROUP_CONCAT(al.title, ' ') FROM tracks_albums ta "
+        f"JOIN albums al ON al.id = ta.album WHERE ta.track = {alias}.id) "
+        f"AS album_title"
+        f", (SELECT GROUP_CONCAT(c.name, ' ') FROM tracks_contributors tc "
+        f"JOIN contributors c ON c.id = tc.contributor "
+        f"WHERE tc.track = {alias}.id AND tc.role = 1) AS artist_name")
 
 
 @register_command("artists")
@@ -3589,26 +3748,45 @@ async def cmd_songs(
     title%3A!!!!!!! genre%3AAlternative artist%3ABillie%20Eilish album%3A… 
     duration%3A13.609 count%3A80134``).  'titles' is a registered alias and is
     echoed as invoked (Perl dispatches both, Request.pm:617/628).
+
+    With a ``search:`` term the hits are ordered by Perl's relevance weight
+    (``searchQuery``: ``ORDER BY quickSearch.fulltextweight DESC``,
+    ``Slim/Control/Queries.pm:3597``; the weight is ``_getWeight``,
+    ``Slim/Plugin/FullTextSearch/Plugin.pm:486-503``) and the search spans
+    title, album, artist and genre (LIB-16/17).
     """
     name = getattr(ctx, "command", "") or "songs"
     if _is_query_echo(args):
         return [render_line(terms=[name, *args])]
     offset, limit, filters = _parse_query_args(args)
-    where, params = _browse_where(filters, {
-        "search": "t.title", "track_id": "t.id", "album_id": "ta.album",
+    search = filters.get("search", "")
+    other = {k: v for k, v in filters.items() if k != "search"}
+    where, params = _browse_where(other, {
+        "track_id": "t.id", "album_id": "ta.album",
         "artist_id": "tc.contributor", "year": "t.year", "genre": "t.genre",
     })
     joins = ""
-    if filters.get("album_id"):
+    if other.get("album_id"):
         joins += " JOIN tracks_albums ta ON ta.track = t.id"
-    if filters.get("artist_id"):
+    if other.get("artist_id"):
         joins += " JOIN tracks_contributors tc ON tc.track = t.id AND tc.role = 1"
+    if search:
+        pred, pred_params = _track_search_predicate(search_tokens(search))
+        if pred:
+            where = (where + " AND " if where else " WHERE ") + pred
+            params = tuple(params) + tuple(pred_params)
     rows = await _query_db(
-        "SELECT DISTINCT t.id, t.title, t.genre, t.year, t.tracknum, t.duration FROM tracks t"
+        "SELECT DISTINCT t.id, t.title, t.genre, t.year, t.tracknum, t.duration"
+        + _track_weight_cols("t") + " FROM tracks t"
         + joins + where +
-        " ORDER BY t.title COLLATE NOCASE LIMIT ? OFFSET ?",
+        (" ORDER BY t.id LIMIT ? OFFSET ?" if search
+         else " ORDER BY t.title COLLATE NOCASE LIMIT ? OFFSET ?"),
         params + (limit, offset),
     )
+    if search:
+        rows = _rank_search_rows(
+            rows, search_tokens(search), title_key="title",
+            w5_keys=("album_title", "genre"), w3_keys=("artist_name", "comment"))
     total = await _query_db(
         "SELECT COUNT(DISTINCT t.id) AS n FROM tracks t" + joins + where,
         params,
@@ -3617,13 +3795,13 @@ async def cmd_songs(
     loop = []
     for r in rows:
         entry: dict[str, Any] = {"id": r["id"], "title": r["title"] or ""}
-        if r["genre"]:
+        if r.get("genre"):
             entry["genre"] = r["genre"]
-        if r["year"]:
+        if r.get("year"):
             entry["year"] = r["year"]
-        if r["tracknum"]:
+        if r.get("tracknum"):
             entry["tracknum"] = r["tracknum"]
-        if r["duration"]:
+        if r.get("duration"):
             entry["duration"] = int(r["duration"])
         loop.append(entry)
     return [
@@ -3641,27 +3819,43 @@ async def cmd_genres(
     ctx: CLIContext,
     args: list[str],
 ) -> list[str]:
-    """genres [<offset> <limit>] [search:] — list genres (from track genre text).
+    """genres [<offset> <limit>] [search:] — list genres with real ids (LIB-10).
 
     Perl CLI text format, one line (live probe 2026-09-12: ``genres 0 1
     id%3A497 genre%3A favorites_url%3Adb%3Agenre.name%3D count%3A762``).
+    ``genresQuery`` selects ``DISTINCT(genres.id), genres.name,
+    genres.namesort`` and orders by ``namesort``
+    (``Slim/Control/Queries.pm:1910-1911``) — the ids are the real
+    ``genres`` table ids (``Slim/Schema/Genre.pm:20-33``), not an offset
+    into a DISTINCT track-text list.
     """
     if _is_query_echo(args):
         return [render_line(terms=["genres", *args])]
     offset, limit, filters = _parse_query_args(args)
-    where, params = _browse_where(filters, {"search": "t.genre"})
-    base = "FROM tracks t WHERE t.genre != ''"
-    if where:
-        where = where.replace(" WHERE ", " AND ", 1)
+
+    conds: list[str] = []
+    params: list[str] = []
+    search = filters.get("search", "")
+    if search:
+        # No FTS path for genres (Plugin.pm:3516): Perl matches the
+        # namesearch column with searchStringSplit word prefixes
+        # (Queries.pm:1814-1823).
+        for pattern in search_string_split(search):
+            conds.append("g.namespell LIKE ?")
+            params.append(pattern)
+    genre_id = filters.get("genre_id", "")
+    if genre_id:
+        conds.append("g.id = ?")
+        params.append(genre_id)
+    where = (" WHERE " + " AND ".join(conds)) if conds else ""
+
     rows = await _query_db(
-        "SELECT DISTINCT t.genre AS name " + base + where +
-        " ORDER BY t.genre COLLATE NOCASE LIMIT ? OFFSET ?",
-        params + (limit, offset),
+        "SELECT g.id AS id, g.name AS name, g.sortkey AS namesort FROM genres g"
+        + where + " ORDER BY g.sortkey COLLATE NOCASE LIMIT ? OFFSET ?",
+        tuple(params) + (limit, offset),
     )
     total = await _query_db(
-        "SELECT COUNT(DISTINCT t.genre) AS n " + base + where,
-        params,
-    )
+        "SELECT COUNT(*) AS n FROM genres g" + where, tuple(params))
     total_n = total[0]["n"] if total else 0
     return [
         render_line(
@@ -3669,8 +3863,8 @@ async def cmd_genres(
             params=query_params(args, ["_index", "_quantity"]),
             results=[
                 ("genres_loop", [
-                    {"id": offset + i + 1, "genre": r["name"] or ""}
-                    for i, r in enumerate(rows)
+                    {"id": r.get("id"), "genre": r.get("name") or ""}
+                    for r in rows
                 ]),
                 ("count", total_n),
             ],

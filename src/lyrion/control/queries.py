@@ -177,6 +177,107 @@ def format_tags(
 
 
 # ---------------------------------------------------------------------------
+# Search helpers — Slim/Utils/Text.pm + the FullTextSearch plugin
+# ---------------------------------------------------------------------------
+
+#: ``_getWeight`` column weights (Slim/Plugin/FullTextSearch/Plugin.pm:496-499).
+FTS_W10 = 10_000   # track/album/artist title
+FTS_W5 = 5         # album title, genre, year
+FTS_W3 = 3         # contributor tuples, comments, lyrics
+FTS_W1 = 1         # bitrate / samplerate / url
+
+_RE_PUNCT = re.compile(r"[^\w\s]")
+_RE_WS_RUN = re.compile(r"  +")
+
+
+def ignore_punct(value: str) -> str:
+    """Perl ``Slim::Utils::Text::ignorePunct`` (Text.pm:45-60).
+
+    Punctuation runs become a single space, spaces are compacted, the result
+    is trimmed; an all-punctuation input is returned unchanged.
+    """
+    if value is None:
+        return None  # type: ignore[return-value]
+    original = value
+    value = _RE_PUNCT.sub(" ", value)
+    value = _RE_WS_RUN.sub(" ", value).strip()
+    return value or original
+
+
+def search_normalize(value: str) -> str:
+    """Perl ``ignoreCaseArticles($value, 1)`` — uc + ignorePunct.
+
+    Used to build the LIKE patterns against the ``*search`` columns
+    (``Slim/Utils/Text.pm:134-176``; ``searchStringSplit`` at :209-236).
+    """
+    return ignore_punct(value.upper())
+
+
+def search_string_split(term: str, substring: bool = False) -> list[str]:
+    """Perl ``Slim::Utils::Text::searchStringSplit`` (Text.pm:209-236).
+
+    Returns the LIKE pattern(s) for one term.  With the default
+    ``searchSubString`` preference of 0 (``Slim/Utils/Prefs.pm:176``) a term
+    matches as a *word prefix*: ``["FOO%", "% FOO%"]``.  With ``substring``
+    it is a plain ``"%FOO%"``.
+    """
+    normalized = search_normalize(term)
+    if substring:
+        return [f"%{normalized}%"]
+    return [f"{normalized}%", f"% {normalized}%"]
+
+
+def search_tokens(term: str) -> list[str]:
+    """Tokenize a search term the way ``parseSearchTerm`` does.
+
+    Perl ``Slim/Plugin/FullTextSearch/Plugin.pm:345-457``: lower-case, replace
+    smart quotes, split on punctuation/whitespace (a hyphen is kept so that a
+    leading ``-`` marks an exclusion), drop empty/non-word tokens.  A ``-``
+    prefixed token is Perl's ``NOT`` (Plugin.pm:454-457).
+    """
+    if not term:
+        return []
+    s = term.lower()
+    for smart in ("\u201c", "\u201d", "\u201e"):
+        s = s.replace(smart, '"')
+    s = re.sub(r"[^\w\s-]", " ", s)
+    return [t for t in re.split(r"\s+", s) if re.search(r"\w", t)]
+
+
+def fulltext_weight(
+    tokens: list[str],
+    *,
+    w10: str = "",
+    w5: tuple[str, ...] | list[str] = (),
+    w3: tuple[str, ...] | list[str] = (),
+    w1: tuple[str, ...] | list[str] = (),
+) -> int:
+    """Relevance weight of one record, mirroring ``_getWeight``.
+
+    Perl ``Slim/Plugin/FullTextSearch/Plugin.pm:486-503`` sums, per search
+    phrase (the type phrase is skipped at :495): ``+10000`` when the phrase
+    hits the ``w10`` column at all, else ``+5 * hits`` on ``w5``,
+    ``+3 * hits`` on ``w3`` and ``+1 * hits`` on ``w1``.  ``searchQuery``
+    orders every entity by ``fulltextweight DESC``
+    (``Slim/Control/Queries.pm:3597``).
+
+    ``w10`` is a single text (the title column, ``:496`` uses it as a
+    presence flag); ``w5``/``w3``/``w1`` are the concatenated column texts.
+    """
+    total = 0
+    for token in tokens:
+        low = token.lower()
+        if not low:
+            continue
+        if low in (w10 or "").lower():
+            total += FTS_W10
+        total += FTS_W5 * sum(x.lower().count(low) for x in w5)
+        total += FTS_W3 * sum(x.lower().count(low) for x in w3)
+        total += FTS_W1 * sum(x.lower().count(low) for x in w1)
+    return total
+
+
+# ---------------------------------------------------------------------------
 # Perl CLI wire format  (Slim/Control/Stdio.pm + Slim/Control/Request.pm)
 # ---------------------------------------------------------------------------
 #
@@ -640,4 +741,13 @@ __all__ = [
     "render_line",
     "query_params",
     "DEFAULT_TAGS",
+    "ignore_punct",
+    "search_normalize",
+    "search_string_split",
+    "search_tokens",
+    "fulltext_weight",
+    "FTS_W10",
+    "FTS_W5",
+    "FTS_W3",
+    "FTS_W1",
 ]

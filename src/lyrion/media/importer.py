@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -19,10 +20,12 @@ from sqlalchemy import select
 from lyrion.database.schema import (
     Album,
     Contributor,
+    Genre,
     Track,
     albums_contributors,
     tracks_albums,
     tracks_contributors,
+    tracks_genres,
 )
 
 logger = logging.getLogger(__name__)
@@ -90,6 +93,44 @@ def _sort_string(value: str) -> str:
             s = s[len(article):]
             break
     return s
+
+
+# Default tag separator — Perl ``splitList`` (Slim/Utils/Prefs.pm:178).
+GENRE_SEPARATOR = ";"
+
+
+def split_tag(tag: str, separator: str = GENRE_SEPARATOR) -> list[str]:
+    """Split a multi-value tag the way ``Slim::Music::Info::splitTag`` does.
+
+    Perl ``Slim/Music/Info.pm:1005-1060``: split on the ``splitList``
+    separator (default ``;``), trim each part, and return the tag unchanged
+    when it does not actually split.  ``R&B`` / ``Rock & Roll`` are exempt
+    (Info.pm:1015-1018, Bug 774).
+    """
+    if not tag:
+        return []
+    if re.match(r"^\s*R\s*&\s*B\s*$", tag, re.I) or \
+            re.match(r"^\s*Rock\s*&\s*Roll\s*$", tag, re.I):
+        return [tag.strip()]
+    parts = [p.strip() for p in tag.split(separator)]
+    parts = [p for p in parts if p]
+    if len(parts) > 1:
+        return parts
+    trimmed = tag.strip()
+    return [trimmed] if trimmed else []
+
+
+def genre_namesearch(name: str) -> str:
+    """Perl ``Genre::add`` namesearch = ``Text::ignoreCase($name, 1)``.
+
+    ``Slim/Schema/Genre.pm:104`` calls ``ignoreCase`` → ``ignoreCaseArticles``
+    (``Slim/Utils/Text.pm:134-176``): upper-case, punctuation → space, compact,
+    strip.  It is the genres table's unique key (Genre.pm:31).
+    """
+    s = name.upper()
+    s = re.sub(r"[^\w\s]", " ", s)
+    s = re.sub(r"  +", " ", s).strip()
+    return s or name.upper()
 
 
 # ---------------------------------------------------------------------------
@@ -379,6 +420,8 @@ class MusicImporter:
         ta_set: set[tuple] = set()
         tc_set: set[tuple] = set()
         ac_set: set[tuple] = set()
+        tg_set: set[tuple] = set()
+        tg_tracks: set[int] = set()
         if track_ids:
             for r in (await session.execute(
                     select(tracks_albums.c.track, tracks_albums.c.album)
@@ -389,6 +432,11 @@ class MusicImporter:
                            tracks_contributors.c.contributor)
                     .where(tracks_contributors.c.track.in_(track_ids)))).all():
                 tc_set.add((r[0], r[1]))
+            for r in (await session.execute(
+                    select(tracks_genres.c.track, tracks_genres.c.genre)
+                    .where(tracks_genres.c.track.in_(track_ids)))).all():
+                tg_set.add((r[0], r[1]))
+                tg_tracks.add(r[0])
         album_ids = [a.id for a in
                      (await session.execute(select(Album))).scalars()]
         if album_ids:
@@ -424,12 +472,25 @@ class MusicImporter:
                     select(Contributor).where(
                         Contributor.namespell.in_(list(artist_names))))).scalars()}
 
+        # Existing genres for the batch keys (LIB-10; Perl Genre::add()).
+        genre_keys: set[str] = set()
+        for _, info in extracted:
+            for gname in split_tag(getattr(info, "genre", "") or ""):
+                genre_keys.add(genre_namesearch(gname))
+        genre_by_namespell: dict[str, Genre] = {
+            g.namespell: g for g in (
+                await session.execute(
+                    select(Genre).where(
+                        Genre.namespell.in_(list(genre_keys))))).scalars()} \
+            if genre_keys else {}
+
         # Album/contributor links for the batch tracks.
         for file_path, info in extracted:
             try:
                 await self._import_links(session, file_path, info,
                                          track_by_url, album_by_key,
-                                         contrib_by_name, ta_set, tc_set, ac_set)
+                                         contrib_by_name, ta_set, tc_set, ac_set,
+                                         genre_by_namespell, tg_set, tg_tracks)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Import failed for %s: %s", file_path, exc)
                 self.stats.error_files += 1
@@ -517,8 +578,11 @@ class MusicImporter:
         album_by_key: dict[tuple, Album],
         contrib_by_name: dict[str, Contributor],
         ta_set: set, tc_set: set, ac_set: set,
+        genre_by_namespell: dict[str, Genre] | None = None,
+        tg_set: set | None = None,
+        tg_tracks: set | None = None,
     ) -> None:
-        """Album + contributor links for a track (Core inserts only)."""
+        """Album + contributor + genre links for a track (Core inserts only)."""
         url = _file_url(file_path)
         track = track_by_url[url]
         artist = (info.artist or "Unknown Artist") if hasattr(info, "artist") else "Unknown Artist"
@@ -603,6 +667,41 @@ class MusicImporter:
                     albums_contributors.insert().values(
                         album=album.id, contributor=contrib.id, role=1))
                 ac_set.add((album.id, contrib.id))
+
+        # Genre links (LIB-10).  Perl ``Slim::Schema::Genre::add``
+        # (Slim/Schema/Genre.pm:91-132): split the tag, upsert one ``genres``
+        # row per value (unique key = namesearch) and ``REPLACE INTO
+        # genre_track``.  A re-tag drops stale links like the album/artist
+        # cleanups above.
+        genre_names = split_tag(getattr(info, "genre", "") or "")
+        if genre_by_namespell is None:
+            genre_by_namespell = {}
+        if tg_set is None:
+            tg_set = set()
+        if genre_names or (tg_tracks and track.id in tg_tracks):
+            new_ids: list[int] = []
+            for name in genre_names:
+                key = genre_namesearch(name)
+                genre = genre_by_namespell.get(key)
+                if genre is None:
+                    genre = Genre(namespell=key, name=name,
+                                  sortkey=_sort_string(name))
+                    session.add(genre)
+                    await session.flush()
+                    genre_by_namespell[key] = genre
+                new_ids.append(genre.id)
+                if (track.id, genre.id) not in tg_set:
+                    await session.execute(
+                        tracks_genres.insert().values(
+                            track=track.id, genre=genre.id))
+                    tg_set.add((track.id, genre.id))
+            # Retag cleanup: drop genre links this track no longer carries.
+            await session.execute(
+                tracks_genres.delete().where(
+                    (tracks_genres.c.track == track.id)
+                    & (tracks_genres.c.genre.notin_(new_ids))))
+            if tg_tracks is not None and new_ids:
+                tg_tracks.add(track.id)
 
     @staticmethod
     def _guess_mime(path: Path) -> str:
