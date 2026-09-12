@@ -885,6 +885,28 @@ class CometdManager:
             cid = msg.get("clientId", "")
             reply: dict = {"channel": channel, "id": msg.get("id", "")}
 
+            # Perl Cometd.pm:225-244: a message from a clientId the manager
+            # does not know (streaming connection lost, server restarted) is
+            # answered "invalid clientId" with advice.reconnect = 'handshake',
+            # and the message is NOT processed. The client then performs a
+            # fresh handshake AND re-sends all its subscriptions.
+            #
+            # Answering success and creating the client on the fly (the old
+            # get_or_create behaviour) left jive believing its lost
+            # /slim/playerstatus/<mac> subscription was still registered, so
+            # it never subscribed again: the Now-Playing title, artist and
+            # cover stayed on the OLD track while the audio and the time
+            # (client-local) were correct (live 2026-09-12).
+            if channel != "/meta/handshake" and cid and cid not in self._clients:
+                reply.update({
+                    "successful": False,
+                    "clientId": None,
+                    "error": "invalid clientId",
+                    "advice": {"reconnect": "handshake", "interval": 0},
+                })
+                replies.append(reply)
+                continue
+
             if channel == "/meta/handshake":
                 client = self.handshake(msg.get("ext") if isinstance(msg.get("ext"), dict) else None)
                 reply.update({

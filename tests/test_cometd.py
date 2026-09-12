@@ -104,3 +104,33 @@ def test_long_poll_timeout_is_perls_sixty_seconds():
     # Perl Slim::Web::Cometd Cometd.pm:48 LONG_POLLING_TIMEOUT => 60000
     from lyrion.web.cometd import LONG_POLL_TIMEOUT
     assert LONG_POLL_TIMEOUT == 60
+
+
+def test_unknown_client_id_is_told_to_rehandshake():
+    """Perl Cometd.pm:225-244 with Manager.pm:96-100 (``is_valid_clid`` =
+    ``exists $self->{events}->{$clid}``): a message from a clientId the
+    manager does not know is answered ``successful:false`` /
+    ``invalid clientId`` with ``advice.reconnect = 'handshake'`` and is not
+    processed — the client then re-handshakes and re-sends ALL its
+    subscriptions.
+
+    Answering success and creating the client on the fly left jive believing
+    its lost /slim/playerstatus/<mac> subscription was still registered: the
+    Now-Playing title/artist/cover froze on the old track while audio and the
+    client-local time were fine (live 2026-09-12).
+    """
+    async def run():
+        mgr = CometdManager(JSONRPCAPI())
+        replies = await mgr.handle_messages([
+            {"channel": "/meta/subscribe", "clientId": "1deadbeef000000",
+             "id": 7, "subscription": "/slim/playerstatus/aa:bb:cc:dd:ee:ff"},
+        ])
+        reply = replies[0]
+        assert reply["successful"] is False
+        assert reply["error"] == "invalid clientId"
+        assert reply["advice"] == {"reconnect": "handshake", "interval": 0}
+        assert "1deadbeef000000" not in mgr._clients, (
+            "an unknown clientId must NOT be created silently"
+        )
+
+    asyncio.run(run())
