@@ -422,7 +422,7 @@ DISCO_REASONS = {
 }
 
 # Perl handler -> human readable, for the frames whose full semantics are
-# still a separate task (IR/BUTN/KNOB = PROT-19 in the parity plan).
+# still a separate task.
 PERL_HANDLER_NAMES = {
     "ANIC": "_animation_complete_handler",
     "BODY": "_http_body_handler",
@@ -434,6 +434,11 @@ PERL_HANDLER_NAMES = {
     "UREQ": "_update_request_handler",
     "ALSS": "_ambient_light_sensor_handler",
 }
+
+# The opcodes that carry a button/IR/knob code and therefore translate into a
+# player action (PROT-19). Slimproto.pm:521-546 (_ir_handler), :1270-1280
+# (_button_handler) and :1282-1318 (_knob_handler) -> lyrion.player.buttons.
+PERL_BUTTON_OPCODES = frozenset({"IR  ", "BUTN", "KNOB"})
 
 
 def classify_opcode(op_raw: str) -> str:
@@ -3147,15 +3152,68 @@ class SlimProtoClient:
         """Recognise the remaining Perl message handlers (socket stays open).
 
         ``Slim/Networking/Slimproto.pm:52-72``: IR/BUTN/KNOB/RAWI map buttons
-        and infrared codes (PROT-19 in the parity plan), ANIC/ALSS/UREQ/DBUG/
-        BODY are display, ambient-light, firmware-update, debug and
-        HTTP-body frames. Perl runs the handler and keeps the connection;
-        until the button/IR semantics land, each frame is logged with its
-        Perl handler name so it is visible instead of silently swallowed.
+        and infrared codes (PROT-19), ANIC/ALSS/UREQ/DBUG/BODY are display,
+        ambient-light, firmware-update, debug and HTTP-body frames. Perl runs
+        the handler and keeps the connection, so the framing/parsing of this
+        loop is untouched here.
+
+        ``IR  ``/``BUTN``/``KNOB`` now hand their payload to
+        :mod:`lyrion.player.buttons` (:meth:`_dispatch_button_frame`), the
+        same 8-hex-code lookup Perl does (``Slimproto.pm:539`` ``'NxxH8'`` /
+        ``:1275`` ``'NH8'`` -> ``IR::enqueue`` at ``:541``/``:1277``). The
+        dispatch is scheduled on the running loop so a slow action never
+        stalls this read loop; the frame is still logged with its Perl
+        handler name.
         """
         handler = PERL_HANDLER_NAMES.get(op_raw, "?")
         logger.debug("Player %s frame %r -> Perl %s (%d bytes)",
                      mac_str, op_raw, handler, len(payload))
+        if op_raw not in PERL_BUTTON_OPCODES:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            # No event loop (e.g. a bare unit-style call): the frame is
+            # logged above and dropped, exactly like a handler with no work.
+            return
+        loop.create_task(self._dispatch_button_frame(mac_str, op_raw, payload))
+
+    async def _dispatch_button_frame(self, mac_str: str, op_raw: str,
+                                     payload: bytes) -> None:
+        """Translate a button/IR/knob frame into a player action.
+
+        Perl parity: ``IR  `` (``Slimproto.pm:521-546``), ``BUTN``
+        (``:1270-1280``) and ``KNOB`` (``:1282-1318``). Both ``IR  `` and
+        ``BUTN`` produce the same 8-hex code and share one lookup path
+        (``Slimproto.pm:541`` / ``:1277`` call the same ``IR::enqueue``).
+        Any failure is logged and swallowed — Perl never closes the socket
+        for a malformed IR/BUTN frame either (``:530-537``).
+        """
+        from lyrion.player.buttons import (
+            handle_button,
+            handle_knob,
+            parse_butn_frame,
+            parse_ir_frame,
+            parse_knob_frame,
+        )
+        try:
+            if op_raw == "IR  ":
+                parsed = parse_ir_frame(payload)
+                if parsed is None:
+                    logger.warning("bad length %d for IR. Ignoring (Perl "
+                                   "Slimproto.pm:530-537)", len(payload))
+                    return
+                _tick, code = parsed
+                await handle_button(mac_str, code, kind="ir")
+            elif op_raw == "BUTN":
+                _tick, code = parse_butn_frame(payload)
+                await handle_button(mac_str, code, kind="butn")
+            elif op_raw == "KNOB":
+                _tick, position, sync = parse_knob_frame(payload)
+                await handle_knob(mac_str, position, sync)
+        except Exception as exc:  # noqa: BLE001 — a bad frame must not kill the loop
+            logger.warning("Button/IR dispatch failed for %s (%r): %s",
+                           mac_str, op_raw, exc)
 
     def _handle_resp_frame(self, mac_str: str, payload: bytes) -> None:
         """Handle a RESP frame: the player forwards the source's HTTP
