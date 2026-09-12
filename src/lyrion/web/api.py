@@ -585,6 +585,8 @@ _JIVE_STRINGS: dict[str, str] = {
     "UNSYNCING_FROM": "Unsyncing from: %s",                # :16885
     "RECENT_SEARCHES": "Recent Searches",                  # :22967
     "PRESET_ADDING": "Saving preset #%s...",               # :23803
+    "PRESET": "Preset #%s",                                # :23841
+    "PRESETS_NOT_DEFINED": "Preset #%s not defined.",      # :23784
     "JIVE_SET_PRESET_X": "Set Preset %s",                  # :22462
     "JIVE_OVERWRITE_PRESET_X": "Replace %s?",              # :22445
     "ADD": "Add",                                          # :11263
@@ -799,11 +801,58 @@ _JIVE_MENU_COMMANDS = frozenset({
 #: Jive-Kommandos mit Wirkung (Jive.pm:95-100, 102-104, 124-125) — Antwort {}
 _JIVE_ACTION_COMMANDS = frozenset({"jivealarm", "jiveendoftracksleep", "jivesync"})
 
-#: Modul-Array ``@recentSearches`` (Jive.pm:37); gefüllt wird es in Perl von
-#: ``cacheSearch`` (Jive.pm:2701-2711) aus den Suchmenüs heraus. Unser Server
-#: hat keinen solchen Cache → der Handler antwortet wie Perl bei leerer Liste
-#: (``_jiveNoResults``, Live-Probe).
+#: Modul-Array ``@recentSearches`` (Jive.pm:39); gefüllt wird es von
+#: ``cacheSearch`` (Jive.pm:2711-2719) aus den Suchmenüs heraus
+#: (``XMLBrowser.pm:1491``), gelesen von ``jiveRecentSearchQuery``
+#: (Jive.pm:2768-2797) und ``recentSearchMenu`` (Jive.pm:2721-2766).
+#: In-Memory wie in Perl (kein Persistieren).
 _JIVE_RECENT_SEARCHES: list = []
+
+
+def _jive_cache_search(search: Any) -> None:
+    """``cacheSearch`` (Jive.pm:2711-2719).
+
+    Perl hängt einen Such-Eintrag nur an, wenn er ``text`` UND
+    ``actions.go.cmd`` trägt; ``unshift`` ⇒ der jüngste Eintrag steht vorne.
+    Die Einträge baut der Such-/Feed-Code (``XMLBrowser.pm:1475-1489``).
+    """
+    if not isinstance(search, dict):
+        return
+    go = (search.get("actions") or {}).get("go") or {}
+    if search.get("text") and go.get("cmd"):
+        _JIVE_RECENT_SEARCHES.insert(0, search)
+
+
+def _jive_recent_search_menu() -> list[dict]:
+    """``recentSearchMenu($client, 1)`` (Jive.pm:2721-2766).
+
+    Zwei Einträge für das Home-Menü (``homeSearchRecent``/``myMusicSearchRecent``
+    → ``cmd ['jiverecentsearches']``), aber nur wenn ``@recentSearches`` GENAU
+    EINEN Eintrag hat (``scalar(@recentSearches) == 1``, Jive.pm:2728 — Perl
+    prüft echt auf ``== 1``, nicht ``>= 1``).
+    """
+    if len(_JIVE_RECENT_SEARCHES) != 1:
+        return []
+    text = _jive_string("RECENT_SEARCHES")
+    return [
+        {
+            "text": text,
+            "id": "homeSearchRecent",
+            "node": "home",
+            "weight": 111,
+            "actions": {"go": {"cmd": ["jiverecentsearches"]}},
+            "window": {"text": text},
+        },
+        {
+            "text": text,
+            "id": "myMusicSearchRecent",
+            "node": "myMusicSearch",
+            "noCustom": 1,
+            "weight": 50,
+            "actions": {"go": {"cmd": ["jiverecentsearches"]}},
+            "window": {"text": text},
+        },
+    ]
 
 
 def _jive_perl_day(days: str, day: int) -> bool:
@@ -1042,6 +1091,17 @@ def _jive_presets_pref(player) -> list | None:
         except (TypeError, ValueError):
             return None
     return raw if isinstance(raw, list) else None
+
+
+def _is_remote_url(url: str) -> bool:
+    """``Slim::Music::Info::isRemoteURL`` (``Slim/Music/Info.pm:1115-1124``).
+
+    Perl asks the protocol-handler registry whether the URL scheme is a
+    registered remote handler. Our port speaks remote protocols over http/
+    https (``networking/protocol.py:2417`` accepts exactly those two).
+    """
+    m = re.match(r"^([a-zA-Z0-9\-]+):", url or "")
+    return bool(m) and m.group(1).lower() in ("http", "https")
 
 
 def _jive_preset_actions(player, jive_preset: int, title, url, ptype,
@@ -2575,18 +2635,20 @@ class JSONRPCAPI:
                     "params": {"id": aid, "menu": 1},
                 }},
             }]
-            # Zufallsmodus: unser Alarm-Modell hat kein ``shufflemode``
-            # (Perl Alarm.pm:268-283), der Client kann es also nur setzen —
-            # die Wirkung fehlt (UNKLAR). Angezeigt wird Index 0.
+            # Shuffle mode: the alarm stores ``shufflemode`` (Alarm.pm:258-275,
+            # persisted :1085/:1360); the menu radios the stored value
+            # (``my $currentShuffleMode = $alarm->shufflemode;`` Jive.pm:795,
+            # ``radio => ($currentShuffleMode == N) + 0`` :799/:815/:831).
             shuffle = [("SHUFFLE_OFF", 0), ("SHUFFLE_ON_SONGS", 1),
                        ("SHUFFLE_ON_ALBUMS", 2)]
+            current_shuffle = int(getattr(alarm, "shufflemode", 0) or 0)
             items.append({                                       # Jive.pm:804-870
                 "text": _jive_string("SHUFFLE"),
                 "count": len(shuffle),
                 "offset": 0,
                 "item_loop": [{
                     "text": _jive_string(key),
-                    "radio": 1 if mode == 0 else 0,
+                    "radio": 1 if mode == current_shuffle else 0,
                     "onClick": "refreshOrigin",
                     "actions": {"do": {
                         "player": 0,
@@ -2644,10 +2706,12 @@ class JSONRPCAPI:
                 return {}
             days = getattr(alarm, "days", "") or ""
             items = []
-            # Perl zählt 0=Sonntag..6=Samstag (Alarm.pm:189-203, ALARM_DAY0..6);
-            # unser Alarm-Modell ist Montag-first, deshalb rechnet
-            # ``dowAdd``/``dowDel`` (Commands.pm:200-207) den Tag auf unseren
-            # Index um (UNKLAR/Ablage: Perl würde hier 0=So senden).
+            # Perl zählt 0=Sonntag..6=Samstag (Alarm.pm:116-118/189-203,
+            # ALARM_DAY0..6) und schickt genau diese Zahl als ``dowAdd``/
+            # ``dowDel`` zurück (Jive.pm:939-963 ``dowAdd => $day``); das
+            # ``alarm update``-Kommando legt sie durch ``$alarm->day()``
+            # (Commands.pm:200-207) mit derselben Zählung ab. Die Zahl wird
+            # daher NICHT auf unseren Montag-first-Index umgerechnet.
             for day in range(7):
                 active = 1 if _jive_perl_day(days, day) else 0
                 items.append({
@@ -2656,11 +2720,9 @@ class JSONRPCAPI:
                     "onClick": "refreshGrandparent",
                     "actions": {
                         "on": {"player": 0, "cmd": ["alarm", "update"],
-                               "params": {"id": aid,
-                                          "dowAdd": str(_jive_day_index(day))}},
+                               "params": {"id": aid, "dowAdd": str(day)}},
                         "off": {"player": 0, "cmd": ["alarm", "update"],
-                                "params": {"id": aid,
-                                           "dowDel": str(_jive_day_index(day))}},
+                                "params": {"id": aid, "dowDel": str(day)}},
                     },
                 })
             return _jive_slice(items, index, quantity)
@@ -2960,16 +3022,28 @@ class JSONRPCAPI:
     def _jive_alarm_action(self, pm, pid: str | None, args: list) -> None:
         """``jiveAlarmCommand`` (Jive.pm:2459-2488) — Snooze/Stop/Fadein.
 
-        Perl wirkt mit ``snooze``/``stop`` auf den gerade klingenden Alarm
-        (``Alarm->getCurrentAlarm``, Alarm.pm:1241-1248) — unser AlarmManager
-        kennt keinen aktuellen Alarm/Klingelzustand, diese beiden Tags bleiben
-        deshalb wirkungslos (UNKLAR). ``fadein`` ist ein Client-Pref
-        (``alarmfadeseconds``) und wird gespeichert.
+        Perl: ``my $alarm = Slim::Utils::Alarm->getCurrentAlarm($client)``
+        (:2471) — the alarm currently sounding (``alarmData->{currentAlarm}``,
+        Alarm.pm:1241-1246) — then ``$alarm->snooze()`` when the ``snooze`` tag
+        is truthy (:2474-2475) else ``$alarm->stop($continueAudio)`` when
+        ``stop`` is (:2476-2477). Both are no-ops without a current alarm
+        (Alarm.pm:741/868); the snooze length is the client pref
+        ``alarmSnoozeSeconds`` (Alarm.pm:750, default 540 — Client.pm:44).
+        ``fadein`` is a client pref (``alarmfadeseconds``) and is stored.
         """
         player = pm.get_player(pid) if (pm is not None and pid) else None
         if player is None:
             return
         _, tagged = _jive_params(args, [])
+        from lyrion.alarms import AlarmManager
+
+        mgr = AlarmManager()
+        if tagged.get("snooze"):            # Perl: getParam('snooze') ? 1 : undef
+            seconds = _jive_num(            # Client.pm:44 alarmSnoozeSeconds
+                _jive_client_pref(player, "alarmSnoozeSeconds", None), 540)
+            mgr.snooze(player.mac, seconds)
+        elif tagged.get("stop"):            # Perl: elsif (defined $stop)
+            mgr.stop(player.mac, bool(tagged.get("continueAudio")))
         if tagged.get("fadein") is not None:
             from lyrion.player.playerprefs import apply_player_pref
             apply_player_pref(player, "alarmfadeseconds", tagged["fadein"])
@@ -3638,6 +3712,9 @@ class JSONRPCAPI:
             {"id": "radios", "text": "Radio", "node": "home", "weight": 20,
              "actions": _go(["radios"], {"menu": "radio"})},
             *my_children,
+            # Jive.pm:316 hängt ``recentSearchMenu($client, 1)`` ans Home-Menü
+            # (nur bei genau einem gecachten Such-Eintrag, Jive.pm:2728).
+            *_jive_recent_search_menu(),
         ]
 
     @staticmethod
@@ -3654,6 +3731,7 @@ class JSONRPCAPI:
             "volume": alarm.volume if alarm else -1,
             "duration": alarm.duration if alarm else 0,
             "repeat": 1 if (alarm and alarm.repeat) else 0,
+            "shufflemode": int(getattr(alarm, "shufflemode", 0) or 0) if alarm else 0,
             "wake": (alarm.wake if alarm else "") or "",
             # 'url:' only → url; 'track:' → track id; 'fr:' → favorite id
             "url": (alarm.wake[4:] if alarm and alarm.wake.startswith("url:")
@@ -3720,10 +3798,10 @@ class JSONRPCAPI:
                 k, v = tok.split(":", 1)
                 parts[k] = v
         current = mgr.get(mac, idx)
-        a = _alarm_from_parts(idx, parts)
+        a = _alarm_from_parts(idx, parts, base=current)
         if current:
             for f in ("enabled", "days", "time", "volume", "fade", "duration",
-                      "repeat", "wake"):
+                      "repeat", "shufflemode", "wake"):
                 if f not in parts:
                     # If hour/minute were given, don't clobber the time
                     # we just built from them.
@@ -3795,10 +3873,10 @@ class JSONRPCAPI:
         except ValueError:
             return {"error": "invalid alarm index"}
         current = mgr.get(mac, idx)
-        a = _alarm_from_parts(idx, parts)
+        a = _alarm_from_parts(idx, parts, base=current)
         if current:
             for f in ("enabled", "days", "time", "volume", "fade", "duration",
-                      "repeat", "wake"):
+                      "repeat", "shufflemode", "wake"):
                 if f not in parts:
                     if f == "time" and ("hour" in parts or "minute" in parts):
                         continue
@@ -4049,6 +4127,58 @@ class JSONRPCAPI:
         except Exception:
             logger.exception("_load_tracks failed for %d ids", len(track_ids))
         return result
+
+    async def _json_button(self, pm, pid: str | None, args: list) -> None:
+        """``button <code>`` → ``Slim::Hardware::IR::executeButton``.
+
+        ``buttonCommand`` (``Slim/Control/Commands.pm:263-291``) passes the
+        ``_buttoncode`` straight to ``Slim::Hardware::IR::executeButton``; the
+        Jive/SqueezeBox preset keys dispatch ``playPreset_<n>``
+        (``Slim/Buttons/Common.pm:908``), so that is the button code handled
+        here (``playPreset``, Common.pm:825-877):
+
+        every other button code is not wired in our port (no IR/Lua button
+        table) and stays a no-op.
+        """
+        code = str(args[0]) if args else ""
+        if not code.lower().startswith("playpreset"):
+            return
+        digits = "".join(ch for ch in code if ch.isdigit())
+        digit = int(digits) if digits else 0
+        if digit == 0:
+            digit = 10                          # Common.pm:828-830
+        if pid is None:
+            return
+        player = pm.get_player(pid)
+        if player is None:
+            return
+        presets = _jive_presets_pref(player)
+        preset = presets[digit - 1] if presets and len(presets) >= digit else None
+        if not isinstance(preset, dict):
+            logger.info("Can't play preset number %s - not set", digit)
+            return
+        ptype = str(preset.get("type") or "")
+        url = preset.get("URL") or ""
+        title = preset.get("text") or ""
+        # Common.pm:834: only audio/playlist entries are playable.
+        if not re.search(r"audio|playlist", ptype) or not url:
+            logger.info("Can't play preset number %s - not an audio entry", digit)
+            return
+        parser = preset.get("parser")
+        if parser or (ptype == "playlist" and _is_remote_url(str(url))):
+            # Common.pm:838-850 routes these through Slim::Buttons::XMLBrowser
+            # ::playItem (a parser/OPML feed). Our port has no XMLBrowser
+            # player, so nothing is started (UNKLAR).
+            logger.info("Preset %s needs XMLBrowser playback - not supported",
+                        digit)
+            return
+        # Common.pm:851-859: title, then ``playlist play <url>``.
+        await pm.play_url(pid, str(url), str(title))
+        self._popup = {"jive": {
+            "type": "popupplay",                # Common.pm:860-868
+            "text": [_jive_str("PRESET", digit), str(title)],
+        }}
+        self._popup_expires = time.time() + 5
 
     async def _json_control(self, pm, pid: str | None, cmd: str, args: list[str]) -> None:
         """Execute control commands (pause/power/play/stop/mixer/playlist)."""
@@ -4357,6 +4487,10 @@ class JSONRPCAPI:
                         player.repeat = max(0, min(2, int(str(rest[0]))))
                     except ValueError:
                         pass
+        elif cmd == "button":
+            # Perl buttonCommand (Commands.pm:263-291) → IR::executeButton;
+            # the preset keys arrive as 'playPreset_<n>' (Common.pm:908).
+            await self._json_button(pm, pid, args)
         elif cmd == "jivesetalbumsort":
             # Perl jiveSetAlbumSort (Jive.pm:329-335): Server-Pref
             # 'jivealbumsort' auf den sortMe-Parameter setzen.

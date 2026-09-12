@@ -59,7 +59,14 @@ def test_alarm_delete_id_form_removes(alarm_env):
 
 
 def test_alarm_add_creates_next_index(alarm_env):
-    """Material: ['alarm', 'add', 'time:HHMM', 'dow:0,2,4', 'url:...']."""
+    """Material: ['alarm', 'add', 'time:HHMM', 'dow:0,2,4', 'url:...'].
+
+    Perl's ``dow`` numbers days 0 = Sunday .. 6 = Saturday
+    (``Slim/Utils/Alarm.pm:116-118`` "0=Sun 6=Sat"; ``Commands.pm:193-198``
+    applies the tag through ``$alarm->day($_, $set)``; live Perl 9.1.1 reports
+    an Mo-Fr alarm as ``dow:1,2,3,4,5``). ``0,2,4`` is therefore Sun/Tue/Thu
+    → our Monday-first mask bits 6, 1, 3 = 64 + 2 + 8 = 74.
+    """
     async def run():
         api = JSONRPCAPI()
         item = await api._json_alarm(
@@ -69,8 +76,8 @@ def test_alarm_add_creates_next_index(alarm_env):
 
     item = asyncio.run(run())
     assert item["hour"] == 7 and item["minute"] == 30
-    # dow 0=Mo,2=We,4=Fr → bitmask 1+4+16 = 21
-    assert item["day"] == 21, f"dow mapping wrong: {item['day']}"
+    # dow 0=So,2=Di,4=Do → bitmask (unser Montag-first): bit1+bit3+bit6 = 74
+    assert item["day"] == 74, f"dow mapping wrong: {item['day']}"
     assert item["volume"] == 70
     assert item["url"] == "http://radio.example/stream"
     alarms = AlarmManager().alarms_for("")

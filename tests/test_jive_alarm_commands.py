@@ -354,17 +354,21 @@ def test_jiveupdatealarmdays_matches_perl_live():
         "Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday",
         "Saturday",
     ]
+    # Perl zählt 0=Sonntag … 6=Samstag (Alarm.pm:116-118/189-203, ALARM_DAY0..6)
+    # und schickt dieselbe Zahl als dowAdd/dowDel zurück (Jive.pm:939-963);
+    # ``alarm update`` legt sie durch ``$alarm->day()`` (Commands.pm:200-207)
+    # mit dieser Zählung ab.
     assert [i["checkbox"] for i in res["item_loop"]] == [0, 1, 1, 1, 1, 1, 0]
     assert [i["onClick"] for i in res["item_loop"]] == ["refreshGrandparent"] * 7
-    # Sonntag = unser Index 6, Montag = 0 (UNKLAR-Ablage: Perl sendet 0=So)
+    # Sonntag = Perl-Tag 0, Montag = 1, Samstag = 6
     assert res["item_loop"][0]["actions"]["on"]["params"] == {
-        "id": "4", "dowAdd": "6"}
-    assert res["item_loop"][0]["actions"]["off"]["params"] == {
-        "id": "4", "dowDel": "6"}
-    assert res["item_loop"][1]["actions"]["on"]["params"] == {
         "id": "4", "dowAdd": "0"}
+    assert res["item_loop"][0]["actions"]["off"]["params"] == {
+        "id": "4", "dowDel": "0"}
+    assert res["item_loop"][1]["actions"]["on"]["params"] == {
+        "id": "4", "dowAdd": "1"}
     assert res["item_loop"][6]["actions"]["on"]["params"] == {
-        "id": "4", "dowAdd": "5"}
+        "id": "4", "dowAdd": "6"}
     assert all(i["actions"]["on"]["cmd"] == ["alarm", "update"]
                for i in res["item_loop"])
 
