@@ -70,6 +70,37 @@ def _stream_frames(writer: FakeWriter):
     return [f for f in writer.frames if f[2:7] == b"strms"]
 
 
+def _flush_frames(writer: FakeWriter):
+    """The ``strm 'f'`` flush frames."""
+    return [f for f in writer.frames if f[2:7] == b"strmf"]
+
+
+def test_switch_does_not_flush_a_playing_player(monkeypatch):
+    """A normal track/stream switch must NOT send ``strm 'f'``.
+
+    Perl sends a flush ONLY from ``_FlushGetNext`` (song-queue flush,
+    StreamingController.pm:990-998); a normal switch is ``closeStream()`` +
+    the new strm (Squeezebox2.pm:398-403). Live regression this locks down:
+    switching from a playing track to a radio favourite sent 'f' and the
+    player kept buffering the source with its decoder stopped —
+    ``mode=play`` with the elapsed time frozen and the old title on screen.
+    """
+    player = _new_player()
+    player.mode = "play"
+    player.current_track_id = 111
+    client, writer, _pm = _make_client(player, monkeypatch)
+
+    assert asyncio.run(client.send_strm_to_player(MAC, 222)) is True
+    assert _flush_frames(writer) == [], "no flush on a normal switch"
+    assert _stream_frames(writer), "the new stream must still go out"
+
+    writer.frames.clear()
+    assert asyncio.run(
+        client.send_remote_stream(MAC, "http://example.com/radio.mp3")
+    ) is True
+    assert _flush_frames(writer) == [], "no flush before a DIRECT stream"
+
+
 def _make_client(player: PlayerState, monkeypatch=None):
     pm = object.__new__(PlayerManager)
     pm._initialized = True
@@ -298,7 +329,7 @@ def test_reconnect_resets_guard_so_replay_streams(monkeypatch):
 def test_concurrent_sends_for_same_track_stream_once(monkeypatch):
     """Two parallel `playlistcontrol cmd:load` requests for the same track
     (the LIVE-02 pattern, observed live as two `Sent strm ... track=51997`
-    in the same second) must produce exactly ONE flush+strm pair: the
+    in the same second) must produce exactly ONE strm frame (and no flush): the
     in-flight claim is taken synchronously, before the first await."""
     player = _new_player()
     player.mode = "play"
@@ -329,11 +360,17 @@ def test_concurrent_sends_for_same_track_stream_once(monkeypatch):
         assert player.stream_in_flight == 51997, (
             "the in-flight claim must be taken before the first await"
         )
-        assert _stream_frames(writer) == []
+        # The first call may already have written its strm frame and be
+        # suspended in drain() — the invariant under test is the claim
+        # above; the duplicate must not add a frame, and the final count
+        # (exactly one, no flush) is asserted after the race.
+        frames_before = len(_stream_frames(writer))
         # Second, concurrent request for the SAME track:
         ok2 = await client.send_strm_to_player(MAC, 51997)
         assert ok2 is True
-        assert _stream_frames(writer) == [], "duplicate must not stream"
+        assert len(_stream_frames(writer)) == frames_before, (
+            "duplicate must not stream"
+        )
         writer.release.set()
         assert await first is True
         return player

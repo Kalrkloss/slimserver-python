@@ -1626,13 +1626,18 @@ class SlimProtoClient:
             server_port=self.web_port,
             pcm_params=pcm_params,
         )
-        # Flush old stream buffers first (Perl LMS behaviour) so the
-        # switch is immediate instead of playing out the old buffer.
-        # Then (or rather: before) the new frame goes out, the previous
-        # /stream.mp3 response for this player is aborted so it cannot keep
-        # filling the player's buffers (LIVE-08).
+        # Close the previous /stream.mp3 response for this player (Perl's
+        # ``closeStream()`` — Squeezebox2.pm:398-403 "always use a new
+        # stream") so it cannot keep filling the player's buffers.
+        #
+        # NO ``strm 'f'`` here: Perl sends a flush ONLY from
+        # ``_FlushGetNext`` (StreamingController.pm:990-998, song-queue
+        # flush), never on a normal track/stream switch. Sending 'f' tore
+        # the player's buffers down ahead of the new stream; for a DIRECT
+        # (radio) stream the player then kept buffering the source while its
+        # decoder stayed stopped — live symptom: ``mode=play`` with the
+        # elapsed time frozen and the old title on screen.
         self.cancel_active_stream(mac)
-        await self._flush_if_playing(mac)
         try:
             writer.write(frame)
             await writer.drain()
@@ -1787,13 +1792,13 @@ class SlimProtoClient:
             logger.warning("No active connection for player %s", mac)
             return False
 
-        # Flush old stream buffers first (Perl LMS behaviour) so the
-        # switch is immediate instead of playing out the old buffer.
-        # The player's previous /stream.mp3 response is aborted first
-        # (LIVE-08) — every branch below (proxy, https fallback, direct)
-        # must not race an old paced stream still filling the buffers.
+        # Close the player's previous /stream.mp3 response (Perl
+        # ``closeStream()``) so it cannot race the new direct stream. No
+        # ``strm 'f'``: Perl never flushes on a normal switch
+        # (StreamingController.pm:990-998 is the queue-flush case only) —
+        # a flush here left the player's decoder stopped while it kept
+        # buffering the source (elapsed frozen, old title on screen).
         self.cancel_active_stream(mac)
-        await self._flush_if_playing(mac)
 
         # Resolve redirects / M3U/PLS playlists server-side (Squeezelite
         # can do neither) — like the Perl LMS does before direct streams.
