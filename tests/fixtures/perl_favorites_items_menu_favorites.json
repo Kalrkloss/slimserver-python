@@ -1,0 +1,335 @@
+{
+ "method": "slim.request",
+ "id": 1,
+ "params": [
+  "24:0a:c4:29:77:90",
+  [
+   "favorites",
+   "items",
+   "0",
+   200,
+   "menu:favorites"
+  ]
+ ],
+ "result": {
+  "count": 8,
+  "item_loop": [
+   {
+    "text": "Chill",
+    "actions": {
+     "go": {
+      "params": {
+       "menu": "favorites",
+       "item_id": "1e09a606.0"
+      },
+      "cmd": [
+       "favorites",
+       "items"
+      ]
+     }
+    },
+    "addAction": "go",
+    "icon-id": "html/images/favorites.png"
+   },
+   {
+    "addAction": "go",
+    "actions": {
+     "go": {
+      "cmd": [
+       "favorites",
+       "items"
+      ],
+      "params": {
+       "item_id": "1e09a606.1",
+       "menu": "favorites"
+      }
+     }
+    },
+    "icon-id": "html/images/favorites.png",
+    "text": "Nachrichten"
+   },
+   {
+    "text": "Lokal",
+    "icon-id": "html/images/favorites.png",
+    "addAction": "go",
+    "actions": {
+     "go": {
+      "cmd": [
+       "favorites",
+       "items"
+      ],
+      "params": {
+       "menu": "favorites",
+       "item_id": "1e09a606.2"
+      }
+     }
+    }
+   },
+   {
+    "actions": {
+     "go": {
+      "params": {
+       "menu": "favorites",
+       "item_id": "1e09a606.3"
+      },
+      "cmd": [
+       "favorites",
+       "items"
+      ]
+     }
+    },
+    "addAction": "go",
+    "icon-id": "html/images/favorites.png",
+    "text": "Dub"
+   },
+   {
+    "text": "Trance",
+    "actions": {
+     "go": {
+      "params": {
+       "menu": "favorites",
+       "item_id": "1e09a606.4"
+      },
+      "cmd": [
+       "favorites",
+       "items"
+      ]
+     }
+    },
+    "addAction": "go",
+    "icon-id": "html/images/favorites.png"
+   },
+   {
+    "addAction": "go",
+    "actions": {
+     "go": {
+      "cmd": [
+       "favorites",
+       "items"
+      ],
+      "params": {
+       "menu": "favorites",
+       "item_id": "1e09a606.5"
+      }
+     }
+    },
+    "icon-id": "html/images/favorites.png",
+    "text": "Rock"
+   },
+   {
+    "type": "audio",
+    "presetParams": {
+     "icon": "/imageproxy/http%3A%2F%2Fcdn-profiles.tunein.com%2Fs355203%2Fimages%2Flogoq.jpg%3Ft%3D1/image.jpg",
+     "favorites_type": "audio",
+     "favorites_title": "1Mix Radio EDM Stream",
+     "favorites_url": "http://opml.radiotime.com/Tune.ashx?id=s355203&formats=aac,ogg,mp3,wmpro,wma,wmvoice&partnerId=16&serial=d2a2c9ee371ad11f177e3da58647d5d1"
+    },
+    "icon-id": "/imageproxy/http%3A%2F%2Fcdn-profiles.tunein.com%2Fs355203%2Fimages%2Flogoq.jpg%3Ft%3D1/image.jpg",
+    "goAction": "play",
+    "text": "1Mix Radio EDM Stream",
+    "params": {
+     "touchToPlaySingle": 1,
+     "isContextMenu": 1,
+     "item_id": "1e09a606.6",
+     "touchToPlay": "1e09a606.6"
+    },
+    "style": "itemplay"
+   },
+   {
+    "presetParams": {
+     "icon": "http://cdn-profiles.tunein.com/s355203/images/logoq.jpg?t=1",
+     "favorites_url": "http://opml.radiotime.com/Tune.ashx?id=s355203&formats=aac,ogg,mp3,wmpro,wma,wmvoice&partnerId=15&serial=89d36ef4510ad7d85b912b3d0fee8bad",
+     "favorites_type": "audio",
+     "favorites_title": "1Mix Radio EDM Stream"
+    },
+    "type": "audio",
+    "text": "1Mix Radio EDM Stream",
+    "params": {
+     "isContextMenu": 1,
+     "item_id": "1e09a606.7",
+     "touchToPlay": "1e09a606.7",
+     "touchToPlaySingle": 1
+    },
+    "goAction": "play",
+    "icon": "/imageproxy/http%3A%2F%2Fcdn-profiles.tunein.com%2Fs355203%2Fimages%2Flogoq.jpg%3Ft%3D1/image.jpg",
+    "style": "itemplay"
+   }
+  ],
+  "offset": 0,
+  "title": "Favorites",
+  "base": {
+   "actions": {
+    "set-preset-7": {
+     "player": 0,
+     "cmd": [
+      "jivefavorites",
+      "set_preset",
+      "key:7"
+     ],
+     "itemsParams": "presetParams"
+    },
+    "set-preset-3": {
+     "itemsParams": "presetParams",
+     "cmd": [
+      "jivefavorites",
+      "set_preset",
+      "key:3"
+     ],
+     "player": 0
+    },
+    "more": {
+     "itemsParams": "params",
+     "params": {
+      "menu": "favorites"
+     },
+     "player": 0,
+     "cmd": [
+      "favorites",
+      "items"
+     ],
+     "window": {
+      "isContextMenu": 1
+     }
+    },
+    "set-preset-2": {
+     "player": 0,
+     "cmd": [
+      "jivefavorites",
+      "set_preset",
+      "key:2"
+     ],
+     "itemsParams": "presetParams"
+    },
+    "add": {
+     "itemsParams": "params",
+     "params": {
+      "menu": "favorites"
+     },
+     "player": 0,
+     "cmd": [
+      "favorites",
+      "playlist",
+      "add"
+     ]
+    },
+    "set-preset-0": {
+     "player": 0,
+     "cmd": [
+      "jivefavorites",
+      "set_preset",
+      "key:0"
+     ],
+     "itemsParams": "presetParams"
+    },
+    "go": {
+     "itemsParams": "params",
+     "params": {
+      "menu": "favorites"
+     },
+     "cmd": [
+      "favorites",
+      "items"
+     ]
+    },
+    "playControl": {
+     "params": {
+      "menu": "favorites",
+      "_index": "0",
+      "_quantity": "200"
+     },
+     "itemsParams": "playControlParams",
+     "cmd": [
+      "favorites",
+      "items"
+     ],
+     "player": 0,
+     "window": {
+      "isContextMenu": 1
+     }
+    },
+    "set-preset-5": {
+     "itemsParams": "presetParams",
+     "player": 0,
+     "cmd": [
+      "jivefavorites",
+      "set_preset",
+      "key:5"
+     ]
+    },
+    "set-preset-6": {
+     "itemsParams": "presetParams",
+     "cmd": [
+      "jivefavorites",
+      "set_preset",
+      "key:6"
+     ],
+     "player": 0
+    },
+    "set-preset-8": {
+     "player": 0,
+     "cmd": [
+      "jivefavorites",
+      "set_preset",
+      "key:8"
+     ],
+     "itemsParams": "presetParams"
+    },
+    "set-preset-1": {
+     "cmd": [
+      "jivefavorites",
+      "set_preset",
+      "key:1"
+     ],
+     "player": 0,
+     "itemsParams": "presetParams"
+    },
+    "set-preset-4": {
+     "cmd": [
+      "jivefavorites",
+      "set_preset",
+      "key:4"
+     ],
+     "player": 0,
+     "itemsParams": "presetParams"
+    },
+    "set-preset-9": {
+     "itemsParams": "presetParams",
+     "cmd": [
+      "jivefavorites",
+      "set_preset",
+      "key:9"
+     ],
+     "player": 0
+    },
+    "add-hold": {
+     "params": {
+      "menu": "favorites"
+     },
+     "itemsParams": "params",
+     "cmd": [
+      "favorites",
+      "playlist",
+      "insert"
+     ],
+     "player": 0
+    },
+    "play": {
+     "player": 0,
+     "cmd": [
+      "favorites",
+      "playlist",
+      "play"
+     ],
+     "itemsParams": "params",
+     "nextWindow": "nowPlaying",
+     "params": {
+      "menu": "favorites"
+     }
+    }
+   }
+  },
+  "window": {
+   "windowStyle": "home_menu"
+  }
+ }
+}

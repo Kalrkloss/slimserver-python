@@ -1,0 +1,77 @@
+{
+ "result": {
+  "loop_loop": [
+   {
+    "id": "3d020141.0",
+    "name": "Chill",
+    "image": "html/images/favorites.png",
+    "isaudio": 0,
+    "hasitems": 1
+   },
+   {
+    "id": "3d020141.1",
+    "name": "Nachrichten",
+    "image": "html/images/favorites.png",
+    "isaudio": 0,
+    "hasitems": 1
+   },
+   {
+    "id": "3d020141.2",
+    "name": "Lokal",
+    "image": "html/images/favorites.png",
+    "isaudio": 0,
+    "hasitems": 1
+   },
+   {
+    "id": "3d020141.3",
+    "name": "Dub",
+    "image": "html/images/favorites.png",
+    "isaudio": 0,
+    "hasitems": 1
+   },
+   {
+    "id": "3d020141.4",
+    "name": "Trance",
+    "image": "html/images/favorites.png",
+    "isaudio": 0,
+    "hasitems": 1
+   },
+   {
+    "id": "3d020141.5",
+    "name": "Rock",
+    "image": "html/images/favorites.png",
+    "isaudio": 0,
+    "hasitems": 1
+   },
+   {
+    "id": "3d020141.6",
+    "name": "1Mix Radio EDM Stream",
+    "type": "audio",
+    "image": "/imageproxy/http%3A%2F%2Fcdn-profiles.tunein.com%2Fs355203%2Fimages%2Flogoq.jpg%3Ft%3D1/image.jpg",
+    "isaudio": 1,
+    "hasitems": 0
+   },
+   {
+    "id": "3d020141.7",
+    "name": "1Mix Radio EDM Stream",
+    "type": "audio",
+    "image": "/imageproxy/http%3A%2F%2Fcdn-profiles.tunein.com%2Fs355203%2Fimages%2Flogoq.jpg%3Ft%3D1/image.jpg",
+    "isaudio": 1,
+    "hasitems": 0
+   }
+  ],
+  "title": "Favorites",
+  "count": 8
+ },
+ "id": 1,
+ "method": "slim.request",
+ "params": [
+  "24:0a:c4:29:77:90",
+  [
+   "favorites",
+   "items",
+   "0",
+   "200"
+  ]
+ ]
+}

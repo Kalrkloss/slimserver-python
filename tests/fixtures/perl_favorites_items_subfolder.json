@@ -1,0 +1,316 @@
+{
+ "id": 1,
+ "method": "slim.request",
+ "params": [
+  "24:0a:c4:29:77:90",
+  [
+   "favorites",
+   "items",
+   "0",
+   200,
+   "menu:favorites",
+   "useContextMenu:1",
+   "item_id:4ff0f847.0"
+  ]
+ ],
+ "result": {
+  "window": {
+   "windowStyle": "home_menu"
+  },
+  "base": {
+   "actions": {
+    "set-preset-7": {
+     "cmd": [
+      "jivefavorites",
+      "set_preset",
+      "key:7"
+     ],
+     "player": 0,
+     "itemsParams": "presetParams"
+    },
+    "more": {
+     "player": 0,
+     "cmd": [
+      "favorites",
+      "items"
+     ],
+     "window": {
+      "isContextMenu": 1
+     },
+     "itemsParams": "params",
+     "params": {
+      "menu": "favorites"
+     }
+    },
+    "set-preset-3": {
+     "player": 0,
+     "cmd": [
+      "jivefavorites",
+      "set_preset",
+      "key:3"
+     ],
+     "itemsParams": "presetParams"
+    },
+    "set-preset-2": {
+     "itemsParams": "presetParams",
+     "cmd": [
+      "jivefavorites",
+      "set_preset",
+      "key:2"
+     ],
+     "player": 0
+    },
+    "add": {
+     "cmd": [
+      "favorites",
+      "playlist",
+      "add"
+     ],
+     "player": 0,
+     "params": {
+      "menu": "favorites"
+     },
+     "itemsParams": "params"
+    },
+    "go": {
+     "itemsParams": "params",
+     "params": {
+      "menu": "favorites"
+     },
+     "nextWindow": "nowPlaying",
+     "player": 0,
+     "cmd": [
+      "favorites",
+      "playlist",
+      "play"
+     ]
+    },
+    "set-preset-0": {
+     "player": 0,
+     "cmd": [
+      "jivefavorites",
+      "set_preset",
+      "key:0"
+     ],
+     "itemsParams": "presetParams"
+    },
+    "set-preset-6": {
+     "cmd": [
+      "jivefavorites",
+      "set_preset",
+      "key:6"
+     ],
+     "player": 0,
+     "itemsParams": "presetParams"
+    },
+    "set-preset-8": {
+     "itemsParams": "presetParams",
+     "player": 0,
+     "cmd": [
+      "jivefavorites",
+      "set_preset",
+      "key:8"
+     ]
+    },
+    "set-preset-5": {
+     "cmd": [
+      "jivefavorites",
+      "set_preset",
+      "key:5"
+     ],
+     "player": 0,
+     "itemsParams": "presetParams"
+    },
+    "playControl": {
+     "window": {
+      "isContextMenu": 1
+     },
+     "player": 0,
+     "cmd": [
+      "favorites",
+      "items"
+     ],
+     "itemsParams": "playControlParams",
+     "params": {
+      "menu": "favorites",
+      "useContextMenu": "1",
+      "_quantity": "200",
+      "item_id": "4ff0f847.0",
+      "_index": "0"
+     }
+    },
+    "set-preset-1": {
+     "cmd": [
+      "jivefavorites",
+      "set_preset",
+      "key:1"
+     ],
+     "player": 0,
+     "itemsParams": "presetParams"
+    },
+    "set-preset-4": {
+     "player": 0,
+     "cmd": [
+      "jivefavorites",
+      "set_preset",
+      "key:4"
+     ],
+     "itemsParams": "presetParams"
+    },
+    "set-preset-9": {
+     "player": 0,
+     "cmd": [
+      "jivefavorites",
+      "set_preset",
+      "key:9"
+     ],
+     "itemsParams": "presetParams"
+    },
+    "play": {
+     "itemsParams": "params",
+     "params": {
+      "menu": "favorites"
+     },
+     "nextWindow": "nowPlaying",
+     "player": 0,
+     "cmd": [
+      "favorites",
+      "playlist",
+      "play"
+     ]
+    },
+    "add-hold": {
+     "itemsParams": "params",
+     "params": {
+      "menu": "favorites"
+     },
+     "player": 0,
+     "cmd": [
+      "favorites",
+      "playlist",
+      "insert"
+     ]
+    }
+   }
+  },
+  "item_loop": [
+   {
+    "icon-id": "/imageproxy/http%3A%2F%2Fcdn-radiotime-logos.tunein.com%2Fs111987q.png/image.png",
+    "presetParams": {
+     "icon": "/imageproxy/http%3A%2F%2Fcdn-radiotime-logos.tunein.com%2Fs111987q.png/image.png",
+     "favorites_url": "http://hirschmilch.de:7000/chillout.mp3",
+     "favorites_type": "audio",
+     "favorites_title": "Hirschmilch Chillout"
+    },
+    "type": "audio",
+    "params": {
+     "touchToPlaySingle": 1,
+     "isContextMenu": 1,
+     "touchToPlay": "4ff0f847.0.0",
+     "item_id": "4ff0f847.0.0"
+    },
+    "text": "Hirschmilch Chillout",
+    "goAction": "play",
+    "style": "itemplay"
+   },
+   {
+    "style": "itemplay",
+    "icon-id": "/imageproxy/http%3A%2F%2Fcdn-radiotime-logos.tunein.com%2Fs158432q.png/image.png",
+    "presetParams": {
+     "favorites_url": " https://absolut-relax.live-sm.absolutradio.de/absolut-relax/stream/mp3",
+     "favorites_type": "audio",
+     "favorites_title": "Absolut relax (Easy Listening)",
+     "icon": "/imageproxy/http%3A%2F%2Fcdn-radiotime-logos.tunein.com%2Fs158432q.png/image.png"
+    },
+    "type": "audio",
+    "params": {
+     "touchToPlaySingle": 1,
+     "isContextMenu": 1,
+     "item_id": "4ff0f847.0.1",
+     "touchToPlay": "4ff0f847.0.1"
+    },
+    "text": "Absolut relax (Easy Listening)",
+    "goAction": "play"
+   },
+   {
+    "goAction": "play",
+    "text": "Hirschmilch Electronic",
+    "params": {
+     "item_id": "4ff0f847.0.2",
+     "touchToPlay": "4ff0f847.0.2",
+     "isContextMenu": 1,
+     "touchToPlaySingle": 1
+    },
+    "type": "audio",
+    "icon-id": "html/images/favorites.png",
+    "presetParams": {
+     "favorites_type": "audio",
+     "favorites_title": "Hirschmilch Electronic",
+     "favorites_url": "http://hirschmilch.de:7000/electronic.mp3",
+     "icon": "html/images/favorites.png"
+    },
+    "style": "itemplay"
+   },
+   {
+    "style": "itemplay",
+    "icon-id": "/plugins/TuneIn/html/images/podcasts.png",
+    "presetParams": {
+     "favorites_url": "http://stream.sunshine-live.de/live/mp3-192",
+     "favorites_type": "audio",
+     "favorites_title": "SUNSHINE LIVE",
+     "icon": "/plugins/TuneIn/html/images/podcasts.png"
+    },
+    "type": "audio",
+    "text": "SUNSHINE LIVE",
+    "params": {
+     "item_id": "4ff0f847.0.3",
+     "touchToPlay": "4ff0f847.0.3",
+     "isContextMenu": 1,
+     "touchToPlaySingle": 1
+    },
+    "goAction": "play"
+   },
+   {
+    "style": "itemplay",
+    "goAction": "play",
+    "params": {
+     "touchToPlaySingle": 1,
+     "isContextMenu": 1,
+     "item_id": "4ff0f847.0.4",
+     "touchToPlay": "4ff0f847.0.4"
+    },
+    "text": "SUNSHINE LIVE - Chillout",
+    "type": "audio",
+    "presetParams": {
+     "icon": "/plugins/TuneIn/html/images/podcasts.png",
+     "favorites_title": "SUNSHINE LIVE - Chillout",
+     "favorites_type": "audio",
+     "favorites_url": "http://stream.sunshine-live.de/sp8/mp3-192"
+    },
+    "icon-id": "/plugins/TuneIn/html/images/podcasts.png"
+   },
+   {
+    "type": "audio",
+    "presetParams": {
+     "favorites_title": "1.FM - Ambient Psychill",
+     "favorites_type": "audio",
+     "favorites_url": "http://strm112.1.fm/ambientpsy_mobile_mp3",
+     "icon": "html/images/favorites.png"
+    },
+    "icon-id": "html/images/favorites.png",
+    "goAction": "play",
+    "text": "1.FM - Ambient Psychill",
+    "params": {
+     "isContextMenu": 1,
+     "touchToPlay": "4ff0f847.0.5",
+     "item_id": "4ff0f847.0.5",
+     "touchToPlaySingle": 1
+    },
+    "style": "itemplay"
+   }
+  ],
+  "title": "Chill",
+  "offset": 0,
+  "count": 6
+ }
+}

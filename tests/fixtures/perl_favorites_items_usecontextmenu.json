@@ -1,0 +1,337 @@
+{
+ "result": {
+  "window": {
+   "windowStyle": "home_menu"
+  },
+  "base": {
+   "actions": {
+    "set-preset-8": {
+     "itemsParams": "presetParams",
+     "player": 0,
+     "cmd": [
+      "jivefavorites",
+      "set_preset",
+      "key:8"
+     ]
+    },
+    "set-preset-6": {
+     "cmd": [
+      "jivefavorites",
+      "set_preset",
+      "key:6"
+     ],
+     "player": 0,
+     "itemsParams": "presetParams"
+    },
+    "set-preset-5": {
+     "player": 0,
+     "cmd": [
+      "jivefavorites",
+      "set_preset",
+      "key:5"
+     ],
+     "itemsParams": "presetParams"
+    },
+    "playControl": {
+     "window": {
+      "isContextMenu": 1
+     },
+     "player": 0,
+     "cmd": [
+      "favorites",
+      "items"
+     ],
+     "itemsParams": "playControlParams",
+     "params": {
+      "menu": "favorites",
+      "_index": "0",
+      "useContextMenu": "1",
+      "_quantity": "200"
+     }
+    },
+    "set-preset-1": {
+     "itemsParams": "presetParams",
+     "cmd": [
+      "jivefavorites",
+      "set_preset",
+      "key:1"
+     ],
+     "player": 0
+    },
+    "add": {
+     "itemsParams": "params",
+     "params": {
+      "menu": "favorites"
+     },
+     "player": 0,
+     "cmd": [
+      "favorites",
+      "playlist",
+      "add"
+     ]
+    },
+    "go": {
+     "itemsParams": "params",
+     "params": {
+      "menu": "favorites"
+     },
+     "cmd": [
+      "favorites",
+      "items"
+     ]
+    },
+    "set-preset-0": {
+     "itemsParams": "presetParams",
+     "player": 0,
+     "cmd": [
+      "jivefavorites",
+      "set_preset",
+      "key:0"
+     ]
+    },
+    "set-preset-9": {
+     "player": 0,
+     "cmd": [
+      "jivefavorites",
+      "set_preset",
+      "key:9"
+     ],
+     "itemsParams": "presetParams"
+    },
+    "play": {
+     "cmd": [
+      "favorites",
+      "playlist",
+      "play"
+     ],
+     "player": 0,
+     "nextWindow": "nowPlaying",
+     "params": {
+      "menu": "favorites"
+     },
+     "itemsParams": "params"
+    },
+    "add-hold": {
+     "params": {
+      "menu": "favorites"
+     },
+     "itemsParams": "params",
+     "cmd": [
+      "favorites",
+      "playlist",
+      "insert"
+     ],
+     "player": 0
+    },
+    "set-preset-4": {
+     "player": 0,
+     "cmd": [
+      "jivefavorites",
+      "set_preset",
+      "key:4"
+     ],
+     "itemsParams": "presetParams"
+    },
+    "set-preset-7": {
+     "cmd": [
+      "jivefavorites",
+      "set_preset",
+      "key:7"
+     ],
+     "player": 0,
+     "itemsParams": "presetParams"
+    },
+    "more": {
+     "window": {
+      "isContextMenu": 1
+     },
+     "player": 0,
+     "cmd": [
+      "favorites",
+      "items"
+     ],
+     "itemsParams": "params",
+     "params": {
+      "menu": "favorites"
+     }
+    },
+    "set-preset-3": {
+     "itemsParams": "presetParams",
+     "player": 0,
+     "cmd": [
+      "jivefavorites",
+      "set_preset",
+      "key:3"
+     ]
+    },
+    "set-preset-2": {
+     "player": 0,
+     "cmd": [
+      "jivefavorites",
+      "set_preset",
+      "key:2"
+     ],
+     "itemsParams": "presetParams"
+    }
+   }
+  },
+  "item_loop": [
+   {
+    "text": "Chill",
+    "addAction": "go",
+    "actions": {
+     "go": {
+      "params": {
+       "item_id": "4ff0f847.0",
+       "menu": "favorites"
+      },
+      "cmd": [
+       "favorites",
+       "items"
+      ]
+     }
+    },
+    "icon-id": "html/images/favorites.png"
+   },
+   {
+    "text": "Nachrichten",
+    "addAction": "go",
+    "actions": {
+     "go": {
+      "params": {
+       "item_id": "4ff0f847.1",
+       "menu": "favorites"
+      },
+      "cmd": [
+       "favorites",
+       "items"
+      ]
+     }
+    },
+    "icon-id": "html/images/favorites.png"
+   },
+   {
+    "text": "Lokal",
+    "addAction": "go",
+    "icon-id": "html/images/favorites.png",
+    "actions": {
+     "go": {
+      "cmd": [
+       "favorites",
+       "items"
+      ],
+      "params": {
+       "item_id": "4ff0f847.2",
+       "menu": "favorites"
+      }
+     }
+    }
+   },
+   {
+    "text": "Dub",
+    "addAction": "go",
+    "icon-id": "html/images/favorites.png",
+    "actions": {
+     "go": {
+      "cmd": [
+       "favorites",
+       "items"
+      ],
+      "params": {
+       "item_id": "4ff0f847.3",
+       "menu": "favorites"
+      }
+     }
+    }
+   },
+   {
+    "text": "Trance",
+    "addAction": "go",
+    "icon-id": "html/images/favorites.png",
+    "actions": {
+     "go": {
+      "params": {
+       "item_id": "4ff0f847.4",
+       "menu": "favorites"
+      },
+      "cmd": [
+       "favorites",
+       "items"
+      ]
+     }
+    }
+   },
+   {
+    "text": "Rock",
+    "addAction": "go",
+    "icon-id": "html/images/favorites.png",
+    "actions": {
+     "go": {
+      "cmd": [
+       "favorites",
+       "items"
+      ],
+      "params": {
+       "menu": "favorites",
+       "item_id": "4ff0f847.5"
+      }
+     }
+    }
+   },
+   {
+    "style": "itemplay",
+    "text": "1Mix Radio EDM Stream",
+    "params": {
+     "touchToPlaySingle": 1,
+     "isContextMenu": 1,
+     "item_id": "4ff0f847.6",
+     "touchToPlay": "4ff0f847.6"
+    },
+    "goAction": "play",
+    "icon-id": "/imageproxy/http%3A%2F%2Fcdn-profiles.tunein.com%2Fs355203%2Fimages%2Flogoq.jpg%3Ft%3D1/image.jpg",
+    "presetParams": {
+     "icon": "/imageproxy/http%3A%2F%2Fcdn-profiles.tunein.com%2Fs355203%2Fimages%2Flogoq.jpg%3Ft%3D1/image.jpg",
+     "favorites_type": "audio",
+     "favorites_title": "1Mix Radio EDM Stream",
+     "favorites_url": "http://opml.radiotime.com/Tune.ashx?id=s355203&formats=aac,ogg,mp3,wmpro,wma,wmvoice&partnerId=16&serial=d2a2c9ee371ad11f177e3da58647d5d1"
+    },
+    "type": "audio"
+   },
+   {
+    "style": "itemplay",
+    "icon": "/imageproxy/http%3A%2F%2Fcdn-profiles.tunein.com%2Fs355203%2Fimages%2Flogoq.jpg%3Ft%3D1/image.jpg",
+    "params": {
+     "touchToPlay": "4ff0f847.7",
+     "item_id": "4ff0f847.7",
+     "isContextMenu": 1,
+     "touchToPlaySingle": 1
+    },
+    "text": "1Mix Radio EDM Stream",
+    "goAction": "play",
+    "presetParams": {
+     "favorites_type": "audio",
+     "favorites_title": "1Mix Radio EDM Stream",
+     "favorites_url": "http://opml.radiotime.com/Tune.ashx?id=s355203&formats=aac,ogg,mp3,wmpro,wma,wmvoice&partnerId=15&serial=89d36ef4510ad7d85b912b3d0fee8bad",
+     "icon": "http://cdn-profiles.tunein.com/s355203/images/logoq.jpg?t=1"
+    },
+    "type": "audio"
+   }
+  ],
+  "title": "Favorites",
+  "offset": 0,
+  "count": 8
+ },
+ "params": [
+  "24:0a:c4:29:77:90",
+  [
+   "favorites",
+   "items",
+   "0",
+   200,
+   "menu:favorites",
+   "useContextMenu:1"
+  ]
+ ],
+ "id": 1,
+ "method": "slim.request"
+}

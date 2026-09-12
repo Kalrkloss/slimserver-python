@@ -761,8 +761,21 @@ class JSONRPCAPI:
             return False
 
     async def _fav_items_loop(self, fm: Any, parent: Optional[int],
-                              parent_path: str, feed_mode: bool) -> list[dict]:
+                              parent_path: str, feed_mode: bool,
+                              menu_mode: bool = False) -> list[dict]:
         """Build the favorites loop with LMS hierarchical ids.
+
+        Two shapes, mirroring Perl's ``XMLBrowser::_cliQuery_done``:
+
+        * ``menu_mode=True`` (the request carried a ``menu:`` token, i.e.
+          SqueezePlay/Android browse menus): the jive menu item shape —
+          ``text``/``addAction``/``icon-id``/``actions`` for folders and
+          ``text``/``type``/``style``/``goAction``/``icon-id``/``params``/
+          ``presetParams`` for stations (``XMLBrowser.pm:1051-1267``).
+          See :mod:`lyrion.web.favorites_menu`.
+        * ``menu_mode=False``: the classic flat shape (``id``/``name``/
+          ``image``/``isaudio``/``hasitems``, ``XMLBrowser.pm:1378-1410``)
+          other controllers (SqueezeTray, Squeezer, SPA) read.
 
         id = display-position path from the virtual root ('0.0', '0.3.1');
         dbid carries the internal DB id; feed_mode embeds children in
@@ -776,42 +789,134 @@ class JSONRPCAPI:
         path = parent_path  # hierarchical prefix for the item ids
         for i, it in enumerate(items):
             is_folder = it["type"] == "folder"
-            # LMS reference format (lyrion.org): hierarchical id
-            # '<root>.<position>' (the apps re-send it as item_id:),
-            # name/image/isaudio/hasitems, type 'audio' for streams.
-            item = {
-                "id": path + f".{i}",
-                "name": it["title"],
-                "image": "html/images/favorites.png",
-                "isaudio": 0 if is_folder else 1,
-                "hasitems": 1 if is_folder else 0,
-                "position": i,
-            }
-            if not is_folder:
-                item["type"] = "audio"
-                item["url"] = it["url"] or ""
-                item["id_hierarchical"] = path + f".{i}"
-                item["dbid"] = str(it["id"])
-            if is_folder:
-                # Folder: go opens the folder's items (hierarchical id).
-                item["actions"] = {
-                    "go": {"player": 0, "cmd": ["favorites", "items"],
-                           "params": {"item_id": path + f".{i}"}},
-                }
+            hier = path + f".{i}"
+            if menu_mode:
+                from lyrion.web import favorites_menu
+                if is_folder:
+                    item = favorites_menu.folder_item(it["title"], hier)
+                else:
+                    item = favorites_menu.audio_item(it["title"], hier,
+                                                     url=it["url"] or "")
             else:
-                # Stream: play/do plays the favorite.
-                item["actions"] = {
-                    "play": {"player": 0, "cmd": ["playlist", "play"],
-                             "params": {"item_id": path + f".{i}"}},
-                    "do": {"player": 0, "cmd": ["playlist", "play"],
-                           "params": {"item_id": path + f".{i}"}},
+                # LMS reference format (lyrion.org): hierarchical id
+                # '<root>.<position>' (the apps re-send it as item_id:),
+                # name/image/isaudio/hasitems, type 'audio' for streams.
+                item = {
+                    "id": hier,
+                    "name": it["title"],
+                    "image": "html/images/favorites.png",
+                    "isaudio": 0 if is_folder else 1,
+                    "hasitems": 1 if is_folder else 0,
+                    "position": i,
                 }
+                if not is_folder:
+                    item["type"] = "audio"
+                    item["url"] = it["url"] or ""
+                    item["id_hierarchical"] = hier
+                    item["dbid"] = str(it["id"])
+                if is_folder:
+                    # Folder: go opens the folder's items (hierarchical id).
+                    item["actions"] = {
+                        "go": {"player": 0, "cmd": ["favorites", "items"],
+                               "params": {"item_id": hier}},
+                    }
+                else:
+                    # Stream: play/do plays the favorite.
+                    item["actions"] = {
+                        "play": {"player": 0, "cmd": ["playlist", "play"],
+                                 "params": {"item_id": hier}},
+                        "do": {"player": 0, "cmd": ["playlist", "play"],
+                               "params": {"item_id": hier}},
+                    }
             if feed_mode and is_folder:
                 item["items"] = await self._fav_items_loop(
-                    fm, int(it["id"]), path + f".{i}", feed_mode)
+                    fm, int(it["id"]), hier, feed_mode, menu_mode)
             loop.append(item)
         return loop
 
+
+    async def _json_favorites_items(self, pid: str | None,
+                                    rest: list) -> dict:
+        """``['favorites','items',<start>,<qty>,…]`` — see favorites_menu.
+
+        Two answer shapes, exactly like Perl's ``XMLBrowser::_cliQuery_done``:
+
+        * a ``menu:`` token (SqueezePlay/Android browse menus) ⇒ the jive
+          menu shape with ``base``/``window`` — including
+          ``base.actions.play.nextWindow == "nowPlaying"``, which is what
+          makes SqueezePlay switch to "Aktueller Titel" after a tap
+          (SlimBrowserApplet.lua:1924-1928, 2044-2048).
+        * no ``menu:`` token ⇒ the classic ``loop_loop`` shape other
+          controllers read (unchanged).
+
+        ``item_id:`` accepts the hierarchical id ('0.3.1') and a bare DB
+        id; a bare numeric first argument (Web UI) is a folder id.
+        """
+        try:
+            from lyrion.music.favorites import get_favorites_manager
+            fm = get_favorites_manager()
+            parent = None
+            parent_path = "0"
+            menu_mode = any(str(a) == "menu" or str(a).startswith("menu:")
+                            for a in rest)
+            feed_mode = any(str(a).startswith("feedMode:")
+                            and str(a)[9:] == "1" for a in rest)
+            # Perl answers feedMode with a nested outline feed
+            # ({"favorites":…,"items":…,"type":…}) — neither shape is parity,
+            # so leave that path exactly as it was before.
+            if feed_mode:
+                menu_mode = False
+            # item_id:<n> (SqueezeTray folder children) — highest priority;
+            # accepts the LMS hierarchical id ('0.3.1') and the DB id.
+            for a in rest:
+                if str(a).startswith("item_id:"):
+                    val = str(a)[8:]
+                    if "." in val:
+                        parent = await fm.resolve_path(val)
+                        parent_path = val if parent is not None else "0"
+                    elif val.isdigit():
+                        parent = int(val)
+                        parent_path = f"0.{val}"
+                    break
+            if parent is None and len(rest) == 1 and str(rest[0]).isdigit():
+                # Web UI: ['favorites','items','<parent_id>'] — a bare
+                # number is the folder id (SqueezeTray sends multiple
+                # args: start/count/want_url — never a bare parent).
+                parent = int(str(rest[0]))
+                parent_path = f"0.{rest[0]}"
+            loop = await self._fav_items_loop(fm, parent, parent_path,
+                                              feed_mode, menu_mode)
+            if menu_mode:
+                from lyrion.web import favorites_menu
+                # Perl echoes the request's tagged params into the
+                # playControl base action (XMLBrowser.pm:978).  The two
+                # leading positionals are the named slots of
+                # ``['favorites','items','_index','_quantity']``
+                # (Request.pm:75 / Favorites/Plugin.pm:75).
+                tagged: dict[str, Any] = {}
+                positional = [str(a) for a in rest[:2]]
+                if len(positional) == 2 and all(p.isdigit()
+                                                for p in positional):
+                    tagged["_index"], tagged["_quantity"] = positional
+                for a in rest:
+                    s = str(a)
+                    if ":" in s:
+                        k, _, v = s.partition(":")
+                        tagged[k] = v
+                return favorites_menu.render_favorites_menu(
+                    loop, playcontrol_params=tagged)
+            resp = self._browse_response(loop)
+            # LMS reference: 'title' on the response level.
+            resp["title"] = "Favorites"
+            return resp
+        except Exception:
+            from lyrion.web import favorites_menu
+            if any(str(a) == "menu" or str(a).startswith("menu:")
+                   for a in (rest or [])):
+                return favorites_menu.render_favorites_menu([])
+            resp = self._browse_response([])
+            resp["title"] = "Favorites"
+            return resp
 
     async def _displaystatus(self, pid: str | None, args: list[str]) -> dict:
         """displaystatus [showBriefly:<text> <duration>] — now-playing popup.
@@ -1142,41 +1247,7 @@ class JSONRPCAPI:
         # hasitems, ...}]}. items is DB-backed (FavoritesManager); the
         # other subcommands go through the CLI handler.
         if cmd == "favorites" and args and str(args[0]) == "items":
-            try:
-                from lyrion.music.favorites import get_favorites_manager
-                fm = get_favorites_manager()
-                rest = args[1:]
-                parent = None
-                parent_path = "0"
-                feed_mode = any(str(a).startswith("feedMode:") and str(a)[9:] == "1"
-                                for a in rest)
-                # item_id:<n> (SqueezeTray folder children) — highest priority;
-                # accepts the LMS hierarchical id ('0.3.1') and the DB id.
-                for a in rest:
-                    if str(a).startswith("item_id:"):
-                        val = str(a)[8:]
-                        if "." in val:
-                            parent = await fm.resolve_path(val)
-                            parent_path = val if parent is not None else "0"
-                        elif val.isdigit():
-                            parent = int(val)
-                            parent_path = f"0.{val}"
-                        break
-                if parent is None and len(rest) == 1 and str(rest[0]).isdigit():
-                    # Web UI: ['favorites','items','<parent_id>'] — a bare
-                    # number is the folder id (SqueezeTray sends multiple
-                    # args: start/count/want_url — never a bare parent).
-                    parent = int(str(rest[0]))
-                    parent_path = f"0.{rest[0]}"
-                loop = await self._fav_items_loop(fm, parent, parent_path, feed_mode)
-                resp = self._browse_response(loop)
-                # LMS reference: 'title' on the response level.
-                resp["title"] = "Favorites"
-                return resp
-            except Exception:
-                resp = self._browse_response([])
-                resp["title"] = "Favorites"
-                return resp
+            return await self._json_favorites_items(pid, args[1:])
 
         # favorites changed — event subscription (SqueezeCtrl): the app
         # watches this channel and reloads the list when a 'changed' event
