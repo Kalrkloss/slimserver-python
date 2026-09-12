@@ -270,7 +270,60 @@ _MIME_BY_EXT = {
 }
 
 
-async def _serve_album_cover(album_id: int, send) -> None:
+import re as _re
+
+_COVER_PATH_RE = _re.compile(
+    r"^/music/(\d+)/(?:"
+    r"cover\.(?:jpg|png)"                    # plain: cover.jpg
+    r"|cover_(\d+)x(\d+)(?:_[a-z])?\.(?:jpg|png)"  # LMS sized: cover_40x40_m.jpg
+    r")$"
+)
+
+
+def _parse_cover_path(path: str) -> tuple[int, tuple[int, int] | None] | None:
+    """Album id + optional (w, h) from an LMS artwork URL.
+
+    Perl's ImageProxy accepts ``/music/<albumid>/cover.jpg`` and the
+    size-encoded form Jive/SqueezePlay use from their ``artworkspec``
+    (``cover_40x40_m.jpg``; the trailing ``_m``/``_f`` is the
+    crop flag). Accepting only the plain form made every cover request
+    from SqueezePlay 404 — the album list then showed endless spinners.
+    """
+    m = _COVER_PATH_RE.match(path)
+    if not m:
+        return None
+    album_id = int(m.group(1))
+    if m.group(2) and m.group(3):
+        return album_id, (int(m.group(2)), int(m.group(3)))
+    return album_id, None
+
+
+def _resize_cover(data: bytes, size: tuple[int, int]) -> bytes:
+    """Downscale a cover with Pillow (Lanczos); returns the original data
+    unchanged when Pillow is unavailable or the image is already small."""
+    try:
+        import io as _io
+
+        from PIL import Image
+    except Exception:  # pragma: no cover - Pillow is a project dependency
+        return data
+    try:
+        with Image.open(_io.BytesIO(data)) as im:
+            if im.width <= size[0] and im.height <= size[1]:
+                return data
+            im = im.convert("RGB")
+            resample = getattr(
+                getattr(Image, "Resampling", Image), "LANCZOS", None
+            ) or getattr(Image, "LANCZOS", 1)
+            im.thumbnail(size, resample)
+            out = _io.BytesIO()
+            im.save(out, format="JPEG", quality=85)
+            return out.getvalue()
+    except Exception:  # noqa: BLE001 - never break artwork on a bad file
+        return data
+
+
+async def _serve_album_cover(album_id: int, send, size: tuple[int, int] | None = None) -> None:
     """Serve the cover image stored in Album.artwork for /music/<id>/cover.
 
     Reads the image file in a thread (SMB reads block) and streams it with
@@ -292,6 +345,11 @@ async def _serve_album_cover(album_id: int, send) -> None:
         })
         await send({"type": "http.response.body", "body": b"no artwork"})
         return
+    if size is not None and data:
+        data = await _asyncio.get_running_loop().run_in_executor(
+            None, _resize_cover, data, size
+        )
+        mime = "image/jpeg"
     await send({
         "type": "http.response.start",
         "status": 200,
@@ -371,14 +429,13 @@ def create_app(
             await stream_track(scope, receive, send)
             return
 
-        # Album cover art (LMS convention): /music/<album_id>/cover.jpg.
-        # Players/controllers request this URL to display album artwork.
+        # Album cover art (LMS convention): /music/<album_id>/cover.jpg and
+        # the size-encoded form Jive asks for from its artworkspec
+        # (/music/<album_id>/cover_40x40_m.jpg).
         if path.startswith("/music/") and method == "GET":
-            import re as _re
-
-            m = _re.match(r"^/music/(\d+)/cover\.(jpg|png)$", path)
-            if m:
-                await _serve_album_cover(int(m.group(1)), send)
+            parsed = _parse_cover_path(path)
+            if parsed is not None:
+                await _serve_album_cover(parsed[0], send, parsed[1])
                 return
 
         # Cometd (Jive controllers + Material Skin). libcometd sends the

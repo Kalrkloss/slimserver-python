@@ -329,12 +329,18 @@ class DiscoveryService:
                 pass
         try:
             from lyrion.config import get_config
-            # Advertise the native Cometd streaming port (9080) so Jive
-            # apps (Orange Squeeze, SqueezePlay) connect to the server
-            # that can serve the Bayeux streaming protocol.
-            http_port = int(get_config().get("cometd_stream_port") or 9080)
+            # Advertise the REAL HTTP port (same as serverport / the ASGI
+            # web app). Jive resolves EVERY server URL against this port —
+            # artwork (/music/<id>/cover_*.jpg), /html/... and the Cometd
+            # endpoint. Advertising the native Cometd port (9080) made
+            # SqueezePlay fetch covers from 9080, where only the Cometd
+            # server listens: it drops those requests ("unerwartete Zeile")
+            # and the album list spins forever with empty cover slots.
+            # Perl parity: one port serves web UI, artwork, stream and
+            # Cometd (Slim/Web/HTTP.pm + Slim/Web/Cometd.pm share it).
+            http_port = int(get_config().get("serverport", 9000) or 9000)
         except Exception:
-            http_port = 9080
+            http_port = 9000
 
         hostname = _socket.gethostname()[:16]
         values = {
