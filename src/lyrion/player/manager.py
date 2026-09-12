@@ -878,7 +878,7 @@ class PlayerManager:
         return await handler.send_ir_to_player(player.mac, button_code)
 
     async def show_display(
-        self, player_id: str, line1: str, line2: str, duration: int = 3
+        self, player_id: str, line1: str, line2: str, duration: int = 1
     ) -> bool:
         """Show a two-line text message on a player (slimproto 'grfe' frame).
 
@@ -886,7 +886,10 @@ class PlayerManager:
             player_id: Player MAC address.
             line1: First display line.
             line2: Second display line.
-            duration: How many seconds to show the message.
+            duration: How many seconds to show the message. Defaults to 1 s
+                like Perl (``Display.pm:258`` "$duration =
+                $args->{'duration'} || 1; # duration - default to 1 second").
+                Was an invented 3 s.
 
         Returns:
             True if the frame was sent to a connected player.

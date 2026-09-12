@@ -320,6 +320,11 @@ CMD_ANIC = 0x09
 CMD_GRFB = 0x0A
 CMD_META = 0x11  # ask the player to report stream metadata (StreamTitle → STMu)
 
+# Perl's default showBriefly duration, Display.pm:258
+# ("$duration = $args->{'duration'} || 1; # duration - default to 1 second").
+# The displaytexttimeout pref is 1 as well (Slim/Utils/Prefs.pm:169).
+DISPLAY_DURATION_DEFAULT = 1
+
 # ── Perl slimproto opcode table (4 ASCII bytes) ───────────────────────────
 # Slim/Networking/Slimproto.pm:52-72 `%message_handlers`. The opcode is the
 # RAW 4-byte name ('IR  ' is space padded), and Perl looks it up in a hash —
@@ -2584,13 +2589,19 @@ class SlimProtoClient:
             return False
 
     async def send_display_to_player(
-        self, mac: str, line1: str, line2: str, duration: int = 3
+        self, mac: str, line1: str, line2: str,
+        duration: int = DISPLAY_DURATION_DEFAULT
     ) -> bool:
         """Send a 'grfe' (text display) frame to a player.
 
         grfe packet: opcode(4) format(1, 0x01 = two lines of text)
         duration(2, big-endian seconds) line1(0-term) line2(0-term).
         Software players (squeezelite/jive) render this on their UI.
+
+        ``duration`` defaults to 1 s: Perl ``Display.pm:258``
+        ``$duration = $args->{'duration'} || 1;  # duration - default to
+        1 second`` (the ``displaytexttimeout`` pref is 1 as well,
+        ``Slim/Utils/Prefs.pm:169``). Was an invented 3 s.
         """
         mac = mac.upper().replace(":", "")
         writer = self._player_writers.get(mac)
