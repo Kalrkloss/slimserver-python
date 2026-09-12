@@ -127,7 +127,11 @@ def _body(sent) -> bytes:
 
 # ── (a) pacer: burst then ~1x realtime ────────────────────────────────────
 
-def test_pacer_bursts_then_throttles_to_realtime(tmp_path):
+def test_pacer_bursts_then_throttles_to_realtime(tmp_path, monkeypatch):
+    # The pacing MECHANICS are tested with a small burst; the production
+    # burst (BURST_SECONDS) is asserted separately below.
+    monkeypatch.setattr(stream_mod, "BURST_SECONDS", 3.0)
+    monkeypatch.setattr(stream_mod, "BURST_MIN_BYTES", 0)
     content = bytes(range(256)) * 1563          # ~400 KB
     clock = {"t": 0.0}
     sent, sleeps = _run_stream(
@@ -150,8 +154,11 @@ def test_pacer_bursts_then_throttles_to_realtime(tmp_path):
     assert max(sleeps) <= stream_mod.CANCEL_POLL_SECONDS + 1e-6
 
 
-def test_pacer_default_bitrate_is_conservative(tmp_path):
+def test_pacer_default_bitrate_is_conservative(tmp_path, monkeypatch):
     # no bitrate in the DB → conservative 128 kbit/s default
+    # (burst mechanics pinned low here; the production burst is asserted in
+    # test_burst_is_at_least_the_player_start_threshold)
+    monkeypatch.setattr(stream_mod, "BURST_MIN_BYTES", 0)
     pacer = stream_mod.StreamPacer.from_bitrate(None)
     assert pacer.bytes_per_sec == stream_mod.DEFAULT_BITRATE_BPS // 8
     assert pacer.burst_bytes == int(pacer.bytes_per_sec * stream_mod.BURST_SECONDS)
@@ -210,9 +217,8 @@ def test_pacer_schedule_is_zero_inside_the_burst():
     original_now = stream_mod._now
     stream_mod._now = lambda: clock["t"]
     try:
-        pacer = stream_mod.StreamPacer.from_bitrate(128000, burst_seconds=2.0)
+        pacer = stream_mod.StreamPacer(16000, 32000)   # 2 s @128k burst
         pacer.start()
-        # 2 s @128k = 32000 B burst
         assert pacer.schedule(16000) == 0.0
         assert pacer.schedule(16000) == 0.0
         assert pacer.schedule(16000) > 0.0        # past the burst
@@ -224,7 +230,9 @@ def test_pacer_schedule_is_zero_inside_the_burst():
 
 # ── (b) cancel stops a running response and cleans the registry ───────────
 
-def test_cancel_active_stream_stops_the_running_response(tmp_path):
+def test_cancel_active_stream_stops_the_running_response(tmp_path, monkeypatch):
+    monkeypatch.setattr(stream_mod, "BURST_SECONDS", 3.0)
+    monkeypatch.setattr(stream_mod, "BURST_MIN_BYTES", 0)
     content = b"z" * (256 * 1024)
     clock = {"t": 0.0}
     asleep: list[float] = []
@@ -249,7 +257,9 @@ def test_cancel_active_stream_stops_the_running_response(tmp_path):
     )
 
 
-def test_handler_registers_itself_and_unregisters_on_completion(tmp_path):
+def test_handler_registers_itself_and_unregisters_on_completion(tmp_path, monkeypatch):
+    monkeypatch.setattr(stream_mod, "BURST_SECONDS", 3.0)
+    monkeypatch.setattr(stream_mod, "BURST_MIN_BYTES", 0)
     seen = {}
 
     def _on_sleep(_count):
@@ -382,3 +392,23 @@ def test_registering_a_new_stream_replaces_and_cancels_the_old_one():
         )
 
     asyncio.run(run())
+
+
+def test_burst_is_at_least_the_player_start_threshold():
+    """The burst must fill the player's start threshold, which the strm
+    frame declares as `bufferThreshold` — Perl default 255 KB
+    (Player.pm:65), remote 20 KB / int(bitrate/8)*bufferSecs/1000 with
+    bufferSecs = 3 (Squeezebox.pm:160-179). Perl itself never rate-limits
+    the stream (HTTP.pm:2152 ff.); the burst we need to start fast is
+    therefore the threshold, not an invented duration."""
+    assert stream_mod.BURST_MIN_BYTES == 255 * 1024
+    assert stream_mod.BURST_SECONDS == 3.0            # Perl bufferSecs
+
+    slow = stream_mod.StreamPacer.from_bitrate(128000)   # 16 KB/s < 255 KB
+    assert slow.burst_bytes == 255 * 1024
+
+    fast = stream_mod.StreamPacer.from_bitrate(2_000_000)  # 250 KB/s * 3 s
+    assert fast.burst_bytes == int(250_000 * 3.0)
+
+    small = stream_mod.StreamPacer.from_bitrate(128000, burst_seconds=0.5)
+    assert small.burst_bytes == stream_mod.BURST_MIN_BYTES

@@ -389,14 +389,14 @@ def test_strm_control_frame_replay_gain_is_ms():
     assert payload[4:][14:18] == struct.pack(">I", 3000)
 
 
-def test_strm_start_frame_matches_perl_except_known_threshold_delta():
+def test_strm_start_frame_matches_perl_byte_for_byte():
     """Perl stream('s') local file: autostart 1, format 'm', pcm '?',
     transitionType '0', outputThreshold 1 for mp3, port 9000, ip 0.
 
-    perl (threshold 255):
+    perl reference frame:
         73316d3f3f3f3fff00003000010000000000232800000000
-    ours (threshold 50 -> PROT-07/P2, still open):
-        73316d3f3f3f3f3200003000010000000000232800000000
+    (bufferThreshold 255 KB = Player.pm:65; the old 50 was a guess and is
+    now fixed — PROT-07 closed.)
     """
     request = b"GET /stream.mp3?player=021122334455 HTTP/1.0\r\n\r\n"
     frame = SlimProtoClient._build_stream_frame(
@@ -410,7 +410,7 @@ def test_strm_start_frame_matches_perl_except_known_threshold_delta():
     assert leaf[1:2] == b"1"                 # autostart
     assert leaf[2:3] == b"m"                 # format byte
     assert leaf[3:7] == b"????"              # pcm size/rate/chan/endian
-    assert leaf[7] == 50                     # bufferThreshold (Perl: 255)
+    assert leaf[7] == 255                    # bufferThreshold (Player.pm:65)
     assert leaf[8] == 0                      # spdif
     assert leaf[9] == 0                      # transitionDuration
     assert leaf[10:11] == b"0"               # transitionType NONE

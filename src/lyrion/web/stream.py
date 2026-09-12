@@ -295,8 +295,19 @@ async def _load_track(track_id: int):
 # "send more" (flow control is socket-level).
 
 DEFAULT_BITRATE_BPS = 128_000   # conservative fallback (bits/s)
-BURST_SECONDS = 3.0             # audio buffered up front before throttling
-PACED_CHUNK_SIZE = 16 * 1024    # ≤ Perl MAXCHUNKSIZE (32768)
+# Up-front burst before throttling to 1x realtime.
+#
+# Perl does NOT rate-limit a player stream: it writes MAXCHUNKSIZE (32768)
+# chunks whenever the socket is writable (Slim/Web/HTTP.pm:61, :2126-2128,
+# :2152 ff.) and lets TCP backpressure pace. Our artificial 1x limit needs a
+# burst large enough to fill the player's start threshold, which is carried
+# in the strm frame: `bufferThreshold` default 255 KB (Player.pm:65), remote
+# 20 KB or int(bitrate/8)*bufferSecs/1000 with bufferSecs = 3
+# (Squeezebox.pm:160-179). So: 3 s of audio, but never less than the 255 KB
+# threshold — otherwise SqueezePlay waits ~17 s before it starts decoding.
+BURST_SECONDS = 3.0                          # Perl `bufferSecs` default
+BURST_MIN_BYTES = 255 * 1024                 # Perl `bufferThreshold` default
+PACED_CHUNK_SIZE = 32 * 1024                 # Perl MAXCHUNKSIZE (HTTP.pm:61)
 CANCEL_POLL_SECONDS = 0.25      # max delay before a cancel is noticed
 
 
@@ -373,11 +384,18 @@ class StreamPacer:
 
     @classmethod
     def from_bitrate(cls, bitrate_bps: int | None,
-                     burst_seconds: float = BURST_SECONDS) -> StreamPacer:
+                     burst_seconds: float | None = None) -> StreamPacer:
+        # Resolve the module constant at CALL time: a default argument
+        # would freeze the value at import and make the burst untestable.
+        if burst_seconds is None:
+            burst_seconds = BURST_SECONDS
         bps = int(bitrate_bps) if bitrate_bps and bitrate_bps > 0 \
             else DEFAULT_BITRATE_BPS
         per_sec = max(1, bps // 8)
-        return cls(per_sec, int(per_sec * max(0.0, burst_seconds)))
+        # Never burst less than the player's start threshold (Perl
+        # bufferThreshold default 255 KB) — see the constants above.
+        burst = max(BURST_MIN_BYTES, int(per_sec * max(0.0, burst_seconds)))
+        return cls(per_sec, burst)
 
     def start(self) -> None:
         self._start = _now()

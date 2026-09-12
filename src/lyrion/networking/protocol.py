@@ -127,6 +127,38 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+# Player buffer threshold, in KB of audio the player buffers before it
+# starts decoding — carried in the strm frame. Perl values:
+#   * default client pref `bufferThreshold` = 255 KB
+#     (Slim/Player/Player.pm:65)
+#   * reduced for a file smaller than the threshold: (filesize/1024)-1 KB
+#     (Slim/Player/Squeezebox.pm:916-921)
+#   * remote streams: 20 KB, or int(bitrate/8) * bufferSecs / 1000 capped at
+#     255 (Squeezebox.pm:160-179; bufferSecs default 3 at :162)
+BUFFER_THRESHOLD_KB = 255
+REMOTE_BUFFER_THRESHOLD_KB = 20
+REMOTE_BUFFER_SECS = 3
+
+
+def stream_buffer_threshold(filesize: int | None = None, *,
+                            remote: bool = False,
+                            bitrate_bps: int | None = None) -> int:
+    """The strm ``bufferThreshold`` value (KB) for a track — Perl parity.
+
+    See the constants above for the Perl locations. Never returns 0: the
+    frame field is a byte, so the value is clamped to 1..255.
+    """
+    if remote:
+        threshold = REMOTE_BUFFER_THRESHOLD_KB
+        if bitrate_bps and bitrate_bps > 0:
+            threshold = int(int(bitrate_bps / 8) * REMOTE_BUFFER_SECS / 1000)
+        threshold = min(threshold, 255)
+    else:
+        threshold = BUFFER_THRESHOLD_KB
+        if filesize and filesize < threshold * 1024:
+            threshold = (int(filesize / 1024) or 2) - 1
+    return max(1, min(255, int(threshold)))
+
 
 def _notify_cometd_server_status() -> None:
     """Wake Cometd /slim/serverstatus subscribers (player list changed).
@@ -1232,7 +1264,7 @@ class SlimProtoClient:
         server_port: int = 9000,
         server_ip: int = 0,
         flags: int = 0,
-        threshold: int = 50,
+        threshold: int = BUFFER_THRESHOLD_KB,
         pcm_params: tuple[str, str, str, str] | None = None,
     ) -> bytes:
         """Build the 24-byte LMS ``strm`` packet plus its HTTP request.
@@ -1636,10 +1668,15 @@ class SlimProtoClient:
 
         # Normal LMS proxy stream: autostart=1.  The player starts after
         # HTTP headers; it must not wait for a cont frame.
+        threshold = stream_buffer_threshold(
+            track_path.stat().st_size
+            if track_path is not None and track_path.is_file() else None,
+        )
         frame = self._build_stream_frame(
             request=request, codec=codec, autostart=1,
             server_port=self.web_port,
             pcm_params=pcm_params,
+            threshold=threshold,
         )
         # Close the previous /stream.mp3 response for this player (Perl's
         # ``closeStream()`` — Squeezebox2.pm:398-403 "always use a new
@@ -1924,6 +1961,7 @@ class SlimProtoClient:
         frame = self._build_stream_frame(
             request=request, codec=codec, autostart=3,
             server_port=port, server_ip=server_ip, flags=flags,
+            threshold=stream_buffer_threshold(remote=True),
         )
         try:
             writer.write(frame)
@@ -1963,6 +2001,7 @@ class SlimProtoClient:
         frame = self._build_stream_frame(
             request=request, codec=codec, autostart=1,
             server_port=self.web_port,
+            threshold=stream_buffer_threshold(remote=True),
         )
         try:
             writer.write(frame)
