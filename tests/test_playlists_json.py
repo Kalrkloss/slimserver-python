@@ -69,7 +69,12 @@ def test_playlists_new_creates_row_without_constraint_error(lib_db):
     assert len(rows) == 1
     assert rows[0][0] == "Test-Playlist"
     assert rows[0][1] == 0 and rows[0][2] == 0
-    assert any("new:" in line for line in out)
+    # Ein-Zeilen-Format wie Perl: Werte und Trenner sind `%3A`-kodiert
+    # (live gegen Perl 9.1.1: `search 0 2 term:night` → `search 0 2
+    # term%3Anight rescan%3A1`), siehe Commit 8e324c8b1 / CTRL-02.
+    assert len(out) == 1 and "\n" not in out[0]
+    assert out[0].startswith("playlists new Test-Playlist ")
+    assert "playlist_id%3A" in out[0]
 
 
 def test_json_playlists_lists_saved(lib_db):
