@@ -2695,8 +2695,16 @@ class SlimProtoClient:
                             player._last_stmd = None  # consume the signal
                             player.forget_stream()
                             asyncio.create_task(_advance_after_track(pm, mac_str))
-                        elif player.mode != "play" and getattr(player, "remote", 0):
-                            player.mode = "play"
+                        # NOTE: the heartbeat must NOT set mode=play by itself.
+                        # Perl's STAT dispatch (Squeezebox2.pm:150-178) has no
+                        # 'STMt' branch — it falls through to the final `else`
+                        # = playerStatusHeartbeat, which changes no playing
+                        # state; 'STMs' (playerTrackStarted, :170-171) is what
+                        # starts playback. The old blanket
+                        # `elif mode != play and remote: mode = play` therefore
+                        # resurrected a stream the user had just stopped
+                        # (live: after `strm 'q'` the next heartbeat tick
+                        # flipped the status back to play).
                     elif event == "STMd":
                         # DECODE_COMPLETE — decoder has no more data. With
                         # small local files this fires LONG before the

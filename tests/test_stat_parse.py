@@ -489,3 +489,25 @@ async def test_strm_to_disconnected_player_returns_false(monkeypatch):
 def test_control_frame_rejects_multichar_command():
     with pytest.raises(ValueError):
         SlimProtoClient._build_strm_control_frame("pp")
+
+
+def test_statt_heartbeat_does_not_resurrect_a_stopped_remote_stream(monkeypatch):
+    """Perl's STAT dispatch (Squeezebox2.pm:150-178) has NO 'STMt' branch: the
+    timing heartbeat falls through to the final `else` =
+    playerStatusHeartbeat, which changes no playing state. Only 'STMs'
+    (playerTrackStarted, :170-171) starts playback.
+
+    Live bug this locks down: after a user stop (`strm 'q'`) the next
+    heartbeat tick flipped our status back to mode=play for radio streams
+    (the old blanket `elif mode != play and remote: mode = play`).
+    """
+    client, player = _client_and_player(monkeypatch, mode="stop", remote=1)
+    client._handle_stat_frame(player.mac, b"STMt" + bytes(47))
+    assert player.mode == "stop"
+
+
+def test_stms_still_starts_a_remote_stream(monkeypatch):
+    """Positive control: STMs (playerTrackStarted) sets play."""
+    client, player = _client_and_player(monkeypatch, mode="stop", remote=1)
+    client._handle_stat_frame(player.mac, b"STMs" + bytes(47))
+    assert player.mode == "play"
