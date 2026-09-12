@@ -11,6 +11,21 @@ from typing import Any, Callable, Optional
 
 logger = logging.getLogger(__name__)
 
+# Perl-Defaults der Client-Prefs, die die Jive-Settings-Seiten abfragen
+# (Squeezebox2.pm:23-60 `%prefs`; ReplayGain-Werte :47-49). Nur die Werte, die
+# eine `playerpref <name> ?`-Abfrage beantworten muss, ohne dass der Player
+# die Pref je gesetzt hat.
+_PLAYERPREF_DEFAULTS = {
+    "replayGainMode": 0,          # Squeezebox2.pm:47
+    "remoteReplayGain": -5,       # :48
+    "localReplayGain": 0,         # :49
+    "digitalVolumeControl": 1,
+    "preampVolumeControl": 0,
+    "bass": 0, "treble": 0, "pitch": 100,
+    "transitionType": 0, "transitionDuration": 0,
+}
+
+
 # SqueezePlay sends locally maintained parameters (volume, power) with a
 # `seq_no:<N>` param and expects the same number back in the playerstatus
 # (`seq_no`) and in the audg frame. Perl stores it per client
@@ -1976,6 +1991,18 @@ class JSONRPCAPI:
             from lyrion.config import get_config
             val = get_config().get(key, "")
             return {key: val}
+
+        # playerpref <pref> [?] — Leseform. Perl beantwortet den Wert unter dem
+        # Schlüssel `_p<N>`, wobei N der Index des `?`-Tokens in
+        # (command + args) ist; live gegen Perl 9.1.1 geprüft:
+        #   playerpref replayGainMode ?  →  {"_p2":"0"}
+        if cmd == "playerpref" and args and any(str(a) == "?" for a in args):
+            player = pm.get_player(pid) if pid else None
+            pref = str(args[0])
+            prefs = dict(getattr(player, "playerprefs", {}) or {}) if player else {}
+            val = prefs.get(pref, _PLAYERPREF_DEFAULTS.get(pref, ""))
+            idx = ["playerpref"] + [str(a) for a in args]
+            return {f"_p{idx.index('?')}": str(val)}
 
         if cmd in ("pause", "power", "play", "stop", "mixer", "sync",
                    "unsync", "pref", "playerpref", "display", "button",

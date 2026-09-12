@@ -159,3 +159,30 @@ def test_cli_playerpref_applies_too():
     asyncio.run(handler.dispatch(ctx, ("playerpref", ["bass", "7"])))
     assert p.bass == 7
     assert p.playerprefs["bass"] == "7"
+
+
+# ── Leseform `playerpref <pref> ?` (Queries.pm) ─────────────────────────────
+# Perl beantwortet den Wert unter `_p<N>` mit N = Index des `?`-Tokens in
+# (command + args). Live gegen Perl 9.1.1 geprüft (read-only):
+#   playerpref replayGainMode ?  →  {"_p2":"0"}
+
+
+def test_playerpref_query_returns_the_default_as_p2():
+    res = _req(["playerpref", "replayGainMode", "?"], _player())
+    assert res == {"_p2": "0"}
+
+
+def test_playerpref_query_returns_the_stored_value():
+    p = _player(playerprefs={"replayGainMode": "2"})
+    assert _req(["playerpref", "replayGainMode", "?"], p) == {"_p2": "2"}
+
+
+def test_playerpref_query_remote_default_is_minus_five():
+    # Squeezebox2.pm:48 remoteReplayGain = -5
+    res = _req(["playerpref", "remoteReplayGain", "?"], _player())
+    assert res == {"_p2": "-5"}
+
+
+def test_playerpref_query_unknown_pref_is_empty():
+    res = _req(["playerpref", "gibtsNicht", "?"], _player())
+    assert res == {"_p2": ""}
