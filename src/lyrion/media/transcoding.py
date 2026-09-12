@@ -10,6 +10,22 @@ is the real 80-rule table, not a hand-maintained subset.
 
 Perl citations
 --------------
+Application site (where the rule is actually used)
+* ``Slim/Player/Song.pm:402``      ``if (main::TRANSCODING)``
+* ``Slim/Player/Song.pm:417-428``  per-format ``getConvertCommand2`` call +
+                                   ``PROBLEM_CONVERT_FILE`` when nothing matches
+* ``Slim/Player/Song.pm:463-468``  ``TRANSCODING`` off → ``command => '-'``
+* ``Slim/Player/Song.pm:476-480``  ``command eq '-'`` + ``canDirectStream``
+* ``Slim/Player/Song.pm:576-586``  real command → ``tokenizeConvertCommand2``
+* ``Slim/Player/Song.pm:630-631``/``:687-688``  chosen ``streamformat``
+* ``Slim/Player/Song.pm:763``      ``streamformat`` accessor
+* ``Slim/Player/StreamingController.pm:1316``  ``'format' => $song->streamformat()``
+* ``Slim/Player/Squeezebox.pm:186``/``:549``   ``stream_s`` takes ``format``
+* ``Slim/Player/Squeezebox.pm:574-781``        ``format`` → ``formatbyte``
+* ``Slim/Player/CapabilitiesHelper.pm:38-59``  ``supportedFormats($client)``
+* ``Slim/Utils/Prefs.pm:205``      ``prioritizeNative => 1``
+
+Rule table (this module)
 * ``Slim/Player/TranscodingHelper.pm:51-135``  ``loadConversionTables``
 * ``Slim/Player/TranscodingHelper.pm:193-225`` ``_getCapabilities``
 * ``Slim/Player/TranscodingHelper.pm:263-307`` ``checkBin`` (``[bin]`` lookup)
@@ -17,6 +33,11 @@ Perl citations
 * ``Slim/Player/TranscodingHelper.pm:519-673`` ``tokenizeConvertCommand2``
 * ``Slim/Music/Info.pm:92-159``               ``loadTypesConfig``
 * ``Slim/Utils/Prefs.pm:176-178``             ``searchSubString`` / ``splitList``
+
+Note on ``Slim/Player/Source.pm``: in the pinned reference (public/9.2 @
+``d1d0a683``) that file contains no ``TranscodingHelper`` call at all — it is
+the stream chunk pump (``Source.pm:107-410`` ``nextChunk``/``_readNextChunk``).
+The rule is applied in ``Song.pm`` as cited above.
 """
 from __future__ import annotations
 
@@ -26,6 +47,8 @@ import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Iterable, Sequence
+
+from lyrion.formats.lms_types import FORMAT_TO_EXTENSION, format_extension
 
 logger = logging.getLogger(__name__)
 
@@ -223,6 +246,41 @@ def load_types_config(paths: Iterable[Path | str] = ()) -> TypesConfig:
 
 
 # ---------------------------------------------------------------------------
+# client capability tokens → Perl type
+# ---------------------------------------------------------------------------
+
+def _build_token_to_type() -> dict[str, str]:
+    """Perl type for every vocabulary a player capability can use.
+
+    Perl pushes the *raw* lowercase HELO tokens into ``myFormats``
+    (``SqueezePlay.pm:170-200``) — they ARE Perl type names there
+    (``SqueezePlay.pm:59`` ``ogg flc aif pcm mp3``).  Our port stores the
+    advertised formats as *extensions* (``FORMAT_TO_EXTENSION``, set by
+    ``player.manager.formats_from_capabilities``), so a capability token has
+    to be mapped back to the Perl type name that ``convert.conf`` profiles
+    are built from (``TranscodingHelper.pm:371-386`` ``"$type-$checkFormat-…"``).
+    """
+    mapping: dict[str, str] = {}
+    for perl_type, extension in FORMAT_TO_EXTENSION.items():
+        mapping.setdefault(extension, perl_type)   # "flac" -> "flc"
+        mapping.setdefault(perl_type, perl_type)   # "flc"  -> "flc"
+    return mapping
+
+
+_FORMAT_TOKEN_TO_TYPE: dict[str, str] = _build_token_to_type()
+
+
+def format_token_to_perl_type(token: str) -> str:
+    """Perl file type a player capability token denotes (see above).
+
+    Unknown tokens are returned unchanged: a token we cannot map must not be
+    silently turned into a different format.
+    """
+    token = (token or "").strip().lower()
+    return _FORMAT_TOKEN_TO_TYPE.get(token, token)
+
+
+# ---------------------------------------------------------------------------
 # cached singletons
 # ---------------------------------------------------------------------------
 
@@ -370,6 +428,142 @@ def get_convert_command(
             return transcoder
 
     return backup
+
+
+# ---------------------------------------------------------------------------
+# stream rule selection — the part the streaming path actually uses
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class StreamRule:
+    """What ``getConvertCommand2`` decides for one track (Perl Song.pm:419).
+
+    ``needs_conversion`` is True only for a profile with a real command; a
+    ``'-'`` command is a passthrough (Perl Song.pm:476-480 / :463-468) and
+    means the source is streamed unchanged.  ``streamformat`` is the Perl type
+    of the bytes that would leave the server — it becomes the ``strm`` format
+    byte (Song.pm:687-688 → StreamingController.pm:1316 →
+    Squeezebox.pm:549-781).
+    """
+
+    source_type: str | None
+    client_formats: tuple[str, ...] = ()
+    native: bool = False
+    needs_conversion: bool = False
+    profile: str | None = None
+    command: str | None = None
+    streamformat: str | None = None
+    reason: str = ""
+
+    def describe(self) -> str:
+        """One line naming the Perl rule and why it applies (for the log)."""
+        client = ",".join(self.client_formats) or "-"
+        if self.reason == "unknown-source-type":
+            return (f"no Perl type for this track — nothing to convert "
+                    f"(client formats: {client})")
+        if self.reason == "client-declares-no-formats":
+            return (f"client declares no formats (?) — keeping the source "
+                    f"stream for {self.source_type}")
+        if self.reason == "passthrough":
+            return (f"{self.source_type} is natively supported — rule "
+                    f"{self.profile} (command '-') keeps the source stream")
+        if self.reason == "no-rule":
+            return (f"no convert.conf profile matched {self.source_type} for "
+                    f"client formats {client} (Perl: PROBLEM_CONVERT_FILE, "
+                    f"Song.pm:426-428)")
+        return (f"{self.source_type} -> {self.streamformat} via {self.profile} "
+                f"({self.command}; client formats: {client})")
+
+
+def _profile_order(
+    source_type: str | None, client_formats: Iterable[str]
+) -> tuple[list[str], bool]:
+    """Perl's ``@supportedformats`` order plus the native flag.
+
+    ``TranscodingHelper.pm:355-357`` fills the list from
+    ``CapabilitiesHelper::supportedFormats`` (CapabilitiesHelper.pm:38-59);
+    with the default pref ``prioritizeNative = 1`` (Prefs.pm:205, :359-366)
+    the source's own type is moved to the FRONT so the ``<type>-<type>-*-*``
+    passthrough profile is tried first.
+
+    Our port keeps the advertised formats as a *set*
+    (``player.supported_formats``), so the HELO preference order (SqueezePlay
+    ``ogg flc aif pcm mp3``, SqueezePlay.pm:59) is not recoverable here.  The
+    remaining formats are therefore ordered deterministically; when several
+    conversion targets are possible this can pick a different — equally valid
+    — profile than Perl would.  That only widens which rule is *named*; the
+    delivered stream is not affected (no external converter is started).
+    """
+    advertised = {
+        str(token).strip().lower() for token in (client_formats or ()) if token
+    }
+    native = bool(source_type) and format_extension(source_type) in advertised
+
+    perl_types: list[str] = []
+    for token in sorted(advertised):
+        perl_type = format_token_to_perl_type(token)
+        if perl_type and perl_type not in perl_types:
+            perl_types.append(perl_type)
+
+    if source_type and source_type in perl_types:
+        perl_types.remove(source_type)
+        perl_types.insert(0, source_type)              # Prefs.pm:205
+    return perl_types, native
+
+
+def select_stream_rule(
+    source_type: str | None,
+    client_formats: Iterable[str],
+    *,
+    player: str | None = None,
+    clientid: str | None = None,
+    stream_modes: Sequence[str] = ("I", "F"),
+    find_bin: Callable[[str], str | None] = shutil.which,
+    tables: ConversionTables | None = None,
+) -> StreamRule:
+    """Pick the conversion Perl would apply to ``source_type`` — or none.
+
+    ``client_formats`` are the formats the client advertised in its HELO caps
+    (our port's extension vocabulary, see :func:`format_token_to_perl_type`);
+    an empty/unknown set means "we cannot ask the player", which must never
+    turn into a conversion (the same assumption as
+    ``Squeezebox._player_can_decode``).
+
+    ``stream_modes`` defaults to ``I``/``F``: a local file is opened as a
+    stream (``I``) or read from disk (``F``) — Perl Song.pm:407-410 pushes
+    ``I`` (unless seeking through a transcoder) and ``F`` for a non-remote
+    handler, ``R`` only for remote ones.
+    """
+    tables = tables or get_conversion_tables()
+    ordered, native = _profile_order(source_type, client_formats)
+    common = (source_type, tuple(ordered), native)
+
+    if not source_type:
+        return StreamRule(*common, reason="unknown-source-type")
+    if not ordered:
+        return StreamRule(*common, reason="client-declares-no-formats")
+
+    transcoder = get_convert_command(
+        source_type, ordered,
+        player=player, clientid=clientid, stream_modes=stream_modes,
+        command_table=tables.command_table, capabilities=tables.capabilities,
+        find_bin=find_bin,
+    )
+    if transcoder is None:
+        # Perl fails the play here (Song.pm:426-428 logError + no transcoder);
+        # the streaming path must not, see protocol._stream_track_to_player.
+        return StreamRule(*common, reason="no-rule")
+
+    command = transcoder.get("command") or ""
+    fields = {
+        "profile": transcoder.get("profile"),
+        "command": command,
+        "streamformat": transcoder.get("streamformat"),
+    }
+    if command == "-":
+        return StreamRule(*common, **fields, reason="passthrough")
+    return StreamRule(*common, **fields, needs_conversion=True,
+                      reason="convert")
 
 
 # ---------------------------------------------------------------------------

@@ -1640,6 +1640,56 @@ class SlimProtoClient:
             return format_extension(perl_type) in formats
         return SlimProtoClient._codec_to_extension(codec) in formats
 
+    @staticmethod
+    def _stream_rule_for_track(mac: str, perl_type: str | None, player):
+        """Which convert.conf rule Perl would apply to this track (or none).
+
+        Perl citation chain:
+
+        * ``Slim/Player/Song.pm:417-424`` — for every format the client
+          advertised, ``Slim::Player::TranscodingHelper::getConvertCommand2(
+          $self, $_, \\@streamFormats, [], \\@wantOptions)`` is called; the
+          first hit wins (``last if $transcoder``).
+        * ``Slim/Player/TranscodingHelper.pm:355-357`` — the candidate list is
+          ``CapabilitiesHelper::supportedFormats($client)``
+          (``CapabilitiesHelper.pm:38-59``), i.e. ``$client->formats()``, which
+          a client with HELO caps fills from those caps
+          (``SqueezePlay.pm:170-200``); ``Prefs.pm:205`` defaults
+          ``prioritizeNative`` to 1, so the source's own type is tried first
+          (``TranscodingHelper.pm:359-366``).
+        * ``Song.pm:426-428`` — no transcoder at all is an error
+          (``PROBLEM_CONVERT_FILE``); ``Song.pm:476-480`` — a ``'-'`` command
+          means the source is streamed as-is.
+
+        The result is *selection only*: our port starts no external converter,
+        so the caller (:meth:`_stream_track_to_player`) keeps the frame
+        consistent with what it really delivers. ``None`` means the lookup
+        itself failed (never a reason to convert).
+        """
+        formats: tuple[str, ...] = ()
+        model = None
+        if player is not None:
+            formats = tuple(getattr(player, "supported_formats", None) or ())
+            model = getattr(player, "model", None)
+        try:
+            from lyrion.media.transcoding import select_stream_rule
+            rule = select_stream_rule(
+                perl_type, formats,
+                player=model,
+                clientid=mac.upper().replace(":", ""),
+                # A local file is offered as a stream ('I') or as a file ('F'):
+                # Perl pushes 'I' (unless seeking through a transcoder) and
+                # 'R'/'F' depending on whether the handler is remote
+                # (Song.pm:407-410).
+                stream_modes=("I", "F"),
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("transcode rule lookup failed for %s: %s", mac, exc)
+            return None
+        logger.info("transcode rule for %s (%s): %s",
+                    mac, perl_type, rule.describe())
+        return rule
+
     def _replay_gain_fixed(self, mac: str, track_id: int) -> int:
         """dBToFixed des anzuwendenden ReplayGain für einen lokalen Track.
 
@@ -2106,24 +2156,67 @@ class SlimProtoClient:
         if perl_type in ("mp4", "aac"):
             pcm_params = (pcm_samplesize_for(perl_type), "?", "?", "?")
 
-        # ── Format fallback: if the player cannot decode this format, run an
-        # ffmpeg transcode to raw PCM (strm codec 'p') instead of streaming
-        # the source. Perl asks the player's declared formats
-        # (CapabilitiesHelper::supportedFormats → $client->formats(), which
-        # SqueezePlay.pm:170-200 fills from the HELO caps). If ffmpeg is
-        # missing, fall back to the direct stream (the LMS must keep
-        # working) and surface a Status-bar notice.
+        # ── Transcoding rule + client decode capability ─────────────────────
+        # Perl asks the convert.conf rule table which profile applies and uses
+        # the profile's streamformat as the strm format byte:
+        #   Song.pm:417-424  getConvertCommand2($song, $type, \@streamFormats,
+        #                    [], \@wantOptions)  — per advertised format
+        #   Song.pm:426-428  no transcoder → logError + PROBLEM_CONVERT_FILE
+        #   Song.pm:476-480  command '-' → the source itself is streamed
+        #   Song.pm:576-586  a real command starts the converter's process
+        #   Song.pm:630-631/:687-688  _streamFormat($transcoder->{streamformat})
+        #   StreamingController.pm:1316 'format' => $song->streamformat()
+        #   Squeezebox.pm:549-781       $format → $formatbyte
+        # The advertised formats come from the HELO caps
+        # (CapabilitiesHelper.pm:38-59 → $client->formats(); SqueezePlay.pm:
+        # 170-200), which our port keeps as ``player.supported_formats``.
+        #
+        # Our port starts NONE of the external converters the profiles name
+        # ([flac]/[sox]/[lame]…, tokenizeConvertCommand2
+        # TranscodingHelper.pm:519-673) — it can only deliver the source file
+        # or raw PCM via the /stream.mp3 ffmpeg path. The frame therefore
+        # never announces a format we will not send: the selected rule is
+        # logged (name + reason), and the codec byte follows what is really
+        # delivered.
+        player = None
         try:
             from lyrion.player.manager import PlayerManager
             player = PlayerManager().get_player(mac)
-            if player is not None and not SlimProtoClient._player_can_decode(
-                    player, codec, perl_type=perl_type):
-                from lyrion.web.stream import ffmpeg_available, ffprobe_audio_info, _set_server_notice
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("player lookup for %s failed: %s", mac, exc)
+
+        rule = self._stream_rule_for_track(mac, perl_type, player)
+        natively_supported = SlimProtoClient._player_can_decode(
+            player, codec, perl_type=perl_type)
+
+        if natively_supported:
+            if rule is not None and rule.needs_conversion:
+                # Table says "convert", the client says "I can play it".
+                # Perl would only convert if the identity profile were
+                # missing; keeping the playable source is the safe reading —
+                # a frame for a format we do not deliver leaves the player
+                # silent.
+                logger.info(
+                    "track %d (%s): client %s decodes natively, rule %s "
+                    "(target %s) not applied — source stream kept",
+                    track_id, perl_type, mac, rule.profile,
+                    rule.streamformat,
+                )
+        else:
+            reason = rule.describe() if rule is not None else "no rule table"
+            try:
+                from lyrion.web.stream import (
+                    ffmpeg_available,
+                    ffprobe_audio_info,
+                    _set_server_notice,
+                )
                 if not ffmpeg_available():
                     _set_server_notice("ffmpeg not found - transcoding not possible")
                     logger.warning(
-                        "track %d codec %s not decodable by %s and no ffmpeg; "
-                        "serving source directly", track_id, codec, mac,
+                        "track %d format %s (%s) not decodable by %s and no "
+                        "converter (Perl rule: %s) — serving the source "
+                        "directly",
+                        track_id, perl_type, codec, mac, reason,
                     )
                 else:
                     info = (ffprobe_audio_info(track_path)
@@ -2134,21 +2227,28 @@ class SlimProtoClient:
                             "bits": info["bits"], "rate": info["rate"],
                             "channels": info["channels"], "bigendian": False,
                         })
-                        logger.info(
-                            "track %d format %s (%s) not natively decodable by %s — "
-                            "transcoding to PCM via ffmpeg (%d/%d/%d)",
-                            track_id, perl_type, codec, mac, info["bits"],
-                            info["rate"], info["channels"],
-                        )
-                        codec = "p"
+                        source_codec = codec
+                        codec = "p"          # Squeezebox.pm:595-597 (pcm)
                         transcode_requested = True
+                        logger.info(
+                            "track %d format %s (%s) not decodable by %s — "
+                            "transcoding to raw PCM via ffmpeg (%d/%d/%d); "
+                            "Perl rule: %s%s",
+                            track_id, perl_type, source_codec, mac, info["bits"],
+                            info["rate"], info["channels"], reason,
+                            "" if rule is None or rule.streamformat == "pcm"
+                            else " (rule target %s not implemented — raw PCM "
+                                 "delivered instead)" % rule.streamformat,
+                        )
                     else:
                         logger.warning(
                             "track %d codec %s not decodable, ffprobe failed; "
-                            "serving source directly", track_id, codec,
+                            "serving source directly (Perl rule: %s)",
+                            track_id, codec, reason,
                         )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Format-fallback decision failed for track %d: %s", track_id, exc)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Transcode decision failed for track %d: %s",
+                               track_id, exc)
 
         # For raw-PCM codecs the strm frame must carry the explicit format
         # (squeezelite pcm_open reads it straight from the frame); parse the
