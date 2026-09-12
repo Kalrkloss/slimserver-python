@@ -172,11 +172,79 @@ class PlayerManager:
         self._initialized = True
         self.players: dict[str, PlayerState] = {}
         self._protocol_handler = None
+        # PROT-18 display wiring (lazily bound to _protocol_handler).
+        self._display_wiring = None
         logger.info("PlayerManager initialized")
 
     def set_protocol_handler(self, handler) -> None:
         """Inject the SlimProto server for sending commands to players."""
         self._protocol_handler = handler
+        self._display_wiring = None  # rebind the display wiring to the new handler
+
+    # ------------------------------------------------------------------
+    # Display wiring (PROT-18)
+    # ------------------------------------------------------------------
+
+    def display_wiring(self):
+        """The :class:`~lyrion.player.display.DisplayWiring` for this handler."""
+        from .display import DisplayWiring
+
+        handler = self._protocol_handler
+        if handler is None:
+            return None
+        # getattr/setattr: some tests build the singleton with object.__new__.
+        wiring = getattr(self, "_display_wiring", None)
+        if wiring is None:
+            wiring = DisplayWiring(handler)
+            self._display_wiring = wiring
+        return wiring
+
+    async def _display_update(self, player: PlayerState) -> list[str]:
+        """Perl ``$client->update()`` — ``Player.pm:152`` -> ``Display.pm:141``.
+
+        Zustandswechsel rufen es direkt (Track-Start ``Player.pm:1115-1116``,
+        ``:1250-1252``). Ohne Renderer im Port gehen nur die Frames raus, die
+        Perl ohne Renderer baut (``visu``; ``grfb`` über
+        :meth:`_display_power`).
+        """
+        wiring = self.display_wiring()
+        if wiring is None:
+            return []
+        try:
+            return await wiring.update(player)
+        except Exception as exc:  # noqa: BLE001 — Display darf nie stören
+            logger.debug("display update for %s failed: %s", player.mac, exc)
+            return []
+
+    async def _display_power(self, player: PlayerState, on: bool) -> list[str]:
+        """Perl ``Player::power`` — ``Player.pm:255-290`` (Helligkeit + Update)."""
+        wiring = self.display_wiring()
+        if wiring is None:
+            return []
+        try:
+            return await wiring.power(player, on)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("display power for %s failed: %s", player.mac, exc)
+            return []
+
+    async def display_on_connect(self, mac: str) -> list[str]:
+        """Perl-Connect-Displaypfad — ``Player.pm:114-124`` + ``Squeezebox.pm:124-134``.
+
+        Setzt die Helligkeit (``powerOn/OffBrightness``) und erzwingt den
+        Visualizer (``Squeezebox.pm:134``). NoDisplay bricht vorher ab
+        (``Player.pm:114``).
+        """
+        player = self.get_player(mac)
+        if player is None:
+            return []
+        wiring = self.display_wiring()
+        if wiring is None:
+            return []
+        try:
+            return await wiring.on_connect(player)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("display on connect for %s failed: %s", mac, exc)
+            return []
 
     # ------------------------------------------------------------------
     # Registration
@@ -527,6 +595,13 @@ class PlayerManager:
             loop.create_task(self.send_audio_outputs(mac, on))
         except RuntimeError:
             pass  # no running loop — state-only fallback
+        # PROT-18: Perl's power path also drives the display
+        # (Player.pm:255-259 power-off brightness, :277-287 power-on).
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(self._display_power(player, on))
+        except RuntimeError:
+            pass  # no running loop — state-only fallback
         if not on:
             # Power off = stop playback (SlimProto strm 'q') + standby. The
             # stop-frame send is async; schedule it on the running loop (all
@@ -552,6 +627,9 @@ class PlayerManager:
             return
         player.power = True
         await self.send_audio_outputs(player.mac, True)
+        # PROT-18: Perl's power-on also re-initialises the display
+        # (Player.pm:265-290: update + brightness(powerOnBrightness) >= 1).
+        await self._display_power(player, True)
 
     async def send_audio_outputs(self, mac: str, enabled: bool) -> bool:
         """Perl ``audio_outputs_enable`` — 'aude' frame (spdif + dac).
@@ -807,6 +885,10 @@ class PlayerManager:
             except Exception:
                 pass
             player.last_activity = time.time()
+            # PROT-18: a new track is a screen change — Perl re-renders the
+            # display when buffering ends / the track starts
+            # (Player.pm:1115-1116, :1250-1252).
+            await self._display_update(player)
         return ok
 
     async def play_url(self, player_id: str, url: str, title: str = "") -> bool:
@@ -859,6 +941,8 @@ class PlayerManager:
             player.remote = 1  # radio stream: never "track end"
             player.mode = "play"
             player.last_activity = time.time()
+            # PROT-18: screen change on a new stream (Player.pm:1115-1116).
+            await self._display_update(player)
             logger.info("play_url %s: %s (%s)", player_id, title or url, url[:60])
         else:
             player.playlist = old_playlist
@@ -885,6 +969,9 @@ class PlayerManager:
         if ok:
             player.mode = "stop"
             player.last_activity = time.time()
+            # PROT-18: playmode change -> the always-on visualizer is hidden
+            # (Squeezebox2.pm:252-257 showVisualizer, :301-305 -> visu [0]).
+            await self._display_update(player)
         return ok
 
     async def pause_player(self, player_id: str, pause: bool) -> bool:
@@ -925,6 +1012,8 @@ class PlayerManager:
                 # Kept so a stray STAT stop-ack cannot flip mode to "stop".
                 player.pause_requested = True
                 player.last_activity = time.time()
+                # PROT-18: playmode change (Squeezebox2.pm:252-257/:301-305).
+                await self._display_update(player)
             return ok
         # resume — continue the paused output in place, never re-stream
         ok = await handler.send_unpause_to_player(player.mac)
@@ -935,6 +1024,9 @@ class PlayerManager:
             # (Perl _JumpOrResume jumps to resumeTime, StreamingController.pm:1605-1614).
             player.elapsed = float(getattr(player, "pause_time", 0.0) or 0.0)
             player.last_activity = time.time()
+            # PROT-18: playmode change -> the always-on visualizer returns
+            # (Squeezebox2.pm:252-257).
+            await self._display_update(player)
         return ok
 
     # ------------------------------------------------------------------
@@ -1000,29 +1092,46 @@ class PlayerManager:
     async def show_display(
         self, player_id: str, line1: str, line2: str, duration: int = 1
     ) -> bool:
-        """Show a two-line text message on a player (slimproto 'grfe' frame).
+        """Show a two-line message on a player's display.
 
-        Args:
-            player_id: Player MAC address.
-            line1: First display line.
-            line2: Second display line.
-            duration: How many seconds to show the message. Defaults to 1 s
-                like Perl (``Display.pm:258`` "$duration =
-                $args->{'duration'} || 1; # duration - default to 1 second").
-                Was an invented 3 s.
+        Perl: the ``display`` command (``Commands.pm:444-472``) wakes the
+        screensaver and calls ``$client->showBriefly({line => [$line1, $line2]},
+        $duration, $p4)`` — ``Display.pm:221-327`` renders the screen (:298) and
+        restores the old one after ``duration`` seconds (``endShowBriefly`` via
+        timer, :325). ``duration`` defaults to 1 s (``Display.pm:258``), the same
+        value as the ``displaytexttimeout`` pref (``Utils/Prefs.pm:169``).
+
+        PROT-18: the rendered payload of a graphics display is a Bitmap
+        (``grfe``, Squeezebox2.pm:243-248) and of a Text display a TextVFD
+        stream (``vfdc``, Text.pm:437-441). The port has neither renderer, so
+        there are no bytes to send; this runs the Perl update path (visualizer)
+        and returns whether a frame actually went out instead of pushing the
+        invented ``format/duration/line`` text-grfe payload that had no
+        Perl source (see ``SlimProtoClient.send_display_to_player``).
 
         Returns:
-            True if the frame was sent to a connected player.
+            True if at least one display frame was sent.
         """
         player = self.get_player(player_id)
         if player is None:
             return False
-        handler = self._protocol_handler
-        if handler is None:
+        wiring = self.display_wiring()
+        if wiring is None:
             return False
-        return await handler.send_display_to_player(
-            player.mac, line1, line2, duration
-        )
+        try:
+            # No ``sleep``: the wait for Perl's endShowBriefly timer must not
+            # block the CLI/JSON request that called us.
+            sent = await wiring.show_briefly(player, duration=duration)
+        except Exception as exc:  # noqa: BLE001 — Display darf nie stören
+            logger.debug("show_display for %s failed: %s", player_id, exc)
+            return False
+        if not sent:
+            logger.info(
+                "show_display %s: %r/%r — kein Frame: der Perl-Renderer "
+                "(Graphics.pm:106-489 / TextVFD.pm:312-357) fehlt im Port",
+                player_id, line1, line2,
+            )
+        return bool(sent)
 
     async def playlist_play(self, player_id: str, index: int) -> bool:
         """Play the track at a playlist index (0-based)."""

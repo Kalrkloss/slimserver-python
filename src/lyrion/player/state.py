@@ -104,6 +104,10 @@ class PlayerState:
     sync_master: Optional[str] = None
     sync_slaves: list[str] = field(default_factory=list)
     display_state: Optional[dict] = None
+    # HELO-Capability-Bit ``$bitmapped = $wlan_channellist & 0x8000``
+    # (Slimproto.pm:955/:972). Es entscheidet die Display-Klasse der SB1:
+    # SqueezeboxG (bitmapped) vs Text (Slimproto.pm:1063-1070).
+    bitmapped: bool = False
     last_activity: float = field(default_factory=time.time)
     name_source: str = "device"  # "device" | "display" | "setd" (highest)
 

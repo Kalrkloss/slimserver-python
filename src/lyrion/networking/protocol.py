@@ -377,6 +377,10 @@ VFD_MAX_BYTES = 500
 # (Squeezebox2.pm:180-182 bytesPerColumn + :188-190 displayWidth = 1-bit
 # 320x32 = 1280 bytes).
 DISPLAY_FRAMEBUF_BYTES_SB2 = 1280
+# The bitmapped SB1 ('grfd') header: SqueezeboxG.pm:34
+# ``my $GRAPHICS_FRAMEBUF_LIVE = (1 * 280 * 2);`` — 560, and that same value is
+# the bitmap size (bytesPerColumn 2 × displayWidth 280, Graphics.pm:93-103).
+GRAPHICS_FRAMEBUF_LIVE = 560
 
 # ── Perl slimproto opcode table (4 ASCII bytes) ───────────────────────────
 # Slim/Networking/Slimproto.pm:52-72 `%message_handlers`. The opcode is the
@@ -1188,6 +1192,17 @@ class SlimProtoClient:
                 except Exception as exc:
                     logger.warning("aude state failed for %s: %s", mac_str, exc)
 
+                # ── Display on connect (PROT-18) ──
+                # Perl Player.pm:114-124 + Squeezebox.pm:124-134: after the aude
+                # state it sets brightness(powerOn/OffBrightness) and forces the
+                # visualiser (Squeezebox.pm:134, the only $forceSend call). A
+                # NoDisplay client returns at Player.pm:114 — before all of it.
+                try:
+                    from lyrion.player.manager import PlayerManager as _DisplayPM
+                    await _DisplayPM().display_on_connect(mac_str)
+                except Exception as exc:
+                    logger.debug("display on connect failed for %s: %s", mac_str, exc)
+
                 # ── Read loop: binary slimproto frames from player ──
                 # Player → server framing (from LMS Slim/Networking/Slimproto.pm
                 # client_readable): 4-byte ASCII opcode + 4-byte BE length + payload.
@@ -1388,6 +1403,15 @@ class SlimProtoClient:
                 await self._send_aude_state(mac_formatted)
             except Exception as exc:
                 logger.warning("aude state failed for %s: %s", mac_formatted, exc)
+
+            # ── Display on connect (PROT-18) ──
+            # Same Perl block as the binary path: Player.pm:114-124 +
+            # Squeezebox.pm:124-134 (brightness + forced visualiser).
+            try:
+                from lyrion.player.manager import PlayerManager as _DisplayPM
+                await _DisplayPM().display_on_connect(mac_formatted)
+            except Exception as exc:
+                logger.debug("display on connect failed for %s: %s", mac_formatted, exc)
 
             # Read loop for this player
             while True:
@@ -2806,6 +2830,21 @@ class SlimProtoClient:
         nowhere else in this Perl tree (``Slim/Display/*.pm`` +
         ``Slim/Player/Squeezebox.pm``), so a caller that wants the Perl bytes
         must use the framebuffer sender.
+
+        WARNING — no Perl counterpart (PROT-18 wiring, 2026-09-12): a census of
+        every ``sendFrame`` in the Perl tree shows exactly one ``'grfe'``
+        sender, ``Squeezebox2.pm:248``, and it carries
+        ``pack('n', $offset) . $transition . pack('c', $param) . $bits``
+        (:243-248) — never a text payload. There is no ``dispc`` opcode and no
+        text-grfe anywhere in ``Slim/``. Perl puts text on a graphics display by
+        RENDERING it (``Graphics.pm:106-489``) and sending the bitmap, and on a
+        Text display by building a TextVFD stream (``Text.pm:437-441`` ->
+        ``TextVFD.pm:312-357`` -> ``Squeezebox.pm:495-502``, opcode ``vfdc``).
+        This method's ``format/duration/line1/line2`` payload is therefore an
+        invention: it is kept only because ``tests/test_display_frame.py`` pins
+        its bytes, and the display wiring
+        (:mod:`lyrion.player.display.DisplayWiring`) deliberately never calls it
+        — a real client would parse those bytes as a framebuffer header.
         """
         mac = mac.upper().replace(":", "")
         writer = self._player_writers.get(mac)
@@ -2828,6 +2867,53 @@ class SlimProtoClient:
             return False
 
     # ── Display frames (PROT-18): visu / vfdc / grfb / grfe-framebuffer ──
+
+    async def send_grfd_framebuffer(self, mac: str, framebuffer: bytes) -> bool:
+        """Send a bitmapped-SB1 'grfd' framebuffer frame to a player.
+
+        Perl ``Slim/Display/SqueezeboxG.pm:149-167`` (``drawFrameBuf``):::
+
+            my $framebuf = pack('n', $GRAPHICS_FRAMEBUF_LIVE) . $$framebufref;
+            my $len = length($framebuf);
+            if ($len != $display->screenBytes() + 2) {
+                $framebuf = substr($framebuf . chr(0) x $display->screenBytes(),
+                                   0, $display->screenBytes() + 2);
+            }
+            $client->sendFrame('grfd', \\$framebuf);
+
+        The header is a single u16 BE — ``$GRAPHICS_FRAMEBUF_LIVE = 1 * 280 * 2``
+        = 560 (``SqueezeboxG.pm:34``), NOT the 4-byte offset/transition/param
+        header of ``grfe`` (``Squeezebox2.pm:243-246``). The bitmap is padded
+        with NULs or truncated to exactly ``screenBytes()`` =
+        ``bytesPerColumn() * displayWidth()`` = 2 * 280 = 560
+        (``Graphics.pm:93-103``, ``SqueezeboxG.pm:128``), so the data handed to
+        ``sendFrame`` is always 562 bytes (2-byte header + 560-byte bitmap).
+
+        Recipients: the bitmapped SB1 (``SqueezeboxG``), selected in
+        ``Slimproto.pm:1058-1065`` (device id ``squeezebox`` + ``$bitmapped``).
+        Its ``graphicCommand`` is ``'grfd'`` (``SqueezeboxG.pm:139-141``); the
+        ``Squeezebox2`` family uses ``'grfe'`` and must not receive this frame.
+        """
+        mac = mac.upper().replace(":", "")
+        writer = self._player_writers.get(mac)
+        if writer is None or writer.is_closing():
+            logger.debug("send_grfd_framebuffer: no writer for player %s", mac)
+            return False
+        bits = bytes(framebuffer)
+        expected = GRAPHICS_FRAMEBUF_LIVE  # screenBytes() = 560
+        if len(bits) != expected:
+            bits = (bits + bytes(expected))[:expected]
+        payload = b"grfd" + struct.pack(">H", GRAPHICS_FRAMEBUF_LIVE) + bits
+        frame = struct.pack(">H", len(payload)) + payload
+        try:
+            writer.write(frame)
+            await writer.drain()
+            logger.info("Sent grfd framebuffer (%d bitmap bytes) to %s",
+                        len(bits), mac)
+            return True
+        except (ConnectionError, OSError, RuntimeError) as exc:
+            logger.warning("send_grfd_framebuffer to %s failed: %s", mac, exc)
+            return False
 
     async def send_visu(self, mac: str, params: Sequence[int]) -> bool:
         """Send a 'visu' visualiser frame to a player.
