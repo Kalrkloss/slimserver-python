@@ -390,13 +390,18 @@ def test_strm_control_frame_replay_gain_is_ms():
 
 
 def test_strm_start_frame_matches_perl_byte_for_byte():
-    """Perl stream('s') local file: autostart 1, format 'm', pcm '?',
-    transitionType '0', outputThreshold 1 for mp3, port 9000, ip 0.
+    """Perl stream_s() local mp3: autostart 1, format 'm', pcm '?',
+    bufferThreshold 255, spdif 0, transitionDuration 10, transitionType '0'
+    (an `a` field, so 0 stringifies!), flags 0, outputThreshold 1, port 9000.
 
-    perl reference frame:
-        73316d3f3f3f3fff00003000010000000000232800000000
-    (bufferThreshold 255 KB = Player.pm:65; the old 50 was a guess and is
-    now fixed — PROT-07 closed.)
+    Reference frame produced by the Perl pack itself:
+
+        perl -e 'print unpack("H*", pack "aaaaaaaCCCaCCCNnN",
+                 "s",1,"m","?","?","?","?",255,0,10,0,0,1,0,0,9000,0)'
+        -> 73316d3f3f3f3fff000a3000010000000000232800000000
+
+    (bufferThreshold 255 KB = Player.pm:65; transitionDuration 10 =
+    Squeezebox2.pm:45 read in Squeezebox.pm:941; the old 50/0 were guesses.)
     """
     request = b"GET /stream.mp3?player=021122334455 HTTP/1.0\r\n\r\n"
     frame = SlimProtoClient._build_stream_frame(
@@ -412,8 +417,8 @@ def test_strm_start_frame_matches_perl_byte_for_byte():
     assert leaf[3:7] == b"????"              # pcm size/rate/chan/endian
     assert leaf[7] == 255                    # bufferThreshold (Player.pm:65)
     assert leaf[8] == 0                      # spdif
-    assert leaf[9] == 0                      # transitionDuration
-    assert leaf[10:11] == b"0"               # transitionType NONE
+    assert leaf[9] == 10                     # transitionDuration (pref 10)
+    assert leaf[10:11] == b"0"               # transitionType NONE (ASCII '0')
     assert leaf[11] == 0                     # flags
     assert leaf[12] == 1                     # outputThreshold (mp3)
     assert leaf[13] == 0                     # slaves
@@ -421,6 +426,8 @@ def test_strm_start_frame_matches_perl_byte_for_byte():
     assert leaf[18:20] == struct.pack(">H", 9000)
     assert leaf[20:24] == bytes(4)           # serverIp = 0 -> peer
     assert payload[28:] == request
+    # ... and the whole 24-byte body equals the Perl pack output
+    assert leaf.hex() == "73316d3f3f3f3fff000a3000010000000000232800000000"
 
 
 # ──────────────────────────────────────────────────────────────────────

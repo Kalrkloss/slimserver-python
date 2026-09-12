@@ -144,6 +144,29 @@ REMOTE_BUFFER_SECS = 3
 # 3 intervals is disconnected (:199-241).
 KEEPALIVE_SECONDS = 5.0
 
+# strm `outputThreshold` per source format byte. Perl: stream_s in
+# Slim/Player/Squeezebox.pm — see output_threshold() for the line numbers.
+OUTPUT_THRESHOLD_BY_FORMAT: dict[str, int] = {
+    "p": 0,    # pcm / wav / aif        (:602, :622)
+    "f": 0,    # flac / ogf (hires: 20) (:645-648, :655)
+    "m": 1,    # mp3 and the default    (:769)
+    "w": 10,   # wma (lossless: 50)     (:682-686)
+    "o": 20,   # ogg vorbis             (:696)
+    "u": 20,   # ops / opus             (:705)
+    "l": 0,    # alac                   (:714)
+    "a": 0,    # mp4 / aac              (:731)
+    "d": 0,    # dsf / dff              (:740)
+    "s": 1,    # SqueezePlayDirect      (:750)
+    "n": 0,    # test                   (:759)
+}
+FLAC_HIRES_SAMPLERATE = 88200   # Squeezebox.pm:646
+# strm transition fields. Perl: the client prefs `transitionType` /
+# `transitionDuration` (defaults 0 = TRANSITION_NONE and 10,
+# Squeezebox2.pm:44-45) are sent in stream_s (Squeezebox.pm:940-941). With
+# TRANSITION_NONE the duration is inert, but Perl still sends the pref value.
+TRANSITION_NONE = 0             # Squeezebox2.pm:44
+TRANSITION_DURATION_DEFAULT = 10  # Squeezebox2.pm:45
+
 
 # ── audg volume → gain (logarithmic, Perl parity) ────────────────────────
 #
@@ -217,6 +240,25 @@ def audg_old_gain(volume: int) -> int:
 def audg_preamp(preamp_volume_control: int = 0) -> int:
     """Perl preamp byte (Squeezebox2.pm:302; pref default 0, Player.pm:39)."""
     return 255 - int(2 * (preamp_volume_control or 0))
+
+
+def output_threshold(codec: str, samplerate: int | None = None) -> int:
+    """Perl ``stream_s`` ``outputThreshold`` for a source format.
+
+    Perl sets this per format byte in ``stream_s`` (Slim/Player/Squeezebox.pm):
+    pcm/wav/aif ``p`` → 0 (:602, :622); flac/ogf ``f`` → 0, but 20 for
+    samplerate >= 88200 (:645-648) and 20 for Ogg-FLAC (:655); wma ``w`` →
+    10, wma-lossless → 50 (:682-686); ogg ``o`` → 20 (:696); ops ``u`` →
+    20 (:705); alac ``l`` → 0 (:714); mp4/aac ``a`` → 0 (:731); dsf/dff
+    ``d`` → 0 (:740); SqueezePlayDirect ``s`` → 1 (:750); test ``n`` → 0
+    (:759); mp3 and the default branch ``m`` → 1 (:769).
+    """
+    codec = (codec or "m")[:1].lower()
+    if codec == "f":
+        if samplerate and samplerate >= FLAC_HIRES_SAMPLERATE:
+            return 20                      # Squeezebox.pm:645-648
+        return 0
+    return OUTPUT_THRESHOLD_BY_FORMAT.get(codec, 1)
 
 
 def stream_buffer_threshold(filesize: int | None = None, *,
@@ -1346,6 +1388,7 @@ class SlimProtoClient:
         server_ip: int = 0,
         flags: int = 0,
         threshold: int = BUFFER_THRESHOLD_KB,
+        samplerate: int | None = None,
         pcm_params: tuple[str, str, str, str] | None = None,
     ) -> bytes:
         """Build the 24-byte LMS ``strm`` packet plus its HTTP request.
@@ -1384,10 +1427,13 @@ class SlimProtoClient:
             p_endian.encode("ascii"), # pcm_endianness ('0' big/'1' little)
             bytes([max(0, min(255, threshold))]),
             bytes([0]),               # SPDIF auto
-            bytes([0]),               # transition period
-            b"0",                    # transition type: none
+            bytes([TRANSITION_DURATION_DEFAULT]),  # transitionDuration pref
+            # transitionType is an `a` field in Perl's template, so the
+            # number 0 is STRINGIFIED to ASCII '0' (0x30) — verified with
+            # perl: pack(...) gives ...ff 00 0a 30 00 01...
+            b"0",                     # transitionType TRANSITION_NONE
             bytes([flags & 0xFF]),
-            bytes([1 if codec == "m" else 0]),  # output threshold
+            bytes([output_threshold(codec, samplerate)]),
             bytes([0]),               # proxy slaves
             struct.pack(">I", 0),
             struct.pack(">H", server_port),
