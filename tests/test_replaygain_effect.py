@@ -136,3 +136,36 @@ def test_replay_gain_fixed_is_zero_in_mode_zero(monkeypatch):
                                    playerprefs={"replayGainMode": 0})}
     client = proto.SlimProtoClient.__new__(proto.SlimProtoClient)
     assert client._replay_gain_fixed(mac, 1) == 0
+
+
+# ── Statusfeld (Queries.pm:4109-4112) ──────────────────────────────────────
+
+
+def _status(player):
+    import asyncio
+
+    from lyrion.player.manager import PlayerManager
+    from lyrion.web.api import JSONRPCAPI
+
+    pm = PlayerManager()
+    pm.players = {player.mac: player}
+    return asyncio.run(JSONRPCAPI()._slim_request(player.mac, ["status", "-", 1, "tags:u"]))
+
+
+def _playing_player(prefs):
+    from lyrion.player.state import PlayerState
+
+    return PlayerState(mac="1C:87:2C:47:FC:36", name="T", ip="127.0.0.1", port=0,
+                       model="squeezeplay", power=True, mode="play",
+                       playerprefs=prefs)
+
+
+def test_status_has_no_replay_gain_in_mode_zero():
+    # Default (Squeezebox2.pm:47) → Perl fügt das Feld nicht hinzu
+    assert "replay_gain" not in _status(_playing_player({"replayGainMode": 0}))
+
+
+def test_status_reports_replay_gain_when_the_mode_is_on():
+    st = _status(_playing_player({"replayGainMode": 1}))
+    # kein Track-Gain in der DB → localReplayGain (Default 0, :49)
+    assert st.get("replay_gain") == 0.0
