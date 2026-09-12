@@ -531,7 +531,11 @@ def test_alarms_loop_uses_perls_key_order():
     from lyrion.alarms import Alarm, AlarmManager
 
     AlarmManager().set(LIVE_MAC, 0, Alarm(
-        index=0, enabled=True, days="0111110", time="06:00", volume=34,
+        # Monday-first im internen Alarm (alarms.py:37): "1111100" = Mo–Fr.
+        # Früher stand hier "0111110" mit der alten Monday-first-dow-Ausgabe;
+        # Perl zählt 0=Sonntag (Alarm.pm:116-118) → Mo–Fr ist dow "1,2,3,4,5"
+        # (so auch die Live-Zeile PERL_ALARMS_0_5).
+        index=0, enabled=True, days="1111100", time="06:00", volume=34,
         fade=1, repeat=True, wake="url:http://hirschmilch.de:7000/chillout.mp3",
     ))
     try:
@@ -553,7 +557,10 @@ def test_alarms_loop_uses_perls_key_order():
 
 def test_alarms_echoes_a_question_marker():
     # Perl registers no '?' entry for 'alarms' (Request.pm:477) → raw echo.
-    assert _dispatch("alarms", ["?"]) == [f"{CLIENT} alarms %3F"]
+    # Live Perl 9.1.1 (read-only, eigener Parent-Gegencheck):
+    #   `alarms ?`  →  `alarms %3F`   (KEIN Client-Präfix — der Präfix wird nur
+    #   gesetzt, wenn eine Client-ID aufgelöst wurde, Stdio.pm:96-131).
+    assert _dispatch("alarms", ["?"]) == ["alarms %3F"]
 
 
 def test_alarm_loop_entry_keys():
@@ -563,7 +570,8 @@ def test_alarm_loop_entry_keys():
                                        time="07:30", volume=-1, wake=""))
     assert list(entry) == ["id", "dow", "enabled", "repeat", "shufflemode",
                            "time", "volume", "url"]
-    assert entry["dow"] == "0"
+    # days="1000000" ist Monday-first → Perl-dow 1 (Alarm.pm:116-118)
+    assert entry["dow"] == "1"
     assert entry["time"] == 7 * 3600 + 30 * 60
     assert entry["url"] == "CURRENT_PLAYLIST"
     assert _keys_of_perl(PERL_ALARMS_0_5)[2:] == list(entry)

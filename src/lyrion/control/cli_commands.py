@@ -3127,7 +3127,11 @@ def _alarm_loop_entry(index: int, a: Any) -> dict[str, Any]:
     volume%3A34 url%3Ahttp%3A%2F%2Fhirschmilch.de%3A7000%2Fchillout.mp3``.
     """
     days = str(getattr(a, "days", "") or "")
-    dow = ",".join(str(i) for i in range(7) if i < len(days) and days[i] == "1")
+    # ``Alarm.days`` ist Monday-first (alarms.py:37, :72); Perl zählt dow
+    # 0=Sonntag..6=Samstag (Alarm.pm:116-118) → Index i ist Perl-Tag (i+1)%7.
+    # Die Live-Zeile im Docstring (Mo-Fr-Alarm → dow 1,2,3,4,5) bestätigt das.
+    dow = ",".join(str((i + 1) % 7) for i in range(7)
+                   if i < len(days) and days[i] == "1")
     time_str = str(getattr(a, "time", "0") or "0")
     try:
         hh, mm = time_str.split(":", 1)
@@ -3141,7 +3145,10 @@ def _alarm_loop_entry(index: int, a: Any) -> dict[str, Any]:
         "dow": dow,
         "enabled": 1 if getattr(a, "enabled", False) else 0,
         "repeat": 1 if getattr(a, "repeat", False) else 0,
-        "shufflemode": 0,
+        # Kein fester Wert: Jive speichert ihn (alarms.py:50-51, Command
+        # ``jiveupdatealarm``, Commands.pm:188) und ``alarmsQuery`` gibt ihn
+        # aus (Queries.pm:235-242).
+        "shufflemode": int(getattr(a, "shufflemode", 0) or 0),
         "time": seconds,
         "volume": int(getattr(a, "volume", -1) or 0),
         "url": url or "CURRENT_PLAYLIST",
