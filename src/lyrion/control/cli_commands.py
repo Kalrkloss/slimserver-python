@@ -92,6 +92,82 @@ def _is_query_echo(args: list[str]) -> bool:
     return bool(args) and args[-1] == "?"
 
 
+# Perl's request verbs that are dispatchable on their own — i.e. a request made
+# of exactly that word matches a leaf in the dispatch tree
+# (Slim/Control/Request.pm:474-637).  A word like 'mixer', 'player', 'playlist'
+# or 'pref' is only a *prefix* there and stays non-dispatchable on its own:
+# live Perl 9.1.1, read-only, 2026-09-12 answers ``can mixer ?`` → ``can mixer
+# 0`` even though ``mixer volume ?`` exists.
+_CAN_REQUESTS = frozenset({
+    "abortscan", "albums", "alarms", "artists", "can", "displaystatus",
+    "genres", "libraries", "playlists", "rescan", "rescanprogress", "roles",
+    "search", "serverstatus", "songinfo", "songs", "syncgroups", "tags",
+    "titles", "tracks", "works", "years",
+})
+
+# 'login', 'shutdown' and 'exit' do not go through the dispatch table and are
+# therefore always available (Slim/Plugin/CLI/Plugin.pm:780-783).
+_CAN_ALWAYS = frozenset({"login", "shutdown", "exit"})
+
+
+def _echo(cmd: str, args: list[str], clientid: Optional[str] = None) -> list[str]:
+    """One line for a request Perl does not dispatch (status 104).
+
+    ``Slim/Plugin/CLI/Plugin.pm:657-663`` ("Request [$cmd] unknown or missing
+    client -- will echo as is...") hands the request to ``cli_request_write``
+    (:692-698); with no match in the dispatch table ``_request`` stays empty and
+    every token becomes the positional parameter ``_p<i>``
+    (``Slim/Control/Request.pm:1093-1100``), which ``renderAsArray`` prints
+    *bare* (:2245-2253).  The answer is therefore the request verbatim.
+
+    Live Perl 9.1.1 (192.168.1.90:9090, read-only, 2026-09-12): ``playercount``
+    → ``playercount``, ``unsubscribe`` → ``unsubscribe``, ``logout`` →
+    ``logout``, ``exit`` → ``exit``, ``volume 50`` → ``volume 50``,
+    ``volume ?`` → ``volume %3F``, ``prev`` → ``prev``, ``display x y 5`` →
+    ``24%3A0a%3Ac4%3A29%3A77%3A90 display x y 5``.
+    """
+    return [render_line(clientid=clientid, terms=[cmd, *args])]
+
+
+def _command_line(
+    verbs: list[str],
+    args: list[str],
+    declared: list[str],
+    clientid: Optional[str] = None,
+    has_tags: bool = False,
+    results: Any = (),
+) -> list[str]:
+    """One line for a Perl command/query that echoes its declared parameters.
+
+    Perl splits a request into the matched verbs and the parameters named by
+    the dispatch entry (``Slim/Control/Request.pm:1021-1061``); a parameter
+    starting with ``_`` is printed as its bare value (:2245-2253), a missing
+    one still occupies its slot and renders as the empty string (:1026-1028).
+    Live Perl: ``ir 123`` → ``<clientid> ir 123 `` (trailing space from the
+    unset ``_time``, Request.pm:506), ``wipecache`` → ``wipecache `` (unset
+    ``_queue``, Request.pm:631).
+    """
+    return [
+        render_line(
+            clientid=clientid,
+            terms=list(verbs),
+            params=query_params(list(args), list(declared), has_tags=has_tags),
+            results=results,
+        )
+    ]
+
+
+def _command_echo(
+    verbs: list[str],
+    args: list[str],
+    declared: list[str],
+    clientid: Optional[str] = None,
+    has_tags: bool = True,
+) -> list[str]:
+    """Like :func:`_command_line` but without results (the echo case)."""
+    return _command_line(verbs, args, declared, clientid, has_tags, ())
+
+
 # ---------------------------------------------------------------------------
 # Authentication
 # ---------------------------------------------------------------------------
@@ -126,8 +202,17 @@ async def cmd_exit(
     ctx: CLIContext,
     args: list[str],
 ) -> list[str]:
-    """exit — close the CLI connection."""
-    return []  # empty list signals connection close
+    """exit — Perl echoes the request, then closes the connection.
+
+    ``Slim/Plugin/CLI/Plugin.pm:618-619`` sets ``$exit = 1`` for 'exit' (and
+    falls through to ``cli_request_write``, :665/:692-698), so the client
+    receives ``exit`` before the socket is closed (live Perl 2026-09-12:
+    ``exit`` → ``exit``).  'quit' has no Perl dispatch at all and is echoed
+    verbatim (:657-663).  The network path breaks its read loop *before*
+    dispatching (src/lyrion/control/cli_server.py:56-57), so this answer is
+    only the protocol line; the connection is still closed by the caller.
+    """
+    return _echo(str(getattr(ctx, "command", "exit") or "exit"), args)
 
 
 @register_command("ping")
@@ -166,8 +251,22 @@ async def cmd_listen(
     ctx: CLIContext,
     args: list[str],
 ) -> list[str]:
-    """listen <on|off> — subscribe/unsubscribe a client to server events."""
-    return ["listen: ok"]
+    """listen <on|off> | listen ? — one escaped line.
+
+    'listen' is registered twice by the CLI plugin itself
+    (``Slim/Plugin/CLI/Plugin.pm:103-106``): as a command with ``_newvalue``
+    (:0,0,0) and as a query (:0,1,0).  ``listenCommand`` adds no result
+    (:799-828) → the answer is the echoed request; ``listenQuery`` adds the
+    bare result ``_listen`` (:829-845, ``defined(...) || 0``).  Live Perl
+    2026-09-12: ``listen ?`` → ``listen 0``.
+
+    This server does not push CLI notifications, so a fresh session always
+    answers ``listen 0`` — exactly what Perl answers before anything
+    subscribed.
+    """
+    if _is_query_echo(args):
+        return _command_line(["listen"], [], [], results=[("_listen", 0)])
+    return _command_echo(["listen"], args, ["_newvalue"])
 
 
 # ---------------------------------------------------------------------------
@@ -217,35 +316,34 @@ async def cmd_can(
     ctx: CLIContext,
     args: list[str],
 ) -> list[str]:
+    """can <request…> ? — is that request dispatchable? One escaped line.
+
+    Perl's CLI plugin registers ``['can','_p1'…'_p5','?']`` as a query
+    (``Slim/Plugin/CLI/Plugin.pm:101-102``) with ``[0,1,0]`` — no client, no
+    tags.  ``canQuery`` (:753-796) drops every ``_p<i>`` that is unset or the
+    literal ``'?'`` and adds the bare result ``_can``: ``1`` for
+    login/shutdown/exit (they bypass the dispatch table, :780-783) or when the
+    remaining tokens name a dispatchable request (:785-787), else ``0``.
+
+    Live Perl 9.1.1, read-only, 2026-09-12: ``can`` → ``can`` (no '?', not a
+    query, echoed), ``can ?`` → ``can 0``, ``can exit ?`` → ``can exit 1``,
+    ``can mixer ?`` → ``can mixer 0``, ``can foobar ?`` → ``can foobar 0``.
     """
-    can <capability>
-    Query whether the server supports a given capability.
-    """
-    capabilities = {
-        "album_art": True,
-        "bitmap": True,
-        "digital_volume_control": True,
-        "exit": True,
-        "flac": True,
-        "favicon": True,
-        "icons": True,
-        "jpeg": True,
-        "mp3": True,
-        "mixer": True,
-        "png": True,
-        "reconnect": True,
-        "remote": True,
-        "resume": True,
-        "save": True,
-        "sync": True,
-        "tcp": True,
-        "wav": True,
-    }
     if not args:
-        return [f"can: {len(capabilities)}"]
-    cap = args[0].lower()
-    result = "1" if capabilities.get(cap, False) else "0"
-    return [f"can {cap}: {result}"]
+        # Without a trailing '?' the request does not select the query entry;
+        # live Perl answers the bare request.
+        return _echo("can", args)
+    if not _is_query_echo(args):
+        return _echo("can", args)
+
+    wanted = [a for a in args if a != "?"]
+    if not wanted:
+        can = 0
+    elif wanted[0] in _CAN_ALWAYS:
+        can = 1
+    else:
+        can = 1 if wanted[0].lower() in _CAN_REQUESTS else 0
+    return _command_line(["can"], wanted, [], results=[("_can", can)])
 
 
 @register_command("serverstatus")
@@ -254,84 +352,126 @@ async def cmd_serverstatus(
     ctx: CLIContext,
     args: list[str],
 ) -> list[str]:
-    """
-    serverstatus [0 100]
-    Return server status (LMS format): version/uuid/name/httpport, info
-    totals, player count and the players_loop (one line per player).
+    """serverstatus [<index> <quantity>] — the server status as ONE CLI line.
+
+    ``addDispatch(['serverstatus','_index','_quantity'],[0,1,1,serverstatusQuery])``
+    (``Slim/Control/Request.pm:611``) — no client (hence no client id in front,
+    Stdio.pm:131) but tags.  ``serverstatusQuery`` (Queries.pm:3705-3830) adds,
+    in this order: ``rescan`` + ``progressname``/``progressdone``/
+    ``progresstotal`` while a scan runs (…:3714-3720) or ``lastscan``
+    (…:3727), ``version`` (:3752/:3755), ``uuid`` (:3772), ``ip`` (:3778),
+    ``httpport`` (:3779), the five ``info total <entity>`` keys (:3785-3789),
+    ``player count`` (:3820), the ``players_loop`` (:3826 → ``_addPlayersLoop``,
+    Queries.pm:2615-2676) and ``other player count`` (:3833).
+
+    Live Perl 9.1.1, read-only, 2026-09-12::
+
+        serverstatus 0 5 rescan%3A1 progressname%3A… progresstotal%3A80529
+        version%3A9.1.1 uuid%3A809f80c3-… ip%3A192.168.1.90 httpport%3A9000
+        info%20total%20albums%3A7181 … player%20count%3A4 playerindex%3A0 …
     """
     try:
         from lyrion import __version__
         from lyrion.player import PlayerManager
-        pm = PlayerManager()
-        players = pm.get_all_players()
-        player_count = len(players)
-    except Exception:
-        __version__ = "9.2.0"
-        players = []
-        player_count = 0
 
-    # info totals
-    info_lines: list[str] = []
+        pm = PlayerManager()
+        players = list(pm.get_all_players())
+    except Exception:  # noqa: BLE001
+        __version__ = "9.2.0"
+        pm = None
+        players = []
+
+    results: list[tuple[str, Any]] = []
+
+    # Scan progress (Perl: only while scanning, else 'lastscan').
+    scanning = False
+    scan_progress = 0
+    scan_total = 0
     try:
-        rows = await _query_db(
-            "SELECT COUNT(*) AS n, COALESCE(SUM(duration),0) AS d FROM tracks"
-        )
-        info_lines.append(f"info total songs: {int(rows[0]['n']) if rows else 0}")
-        info_lines.append(f"info total duration: {int(rows[0]['d']) if rows else 0}")
-        r_art = await _query_db(
-            "SELECT COUNT(DISTINCT c.id) AS n FROM contributors c "
-            "JOIN tracks_contributors tc ON tc.contributor = c.id AND tc.role = 1"
-        )
-        info_lines.append(f"info total artists: {int(r_art[0]['n']) if r_art else 0}")
-        r_alb = await _query_db("SELECT COUNT(*) AS n FROM albums")
-        info_lines.append(f"info total albums: {int(r_alb[0]['n']) if r_alb else 0}")
-        r_gen = await _query_db(
-            "SELECT COUNT(DISTINCT genre) AS n FROM tracks WHERE genre != ''"
-        )
-        info_lines.append(f"info total genres: {int(r_gen[0]['n']) if r_gen else 0}")
-        # lastscan: the timestamp of the most recent scan (Perl parity)
-        r_scan = await _query_db(
-            "SELECT MAX(last_rescan) AS t FROM tracks"
-        )
-        info_lines.append(f"lastscan: {int(r_scan[0]['t']) if r_scan and r_scan[0]['t'] else 0}")
+        from lyrion.media.scan_state import SCAN_STATE
+
+        snap = SCAN_STATE.snapshot()
+        scanning = bool(snap.get("scanning"))
+        scan_progress = int(snap.get("progress", 0) or 0)
+        scan_total = int(snap.get("total", 0) or 0)
     except Exception:  # noqa: BLE001
         pass
+    if scanning:
+        results.append(("rescan", 1))
+        results.append(("progressname", "Rescanning"))
+        results.append(("progressdone", scan_progress))
+        results.append(("progresstotal", scan_total))
 
-    # Server IP (Perl sends the server's address at top level)
+    results.append(("version", _server_version()))
+    uuid = getattr(pm, "server_uuid", "") or "lyrion-local"
+    results.append(("uuid", uuid))
+    # Server address (Perl: Slim::Utils::Network::serverAddr()).
     import socket
+
+    server_ip = "127.0.0.1"
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.connect(("8.8.8.8", 80))
         server_ip = s.getsockname()[0]
         s.close()
-    except Exception:
-        server_ip = "127.0.0.1"
+    except Exception:  # noqa: BLE001
+        pass
+    results.append(("ip", server_ip))
+    results.append(("httpport", 9000))
 
-    out = [
-        f"serverstatus version:{__version__ if '__version__' in dir() else '9.2.0'}",
-        f"serverstatus uuid:{getattr(pm, 'server_uuid', 'lyrion-local')}",
-        f"serverstatus name:Lyrion",
-        f"serverstatus ip:{server_ip}",
-        f"serverstatus httpport:9000",
-    ]
-    out.extend(f"serverstatus {l}" for l in info_lines)
-    out.append(f"serverstatus player count:{player_count}")
-    out.append(f"serverstatus sn.player count:{player_count}")
-    out.append(f"serverstatus other player count:0")
-    # players_loop
-    for i, p in enumerate(players):
-        mac = p.mac if p.mac else ""          # raw MAC — Perl does NOT url-encode
-        name = p.name or p.mac or ""
-        out.append(
-            f"playerindex:{i} playerid:{mac} uuid: ip:{p.ip or '0.0.0.0'}:{p.port or 0} "
-            f"name:{name} model:{p.model or 'squeezebox'} modelname:{p.model or 'squeezebox'} "
-            f"isplaying:{1 if p.mode == 'play' else 0} displaytype:none isplayer:1 "
-            f"canpoweroff:1 connected:{1 if p.connected else 0} "
-            f"power:{1 if p.power else 0} firmware:1 seq_no:0 "
-            f"sn.player.count:{player_count}"
+    totals: dict[str, int] = {}
+    try:
+        rows = await _query_db(
+            "SELECT COUNT(*) AS n, COALESCE(SUM(duration),0) AS d FROM tracks"
         )
-    out.append("")
-    return out
+        totals["albums"] = 0
+        totals["artists"] = 0
+        totals["genres"] = 0
+        totals["songs"] = int(rows[0]["n"]) if rows else 0
+        totals["duration"] = int(rows[0]["d"]) if rows else 0
+        r_alb = await _query_db("SELECT COUNT(*) AS n FROM albums")
+        totals["albums"] = int(r_alb[0]["n"]) if r_alb else 0
+        r_art = await _query_db(
+            "SELECT COUNT(DISTINCT c.id) AS n FROM contributors c "
+            "JOIN tracks_contributors tc ON tc.contributor = c.id AND tc.role = 1"
+        )
+        totals["artists"] = int(r_art[0]["n"]) if r_art else 0
+        r_gen = await _query_db(
+            "SELECT COUNT(DISTINCT genre) AS n FROM tracks WHERE genre != ''"
+        )
+        totals["genres"] = int(r_gen[0]["n"]) if r_gen else 0
+        # A scan that ran before adds 'lastscan' instead of the live progress.
+        if not scanning:
+            r_scan = await _query_db("SELECT MAX(last_rescan) AS t FROM tracks")
+            lastscan = (
+                int(r_scan[0]["t"])
+                if r_scan and r_scan[0]["t"]
+                else 0
+            )
+            if lastscan:
+                results.append(("lastscan", lastscan))
+    except Exception:  # noqa: BLE001
+        pass
+
+    for entity in ("albums", "artists", "genres", "songs", "duration"):
+        results.append((f"info total {entity}", totals.get(entity, 0)))
+
+    results.append(("player count", _connected_player_count(players)))
+    results.append(
+        (
+            "players_loop",
+            [_players_loop_entry(i, p) for i, p in enumerate(players)],
+        )
+    )
+    results.append(("other player count", 0))
+
+    return [
+        render_line(
+            terms=["serverstatus"],
+            params=query_params(args, ["_index", "_quantity"]),
+            results=results,
+        )
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -433,13 +573,15 @@ async def cmd_playercount(
     ctx: CLIContext,
     args: list[str],
 ) -> list[str]:
-    """playercount — return number of connected players."""
-    dispatcher = handler._dispatcher
-    if dispatcher:
-        count = await dispatcher.count_players()
-    else:
-        count = 0
-    return [f"playercount: {count}"]
+    """playercount — Perl has no such request, so it is echoed verbatim.
+
+    No entry in the dispatch table (``Slim/Control/Request.pm:474-637``)
+    → status 104 → the request is echoed (Plugin/CLI/Plugin.pm:657-663,
+    Request.pm:1093-1100).  Live Perl 2026-09-12: ``playercount`` →
+    ``playercount``.  The count comes from ``player count ?``
+    (Queries.pm:2519-2531 → ``player count 4``).
+    """
+    return _echo("playercount", args)
 
 
 @register_command("player")
@@ -526,22 +668,35 @@ async def cmd_name(
     ctx: CLIContext,
     args: list[str],
 ) -> list[str]:
-    """name [<new name>] — query or set the player name. 'name ?' queries."""
+    """name [<new name>] | name ? — one escaped line, client id in front.
+
+    ``nameQuery`` adds the bare result ``_value`` (``Slim/Control/Queries.pm:
+    2496-2512``, ``addDispatch(['name','?'])`` Request.pm:530) while the setter
+    ``nameCommand`` adds nothing at all (Commands.pm:668-694), so both forms
+    answer ``<clientid> name <value>``; a bare ``0`` means "no rename"
+    (Commands.pm:685).  Live Perl 2026-09-12: ``name ?`` →
+    ``24%3A0a%3Ac4%3A29%3A77%3A90 name Schlafzimmer``.
+    """
     if not ctx.player_id:
-        return ["no player selected"]
+        return [render_line(terms=["name", *args])]
     try:
         from lyrion.player import PlayerManager
+
         pm = PlayerManager()
         player = pm.get_player(ctx.player_id)
         if player is None:
-            return ["player not found", ""]
+            return [render_line(terms=["name", *args])]
         if args and str(args[0]) != "?":
-            new_name = " ".join(args)
-            pm.rename_player(player.mac, new_name)
-            return [f"name: {new_name}", ""]
-        return [f"name: {player.name}", ""]
-    except Exception as e:  # noqa: BLE001
-        return [f"cli error: {e}", ""]
+            new_name = " ".join(str(a) for a in args)
+            if new_name != "0":
+                pm.rename_player(player.mac, new_name)
+            return _command_line(["name"], args, ["_newvalue"],
+                                 clientid=ctx.player_id)
+        return _command_line(["name"], [a for a in args if a != "?"], [],
+                             clientid=ctx.player_id,
+                             results=[("_value", player.name or "")])
+    except Exception as exc:  # noqa: BLE001
+        return _echo("name", args, clientid=ctx.player_id)
 
 
 @register_command("sync")
@@ -550,15 +705,47 @@ async def cmd_sync(
     ctx: CLIContext,
     args: list[str],
 ) -> list[str]:
-    """sync <masterMac> <slaveMac> — synchronize two players."""
-    if len(args) >= 2:
+    """sync <playerid> | sync ? — one escaped line, client id in front.
+
+    ``syncQuery`` adds the bare result ``_sync``: the comma-joined sync buddies
+    or ``'-'`` when the player is not synced (``Slim/Control/Queries.pm:
+    4682-4706``, ``addDispatch(['sync','?'])`` Request.pm:621).  The command
+    entry ``['sync','_indexid-']`` (:622) adds nothing → the request is echoed.
+    Live Perl 2026-09-12: ``sync ?`` →
+    ``24%3A0a%3Ac4%3A29%3A77%3A90 sync 00%3A04%3A20%3A2b%3A88%3Ac8``.
+    """
+    if _is_query_echo(args):
+        buddies: list[str] = []
         try:
             from lyrion.player import PlayerManager
-            PlayerManager().sync_players(args[0], [args[1]])
-            return [f"sync: {args[0]} {args[1]}", ""]
-        except Exception as e:  # noqa: BLE001
-            return [f"cli error: {e}", ""]
-    return ["sync: ", ""]
+
+            player = PlayerManager().get_player(ctx.player_id) if ctx.player_id else None
+            if player is not None:
+                buddies = [
+                    str(m) for m in (getattr(player, "sync_slaves", None) or [])
+                ]
+                if getattr(player, "sync_master", None):
+                    buddies = [str(player.sync_master), *buddies]
+        except Exception:  # noqa: BLE001
+            buddies = []
+        return _command_line(
+            ["sync"], [], [], clientid=ctx.player_id,
+            results=[("_sync", ",".join(buddies) if buddies else "-")],
+        )
+    if len(args) >= 1:
+        try:
+            from lyrion.player import PlayerManager
+
+            pm = PlayerManager()
+            # Perl's sync master is the request's client; the parameter names
+            # the buddy (Slim/Control/Commands.pm syncCommand:12).
+            if ctx.player_id:
+                pm.sync_players(ctx.player_id, [args[0]])
+            elif len(args) >= 2:
+                pm.sync_players(args[0], [args[1]])
+        except Exception:  # noqa: BLE001
+            pass
+    return _command_echo(["sync"], args, ["_indexid-"], clientid=ctx.player_id)
 
 
 @register_command("unsync")
@@ -567,16 +754,22 @@ async def cmd_unsync(
     ctx: CLIContext,
     args: list[str],
 ) -> list[str]:
-    """unsync <playerMac> — remove a player from its sync group."""
+    """unsync <playerMac> — Perl has no 'unsync' request; it is echoed.
+
+    There is no entry in the dispatch table (``Slim/Control/Request.pm:
+    474-637``) and no CLI plugin registration, so the request is echoed
+    (Plugin/CLI/Plugin.pm:657-663, Request.pm:1093-1100).  Live Perl
+    2026-09-12: ``unsync`` → ``unsync``.
+    """
     target = args[0] if args else ctx.player_id
     if target:
         try:
             from lyrion.player import PlayerManager
+
             PlayerManager().unsync_player(target)
-            return [f"unsync: {target}", ""]
-        except Exception as e:  # noqa: BLE001
-            return [f"cli error: {e}", ""]
-    return ["unsync: ", ""]
+        except Exception:  # noqa: BLE001
+            pass
+    return _echo("unsync", args)
 
 
 @register_command("syncgroups")
@@ -585,23 +778,45 @@ async def cmd_syncgroups(
     ctx: CLIContext,
     args: list[str],
 ) -> list[str]:
-    """syncgroups — list all sync groups (master -> slaves)."""
+    """syncgroups ? — one escaped line, loop unrolled inline.
+
+    ``syncGroupsQuery`` adds the ``syncgroups_loop`` with exactly two keys per
+    group: ``sync_members`` (master id + its buddies, comma-joined) and
+    ``sync_member_names`` (the same players' names)
+    (``Slim/Control/Queries.pm:4708-4746``, ``addDispatch(['syncgroups','?'])``
+    Request.pm:623 — no client).  Live Perl 2026-09-12::
+
+        syncgroups sync_members%3A24%3A0a%3Ac4%3A29%3A77%3A90%2C00%3A04%3A20%2A
+        sync_member_names%3ASchlafzimmer%2CSqueezebox%20Radio
+    """
+    if not _is_query_echo(args):
+        return _echo("syncgroups", args)
+    loop: list[dict[str, Any]] = []
     try:
         from lyrion.player import PlayerManager
-        groups: dict[str, list[str]] = {}
-        for p in PlayerManager().get_all_players():
-            if p.sync_master:
-                groups.setdefault(p.sync_master, []).append(p.mac)
-        if not groups:
-            return ["syncgroups count:0", ""]
-        out = [f"syncgroups count:{len(groups)}"]
-        for master, slaves in groups.items():
-            out.append(f"sync_master: {master}")
-            out.append("sync_slaves: " + ",".join(slaves))
-        out.append("")
-        return out
-    except Exception as e:  # noqa: BLE001
-        return [f"cli error: {e}", ""]
+
+        pm = PlayerManager()
+        players = list(pm.get_all_players())
+        groups: dict[str, list[Any]] = {}
+        for p in players:
+            master = getattr(p, "sync_master", None)
+            if master:
+                groups.setdefault(str(master), []).append(p)
+        by_mac = {str(getattr(p, "mac", "")): p for p in players}
+        for master_mac, slaves in groups.items():
+            master = by_mac.get(master_mac)
+            members = [master_mac, *[str(getattr(s, "mac", "")) for s in slaves]]
+            names = [
+                str(getattr(master, "name", "") or "") if master else "",
+                *[str(getattr(s, "name", "") or "") for s in slaves],
+            ]
+            loop.append({
+                "sync_members": ",".join(members),
+                "sync_member_names": ",".join(names),
+            })
+    except Exception:  # noqa: BLE001
+        loop = []
+    return _command_line(["syncgroups"], [], [], results=[("syncgroups_loop", loop)])
 
 
 @register_command("songinfo")
@@ -610,21 +825,24 @@ async def cmd_songinfo(
     ctx: CLIContext,
     args: list[str],
 ) -> list[str]:
-    """songinfo <start> <count> track_id:<id> — detailed track info.
+    """songinfo <start> <count> track_id:<id> — ONE line, ``songinfo_loop``.
 
-    Perl-LMS format: one line PER FIELD (songinfo_loop items), e.g.
-        songinfo 0 100 count:27
-        id:2
-        title:Sabkah
-        artist:Nils Petter Molvær
-        duration:314.546
-        ...
-    Fields present depend on the track; 'id' and 'title' always come.
+    ``songinfoQuery`` (``Slim/Control/Queries.pm:4603-4680``) requires
+    ``track_id`` or ``url`` and *without* either sets status bad-params
+    (:4627-4629) — the request is then still echoed (Plugin/CLI/Plugin.pm:665),
+    live Perl 2026-09-12: ``songinfo 0 1`` → ``songinfo 0 1``, ``songinfo ?`` →
+    ``songinfo %3F``.  With a track the answer is the ``songinfo_loop``
+    (:4645-4670) unrolled inline (Request.pm:2264-2281); there is **no** count
+    result.  Live Perl: ``songinfo 0 20 track_id:6417`` →
+    ``songinfo 0 20 track_id%3A6417 rescan%3A1`` (the scan flag, :4635-4637).
     """
+    if _is_query_echo(args):
+        return _echo("songinfo", args)
     offset, limit, filters = _parse_query_args(args)
     tid = filters.get("track_id")
     if not tid or not str(tid).isdigit():
-        return ["songinfo: no track_id", ""]
+        # Perl: missing track_id/url → bad params → the request is echoed.
+        return _command_line(["songinfo"], args, ["_index", "_quantity"])
     rows = await _query_db(
         "SELECT t.id, t.title, t.url, t.duration, t.year, t.tracknum, t.genre, "
         "t.filesize, t.samplerate, t.bitspersample AS samplesize, t.channels, "
@@ -633,7 +851,7 @@ async def cmd_songinfo(
         (int(tid),),
     )
     if not rows:
-        return [f"songinfo {offset} {limit} count:0", ""]
+        return _command_line(["songinfo"], args, ["_index", "_quantity"])
     r = rows[0]
 
     import os as _os
@@ -720,11 +938,15 @@ async def cmd_songinfo(
     fields.append(("work", ""))
     fields.append(("artwork_url", "0"))
 
-    out = [f"songinfo {offset} {limit} count:{len(fields)}"]
-    for key, value in fields:
-        out.append(f"{key}:{value}")
-    out.append("")
-    return out
+    # ONE line: the loop items are unrolled inline, no per-field line
+    # (Slim/Control/Request.pm:2264-2281; Plugin/CLI/Plugin.pm:692-698).
+    return [
+        render_line(
+            terms=["songinfo"],
+            params=query_params(args, ["_index", "_quantity"]),
+            results=[("songinfo_loop", [dict(fields)])],
+        )
+    ]
 
 
 @register_command("years")
@@ -733,7 +955,16 @@ async def cmd_years(
     ctx: CLIContext,
     args: list[str],
 ) -> list[str]:
-    """years [<offset> <limit>] — list release years in the library."""
+    """years [<index> <quantity>] — ONE line, ``years_loop`` then ``count``.
+
+    ``yearsQuery`` (``Slim/Control/Queries.pm:4949-5060``) iterates the
+    distinct years and adds ``year`` + ``favorites_url`` per item
+    (``db:year.id=<year>``) into ``years_loop``; the ``count`` result is added
+    *after* the loop.  Live Perl 9.1.1, read-only, 2026-09-12: ``years 0 1`` →
+    ``years 0 1 year%3A0 favorites_url%3Adb%3Ayear.id%3D0 count%3A65``.
+    """
+    if _is_query_echo(args):
+        return _echo("years", args)
     offset, limit, _ = _parse_query_args(args)
     rows = await _query_db(
         "SELECT DISTINCT year AS y FROM tracks WHERE year > 0 "
@@ -744,14 +975,14 @@ async def cmd_years(
         "SELECT COUNT(DISTINCT year) AS n FROM tracks WHERE year > 0"
     )
     total_n = total[0]["n"] if total else 0
-    # Perl parity: years_loop items carry year + favorites_url
-    # (db:year.id=<year>); no id field.
-    out = [f"years {offset} {limit} count:{total_n}"]
-    for r in rows:
-        y = r["y"]
-        out.append(f"year:{y} favorites_url:db:year.id={y}")
-    out.append("")
-    return out
+    loop = [
+        {"year": r["y"], "favorites_url": f"db:year.id={r['y']}"}
+        for r in rows
+    ]
+    return _command_line(
+        ["years"], args, ["_index", "_quantity"],
+        results=[("years_loop", loop), ("count", total_n)],
+    )
 
 
 @register_command("musicfolder")
@@ -760,15 +991,23 @@ async def cmd_musicfolder(
     ctx: CLIContext,
     args: list[str],
 ) -> list[str]:
-    """musicfolder [<offset> <limit>] [folder_id:<path>] — browse folders.
+    """musicfolder [<index> <quantity>] [folder_id:<path>] — ONE line.
 
-    The folder hierarchy is derived from the scanned track URLs
-    (file:///...). folder_id is the parent directory URL; the root lists
-    the top-level directories.
+    ``musicfolderQuery`` is a thin wrapper around ``mediafolderQuery``
+    (``Slim/Control/Queries.pm:2165-2167`` → :2169-2350) which fills the
+    ``folder_loop`` with ``id``, ``filename`` and ``type`` (``'folder'`` for a
+    directory, :2472-2487) and adds ``count`` last (:2507).  Live Perl 9.1.1,
+    read-only, 2026-09-12: ``musicfolder 0 1`` → ``musicfolder 0 1 id%3A81408
+    filename%3A6MzM6F.Fetenhits_Rock_Classics_Best_Of-3CD-2020-NoGroup.nfo
+    type%3Afolder count%3A303``.
     """
+    if _is_query_echo(args):
+        return _echo("musicfolder", args)
     offset, limit, filters = _parse_query_args(args)
     folder = filters.get("folder_id", "")
     parent_prefix = folder.rstrip("/")
+    loop: list[dict[str, Any]] = []
+    count = 0
     if folder:
         # tracks directly in this folder + one subfolder level
         rows = await _query_db(
@@ -776,40 +1015,43 @@ async def cmd_musicfolder(
             "ORDER BY url LIMIT ? OFFSET ?",
             (parent_prefix + "/%", limit, offset),
         )
-        items: list[str] = []
+        names: list[str] = []
         for r in rows:
             rel = r["url"][len(parent_prefix) + 1:]
-            items.append(rel.split("/", 1)[0])
+            names.append(rel.split("/", 1)[0])
         total = await _query_db(
             "SELECT COUNT(DISTINCT url) AS n FROM tracks WHERE url LIKE ?",
             (parent_prefix + "/%",),
         )
-        out = [f"musicfolder {offset} {limit} count:{total[0]['n'] if total else 0}"]
-        for i, name in enumerate(dict.fromkeys(items)):
-            # Perl parity: folder items = id + filename + type (no title).
-            out.append(f"id:{offset + i + 1} filename:{name} type:folder")
-        out.append("")
-        return out
-    # root: distinct first path components under file:// roots
-    rows = await _query_db(
-        "SELECT DISTINCT url FROM tracks WHERE url LIKE 'file://%' "
-        "ORDER BY url LIMIT 500",
+        count = total[0]["n"] if total else 0
+        names = list(dict.fromkeys(names))
+        loop = [
+            {"id": offset + i + 1, "filename": name, "type": "folder"}
+            for i, name in enumerate(names)
+        ]
+    else:
+        # root: distinct first path components under file:// roots
+        rows = await _query_db(
+            "SELECT DISTINCT url FROM tracks WHERE url LIKE 'file://%' "
+            "ORDER BY url LIMIT 500",
+        )
+        roots: dict[str, str] = {}
+        for r in rows:
+            path = r["url"][len("file://"):].lstrip("/")
+            parts = path.split("/")
+            if len(parts) >= 2:
+                roots.setdefault(parts[0], f"file:///{parts[0]}")
+        names = sorted(roots.keys())
+        count = len(names)
+        page = names[offset:offset + limit]
+        loop = [
+            {"id": offset + i + 1, "filename": name, "type": "folder"}
+            for i, name in enumerate(page)
+        ]
+    return _command_line(
+        ["musicfolder"], args, ["_index", "_quantity"],
+        results=[("folder_loop", loop), ("count", count)],
     )
-    roots: dict[str, str] = {}
-    for r in rows:
-        path = r["url"][len("file://"):].lstrip("/")
-        parts = path.split("/")
-        if len(parts) >= 2:
-            root = parts[0]
-            roots.setdefault(root, f"file:///{root}")
-    names = sorted(roots.keys())
-    page = names[offset:offset + limit]
-    out = [f"musicfolder {offset} {limit} count:{len(names)}"]
-    for i, name in enumerate(page):
-        # Perl parity: id + filename + type (no title).
-        out.append(f"id:{offset + i + 1} filename:{name} type:folder")
-    out.append("")
-    return out
 
 
 @register_command("rescanprogress")
@@ -818,23 +1060,31 @@ async def cmd_rescanprogress(
     ctx: CLIContext,
     args: list[str],
 ) -> list[str]:
-    """rescanprogress — report rescan progress (LMS tagged format).
+    """rescanprogress — ONE line: ``rescanprogress rescan:<0|1>``.
 
-    Real scan state from the shared ScanState singleton; while idle:
-    'rescanprogress progress:0 scanning:0'.
+    ``rescanprogressQuery`` is registered as a *query* with ``[0,1,1]`` and no
+    parameter (``Slim/Control/Request.pm:608``); it adds the result ``rescan``
+    (``Slim/Control/Queries.pm:3231-3360``) — ``1`` plus ``fullname``/per-step
+    percentages/``steps``/``totaltime`` while a scan runs, else ``0``
+    (:3355-3357).  Live Perl 9.1.1, read-only, 2026-09-12 (idle):
+    ``rescanprogress`` → ``rescanprogress rescan%3A0``.
     """
     try:
         from lyrion.media.scan_state import SCAN_STATE
+
         st = SCAN_STATE.snapshot()
-        return [
-            "rescanprogress progress:%d scanning:%d" % (
-                int(st.get("progress", 0)),
-                1 if st.get("scanning") else 0,
-            ),
-            "",
-        ]
+        scanning = 1 if st.get("scanning") else 0
+        progress = int(st.get("progress", 0) or 0)
+        total = int(st.get("total", 0) or 0)
     except Exception:  # noqa: BLE001
-        return ["rescanprogress progress:0 scanning:0", ""]
+        scanning, progress, total = 0, 0, 0
+    results: list[tuple[str, Any]] = [("rescan", scanning)]
+    if scanning:
+        results.append(("steps", "importer"))
+        results.append(("totaltime", "00:00:00"))
+        if total:
+            results.append(("importer", int(progress / total * 100)))
+    return _command_line(["rescanprogress"], [], [], results=results)
 
 
 @register_command("abortscan")
@@ -843,13 +1093,22 @@ async def cmd_abortscan(
     ctx: CLIContext,
     args: list[str],
 ) -> list[str]:
-    """abortscan — cancel a running rescan (Perl Slim::Music::Import->abortScan)."""
+    """abortscan — Perl answers the echoed request (no result at all).
+
+    ``addDispatch(['abortscan'],[0,0,0,abortScanCommand])``
+    (``Slim/Control/Request.pm:474``); ``abortScanCommand`` only calls
+    ``Slim::Music::Import->abortScan`` and ``setStatusDone`` — it adds no
+    result, so ``renderAsArray`` prints just the request verb
+    (Plugin/CLI/Plugin.pm:692-698).  Live Perl 2026-09-12: ``abortscan`` →
+    ``abortscan``.
+    """
     try:
         from lyrion.media.scan_state import SCAN_STATE
+
         SCAN_STATE.request_abort()
     except Exception:  # noqa: BLE001
         pass
-    return ["abortscan: ok", ""]
+    return _echo("abortscan", args)
 
 
 @register_command("menu")
@@ -858,16 +1117,23 @@ async def cmd_menu(
     ctx: CLIContext,
     args: list[str],
 ) -> list[str]:
-    """menu [<start> <count>] [direct:1] — return the home menu (text form).
+    """menu [<index> <quantity>] [direct:1] — ONE line, ``item_loop`` inline.
 
-    Mirrors the JSON-RPC menu handler for telnet clients. The JSON-RPC
-    response uses 'item_loop' (not 'loop_loop'), so read that key.
+    Jive registers ``['menu','_index','_quantity']`` as a query
+    (``Slim/Control/Jive.pm:57``).  ``menuQuery`` (:Jive.pm menuQuery) only
+    fills results for a *disconnected* client or with ``direct`` set — then
+    ``setRawResults({count, offset, item_loop})``; otherwise it adds nothing
+    and the request is echoed.  Live Perl 9.1.1, read-only, 2026-09-12:
+    ``menu 0 5`` → ``24%3A0a%3Ac4%3A29%3A77%3A90 menu 0 5`` (no results).
+
+    We always expose the items (our home menu) as ``item_loop`` entries with
+    ``text``/``browse``; the loop is unrolled inline like every other loop
+    (``Slim/Control/Request.pm:2264-2281``).
     """
     try:
         from lyrion.web.api import JSONRPCAPI
+
         res = await JSONRPCAPI()._slim_request(ctx.player_id or "", ["menu"] + list(args))
-        # JSON-RPC menu returns item_loop + count (+ offset). Fall back to
-        # the bare home-menu list if the shape differs.
         loop = res.get("item_loop")
         if loop is None:
             home = JSONRPCAPI()._home_menu()
@@ -877,16 +1143,27 @@ async def cmd_menu(
         total = res.get("count")
         if total is None:
             total = len(loop)
-        out = [f"menu count:{total}"]
-        for i, item in enumerate(loop):
+        items: list[dict[str, Any]] = []
+        for item in loop:
             text = item.get("text") or item.get("name", "")
-            node = item.get("node") or item.get("id", "")
-            browse_id = item.get("browse", {}).get("id", "") if isinstance(item.get("browse"), dict) else item.get("browse", "")
-            out.append(f"menu index:{i} text:{text} browse:{browse_id}")
-        out.append("")
-        return out
-    except Exception as e:  # noqa: BLE001
-        return [f"cli error: {e}", ""]
+            browse_id = (
+                item.get("browse", {}).get("id", "")
+                if isinstance(item.get("browse"), dict)
+                else item.get("browse", "")
+            )
+            items.append({
+                "text": text,
+                "node": item.get("node") or item.get("id", ""),
+                "browse": browse_id,
+            })
+        return _command_line(
+            ["menu"], args, ["_index", "_quantity"],
+            clientid=ctx.player_id,
+            results=[("count", total), ("offset", 0), ("item_loop", items)],
+        )
+    except Exception as exc:  # noqa: BLE001
+        # Perl echoes a request it cannot dispatch (Plugin/CLI/Plugin.pm:657-663).
+        return _echo("menu", args, clientid=ctx.player_id)
 
 
 @register_command("playerstatus")
@@ -913,8 +1190,19 @@ async def cmd_displaystatus(
     ctx: CLIContext,
     args: list[str],
 ) -> list[str]:
-    """displaystatus [<playerId>] — display/now-playing info (popup stub)."""
-    return ["displaystatus: ", ""]
+    """displaystatus [subscribe:<mode>] — ONE line, client id in front.
+
+    ``addDispatch(['displaystatus'],[1,1,1,displaystatusQuery])``
+    (``Slim/Control/Request.pm:495``).  ``displaystatusQuery`` (Queries.pm:
+    1630-…) only adds results while a display notification is being tracked
+    (``$request->privateData``) or when a subscription is set up; for a plain
+    request it adds nothing, so the answer is the client id plus the request
+    verb.  Live Perl 9.1.1, read-only, 2026-09-12: ``displaystatus`` →
+    ``24%3A0a%3Ac4%3A29%3A77%3A90 displaystatus``.
+    """
+    return _command_line(
+        ["displaystatus"], [], [], clientid=ctx.player_id
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -928,50 +1216,48 @@ async def cmd_play(
     ctx: CLIContext,
     args: list[str],
 ) -> list[str]:
+    """play [<trackId>] — start playback; the answer is ONE escaped line.
+
+    Perl registers ``['play','_fadein']`` as the *command* entry
+    (``Slim/Control/Request.pm:533``) and only a command (no '?' query), so
+    ``playcontrolCommand`` adds no result and the request is echoed with the
+    client id in front (Plugin/CLI/Plugin.pm:692-698; live Perl 2026-09-12:
+    ``play ?`` → ``play %3F`` — command-only entries answer the raw echo).
     """
-    play [trackId]
-    Start playback, optionally at a specific track index (DB id).
-    """
+    if _is_query_echo(args):
+        return _echo("play", args)
     if not ctx.player_id:
-        return ["no player selected"]
+        return _command_echo(["play"], args, ["_fadein"])
     try:
         from lyrion.player import PlayerManager
+
         pm = PlayerManager()
         if args:
-            track_id = int(args[0])
-            ok = await pm.play_track(ctx.player_id, track_id)
-            if not ok:
-                return ["cli error: could not start playback (player not connected?)"]
-            return [f"play {track_id}", ""]
+            await pm.play_track(ctx.player_id, int(args[0]))
+            return _command_echo(["play"], args, ["_fadein"],
+                                 clientid=ctx.player_id)
         # No track id — resume whatever is selected
         player = pm.get_player(ctx.player_id)
         if player is not None:
             # Paused -> resume in place (LMS play button behaviour)
             if player.mode == "pause":
-                ok = await pm.pause_player(ctx.player_id, False)
-                return ["play", ""] if ok else ["cli error: playback failed"]
+                await pm.pause_player(ctx.player_id, False)
             # Radio stream (current_track_id None, current_url set)
-            if player.current_track_id is None and getattr(player, "current_url", None):
-                ok = await pm.play_url(ctx.player_id, player.current_url,
-                                       getattr(player, "current_title", "") or "")
-                return [f"play {player.current_url[:60]}", ""] if ok \
-                    else ["cli error: playback failed"]
-            if player.current_track_id is not None:
-                ok = await pm.play_track(ctx.player_id, player.current_track_id)
-                return [f"play {player.current_track_id}", ""] if ok else ["cli error: playback failed"]
+            elif player.current_track_id is None and getattr(player, "current_url", None):
+                await pm.play_url(ctx.player_id, str(player.current_url),
+                                  getattr(player, "current_title", "") or "")
+            elif player.current_track_id is not None:
+                await pm.play_track(ctx.player_id, player.current_track_id)
             # Fallback: resume the current playlist entry
-            if player.playlist and 0 <= player.playlist_position < len(player.playlist):
+            elif player.playlist and 0 <= player.playlist_position < len(player.playlist):
                 entry = player.playlist[player.playlist_position]
                 if isinstance(entry, str):
-                    ok = await pm.play_url(ctx.player_id, entry, "")
+                    await pm.play_url(ctx.player_id, entry, "")
                 else:
-                    ok = await pm.play_track(ctx.player_id, entry)
-                return ["play", ""] if ok else ["cli error: playback failed"]
-        return ["play", ""]
-    except ValueError:
-        return ["cli error: track id must be a number", ""]
-    except Exception as e:  # noqa: BLE001
-        return [f"cli error: {e}", ""]
+                    await pm.play_track(ctx.player_id, entry)
+        return _command_echo(["play"], args, ["_fadein"], clientid=ctx.player_id)
+    except Exception:  # noqa: BLE001
+        return _command_echo(["play"], args, ["_fadein"], clientid=ctx.player_id)
 
 
 @register_command("pause")
@@ -980,26 +1266,36 @@ async def cmd_pause(
     ctx: CLIContext,
     args: list[str],
 ) -> list[str]:
+    """pause [0|1] — toggle/force pause; the answer is ONE escaped line.
+
+    ``['pause','_newvalue','_fadein','_suppressShowBriefly']`` is a command
+    entry (``Slim/Control/Request.pm:532``) whose handler adds no result
+    (Commands.pm playcontrolCommand), so the request is echoed — with the
+    client id because it needs one (:0 needsClient flag is 1).  Live Perl
+    2026-09-12: ``pause ?`` → ``pause %3F`` (command-only entry ⇒ raw echo).
     """
-    pause [0|1]
-    Toggle pause, or force pause on (1) / off (0).
-    """
+    if _is_query_echo(args):
+        return _echo("pause", args)
     if not ctx.player_id:
-        return ["no player selected"]
+        return _command_echo(["pause"], args,
+                             ["_newvalue", "_fadein", "_suppressShowBriefly"])
     try:
         from lyrion.player import PlayerManager
+
         pm = PlayerManager()
         if args and args[0] == "0":
-            ok = await pm.pause_player(ctx.player_id, False)
+            await pm.pause_player(ctx.player_id, False)
         elif args and args[0] == "1":
-            ok = await pm.pause_player(ctx.player_id, True)
+            await pm.pause_player(ctx.player_id, True)
         else:
             player = pm.get_player(ctx.player_id)
             currently_paused = player is not None and player.mode == "pause"
-            ok = await pm.pause_player(ctx.player_id, not currently_paused)
-        return [] if ok else ["cli error: could not pause/resume"]
-    except Exception as e:  # noqa: BLE001
-        return [f"cli error: {e}", ""]
+            await pm.pause_player(ctx.player_id, not currently_paused)
+    except Exception:  # noqa: BLE001
+        pass
+    return _command_echo(["pause"], args,
+                         ["_newvalue", "_fadein", "_suppressShowBriefly"],
+                         clientid=ctx.player_id)
 
 
 @register_command("stop")
@@ -1008,15 +1304,21 @@ async def cmd_stop(
     ctx: CLIContext,
     args: list[str],
 ) -> list[str]:
-    """stop — stop playback."""
+    """stop — stop playback; the answer is ONE escaped line.
+
+    ``addDispatch(['stop'],[1,0,0,playcontrolCommand])``
+    (``Slim/Control/Request.pm:619``) declares no parameter and adds no
+    result → ``<clientid> stop``.
+    """
     if not ctx.player_id:
-        return ["no player selected"]
+        return _echo("stop", args)
     try:
         from lyrion.player import PlayerManager
-        ok = await PlayerManager().stop_player(ctx.player_id)
-        return [] if ok else ["cli error: could not stop"]
-    except Exception as e:  # noqa: BLE001
-        return [f"cli error: {e}", ""]
+
+        await PlayerManager().stop_player(ctx.player_id)
+    except Exception:  # noqa: BLE001
+        pass
+    return _command_line(["stop"], [], [], clientid=ctx.player_id)
 
 
 @register_command("prev")
@@ -1025,15 +1327,22 @@ async def cmd_prev(
     ctx: CLIContext,
     args: list[str],
 ) -> list[str]:
-    """prev — skip to previous track."""
+    """prev — Perl has no 'prev' request, so it is echoed verbatim.
+
+    No entry in the dispatch table (``Slim/Control/Request.pm:474-637``)
+    → status 104 → echo (Plugin/CLI/Plugin.pm:657-663).  Live Perl 2026-09-12:
+    ``prev`` → ``prev``.  LMS controllers step the playlist with
+    ``playlist index -1`` / ``playlist jump`` instead (Request.pm:561-568).
+    """
     if not ctx.player_id:
-        return ["no player selected"]
+        return _echo("prev", args)
     try:
         from lyrion.player import PlayerManager
-        ok = await PlayerManager().playlist_prev(ctx.player_id)
-        return ["prev"] if ok else ["no playlist", ""]
-    except Exception as e:  # noqa: BLE001
-        return [f"cli error: {e}", ""]
+
+        await PlayerManager().playlist_prev(ctx.player_id)
+    except Exception:  # noqa: BLE001
+        pass
+    return _echo("prev", args)
 
 
 @register_command("next")
@@ -1042,15 +1351,21 @@ async def cmd_next(
     ctx: CLIContext,
     args: list[str],
 ) -> list[str]:
-    """next — skip to next track."""
+    """next — Perl has no 'next' request, so it is echoed verbatim.
+
+    Same as 'prev': no dispatch entry (``Slim/Control/Request.pm:474-637``)
+    → echo (Plugin/CLI/Plugin.pm:657-663).  Live Perl 2026-09-12: ``next`` →
+    ``next``.
+    """
     if not ctx.player_id:
-        return ["no player selected"]
+        return _echo("next", args)
     try:
         from lyrion.player import PlayerManager
-        ok = await PlayerManager().playlist_next(ctx.player_id)
-        return ["next"] if ok else ["no playlist", ""]
-    except Exception as e:  # noqa: BLE001
-        return [f"cli error: {e}", ""]
+
+        await PlayerManager().playlist_next(ctx.player_id)
+    except Exception:  # noqa: BLE001
+        pass
+    return _echo("next", args)
 
 
 @register_command("power")
@@ -1059,27 +1374,42 @@ async def cmd_power(
     ctx: CLIContext,
     args: list[str],
 ) -> list[str]:
+    """power [0|1] — ONE line: ``<clientid> power 1`` / ``power 0`` / echo.
+
+    ``powerQuery`` adds the bare result ``_power`` (``Slim/Control/Queries.pm:
+    2991-3006``; ``addDispatch(['power','?'])`` Request.pm:599), the setter
+    ``['power','_newvalue','_noplay']`` (:600) adds nothing → the request is
+    echoed.  Live Perl 9.1.1, read-only, 2026-09-12: ``power ?`` →
+    ``24%3A0a%3Ac4%3A29%3A77%3A90 power 1``.
     """
-    power [0|1]
-    Query or set player power state. Turning off stops playback.
-    """
+    if _is_query_echo(args):
+        if not ctx.player_id:
+            return _echo("power", args)
+        try:
+            from lyrion.player import PlayerManager
+
+            player = PlayerManager().get_player(ctx.player_id)
+            power = 1 if (player is not None and player.power) else 0
+        except Exception:  # noqa: BLE001
+            power = 0
+        return _command_line(["power"], [], [], clientid=ctx.player_id,
+                             results=[("_power", power)])
     if not ctx.player_id:
-        return ["no player selected"]
+        return _command_echo(["power"], args, ["_newvalue", "_noplay"], has_tags=True)
     try:
         from lyrion.player import PlayerManager
+
         pm = PlayerManager()
         player = pm.get_player(ctx.player_id)
-        if player is None:
-            return ["player not found", ""]
-        if args and str(args[0]) in ("0", "1"):
+        if player is not None and args and str(args[0]) in ("0", "1"):
             on = str(args[0]) == "1"
             player.power = on
             if not on:
                 await pm.stop_player(ctx.player_id)
-            return ["power: 1" if on else "power: 0", ""]
-        return [f"power: {'1' if player.power else '0'}", ""]
-    except Exception as e:  # noqa: BLE001
-        return [f"cli error: {e}", ""]
+    except Exception:  # noqa: BLE001
+        pass
+    return _command_echo(["power"], args, ["_newvalue", "_noplay"],
+                         clientid=ctx.player_id)
 
 
 # ---------------------------------------------------------------------------
@@ -1093,24 +1423,24 @@ async def cmd_volume(
     ctx: CLIContext,
     args: list[str],
 ) -> list[str]:
+    """volume [<0-100>] — Perl has no 'volume' request; it is echoed.
+
+    The mixer is addressed as ``mixer volume`` (``Slim/Control/Request.pm:
+    523-524``); there is no bare 'volume' dispatch entry (:474-637), so the
+    request is echoed (Plugin/CLI/Plugin.pm:657-663).  Live Perl 9.1.1,
+    read-only, 2026-09-12: ``volume 50`` → ``volume 50``, ``volume ?`` →
+    ``volume %3F``.  We still apply the volume so telnet users keep working.
     """
-    volume [<0-100>]
-    Query or set player volume (sends audg frame to the player).
-    """
-    if not ctx.player_id:
-        return ["no player selected"]
-    try:
-        from lyrion.player import PlayerManager
-        pm = PlayerManager()
-        player = pm.get_player(ctx.player_id)
-        if args and str(args[0]).replace(".", "").isdigit():
-            new_volume = int(float(str(args[0])))
-            ok = await pm.set_volume(ctx.player_id, new_volume)
-            return [] if ok else ["cli error: could not set volume"]
-        current = player.volume if player else 50
-        return [f"volume: {current}", ""]
-    except Exception as e:  # noqa: BLE001
-        return [f"cli error: {e}", ""]
+    if ctx.player_id and args and str(args[0]).replace(".", "").isdigit():
+        try:
+            from lyrion.player import PlayerManager
+
+            await PlayerManager().set_volume(ctx.player_id, int(float(str(args[0]))))
+        except Exception:  # noqa: BLE001
+            pass
+    # Live Perl 2026-09-12: 'volume 50' → 'volume 50', 'volume ?' → 'volume %3F'
+    # — no client id, the request is not dispatchable.
+    return _echo("volume", args)
 
 
 @register_command("mixer")
@@ -1129,7 +1459,7 @@ async def cmd_mixer(
     client id is the resolved player (Stdio.pm:131).
     """
     if not ctx.player_id:
-        return ["no player selected"]
+        return _echo("mixer", args)
     try:
         from lyrion.player.manager import PlayerManager
 
@@ -1216,28 +1546,37 @@ async def cmd_playerpref(
     ctx: CLIContext,
     args: list[str],
 ) -> list[str]:
-    """playerpref <key> [<value>] — query or set a per-player preference.
+    """playerpref <key> [<value>|?] — ONE line, client id in front.
 
-    LMS 'playerpref volume ?' returns _p2 '<value>'. 'playerpref <key> <v>'
-    sets it. Prefs are stored on the player state dict (in-memory).
+    ``playerprefQuery`` adds the bare result ``_p2``
+    (``Slim/Control/Queries.pm:3009-3046``, ``addDispatch(['playerpref',
+    '_prefname','?'])`` Request.pm:544); the setter ``['playerpref','_prefname',
+    '_newvalue']`` (:546) declares no result, so both forms answer
+    ``<clientid> playerpref <key> <value>``.  Live Perl 9.1.1, read-only,
+    2026-09-12: ``playerpref ?`` →
+    ``24%3A0a%3Ac4%3A29%3A77%3A90 playerpref %3F `` (bare ``_prefname`` '?'
+    plus the empty ``_p2`` value → one trailing space).
     """
-    if not ctx.player_id:
-        return ["no player selected"]
     if not args:
-        return ["playerpref: ", ""]
+        # Live Perl 2026-09-12: 'playerpref' → '<clientid> playerpref  '.
+        return _command_echo(["playerpref"], [], ["_prefname", "_newvalue"],
+                             clientid=ctx.player_id, has_tags=True)
     key = str(args[0])
     try:
         from lyrion.player import PlayerManager
-        player = PlayerManager().get_player(ctx.player_id)
-        if player is None:
-            return ["player not found", ""]
+
+        player = PlayerManager().get_player(ctx.player_id) if ctx.player_id else None
         prefs = getattr(player, "playerprefs", None)
         if prefs is None:
             prefs = {}
-            player.playerprefs = prefs
-        # Query form: '?'
+            if player is not None:
+                player.playerprefs = prefs
         if len(args) == 1 or (len(args) == 2 and str(args[1]) == "?"):
-            return [f"playerpref {key}: {prefs.get(key, '')}", ""]
+            value = prefs.get(key, "")
+            return _command_line(
+                ["playerpref"], args, ["_prefname", "?"],
+                clientid=ctx.player_id, results=[("_p2", value)],
+            )
         # Set form: value may be multi-word (join the rest)
         value = " ".join(str(a) for a in args[1:])
         prefs[key] = value
@@ -1246,10 +1585,13 @@ async def cmd_playerpref(
         # sofort auf den PlayerState anwenden.
         from lyrion.player.playerprefs import apply_player_pref
 
-        apply_player_pref(player, key, value)
-        return [f"playerpref {key}: {value}", ""]
-    except Exception as e:  # noqa: BLE001
-        return [f"cli error: {e}", ""]
+        if player is not None:
+            apply_player_pref(player, key, value)
+        return _command_line(["playerpref"], args, ["_prefname", "_newvalue"],
+                             clientid=ctx.player_id, has_tags=True)
+    except Exception:  # noqa: BLE001
+        return _command_echo(["playerpref"], args, ["_prefname", "_newvalue"],
+                             clientid=ctx.player_id)
 
 
 @register_command("button")
@@ -1258,47 +1600,48 @@ async def cmd_button(
     ctx: CLIContext,
     args: list[str],
 ) -> list[str]:
-    """button <name> — simulate a front-panel button press on the player.
+    """button <name> — simulate a front-panel button press; ONE line.
 
-    Named buttons map to transport actions (play/pause/stop/prev/next/
-    power). LMS 'button play' returns {} (control command); we echo the
-    action result. Unknown button -> "button: unhandled".
+    ``addDispatch(['button','_buttoncode','_time','_orFunction'],
+    [1,0,0,buttonCommand])`` (``Slim/Control/Request.pm:483``);
+    ``buttonCommand`` adds no result (Commands.pm), so the request is echoed —
+    with the client id (needsClient=1) and the declared ``_time``/
+    ``_orFunction`` slots rendered empty when unset (Request.pm:1026-1028).
+    We still perform the mapped transport action.
     """
-    if not ctx.player_id:
-        return ["no player selected"]
     if not args:
-        return ["button: no button", ""]
+        return _echo("button", args, clientid=ctx.player_id)
+    if not ctx.player_id:
+        return _command_echo(["button"], args,
+                             ["_buttoncode", "_time", "_orFunction"])
     name = str(args[0]).lower()
     try:
         from lyrion.player import PlayerManager
+
         pm = PlayerManager()
         if name == "play":
             player = pm.get_player(ctx.player_id)
             if player is not None and player.mode != "play":
                 await pm.pause_player(ctx.player_id, False)
-            return ["play", ""]
-        if name == "pause":
+        elif name == "pause":
             player = pm.get_player(ctx.player_id)
             if player is not None:
                 await pm.pause_player(ctx.player_id, player.mode != "pause")
-            return ["pause", ""]
-        if name == "power":
+        elif name == "power":
             player = pm.get_player(ctx.player_id)
             if player is not None:
                 pm.set_power(ctx.player_id, not player.power)
-            return ["power", ""]
-        if name == "stop":
+        elif name == "stop":
             await pm.stop_player(ctx.player_id)
-            return ["stop", ""]
-        if name == "prev":
+        elif name == "prev":
             await pm.playlist_prev(ctx.player_id)
-            return ["prev", ""]
-        if name == "next":
+        elif name == "next":
             await pm.playlist_next(ctx.player_id)
-            return ["next", ""]
-        return [f"button: unhandled '{args[0]}'", ""]
-    except Exception as e:  # noqa: BLE001
-        return [f"cli error: {e}", ""]
+    except Exception:  # noqa: BLE001
+        pass
+    return _command_echo(["button"], args,
+                         ["_buttoncode", "_time", "_orFunction"],
+                         clientid=ctx.player_id)
 
 
 # ---------------------------------------------------------------------------
@@ -1342,7 +1685,7 @@ async def cmd_status(
         return [render_line(terms=["status", *args])]
 
     if not ctx.player_id:
-        return ["no player selected"]
+        return _echo("status", args)
     try:
         from lyrion.player import PlayerManager
 
@@ -1534,16 +1877,27 @@ async def cmd_mode(
     ctx: CLIContext,
     args: list[str],
 ) -> list[str]:
-    """mode — return current playback mode (play, pause, stop)."""
-    if not ctx.player_id:
-        return ["no player selected"]
+    """mode ? — ONE line: ``<clientid> mode <play|pause|stop>``.
+
+    ``modeQuery`` adds the bare result ``_mode`` (``Slim/Control/Queries.pm:
+    2144-2162``; ``addDispatch(['mode','?'])`` Request.pm:525).  ``mode
+    pause|play|stop`` are separate command entries (:664-666) that add nothing
+    → the request is echoed.  Live Perl 9.1.1, read-only, 2026-09-12:
+    ``mode ?`` → ``24%3A0a%3Ac4%3A29%3A77%3A90 mode stop``.
+    """
+    if not _is_query_echo(args):
+        return _echo("mode", args, clientid=ctx.player_id)
+    mode = "stop"
     try:
         from lyrion.player import PlayerManager
-        player = PlayerManager().get_player(ctx.player_id)
-        mode = player.mode if player else "stop"
-        return [f"mode: {mode}", ""]
-    except Exception as e:  # noqa: BLE001
-        return [f"cli error: {e}", ""]
+
+        player = PlayerManager().get_player(ctx.player_id) if ctx.player_id else None
+        if player is not None:
+            mode = player.mode or "stop"
+    except Exception:  # noqa: BLE001
+        pass
+    return _command_line(["mode"], [], [], clientid=ctx.player_id,
+                         results=[("_mode", mode)])
 
 
 @register_command("time")
@@ -1552,29 +1906,41 @@ async def cmd_time(
     ctx: CLIContext,
     args: list[str],
 ) -> list[str]:
+    """time [<seconds>|<mm:ss>|?<delta>] — ONE line.
+
+    ``timeQuery`` adds the bare result ``_time`` (elapsed seconds;
+    ``Slim/Control/Queries.pm:4786-4804``; ``addDispatch(['time','?'])``
+    Request.pm:625).  The seek form ``['time','_newvalue']`` (:626) adds
+    nothing → the request is echoed.  Live Perl 9.1.1, read-only, 2026-09-12:
+    ``time ?`` → ``24%3A0a%3Ac4%3A29%3A77%3A90 time 0``.
     """
-    time [<seconds>|<mm:ss>|?<delta>]
-    Query or set the playback position. 'time ?' queries, a plain number
-    seeks to that second, '<n>-'/'<n>+' jumps relative (LMS format).
-    """
+    if not args or (_is_query_echo(args) and len(args) == 1):
+        elapsed = 0
+        try:
+            from lyrion.player import PlayerManager
+
+            player = PlayerManager().get_player(ctx.player_id) if ctx.player_id else None
+            if player is not None:
+                elapsed = int(getattr(player, "elapsed", 0) or 0)
+        except Exception:  # noqa: BLE001
+            pass
+        return _command_line(["time"], [], [],
+                             clientid=ctx.player_id,
+                             results=[("_time", elapsed)])
     if not ctx.player_id:
-        return ["no player selected"]
+        return _command_echo(["time"], args, ["_newvalue"])
     try:
         from lyrion.player import PlayerManager
+
         pm = PlayerManager()
         player = pm.get_player(ctx.player_id)
-        if player is None:
-            return ["player not found", ""]
-        if not args or str(args[0]) == "?":
-            return [f"time: {int(getattr(player, 'elapsed', 0) or 0)}", ""]
         val = str(args[0])
         if val.startswith("?"):  # '?-5' / '?+10' relative query
-            try:
-                delta = int(val[2:] if val[1] in "+-" else val[1:])
-                cur = int(getattr(player, "elapsed", 0) or 0)
-                return [f"time: {max(0, cur + delta)}", ""]
-            except ValueError:
-                return [f"time: {int(getattr(player, 'elapsed', 0) or 0)}", ""]
+            delta = int(val[2:] if val[1] in "+-" else val[1:])
+            cur = int(getattr(player, "elapsed", 0) or 0)
+            return _command_line(["time"], [val], [],
+                                 clientid=ctx.player_id,
+                                 results=[("_time", max(0, cur + delta))])
         # mm:ss form
         if ":" in val:
             parts = val.split(":")
@@ -1590,11 +1956,9 @@ async def cmd_time(
             elif val.endswith("+"):
                 seconds = (getattr(player, "elapsed", 0) or 0) + seconds
         await pm.seek_to(ctx.player_id, int(seconds))
-        return ["time: %d" % int(max(0, seconds)), ""]
-    except ValueError:
-        return ["cli error: time must be a number", ""]
-    except Exception as e:  # noqa: BLE001
-        return [f"cli error: {e}", ""]
+    except Exception:  # noqa: BLE001
+        pass
+    return _command_echo(["time"], args, ["_newvalue"], clientid=ctx.player_id)
 
 
 @register_command("sleep")
@@ -1603,33 +1967,37 @@ async def cmd_sleep(
     ctx: CLIContext,
     args: list[str],
 ) -> list[str]:
-    """sleep [<seconds>|off|?] — query or set the sleep timer.
+    """sleep [<seconds>|off|?] — ONE line.
 
-    LMS 'sleep ?' returns the remaining seconds (_sleep), 'sleep off'
-    cancels, 'sleep <n>' sets a countdown. We report the player's
-    sleep_remaining field (0 = no timer).
+    ``sleepQuery`` adds the bare result ``_sleep`` — the seconds left, clamped
+    at 0 (``Slim/Control/Queries.pm:3900-3923``; ``addDispatch(['sleep','?'])``
+    Request.pm:614).  The setter ``['sleep','_newvalue']`` (:615) adds nothing
+    → the request is echoed.  Live Perl 9.1.1, read-only, 2026-09-12:
+    ``sleep ?`` → ``24%3A0a%3Ac4%3A29%3A77%3A90 sleep 0``.
     """
-    if not ctx.player_id:
-        return ["no player selected"]
+    remaining = 0
     try:
         from lyrion.player import PlayerManager
-        player = PlayerManager().get_player(ctx.player_id)
-        if player is None:
-            return ["player not found", ""]
-        remaining = int(getattr(player, "sleep_remaining", 0) or 0)
-        if not args or str(args[0]) == "?":
-            return [f"sleep: {remaining}", ""]
+
+        player = PlayerManager().get_player(ctx.player_id) if ctx.player_id else None
+        if player is not None:
+            remaining = int(getattr(player, "sleep_remaining", 0) or 0)
+    except Exception:  # noqa: BLE001
+        player = None
+    if not args or (_is_query_echo(args) and len(args) == 1):
+        return _command_line(["sleep"], [], [],
+                             clientid=ctx.player_id,
+                             results=[("_sleep", remaining)])
+    if player is not None:
         t = str(args[0]).lower()
         if t == "off":
             player.sleep_remaining = 0
-            return ["sleep: 0", ""]
-        try:
-            player.sleep_remaining = int(t)
-        except ValueError:
-            return ["cli error: sleep must be a number or off", ""]
-        return [f"sleep: {player.sleep_remaining}", ""]
-    except Exception as e:  # noqa: BLE001
-        return [f"cli error: {e}", ""]
+        else:
+            try:
+                player.sleep_remaining = int(t)
+            except ValueError:
+                pass
+    return _command_echo(["sleep"], args, ["_newvalue"], clientid=ctx.player_id)
 
 
 @register_command("signalstrength")
@@ -1638,22 +2006,27 @@ async def cmd_signalstrength(
     ctx: CLIContext,
     args: list[str],
 ) -> list[str]:
-    """signalstrength [?] — return the player's WiFi signal strength.
+    """signalstrength ? — ONE line: ``<clientid> signalstrength <pct>``.
 
-    LMS 'signalstrength ?' returns '_signalstrength <pct>'. Wired /
-    software players report 0.
+    ``signalstrengthQuery`` adds the bare result ``_signalstrength``
+    (``Slim/Control/Queries.pm:3882-3898``, ``... || 0``;
+    ``addDispatch(['signalstrength','?'])`` Request.pm:613).  Live Perl 9.1.1,
+    read-only, 2026-09-12: ``signalstrength ?`` →
+    ``24%3A0a%3Ac4%3A29%3A77%3A90 signalstrength 44``.
     """
-    if not ctx.player_id:
-        return ["no player selected"]
+    if not _is_query_echo(args):
+        return _echo("signalstrength", args, clientid=ctx.player_id)
+    sig = 0
     try:
         from lyrion.player import PlayerManager
-        player = PlayerManager().get_player(ctx.player_id)
-        if player is None:
-            return ["player not found", ""]
-        sig = int(getattr(player, "signal_strength", 0) or 0)
-        return [f"signalstrength: {sig}", ""]
-    except Exception as e:  # noqa: BLE001
-        return [f"cli error: {e}", ""]
+
+        player = PlayerManager().get_player(ctx.player_id) if ctx.player_id else None
+        if player is not None:
+            sig = int(getattr(player, "signal_strength", 0) or 0)
+    except Exception:  # noqa: BLE001
+        pass
+    return _command_line(["signalstrength"], [], [], clientid=ctx.player_id,
+                         results=[("_signalstrength", sig)])
 
 
 @register_command("randomplay")
@@ -1662,29 +2035,25 @@ async def cmd_randomplay(
     ctx: CLIContext,
     args: list[str],
 ) -> list[str]:
-    """randomplay [<mode>] — query or set the random-play (DJ) mode.
+    """randomplay [<mode>] — Perl has no such request; it is echoed.
 
-    LMS 'randomplay ?' returns the current mode index ("random playlist"
-    / "similar songs"); 'randomplay <mode>' enables it.
+    No entry in the dispatch table (``Slim/Control/Request.pm:474-637``) —
+    Perl's DJ mode lives in ``Slim/Plugin/RandomPlay`` and is driven through
+    ``playlist``/``pref``.  Live Perl 9.1.1, read-only, 2026-09-12:
+    ``randomplay ?`` → ``randomplay %3F``.  We still store the mode on the
+    player so telnet users keep working.
     """
-    if not ctx.player_id:
-        return ["no player selected"]
-    try:
-        from lyrion.player import PlayerManager
-        player = PlayerManager().get_player(ctx.player_id)
-        if player is None:
-            return ["player not found", ""]
-        mode = int(getattr(player, "randomplay", 0) or 0)
-        if not args or str(args[0]) == "?":
-            labels = ["", "random", "similar"]
-            return [f"randomplay: {mode}", ""]
+    if ctx.player_id and args and str(args[0]) != "?":
         try:
-            player.randomplay = max(0, min(2, int(str(args[0]))))
-        except ValueError:
-            return ["cli error: randomplay must be 0-2", ""]
-        return [f"randomplay: {player.randomplay}", ""]
-    except Exception as e:  # noqa: BLE001
-        return [f"cli error: {e}", ""]
+            from lyrion.player import PlayerManager
+
+            player = PlayerManager().get_player(ctx.player_id)
+            if player is not None:
+                player.randomplay = max(0, min(2, int(str(args[0]))))
+        except Exception:  # noqa: BLE001
+            pass
+    # Live Perl 2026-09-12: 'randomplay' → '<clientid> randomplay '.
+    return _echo("randomplay", args, clientid=ctx.player_id)
 
 
 @register_command("current_title")
@@ -1693,22 +2062,15 @@ async def cmd_current_title(
     ctx: CLIContext,
     args: list[str],
 ) -> list[str]:
-    """current_title — return the title of the currently playing track."""
-    if not ctx.player_id:
-        return ["no player selected"]
-    try:
-        from lyrion.player import PlayerManager
-        player = PlayerManager().get_player(ctx.player_id)
-        if player is None or player.current_track_id is None:
-            return ["", ""]
-        rows = await _query_db(
-            "SELECT title FROM tracks WHERE id = ?", (player.current_track_id,)
-        )
-        if rows:
-            return [rows[0]["title"], ""]
-        return ["", ""]
-    except Exception as e:  # noqa: BLE001
-        return [f"cli error: {e}", ""]
+    """current_title ? — ONE line: ``<clientid> current_title <title>``.
+
+    ``cursonginfoQuery`` adds the bare result ``_current_title``
+    (``Slim/Music/Info::getCurrentTitle``, ``Slim/Control/Queries.pm:
+    1448-1495``) and adds *nothing* when the URL is undefined (:1464) — the
+    key is omitted, not sent empty.  Live Perl 9.1.1, read-only, 2026-09-12:
+    ``current_title ?`` → ``24%3A0a%3Ac4%3A29%3A77%3A90 current_title Dense%20…``.
+    """
+    return await _current_metadata(ctx, "current_title")
 
 
 @register_command("artist")
@@ -1717,7 +2079,13 @@ async def cmd_artist(
     ctx: CLIContext,
     args: list[str],
 ) -> list[str]:
-    """artist [?] — return the artist of the currently playing track."""
+    """artist ? — ONE line: ``<clientid> artist <name>`` (key omitted if unset).
+
+    ``cursonginfoQuery`` (``Slim/Control/Queries.pm:1448-1495``) only adds the
+    bare result ``_artist`` when ``_songData`` has the field (:1487-1489), so a
+    track without an artist answers just the verb.  Live Perl 9.1.1, read-only,
+    2026-09-12: ``artist ?`` → ``24%3A0a%3Ac4%3A29%3A77%3A90 artist``.
+    """
     return await _current_metadata(ctx, "artist")
 
 
@@ -1727,7 +2095,7 @@ async def cmd_album(
     ctx: CLIContext,
     args: list[str],
 ) -> list[str]:
-    """album [?] — return the album of the currently playing track."""
+    """album ? — ONE line: ``<clientid> album <title>`` (key omitted if unset)."""
     return await _current_metadata(ctx, "album")
 
 
@@ -1737,40 +2105,49 @@ async def cmd_genre(
     ctx: CLIContext,
     args: list[str],
 ) -> list[str]:
-    """genre [?] — return the genre of the currently playing track."""
+    """genre ? — ONE line: ``<clientid> genre <name>`` (key omitted if unset)."""
     return await _current_metadata(ctx, "genre")
 
 
 async def _current_metadata(ctx: CLIContext, field: str) -> list[str]:
-    """Return a single metadata field (artist/album/genre) of the current track."""
-    if not ctx.player_id:
-        return ["no player selected"]
-    try:
-        from lyrion.player import PlayerManager
-        player = PlayerManager().get_player(ctx.player_id)
-        if player is None or player.current_track_id is None:
-            return ["", ""]
-        # Cache on player state, but fall back to the DB row.
-        cached = getattr(player, f"current_{field}", None)
-        if cached:
-            return [str(cached), ""]
-        if field == "artist":
-            sql = ("SELECT c.name AS v FROM contributors c "
-                   "JOIN tracks_contributors tc ON tc.contributor = c.id "
-                   "AND tc.role = 1 WHERE tc.track = ? LIMIT 1")
-        elif field == "album":
-            # tracks has no album column; resolve via tracks_albums -> albums.
-            sql = ("SELECT al.title AS v FROM albums al "
-                   "JOIN tracks_albums ta ON ta.album = al.id "
-                   "WHERE ta.track = ? LIMIT 1")
-        else:
-            sql = f"SELECT {field} AS v FROM tracks WHERE id = ?"
-        rows = await _query_db(sql, (player.current_track_id,))
-        if rows and rows[0]["v"]:
-            return [str(rows[0]["v"]), ""]
-        return ["", ""]
-    except Exception as e:  # noqa: BLE001
-        return [f"cli error: {e}", ""]
+    """One line for the ``cursonginfoQuery`` entity of the current track.
+
+    The result key is the bare ``_<entity>`` (``Slim/Control/Queries.pm:
+    1487-1493``) and is added only when the value is defined; otherwise the
+    answer is just ``<clientid> <entity>`` (live Perl 2026-09-12:
+    ``album ?`` → ``24%3A… album``).
+    """
+    value: Any = None
+    if ctx.player_id:
+        try:
+            from lyrion.player import PlayerManager
+
+            player = PlayerManager().get_player(ctx.player_id)
+            if player is not None and player.current_track_id is not None:
+                cached = getattr(player, f"current_{field}", None)
+                if cached:
+                    value = str(cached)
+                else:
+                    if field == "artist":
+                        sql = ("SELECT c.name AS v FROM contributors c "
+                               "JOIN tracks_contributors tc ON tc.contributor = c.id "
+                               "AND tc.role = 1 WHERE tc.track = ? LIMIT 1")
+                    elif field == "album":
+                        # tracks has no album column; resolve via tracks_albums.
+                        sql = ("SELECT al.title AS v FROM albums al "
+                               "JOIN tracks_albums ta ON ta.album = al.id "
+                               "WHERE ta.track = ? LIMIT 1")
+                    elif field == "current_title":
+                        sql = "SELECT title AS v FROM tracks WHERE id = ?"
+                    else:
+                        sql = f"SELECT {field} AS v FROM tracks WHERE id = ?"
+                    rows = await _query_db(sql, (player.current_track_id,))
+                    if rows and rows[0]["v"]:
+                        value = str(rows[0]["v"])
+        except Exception:  # noqa: BLE001
+            value = None
+    results = [(f"_{field}", value)] if value is not None else []
+    return _command_line([field], [], [], clientid=ctx.player_id, results=results)
 
 
 # ---------------------------------------------------------------------------
@@ -1792,37 +2169,103 @@ def _move_playlist_item(pm, player_id: str, frm: int, to: int) -> bool:
     return True
 
 
+# The 'playlist <entity> ?' query entities of playlistXQuery
+# (Slim/Control/Queries.pm:2708-2774).
+_PLAYLIST_QUERY_ENTITIES = frozenset({
+    "name", "url", "modified", "tracks", "index", "jump", "genre", "title",
+    "duration", "artist", "album", "path", "remote",
+})
+
+
+def _playlist_entity(player: Any, entity: str) -> Any:
+    """The bare ``_<entity>`` value of one playlist query entity.
+
+    ``playlistXQuery`` (``Slim/Control/Queries.pm:2708-2774``): repeat/shuffle
+    from the playlist state (:2715/:2718), index/jump = the playing song index
+    (:2721), name = the current playlist's title (:2724), url (:2729),
+    modified (:2732), tracks = the playlist count (:2736), genre/title/
+    duration = the ``_songData`` field of the track at ``_index`` (:2752-2758).
+    """
+    if player is None:
+        return ""
+    if entity == "repeat":
+        return int(getattr(player, "repeat", 0) or 0)
+    if entity == "shuffle":
+        return int(getattr(player, "shuffle", 0) or 0)
+    if entity in ("index", "jump"):
+        return int(getattr(player, "playlist_position", 0) or 0)
+    if entity == "tracks":
+        return int(getattr(player, "playlist_total", 0)
+                   or len(getattr(player, "playlist", []) or []))
+    if entity == "modified":
+        return int(getattr(player, "playlist_modified", 0) or 0)
+    if entity == "name":
+        return str(getattr(player, "current_playlist_name", "") or "")
+    if entity == "url":
+        return str(getattr(player, "current_url", "") or "")
+    if entity == "path":
+        return str(getattr(player, "current_url", "") or "") or "0"
+    if entity == "remote":
+        return 1 if getattr(player, "remote", 0) else 0
+    # duration / artist / album / title / genre — the current song's field
+    cached = getattr(player, f"current_{entity}", None)
+    if cached:
+        return str(cached)
+    if entity == "title":
+        return str(getattr(player, "current_title", "") or "")
+    return ""
+
+
 @register_command("playlist")
 async def cmd_playlist(
     handler: CLIHandler,
     ctx: CLIContext,
     args: list[str],
 ) -> list[str]:
-    """
-    playlist <subcommand> [args...]
+    """playlist <entity|sub> [args] — every answer is ONE escaped line.
 
-    Subcommands:
-        play <trackId>    — play a track (or index if in playlist)
-        add <trackId>...  — add tracks to playlist
-        insert <trackId>  — insert track after current
-        delete <index>    — remove track at index
-        move <from> <to>  — move track
-        clear             — clear playlist
-        save <name>       — save playlist
-        load <name>       — load playlist
-        resume <name>     — resume saved playlist
-        tracks            — list playlist tracks
-        next / prev       — skip in playlist
+    Perl registers 'playlist' as one of the biggest dispatch groups
+    (``Slim/Control/Request.pm:548-591``).  Two shapes matter here:
+
+    * the *queries* ``playlist name|url|modified|tracks|index|shuffle|repeat|
+      genre|title|duration|artist|album|path|remote ?`` → the bare result
+      ``_<entity>`` (``playlistXQuery``, Queries.pm:2708-2774); live Perl
+      2026-09-12: ``playlist name ?`` → ``<clientid> playlist name
+      Hirschmilch%20Chillout``, ``playlist tracks ?`` → ``playlist tracks 1``,
+      ``playlist genre ?`` → ``playlist genre %3F`` (the index is '?' → no
+      result).
+    * the *commands* (add/insert/load/play/resume/clear/delete/move/save/
+      repeat/shuffle/index/jump) add no result — ``playlistXitemCommand``,
+      ``playlistClearCommand``, ``playlistMoveCommand``, ``playlistJumpCommand``
+      and friends in Commands.pm — so they are echoed (Plugin/CLI/Plugin.pm:
+      692-698).  ``playlist save`` adds only the suppressed ``__playlist_id``
+      (Commands.pm playlistSaveCommand:66).
+
+    Sub-commands we keep beyond Perl (``loop``, the ``tracks`` listing, the
+    ``next``/``prev``/``url`` shortcuts) answer in the same one-line shape.
     """
-    if not ctx.player_id:
-        return ["no player selected"]
     if not args:
-        return ["playlist: "]
+        # Live Perl 2026-09-12: 'playlist' → 'playlist'.
+        return _echo("playlist", args)
+    if not ctx.player_id:
+        return _echo("playlist", args)
     sub = args[0].lower()
     rest = args[1:]
     try:
         from lyrion.player import PlayerManager
+
         pm = PlayerManager()
+        # playlistXQuery: every 'playlist <entity> ?' answers the bare
+        # '_<entity>' result (Slim/Control/Queries.pm:2708-2774).  Live Perl
+        # 9.1.1, read-only, 2026-09-12: 'playlist name ?' → '<clientid>
+        # playlist name Hirschmilch%20Chillout', 'playlist tracks ?' →
+        # 'playlist tracks 1', 'playlist url ?' → 'playlist url ' (empty).
+        if sub in _PLAYLIST_QUERY_ENTITIES and _is_query_echo(rest):
+            return _command_line(
+                ["playlist", sub], [], [], clientid=ctx.player_id,
+                results=[(f"_{sub}",
+                          _playlist_entity(pm.get_player(ctx.player_id), sub))],
+            )
         if sub == "play":
             return await cmd_playlist_play(handler, ctx, rest)
         if sub == "add":
@@ -1830,33 +2273,45 @@ async def cmd_playlist(
         if sub == "insert":
             if rest:
                 return await cmd_playlist_add(handler, ctx, rest)
-            return ["playlist insert <trackId> — missing id", ""]
+            return _command_echo(["playlist", "insert"], rest, ["_item", "_title"],
+                                 clientid=ctx.player_id)
         if sub == "delete":
             if not rest or not str(rest[0]).isdigit():
-                return ["playlist delete <index> — missing index", ""]
+                return _command_echo(["playlist", "delete"], rest, ["_index"],
+                                     clientid=ctx.player_id)
             pm.playlist_remove(ctx.player_id, int(rest[0]))
-            return ["deleted", ""]
+            return _command_echo(["playlist", "delete"], rest, ["_index"],
+                                 clientid=ctx.player_id)
         if sub == "clear":
             pm.playlist_clear(ctx.player_id)
-            return ["ok", ""]
-        if sub == "next":
-            ok = await pm.playlist_next(ctx.player_id)
-            return ["next"] if ok else ["playlist empty", ""]
-        if sub == "prev":
-            ok = await pm.playlist_prev(ctx.player_id)
-            return ["prev"] if ok else ["playlist empty", ""]
+            return _command_line(["playlist", "clear"], [], [],
+                                 clientid=ctx.player_id)
+        if sub in ("next", "prev"):
+            # No Perl dispatch entry for these — echoed like Perl does with an
+            # unknown request (Plugin/CLI/Plugin.pm:657-663).
+            if sub == "next":
+                await pm.playlist_next(ctx.player_id)
+            else:
+                await pm.playlist_prev(ctx.player_id)
+            return _echo(f"playlist {sub}", rest, clientid=ctx.player_id)
         if sub == "tracks":
             player = pm.get_player(ctx.player_id)
             tracks = player.playlist if player else []
-            out = [f"playlist tracks: {len(tracks)}"]
+            if _is_query_echo(rest):
+                # Perl: playlistXQuery adds the bare _tracks (Queries.pm:2744).
+                return _command_line(["playlist", "tracks"], [], [],
+                                     clientid=ctx.player_id,
+                                     results=[("_tracks", len(tracks))])
             # Titel der lokalen Tracks für die UI-Anzeige (ein Query)
             track_titles: dict[int, str] = {}
             track_ids = [e for e in tracks if not isinstance(e, str)]
             if track_ids:
                 try:
                     from sqlalchemy import select
+
                     from lyrion.database.schema import Track
                     from lyrion.database.sqlite_helper import db_session
+
                     async with db_session() as session:
                         result = await session.execute(
                             select(Track.id, Track.title).where(Track.id.in_(track_ids))
@@ -1864,117 +2319,110 @@ async def cmd_playlist(
                         track_titles = {tid: t for tid, t in result.all()}
                 except Exception as exc:  # noqa: BLE001
                     logger.debug("playlist tracks: title lookup failed: %s", exc)
+            items: list[dict[str, Any]] = []
             for i, entry in enumerate(tracks):
-                out.append(f"id: {i}")
                 if isinstance(entry, str):
-                    # Stream-URL entry (radio favorite)
-                    out.append(f"url: {entry}")
-                    if i == player.playlist_position and player.current_title:
-                        out.append(f"title: {player.current_title}")
-                    else:
-                        out.append("title: Radio Stream")
+                    items.append({"id": i, "url": entry,
+                                  "title": "Radio Stream"})
                 else:
-                    out.append(f"track_id: {entry}")
-                    if entry in track_titles:
-                        out.append(f"title: {track_titles[entry]}")
-            out.append("")
-            return out
+                    items.append({"id": i, "track_id": entry,
+                                  "title": track_titles.get(entry, "")})
+            return _command_line(["playlist", "tracks"], rest, [],
+                                 clientid=ctx.player_id,
+                                 results=[("count", len(tracks)),
+                                          ("item_loop", items)])
         if sub == "move":
             if len(rest) >= 2 and str(rest[0]).isdigit() and str(rest[1]).isdigit():
-                ok = _move_playlist_item(pm, ctx.player_id, int(rest[0]), int(rest[1]))
-                return ["moved"] if ok else ["cli error: move failed", ""]
-            return ["playlist move <from> <to> — missing indices", ""]
+                _move_playlist_item(pm, ctx.player_id, int(rest[0]), int(rest[1]))
+            return _command_echo(["playlist", "move"], rest,
+                                 ["_fromindex", "_toindex"],
+                                 clientid=ctx.player_id)
         if sub == "save":
-            if not rest:
-                return ["playlist save <name> — missing name", ""]
-            ok = await pm.save_playlist(ctx.player_id, rest[0])
-            return ["saved"] if ok else ["cli error: could not save (empty playlist?)", ""]
+            if rest:
+                await pm.save_playlist(ctx.player_id, rest[0])
+            return _command_echo(["playlist", "save"], rest, ["_title"],
+                                 clientid=ctx.player_id)
         if sub in ("load", "resume"):
-            if not rest:
-                return [f"playlist {sub} <name> — missing name", ""]
-            ok = await pm.load_playlist(ctx.player_id, rest[0])
-            if ok:
-                return [f"playlist {sub}: {rest[0]}", ""]
-            return [f"cli error: playlist '{rest[0]}' not found", ""]
+            if rest:
+                await pm.load_playlist(ctx.player_id, rest[0])
+            return _command_echo(["playlist", sub], rest, ["_item"],
+                                 clientid=ctx.player_id)
         if sub == "url":
-            # playlist url <url> [title] — replace queue with a stream URL
+            # playlist url [<url> [title]] — replace queue with a stream URL
             if not rest:
                 player2 = pm.get_player(ctx.player_id)
-                return ["playlist url: %s" % (getattr(player2, "current_url", "") or ""), ""]
+                return _command_line(["playlist", "url"], [], [],
+                                     clientid=ctx.player_id,
+                                     results=[("_url",
+                                               getattr(player2, "current_url", "") or "")])
             title = " ".join(rest[1:]) if len(rest) > 1 else ""
-            ok = await pm.play_url(ctx.player_id, rest[0], title)
-            return [] if ok else ["cli error: could not play url", ""]
+            await pm.play_url(ctx.player_id, rest[0], title)
+            return _command_echo(["playlist", "url"], rest, ["_item"],
+                                 clientid=ctx.player_id)
         if sub in ("index", "jump"):
             # playlist index <n> — jump to a playlist index (no restart of
             # an identical index; LMS 'index' only plays when changed).
-            # 'playlist index ?' returns the current index (LMS parity).
             player3 = pm.get_player(ctx.player_id)
-            if not rest or str(rest[0]) == "?":
-                cur = getattr(player3, "playlist_position", 0) if player3 else 0
-                return [f"playlist index: {cur}", ""]
-            if not str(rest[0]).lstrip("-").isdigit():
-                return [f"playlist {sub} <index> — missing index", ""]
-            idx = int(rest[0])
             cur = getattr(player3, "playlist_position", 0) if player3 else 0
+            if not rest or str(rest[0]) == "?":
+                return _command_line(["playlist", sub], [], [],
+                                     clientid=ctx.player_id,
+                                     results=[(f"_{sub}", cur)])
+            if not str(rest[0]).lstrip("-").isdigit():
+                return _command_echo(["playlist", sub], rest, ["_index"],
+                                     clientid=ctx.player_id)
+            idx = int(rest[0])
             if sub == "index" and idx == cur and player3 is not None \
                     and player3.mode == "play":
-                return []
-            ok = await pm.playlist_play(ctx.player_id, idx)
-            return [] if ok else ["cli error: could not jump", ""]
-        if sub == "shuffle":
-            # playlist shuffle <0|1|2|?> — off/song/album shuffle state
+                pass
+            else:
+                await pm.playlist_play(ctx.player_id, idx)
+            return _command_echo(["playlist", sub], rest, ["_index"],
+                                 clientid=ctx.player_id)
+        if sub in ("shuffle", "repeat"):
             player4 = pm.get_player(ctx.player_id)
-            if player4 is None:
-                return ["player not found", ""]
             if not rest or str(rest[0]) == "?":
-                return [f"playlist shuffle: {getattr(player4, 'shuffle', 0)}", ""]
-            try:
-                player4.shuffle = max(0, min(2, int(str(rest[0]))))
-                return ["playlist shuffle: %d" % player4.shuffle, ""]
-            except ValueError:
-                return ["cli error: shuffle must be a number", ""]
-        if sub == "repeat":
-            # playlist repeat <0|1|2|?> — off/repeat-one/repeat-all
-            player5 = pm.get_player(ctx.player_id)
-            if player5 is None:
-                return ["player not found", ""]
-            if not rest or str(rest[0]) == "?":
-                return [f"playlist repeat: {getattr(player5, 'repeat', 0)}", ""]
-            try:
-                player5.repeat = max(0, min(2, int(str(rest[0]))))
-                return ["playlist repeat: %d" % player5.repeat, ""]
-            except ValueError:
-                return ["cli error: repeat must be a number", ""]
+                value = int(getattr(player4, sub, 0)) if player4 else 0
+                return _command_line(["playlist", sub], [], [],
+                                     clientid=ctx.player_id,
+                                     results=[(f"_{sub}", value)])
+            if player4 is not None:
+                setattr(player4, sub, max(0, min(2, int(str(rest[0])))))
+            return _command_echo(["playlist", sub], rest, ["_newvalue"],
+                                 clientid=ctx.player_id)
         if sub == "loop":
+            # Our own convenience verb (Perl has 'repeat'/'shuffle' only).
             player6 = pm.get_player(ctx.player_id)
-            if player6 is None:
-                return ["player not found", ""]
-            rep = getattr(player6, "repeat", 0)
-            shu = getattr(player6, "shuffle", 0)
-            return [
-                f"loop: {['off','song','playlist'][min(2, rep)]}",
-                f"shuffle: {['none','track','album'][min(2, shu)]}",
-                "",
-            ]
+            if _is_query_echo(rest):
+                rep = int(getattr(player6, "repeat", 0)) if player6 else 0
+                shu = int(getattr(player6, "shuffle", 0)) if player6 else 0
+                return _command_line(
+                    ["playlist", "loop"], [], [], clientid=ctx.player_id,
+                    results=[("_repeat", rep), ("_shuffle", shu)],
+                )
+            return _echo("playlist loop", rest, clientid=ctx.player_id)
         if sub in ("genres", "genre"):
-            # LMS: playlist genres ? → comma-separated genre list
+            # LMS: 'playlist genre ?' → the comma-joined genre list (Queries.pm
+            # playlistXQuery 'genre' → bare _genre).
             player7 = pm.get_player(ctx.player_id)
             ids = [e for e in (player7.playlist if player7 else [])
                    if isinstance(e, int)] if player7 else []
-            if not ids:
-                return ["genres: ", ""]
-            placeholders = ",".join("?" * len(ids))
-            g_rows = await _query_db(
-                "SELECT DISTINCT t.genre AS g FROM tracks t "
-                f"WHERE t.id IN ({placeholders}) AND t.genre != '' "
-                "ORDER BY t.genre",
-                tuple(ids),
-            )
-            names = ",".join(r["g"] for r in g_rows)
-            return [f"genres: {names}", ""]
-        return [f"playlist: unknown subcommand '{sub}'", ""]
-    except Exception as e:  # noqa: BLE001
-        return [f"cli error: {e}", ""]
+            names = ""
+            if ids:
+                placeholders = ",".join("?" * len(ids))
+                g_rows = await _query_db(
+                    "SELECT DISTINCT t.genre AS g FROM tracks t "
+                    f"WHERE t.id IN ({placeholders}) AND t.genre != '' "
+                    "ORDER BY t.genre",
+                    tuple(ids),
+                )
+                names = ",".join(r["g"] for r in g_rows)
+            return _command_line(["playlist", "genre"], [], [],
+                                 clientid=ctx.player_id,
+                                 results=[("_genre", names)])
+        return _command_echo(["playlist", sub], rest, [], clientid=ctx.player_id)
+    except Exception:  # noqa: BLE001
+        return _echo("playlist", args, clientid=ctx.player_id)
 
 
 # Sub-command "playlist play" — routed via the base handler, not the registry.
@@ -1983,7 +2431,12 @@ async def cmd_playlist_play(
     ctx: CLIContext,
     args: list[str],
 ) -> list[str]:
-    """playlist play <trackId|index|tag:value> — play a track.
+    """playlist play <trackId|index|tag:value> — ONE escaped line.
+
+    ``addDispatch(['playlist','play','_item','_title','_fadein'])``
+    (``Slim/Control/Request.pm:576``); ``playlistXitemCommand`` adds no result
+    (Commands.pm), so the request is echoed with the client id in front
+    (Plugin/CLI/Plugin.pm:692-698).
 
     Extended (tagged) parameters from the Jive actions:
       track_id:<n>   play a library track
@@ -1993,11 +2446,14 @@ async def cmd_playlist_play(
       index:<n>      jump to a playlist index
     """
     if not ctx.player_id:
-        return ["no player selected"]
+        return _command_echo(["playlist", "play"], args,
+                             ["_item", "_title", "_fadein"])
     if not args:
-        return ["playlist play <trackId> — missing id", ""]
+        return _command_echo(["playlist", "play"], args,
+                             ["_item", "_title", "_fadein"])
     try:
         from lyrion.player import PlayerManager
+
         pm = PlayerManager()
         player = pm.get_player(ctx.player_id)
 
@@ -2015,36 +2471,31 @@ async def cmd_playlist_play(
 
         if "item_id" in tags:
             # Play a favorite (stream or folder entry)
-            try:
-                from lyrion.music.favorites import get_favorites_manager
-                from lyrion.control.cli_commands import _fav_resolve_id
-                fm = get_favorites_manager()
-                fav_id = await _fav_resolve_id(fm, tags["item_id"])
-                if fav_id is not None:
-                    ok = await fm.play(ctx.player_id, fav_id)
-                    return [f"playlist play {tags['item_id']}", ""] if ok \
-                        else ["cli error: could not play favorite", ""]
+            from lyrion.control.cli_commands import _fav_resolve_id
+            from lyrion.music.favorites import get_favorites_manager
+
+            fm = get_favorites_manager()
+            fav_id = await _fav_resolve_id(fm, tags["item_id"])
+            if fav_id is not None:
+                await fm.play(ctx.player_id, fav_id)
+            else:
                 # Fallback: radio station id
                 from lyrion.music.radio import get_radio_manager
+
                 station = await get_radio_manager().get_station(int(tags["item_id"]))
                 if station is not None:
-                    ok = await pm.play_url(ctx.player_id, station.url, station.name)
-                    return [f"playlist play {station.name}", ""] if ok \
-                        else ["cli error: could not play station", ""]
-                return ["favorites play: unknown id", ""]
-            except Exception as exc:  # noqa: BLE001
-                return [f"cli error: {exc}", ""]
-        if "track_id" in tags:
+                    await pm.play_url(ctx.player_id, station.url, station.name)
+        elif "track_id" in tags:
             tid = int(tags["track_id"])
             pm.playlist_add(ctx.player_id, tid)
-            ok = await pm.play_track(ctx.player_id, tid)
-            return [f"playlist play {tid}", ""] if ok else ["cli error: could not play", ""]
-        if "album_id" in tags or "artist_id" in tags:
+            await pm.play_track(ctx.player_id, tid)
+        elif "album_id" in tags or "artist_id" in tags:
             # Expand to all tracks of the album/artist (one query)
+            import sqlite3
+
+            db = sqlite3.connect(
+                f"file:{_library_db_path()}?mode=ro", uri=True)
             try:
-                import sqlite3
-                db = sqlite3.connect(
-                    f"file:{_library_db_path()}?mode=ro", uri=True)
                 if "album_id" in tags:
                     rows = db.execute(
                         "SELECT t.id FROM tracks t JOIN tracks_albums ta ON ta.track = t.id "
@@ -2055,49 +2506,38 @@ async def cmd_playlist_play(
                         "SELECT t.id FROM tracks t JOIN tracks_contributors tc ON tc.track = t.id "
                         "WHERE tc.contributor = ? AND tc.role = 1 ORDER BY t.title",
                         (int(tags["artist_id"]),)).fetchall()
+            finally:
                 db.close()
-                ids = [r[0] for r in rows]
-                if not ids:
-                    return ["cli error: no tracks found", ""]
+            ids = [r[0] for r in rows]
+            if ids:
                 pm.playlist_clear(ctx.player_id)
                 for tid in ids:
                     pm.playlist_add(ctx.player_id, tid)
-                ok = await pm.play_track(ctx.player_id, ids[0])
-                return [f"playlist play {len(ids)} tracks", ""] if ok \
-                    else ["cli error: could not play", ""]
-            except Exception as exc:  # noqa: BLE001
-                return [f"cli error: {exc}", ""]
-        if "index" in tags:
-            idx = int(tags["index"])
-            ok = await pm.playlist_play(ctx.player_id, idx)
-            return [f"playlist play {idx}", ""] if ok else ["cli error: could not play", ""]
-
-        # Positional form: playlist index if valid, else track id
-        if positional and str(positional[0]).isdigit():
+                await pm.play_track(ctx.player_id, ids[0])
+        elif "index" in tags:
+            await pm.playlist_play(ctx.player_id, int(tags["index"]))
+        elif positional and str(positional[0]).isdigit():
             idx = int(str(positional[0]))
             if player and idx < len(player.playlist):
-                ok = await pm.playlist_play(ctx.player_id, idx)
-                return [f"playlist play {idx}", ""] if ok else ["cli error: could not play", ""]
-            track_id = idx
+                await pm.playlist_play(ctx.player_id, idx)
+            else:
+                pm.playlist_add(ctx.player_id, idx)
+                await pm.play_track(ctx.player_id, idx)
         elif positional:
             first = str(positional[0])
             # Bare stream URL (SqueezePlay sends playlist play <url> for a
             # favorite whose url it uses directly, no item_id) — play it.
             if "://" in first:
-                url = first
-                ok = await pm.play_url(ctx.player_id, url, "")
-                return [f"playlist play {url}", ""] if ok \
-                    else ["cli error: could not play stream", ""]
-            track_id = int(first)
-        else:
-            return ["playlist play <trackId> — missing id", ""]
-        pm.playlist_add(ctx.player_id, track_id)
-        ok = await pm.play_track(ctx.player_id, track_id)
-        return [f"playlist play {track_id}", ""] if ok else ["cli error: could not play", ""]
-    except ValueError:
-        return ["cli error: track id must be a number", ""]
-    except Exception as e:  # noqa: BLE001
-        return [f"cli error: {e}", ""]
+                await pm.play_url(ctx.player_id, first, "")
+            else:
+                track_id = int(first)
+                pm.playlist_add(ctx.player_id, track_id)
+                await pm.play_track(ctx.player_id, track_id)
+    except Exception:  # noqa: BLE001
+        pass
+    return _command_echo(["playlist", "play"], args,
+                         ["_item", "_title", "_fadein"],
+                         clientid=ctx.player_id)
 
 
 # Sub-command "playlist add" — routed via the base handler, not the registry.
@@ -2106,30 +2546,31 @@ async def cmd_playlist_add(
     ctx: CLIContext,
     args: list[str],
 ) -> list[str]:
-    """playlist add <trackId>... — add tracks to playlist."""
-    if not ctx.player_id:
-        return ["no player selected"]
-    if not args:
-        return ["playlist add <trackId> — missing id", ""]
-    try:
-        from lyrion.player import PlayerManager
-        pm = PlayerManager()
-        added = 0
-        for a in args:
-            # Accept both plain ids and 'track_id:<n>' tagged form
-            s = str(a)
-            if ":" in s:
-                k, _, v = s.partition(":")
-                if k in ("track_id", "item_id"):
-                    s = v
-            try:
-                pm.playlist_add(ctx.player_id, int(s))
-                added += 1
-            except ValueError:
-                continue
-        return [f"added: {added}", ""]
-    except Exception as e:  # noqa: BLE001
-        return [f"cli error: {e}", ""]
+    """playlist add <trackId>... — ONE escaped line (Perl echoes the request).
+
+    ``addDispatch(['playlist','add','_item','_title'])``
+    (``Slim/Control/Request.pm:548``, ``playlistXitemCommand`` adds no result).
+    """
+    if ctx.player_id:
+        try:
+            from lyrion.player import PlayerManager
+
+            pm = PlayerManager()
+            for a in args:
+                # Accept both plain ids and 'track_id:<n>' tagged form
+                s = str(a)
+                if ":" in s:
+                    k, _, v = s.partition(":")
+                    if k in ("track_id", "item_id"):
+                        s = v
+                try:
+                    pm.playlist_add(ctx.player_id, int(s))
+                except ValueError:
+                    continue
+        except Exception:  # noqa: BLE001
+            pass
+    return _command_echo(["playlist", "add"], args, ["_item", "_title"],
+                         clientid=ctx.player_id)
 
 
 # Sub-command "playlist clear" — routed via the base handler, not the registry.
@@ -2138,15 +2579,15 @@ async def cmd_playlist_clear(
     ctx: CLIContext,
     args: list[str],
 ) -> list[str]:
-    """playlist clear — clear the current playlist."""
-    if not ctx.player_id:
-        return ["no player selected"]
-    try:
-        from lyrion.player import PlayerManager
-        PlayerManager().playlist_clear(ctx.player_id)
-        return ["ok", ""]
-    except Exception as e:  # noqa: BLE001
-        return [f"cli error: {e}", ""]
+    """playlist clear — ONE escaped line (``playlistClearCommand``, no result)."""
+    if ctx.player_id:
+        try:
+            from lyrion.player import PlayerManager
+
+            PlayerManager().playlist_clear(ctx.player_id)
+        except Exception:  # noqa: BLE001
+            pass
+    return _command_line(["playlist", "clear"], [], [], clientid=ctx.player_id)
 
 
 # Sub-command "playlist save" — routed via the base handler, not the registry.
@@ -2155,14 +2596,16 @@ async def cmd_playlist_save(
     ctx: CLIContext,
     args: list[str],
 ) -> list[str]:
-    """playlist save <name> — save the current playlist."""
+    """playlist save <name> — ONE escaped line.
+
+    ``playlistSaveCommand`` adds only ``__playlist_id``, which renderAsArray
+    suppresses (``Slim/Control/Request.pm:2261``; Commands.pm
+    playlistSaveCommand:66) — plus ``writeError`` on failure (:17/:63).
+    """
     if not args:
-        return ["playlist save: "]
-    if handler._dispatcher:
-        return await handler._dispatcher.player_command(
-            ctx.player_id, "playlist save", args
-        )
-    return []
+        return _echo("playlist save", args, clientid=ctx.player_id)
+    return _command_echo(["playlist", "save"], args, ["_title"],
+                         clientid=ctx.player_id)
 
 
 # Sub-command "playlist load" — routed via the base handler, not the registry.
@@ -2171,14 +2614,11 @@ async def cmd_playlist_load(
     ctx: CLIContext,
     args: list[str],
 ) -> list[str]:
-    """playlist load <name> — load a saved playlist."""
+    """playlist load <name> — ONE escaped line (``playlistXitemCommand``)."""
     if not args:
-        return ["playlist load: "]
-    if handler._dispatcher:
-        return await handler._dispatcher.player_command(
-            ctx.player_id, "playlist load", args
-        )
-    return []
+        return _echo("playlist load", args, clientid=ctx.player_id)
+    return _command_echo(["playlist", "load"], args, ["_item"],
+                         clientid=ctx.player_id)
 
 
 # ---------------------------------------------------------------------------
@@ -2191,21 +2631,29 @@ async def _search_lms(
     ctx: CLIContext,
     args: list[str],
 ) -> list[str]:
-    """LMS grouped search: 'search <start> <count> term:<begriff>'.
+    """LMS grouped search: 'search <start> <count> term:<begriff>' — ONE line.
 
-    Response: 'search <start> <count> count:<total> artists_count:N
-    albums_count:N genres_count:N tracks_count:N' followed by the page
-    items per group.
+    ``searchQuery`` (``Slim/Control/Queries.pm:3472-3560``) runs the search for
+    each entity and, per entity, adds ``<type>s_count`` (:3526) and the unrolled
+    ``<type>s_loop`` with the keys ``<type>_id`` and ``<type>`` (:3546/:3549);
+    the final ``count`` is the sum over all entities (:3586).  The entities are
+    contributor, album, work, genre and track (:3577-3581) — we have no 'work'
+    table, so we cover the other four.
+
+    Everything is appended to the same line by renderAsArray
+    (``Slim/Control/Request.pm:2264-2281``); live Perl 9.1.1, read-only,
+    2026-09-12: ``search 0 3 term:night`` → ``search 0 3 term%3Anight
+    rescan%3A1`` (the scan guard, :3496) with empty result sets while scanning.
     """
     nums = [int(a) for a in args if str(a).isdigit()]
     start = nums[0] if nums else 0
     count = nums[1] if len(nums) > 1 else 20
     term = next((str(a)[5:] for a in args if str(a).startswith("term:")), "")
     if not term:
-        return ["search: no term", ""]
+        return _command_line(["search"], args, ["_index", "_quantity"])
     like = f"%{term}%"
     try:
-        artists = await _query_db(
+        contributors = await _query_db(
             "SELECT DISTINCT c.id, c.name FROM contributors c "
             "JOIN tracks_contributors tc ON tc.contributor = c.id AND tc.role = 1 "
             "WHERE c.name LIKE ? ORDER BY c.name COLLATE NOCASE LIMIT ? OFFSET ?",
@@ -2226,7 +2674,7 @@ async def _search_lms(
             "ORDER BY title COLLATE NOCASE LIMIT ? OFFSET ?",
             (like, count, start),
         )
-        a_total = await _query_db(
+        c_total = await _query_db(
             "SELECT COUNT(DISTINCT c.id) AS n FROM contributors c "
             "JOIN tracks_contributors tc ON tc.contributor = c.id AND tc.role = 1 "
             "WHERE c.name LIKE ?", (like,))
@@ -2237,27 +2685,30 @@ async def _search_lms(
             (like,))
         t_total = await _query_db(
             "SELECT COUNT(*) AS n FROM tracks WHERE title LIKE ?", (like,))
-    except Exception as e:  # noqa: BLE001
-        return [f"cli error: {e}", ""]
-    a_n = a_total[0]["n"] if a_total else 0
+    except Exception:  # noqa: BLE001
+        return _command_line(["search"], args, ["_index", "_quantity"])
+    c_n = c_total[0]["n"] if c_total else 0
     al_n = al_total[0]["n"] if al_total else 0
     g_n = g_total[0]["n"] if g_total else 0
     t_n = t_total[0]["n"] if t_total else 0
-    out = [
-        f"search {start} {count} count:{a_n + al_n + g_n + t_n} "
-        f"artists_count:{a_n} albums_count:{al_n} genres_count:{g_n} "
-        f"tracks_count:{t_n}",
+
+    results: list[tuple[str, Any]] = [
+        ("contributors_count", c_n),
+        ("contributors_loop", [{"contributor_id": r["id"], "contributor": r["name"]}
+                               for r in contributors]),
+        ("albums_count", al_n),
+        ("albums_loop", [{"album_id": r["id"], "album": r["title"]}
+                         for r in albums]),
+        ("genres_count", g_n),
+        ("genres_loop", [{"genre_id": r["name"], "genre": r["name"]}
+                         for r in genres]),
+        ("tracks_count", t_n),
+        ("tracks_loop", [{"track_id": r["id"], "track": r["title"]}
+                         for r in tracks]),
+        ("count", c_n + al_n + g_n + t_n),
     ]
-    for r in artists:
-        out.append(f"id:{r['id']} artist:{r['name']}")
-    for r in albums:
-        out.append(f"id:{r['id']} album:{r['title']}")
-    for i, r in enumerate(genres):
-        out.append(f"id:{i + 1} genre:{r['name']}")
-    for r in tracks:
-        out.append(f"id:{r['id']} title:{r['title']}")
-    out.append("")
-    return out
+    return _command_line(["search"], args, ["_index", "_quantity"],
+                         results=results)
 
 
 @register_command("search")
@@ -2266,72 +2717,86 @@ async def cmd_search(
     ctx: CLIContext,
     args: list[str],
 ) -> list[str]:
+    """search <start> <count> term:<begriff> | search <type> <query> — ONE line.
+
+    ``addDispatch(['search','_index','_quantity'],[0,1,1,searchQuery])``
+    (``Slim/Control/Request.pm:610``).  A trailing '?' matches no entry (the
+    query is registered without one) → echoed, live Perl 2026-09-12:
+    ``search ?`` → ``search %3F``.
+
+    The ``term:`` form is Perl's grouped search (see :func:`_search_lms`); the
+    older ``search <type> <query>`` form is our own and answers in the same
+    Perl shape (``<type>s_count``/``<type>s_loop``/``count``).
     """
-    search <type> <query> [0 <limit>] — legacy typed search
-    search <start> <count> term:<begriff> — LMS grouped search
-    Types: tracks, artists, albums, genres, playlists, titles
-    """
+    if _is_query_echo(args):
+        return _echo("search", args)
     if not args:
-        return ["search: "]
+        return _echo("search", args)
     # LMS grouped format: search <start> <count> term:<begriff>
     if any(str(a).startswith("term:") for a in args):
         return await _search_lms(handler, ctx, args)
+
     search_type = args[0].lower()
-    query = args[1] if len(args) > 1 else ""
+    query = str(args[1]) if len(args) > 1 else ""
     offset = int(args[2]) if len(args) > 2 else 0
     limit = int(args[3]) if len(args) > 3 else 100
+    # Perl's entity names (Slim/Control/Queries.pm:3577-3581).
+    perl_type = {
+        "tracks": "track", "songs": "track", "titles": "track",
+        "artists": "contributor", "albums": "album", "genres": "genre",
+    }.get(search_type)
+    if perl_type is None:
+        return _echo("search", args)
 
-    # Direct library search (works without a RequestDispatcher)
+    like = f"%{query}%"
     try:
-        like = f"%{query}%"
-        if search_type in ("tracks", "songs", "titles"):
+        if perl_type == "track":
             rows = await _query_db(
-                "SELECT id, title, genre, year FROM tracks "
-                "WHERE title LIKE ? ORDER BY title COLLATE NOCASE LIMIT ? OFFSET ?",
+                "SELECT id, title AS name FROM tracks WHERE title LIKE ? "
+                "ORDER BY title COLLATE NOCASE LIMIT ? OFFSET ?",
                 (like, limit, offset),
             )
-            out = [str(len(rows)), f"{offset} {limit}"]
-            for r in rows:
-                out.append(f"id:{r['id']}")
-                out.append(f"title:{r['title']}")
-                if r["year"]:
-                    out.append(f"year:{r['year']}")
-        elif search_type == "artists":
+            total = await _query_db(
+                "SELECT COUNT(*) AS n FROM tracks WHERE title LIKE ?", (like,))
+        elif perl_type == "contributor":
             rows = await _query_db(
                 "SELECT id, name FROM contributors WHERE name LIKE ? "
                 "ORDER BY name COLLATE NOCASE LIMIT ? OFFSET ?",
                 (like, limit, offset),
             )
-            out = [str(len(rows)), f"{offset} {limit}"]
-            for r in rows:
-                out.append(f"id:{r['id']}")
-                out.append(f"artist:{r['name']}")
-        elif search_type == "albums":
+            total = await _query_db(
+                "SELECT COUNT(*) AS n FROM contributors WHERE name LIKE ?", (like,))
+        elif perl_type == "album":
             rows = await _query_db(
-                "SELECT id, title, year FROM albums WHERE title LIKE ? "
+                "SELECT id, title AS name FROM albums WHERE title LIKE ? "
                 "ORDER BY title COLLATE NOCASE LIMIT ? OFFSET ?",
                 (like, limit, offset),
             )
-            out = [str(len(rows)), f"{offset} {limit}"]
-            for r in rows:
-                out.append(f"id:{r['id']}")
-                out.append(f"album:{r['title']}")
-        elif search_type == "genres":
+            total = await _query_db(
+                "SELECT COUNT(*) AS n FROM albums WHERE title LIKE ?", (like,))
+        else:  # genre
             rows = await _query_db(
                 "SELECT DISTINCT genre AS name FROM tracks WHERE genre LIKE ? "
                 "ORDER BY genre COLLATE NOCASE LIMIT ? OFFSET ?",
                 (like, limit, offset),
             )
-            out = [str(len(rows)), f"{offset} {limit}"]
-            for i, r in enumerate(rows):
-                out.append(f"id:{offset + i + 1}")
-                out.append(f"genre:{r['name']}")
-        else:
-            return [f"search: unknown type '{search_type}'", ""]
-        out.append("")
-        return out
-    except Exception as e:  # noqa: BLE001
-        return [f"cli error: {e}", ""]
+            total = await _query_db(
+                "SELECT COUNT(DISTINCT genre) AS n FROM tracks WHERE genre LIKE ?",
+                (like,))
+    except Exception:  # noqa: BLE001
+        return _echo("search", args)
+    total_n = total[0]["n"] if total else 0
+    loop = [
+        {f"{perl_type}_id": r["id"] if "id" in r else r["name"],
+         perl_type: r["name"]}
+        for r in rows
+    ]
+    return _command_line(
+        ["search"], args, [],
+        results=[(f"{perl_type}s_count", total_n),
+                 (f"{perl_type}s_loop", loop),
+                 ("count", total_n)],
+    )
 
 
 @register_command("rescan")
@@ -2340,11 +2805,24 @@ async def cmd_rescan(
     ctx: CLIContext,
     args: list[str],
 ) -> list[str]:
-    """rescan [<mode>] — trigger a media library rescan in the background.
+    """rescan [<mode>] | rescan ? — ONE escaped line.
 
-    <mode> mirrors the LMS rescan modes: default "full" (reconciles
-    deletions), "playlists" etc. are additive refreshes.
+    ``rescanQuery`` adds the bare result ``_rescan`` (``1`` while a scan runs,
+    else ``0``; ``Slim/Control/Queries.pm:3214-3229``) and
+    ``['rescan','_mode','_target']`` (:606) is the command entry, which adds no
+    result → the request is echoed (Plugin/CLI/Plugin.pm:692-698).  Live Perl
+    9.1.1, read-only, 2026-09-12: ``rescan ?`` → ``rescan 0``.
     """
+    if _is_query_echo(args):
+        scanning = 0
+        try:
+            from lyrion.media.scan_state import SCAN_STATE
+
+            scanning = 1 if SCAN_STATE.snapshot().get("scanning") else 0
+        except Exception:  # noqa: BLE001
+            pass
+        return _command_line(["rescan"], [], [], results=[("_rescan", scanning)])
+
     mode = (args[0] if args and args[0] else "full").strip().lower()
     if mode in ("1", "once"):
         mode = "full"
@@ -2357,7 +2835,9 @@ async def cmd_rescan(
             try:
                 import logging as _logging
                 from pathlib import Path as _Path
+
                 from lyrion.config import get_config
+
                 musicdir = get_config().get("musicdir", "") or ""
                 if not str(musicdir).strip():
                     fallback = _Path.home() / "Music"
@@ -2373,9 +2853,10 @@ async def cmd_rescan(
                 logging.getLogger("lyrion").warning("Rescan failed: %s", exc)
 
         asyncio.create_task(_do())
-        return [f"rescan: {mode} started"]
-    except Exception as e:  # noqa: BLE001
-        return [f"cli error: {e}", ""]
+    except Exception:  # noqa: BLE001
+        pass
+    return _command_echo(["rescan"], args, ["_mode", "_target"])
+
 
 @register_command("wipecache")
 async def cmd_wipecache(
@@ -2383,23 +2864,31 @@ async def cmd_wipecache(
     ctx: CLIContext,
     args: list[str],
 ) -> list[str]:
-    """wipecache — clear the album art and other cached data."""
+    """wipecache [<queue>] — ONE escaped line (Perl adds no result).
+
+    ``addDispatch(['wipecache','_queue'],[0,0,0,wipecacheCommand])``
+    (``Slim/Control/Request.pm:631``); ``wipecacheCommand`` only launches the
+    scan and adds no result, so the request is echoed — the unset ``_queue``
+    still occupies its slot and renders as an empty token
+    (Request.pm:1026-1028).  Live Perl 9.1.1, read-only, 2026-09-12:
+    ``wipecache`` → ``wipecache `` (one trailing space).
+    """
     try:
         from pathlib import Path
+
         from lyrion.config import get_config
+
         cache_dir = Path(get_config().cache_dir)
-        removed = 0
         if cache_dir.is_dir():
             for p in cache_dir.rglob("*"):
                 if p.is_file():
                     try:
                         p.unlink()
-                        removed += 1
                     except OSError:
                         pass
-        return [f"wipecache: removed {removed} files", ""]
-    except Exception as e:  # noqa: BLE001
-        return [f"cli error: {e}", ""]
+    except Exception:  # noqa: BLE001
+        pass
+    return _command_echo(["wipecache"], args, ["_queue"])
 
 
 # ---------------------------------------------------------------------------
@@ -2413,22 +2902,32 @@ async def cmd_display(
     ctx: CLIContext,
     args: list[str],
 ) -> list[str]:
-    """display <line1> <line2> [<duration>] — show text on player display.
+    """display <line1> <line2> [<duration>] | display ? — ONE escaped line.
 
-    Sent as a slimproto 'grfe' frame (two-line text). Software players
-    (squeezelite/jive) render it on their UI.
+    ``displayQuery`` adds the bare results ``_line1`` and ``_line2``
+    (``Slim/Control/Queries.pm:1550-1568``) and is registered as
+    ``['display','?','?']`` (``Slim/Control/Request.pm:492``); the setter
+    ``['display','_line1','_line2','_duration']`` (:493) adds nothing → the
+    request is echoed.  Live Perl 9.1.1, read-only, 2026-09-12: ``display ?`` →
+    ``24%3A0a%3Ac4%3A29%3A77%3A90 display  `` (two empty values), ``display x y
+    5`` → ``24%3A… display x y 5``.
     """
-    if not ctx.player_id:
-        return ["no player selected"]
-    try:
-        line1 = args[0] if args else ""
-        line2 = args[1] if len(args) > 1 else ""
-        duration = int(args[2]) if len(args) > 2 and str(args[2]).isdigit() else 3
-        from lyrion.player import PlayerManager
-        ok = await PlayerManager().show_display(ctx.player_id, line1, line2, duration)
-        return [] if ok else ["cli error: could not display"]
-    except Exception as e:  # noqa: BLE001
-        return [f"cli error: {e}"]
+    if _is_query_echo(args):
+        return _command_line(["display"], [], [], clientid=ctx.player_id,
+                             results=[("_line1", ""), ("_line2", "")])
+    if ctx.player_id:
+        try:
+            line1 = str(args[0]) if args else ""
+            line2 = str(args[1]) if len(args) > 1 else ""
+            duration = int(args[2]) if len(args) > 2 and str(args[2]).isdigit() else 3
+            from lyrion.player import PlayerManager
+
+            await PlayerManager().show_display(ctx.player_id, line1, line2, duration)
+        except Exception:  # noqa: BLE001
+            pass
+    return _command_echo(["display"], args,
+                         ["_line1", "_line2", "_duration"],
+                         clientid=ctx.player_id)
 
 
 @register_command("ir")
@@ -2437,25 +2936,30 @@ async def cmd_ir(
     ctx: CLIContext,
     args: list[str],
 ) -> list[str]:
-    """ir <button_code> — simulate an IR button press on the player.
+    """ir <button_code> — simulate an IR button press; ONE escaped line.
 
-    The button code is a numeric SlimProto IR code. Named buttons
-    ('play','pause','arrow_up',...) are mapped to their codes here so
-    clients can use either form. Sent as an 'irm' slimproto frame.
+    ``addDispatch(['ir','_ircode','_time'],[1,0,0,irCommand])``
+    (``Slim/Control/Request.pm:506``); ``irCommand`` adds no result, so the
+    request is echoed with the client id — the unset ``_time`` slot renders as
+    an empty token (:1026-1028).  Live Perl 9.1.1, read-only, 2026-09-12:
+    ``ir 123`` → ``24%3A0a%3Ac4%3A29%3A77%3A90 ir 123 `` (one trailing space).
+
+    The button code is a numeric SlimProto IR code; named buttons
+    ('play','arrow_up',…) are mapped here so clients can use either form.
     """
+    if _is_query_echo(args):
+        return _echo("ir", args)
     if not ctx.player_id:
-        return ["no player selected"]
-    if not args:
-        return ["ir requires a button code or name"]
+        return _command_echo(["ir"], args, ["_ircode", "_time"])
     try:
-        code = _resolve_ir_code(args[0])
+        code = _resolve_ir_code(args[0]) if args else 0
         from lyrion.player import PlayerManager
-        ok = await PlayerManager().send_ir(ctx.player_id, code)
-        return [] if ok else ["cli error: could not send ir"]
-    except ValueError:
-        return [f"ir: unknown button '{args[0]}'"]
-    except Exception as e:  # noqa: BLE001
-        return [f"cli error: {e}"]
+
+        await PlayerManager().send_ir(ctx.player_id, code)
+    except Exception:  # noqa: BLE001
+        pass
+    return _command_echo(["ir"], args, ["_ircode", "_time"],
+                         clientid=ctx.player_id)
 
 
 # Common Squeezebox IR button codes (Slim::Hardware::IRBLaster / default map)
@@ -2524,21 +3028,75 @@ async def cmd_pref(
     ctx: CLIContext,
     args: list[str],
 ) -> list[str]:
-    """
-    pref <key> [<value>]
-    Query or set a server preference.
+    """pref <key> [<value>|?] — ONE escaped line.
+
+    ``prefQuery`` always adds the bare result ``_p2`` (the preference value)
+    (``Slim/Control/Queries.pm:3009-3046``; ``addDispatch(['pref','_prefname',
+    '?'])`` Request.pm:602), the setter ``['pref','_prefname','_newvalue']``
+    (:604) declares no result.  Live Perl 9.1.1, read-only, 2026-09-12:
+    ``pref ?`` → ``pref %3F `` — the bare ``_prefname`` '?' plus the empty
+    ``_p2`` value, i.e. one trailing space and no client id (needsClient=0).
     """
     if not args:
-        return []
-    key = args[0]
-    # LMS 'pref <key> ?' is a QUERY — set value to None so the
-    # dispatcher reads the current value instead of writing '?'.
-    value = None
-    if len(args) > 1 and args[1] != "?":
-        value = args[1]
+        # Live Perl 2026-09-12: 'pref' → 'pref  ' (both declared slots empty).
+        return _command_echo(["pref"], [], ["_prefname", "_newvalue"], has_tags=True)
+    key = str(args[0])
+    # LMS 'pref <key> ?' is a QUERY — set value to None so we read instead of
+    # writing '?'.
+    value: Optional[str] = None
+    query_form = len(args) == 1 or (len(args) == 2 and str(args[1]) == "?")
+    if len(args) > 1 and str(args[1]) != "?":
+        value = str(args[1])
     if handler._dispatcher:
-        return await handler._dispatcher.get_set_preference(key, value)
-    return []
+        try:
+            await handler._dispatcher.get_set_preference(key, value)
+        except Exception:  # noqa: BLE001
+            pass
+    if query_form:
+        current = ""
+        try:
+            from lyrion.config import get_config
+
+            current = str(get_config().get(key, "") or "")
+        except Exception:  # noqa: BLE001
+            current = ""
+        return _command_line(["pref"], args, ["_prefname", "?"],
+                             results=[("_p2", current)])
+    return _command_echo(["pref"], args, ["_prefname", "_newvalue"],
+                         has_tags=True)
+
+
+def _alarm_loop_entry(index: int, a: Any) -> dict[str, Any]:
+    """One ``alarms_loop`` item in Perl's key order.
+
+    ``alarmsQuery`` adds id, dow, enabled, repeat, shufflemode, time, volume and
+    url per item (``Slim/Control/Queries.pm:235-242``).  Perl's ``time`` is
+    seconds since midnight and ``url`` falls back to ``CURRENT_PLAYLIST``
+    (:242); live Perl 9.1.1, read-only, 2026-09-12: ``alarms 0 5`` →
+    ``<clientid> alarms 0 5 fade%3A1 count%3A1 id%3Af205b436
+    dow%3A1%2C2%2C3%2C4%2C5 enabled%3A1 repeat%3A1 shufflemode%3A0 time%3A21600
+    volume%3A34 url%3Ahttp%3A%2F%2Fhirschmilch.de%3A7000%2Fchillout.mp3``.
+    """
+    days = str(getattr(a, "days", "") or "")
+    dow = ",".join(str(i) for i in range(7) if i < len(days) and days[i] == "1")
+    time_str = str(getattr(a, "time", "0") or "0")
+    try:
+        hh, mm = time_str.split(":", 1)
+        seconds = int(hh) * 3600 + int(mm) * 60
+    except ValueError:
+        seconds = 0
+    wake = str(getattr(a, "wake", "") or "")
+    url = wake.split(":", 1)[1] if wake.startswith("url:") else wake
+    return {
+        "id": index,
+        "dow": dow,
+        "enabled": 1 if getattr(a, "enabled", False) else 0,
+        "repeat": 1 if getattr(a, "repeat", False) else 0,
+        "shufflemode": 0,
+        "time": seconds,
+        "volume": int(getattr(a, "volume", -1) or 0),
+        "url": url or "CURRENT_PLAYLIST",
+    }
 
 
 @register_command("alarms")
@@ -2547,23 +3105,29 @@ async def cmd_alarms(
     ctx: CLIContext,
     args: list[str],
 ) -> list[str]:
-    """alarms [<start> <count>] — list alarm clocks.
+    """alarms [<index> <quantity>] — ONE line, ``alarms_loop`` unrolled inline.
 
-    LMS returns count + fade (global fade-in seconds). Each configured
-    alarm is reported via an 'alarm <index>' line like SqueezePlay expects.
+    ``addDispatch(['alarms','_index','_quantity'],[1,1,1,alarmsQuery])``
+    (``Slim/Control/Request.pm:477``); ``alarmsQuery`` (Queries.pm:185-246) adds
+    the result ``fade`` (the global fade-in seconds, :207) and ``count`` (:219)
+    *before* the ``alarms_loop`` (:235-242), which is unrolled on the same line
+    (Request.pm:2264-2281).  Perl's '?' would select a query entry that does not
+    exist for 'alarms', so ``alarms ?`` is echoed.
     """
-    from lyrion.alarms import AlarmManager, alarm_query_string
+    if _is_query_echo(args):
+        return _echo("alarms", args, clientid=ctx.player_id)
+    from lyrion.alarms import AlarmManager
 
     mac = ctx.player_id or ""
     if mac == "-":
         mac = ""
-    mgr = AlarmManager()
-    alarms = mgr.alarms_for(mac)
-    lines = [f"alarms count:{len(alarms)}", "alarms fade:0", ""]
-    for idx in sorted(alarms):
-        lines.append(alarm_query_string(idx, alarms[idx]) + "\n")
-    lines.append("")
-    return lines
+    alarms = AlarmManager().alarms_for(mac)
+    loop = [_alarm_loop_entry(idx, alarms[idx]) for idx in sorted(alarms)]
+    return _command_line(
+        ["alarms"], args, ["_index", "_quantity"],
+        clientid=ctx.player_id, has_tags=True,
+        results=[("fade", 0), ("count", len(loop)), ("alarms_loop", loop)],
+    )
 
 
 @register_command("alarm")
@@ -2572,21 +3136,25 @@ async def cmd_alarm(
     ctx: CLIContext,
     args: list[str],
 ) -> list[str]:
-    """alarm <index> [key:value ...] — query or set a single alarm.
+    """alarm <index> [key:value …|delete|?] — ONE escaped line.
 
-    Query form:  'alarm <index> ?'  → returns the alarm's fields.
-    Set form:    'alarm <index> enabled:1 days:1111111 time:06:30 ...'
-    Delete form: 'alarm <index> delete'
+    ``addDispatch(['alarm','_cmd'],[1,0,1,alarmCommand])``
+    (``Slim/Control/Request.pm:475``) — a *command* with tags and no query
+    entry, so the parameters are echoed and ``alarmCommand`` only adds the
+    result ``id`` for the caller (``Slim/Control/Commands.pm alarmCommand:161``).
+    Perl has no '?' entry for 'alarm' (:475-476 — only 'alarm playlists' is a
+    query), so the field query below is our own one-line extension of the same
+    ``alarms_loop`` keys.
     """
-    from lyrion.alarms import (AlarmManager, _alarm_from_parts,
-                               alarm_query_string)
+    from lyrion.alarms import AlarmManager, _alarm_from_parts
 
     if not args:
-        return ["alarm: ", ""]
+        return _echo("alarm", args, clientid=ctx.player_id)
     try:
         idx = int(args[0])
     except ValueError:
-        return ["alarm: invalid index", ""]
+        return _command_echo(["alarm"], args, ["_cmd"],
+                             clientid=ctx.player_id, has_tags=True)
 
     mac = ctx.player_id or ""
     if mac == "-":
@@ -2595,17 +3163,29 @@ async def cmd_alarm(
 
     if len(args) == 1 or (len(args) == 2 and args[1] == "?"):
         a = mgr.get(mac, idx)
-        return [alarm_query_string(idx, a), ""]
+        if a is None:
+            return [render_line(
+                clientid=ctx.player_id,
+                terms=["alarm", *args],
+            )]
+        entry = _alarm_loop_entry(idx, a)
+        return _command_line(
+            ["alarm"], args, ["_cmd"],
+            clientid=ctx.player_id, has_tags=True,
+            results=[("id", entry.pop("id")), *entry.items()],
+        )
 
     if len(args) >= 2 and args[1] == "delete":
         mgr.delete(mac, idx)
-        return [alarm_query_string(idx, None), ""]
+        return _command_line(["alarm"], args, ["_cmd"],
+                             clientid=ctx.player_id, has_tags=True,
+                             results=[("id", idx)])
 
     # Set form: collect key:value pairs (and tolerate a bare '0'/'1' toggle).
     parts: dict[str, str] = {}
     for tok in args[1:]:
-        if ":" in tok:
-            k, v = tok.split(":", 1)
+        if ":" in str(tok):
+            k, v = str(tok).split(":", 1)
             parts[k] = v
     current = mgr.get(mac, idx)
     a = _alarm_from_parts(idx, parts)
@@ -2616,7 +3196,9 @@ async def cmd_alarm(
             if f not in parts:
                 setattr(a, f, getattr(current, f))
     mgr.set(mac, idx, a)
-    return [alarm_query_string(idx, a), ""]
+    return _command_line(["alarm"], args, ["_cmd"],
+                         clientid=ctx.player_id, has_tags=True,
+                         results=[("id", idx)])
 
 
 # ---------------------------------------------------------------------------
@@ -2630,22 +3212,24 @@ async def cmd_subscribe(
     ctx: CLIContext,
     args: list[str],
 ) -> list[str]:
+    """subscribe <functions> — ONE escaped line (Perl echoes the request).
+
+    ``addDispatch(['subscribe','_functions'],[0,0,0,subscribeCommand])``
+    (``Slim/Plugin/CLI/Plugin.pm:107-108``); ``subscribeCommand`` (:846-880)
+    only registers the notification terms and adds no result, so the request is
+    echoed (Plugin/CLI/Plugin.pm:692-698).
+
+    Our CLI subscription below is a different mechanism (per-player status
+    pushes); the answer follows Perl.
     """
-    subscribe <playerId> [<interval>]
-    Subscribe to status updates for a player. The server pushes the
-    current status whenever the player state changes (STAT event) and at
-    least every <interval> seconds (keep-alive). Unsubscribe with
-    'unsubscribe'.
-    """
-    if not args:
-        return ["subscribe: "]
-    player_id = args[0]
-    interval = int(args[1]) if len(args) > 1 and str(args[1]).isdigit() else 5
-    ctx.subscribed_player = player_id
-    ctx.subscribe_interval = max(1, interval)
-    if player_id not in handler._subscriptions:
-        handler._subscriptions[player_id] = asyncio.Queue()
-    return [f"subscribe: {player_id} {ctx.subscribe_interval}"]
+    if args:
+        player_id = str(args[0])
+        interval = int(args[1]) if len(args) > 1 and str(args[1]).isdigit() else 5
+        ctx.subscribed_player = player_id
+        ctx.subscribe_interval = max(1, interval)
+        if player_id not in handler._subscriptions:
+            handler._subscriptions[player_id] = asyncio.Queue()
+    return _command_echo(["subscribe"], args, ["_functions"])
 
 
 @register_command("unsubscribe")
@@ -2654,13 +3238,18 @@ async def cmd_unsubscribe(
     ctx: CLIContext,
     args: list[str],
 ) -> list[str]:
-    """unsubscribe — cancel player subscription."""
+    """unsubscribe — Perl has no such request, so it is echoed verbatim.
+
+    No dispatch entry (``Slim/Control/Request.pm:474-637``) and no CLI-plugin
+    registration → status 104 → echo (Plugin/CLI/Plugin.pm:657-663).  Live Perl
+    9.1.1, read-only, 2026-09-12: ``unsubscribe`` → ``unsubscribe``.
+    """
     player_id = ctx.subscribed_player
     ctx.subscribed_player = None
     ctx.subscribe_interval = 0
     if player_id:
         handler._subscriptions.pop(player_id, None)
-    return ["unsubscribe: done"]
+    return _echo("unsubscribe", args)
 
 
 # ---------------------------------------------------------------------------
@@ -2674,51 +3263,47 @@ async def cmd_info(
     ctx: CLIContext,
     args: list[str],
 ) -> list[str]:
-    """info total <genres|artists|albums|songs|duration> [?] — library stats.
+    """info total <genres|artists|albums|songs|duration> ? — ONE escaped line.
 
-    Response (LMS format, no colon): 'info total songs <n>'.
-    'info' without args returns all totals.
+    Five separate dispatch entries (``Slim/Control/Request.pm:501-505``), each
+    ``['info','total','<entity>','?']`` with ``[0,1,0]`` — no client, no tags.
+    ``infoTotalQuery`` (``Slim/Control/Queries.pm:2019-2051``) adds the bare
+    result ``_<entity>``, so the answer is ``info total songs 80134`` (live
+    Perl 9.1.1, read-only, 2026-09-12).  'info' or 'info total' alone match no
+    leaf — live Perl: ``info total ?`` → ``info total %3F``.
     """
+    want = " ".join(str(a).lower() for a in args)
+    if not _is_query_echo(args) or not want.startswith("total "):
+        return _echo("info", args)
+    key = want.split(" ", 1)[1].rstrip("?").strip()
+    if key not in ("genres", "artists", "albums", "songs", "duration"):
+        return _echo("info", args)
+    value: Any = 0
     try:
-        want = " ".join(a.lower() for a in args)
-        totals: dict[str, str] = {}
-
-        rows = await _query_db(
-            "SELECT COUNT(*) AS n, COALESCE(SUM(duration),0) AS d FROM tracks"
-        )
-        songs = int(rows[0]["n"]) if rows else 0
-        totals["songs"] = str(songs)
-        totals["duration"] = str(int(rows[0]["d"]) if rows else 0)
-
-        r_art = await _query_db(
-            "SELECT COUNT(DISTINCT c.id) AS n FROM contributors c "
-            "JOIN tracks_contributors tc ON tc.contributor = c.id AND tc.role = 1"
-        )
-        totals["artists"] = str(int(r_art[0]["n"]) if r_art else 0)
-
-        r_alb = await _query_db("SELECT COUNT(*) AS n FROM albums")
-        totals["albums"] = str(int(r_alb[0]["n"]) if r_alb else 0)
-
-        r_gen = await _query_db(
-            "SELECT COUNT(DISTINCT genre) AS n FROM tracks WHERE genre != ''"
-        )
-        totals["genres"] = str(int(r_gen[0]["n"]) if r_gen else 0)
-
-        # info total X [?] — single query; info — all totals
-        if want.startswith("total "):
-            key = want.split(" ", 1)[1].rstrip("?").strip()
-            if key in totals:
-                return [f"info total {key} {totals[key]}", ""]
-            return ["info total ?", ""]
-        if not want:
-            out = [f"info total {k} {v}" for k, v in totals.items()]
-            out.append("")
-            return out
-        out = [f"info total {k} {v}" for k, v in totals.items() if k in want]
-        out.append("")
-        return out
-    except Exception as e:  # noqa: BLE001
-        return [f"cli error: {e}", ""]
+        if key == "songs":
+            rows = await _query_db("SELECT COUNT(*) AS n FROM tracks")
+            value = int(rows[0]["n"]) if rows else 0
+        elif key == "duration":
+            rows = await _query_db("SELECT COALESCE(SUM(duration),0) AS n FROM tracks")
+            value = rows[0]["n"] if rows else 0
+        elif key == "albums":
+            rows = await _query_db("SELECT COUNT(*) AS n FROM albums")
+            value = int(rows[0]["n"]) if rows else 0
+        elif key == "artists":
+            rows = await _query_db(
+                "SELECT COUNT(DISTINCT c.id) AS n FROM contributors c "
+                "JOIN tracks_contributors tc ON tc.contributor = c.id AND tc.role = 1"
+            )
+            value = int(rows[0]["n"]) if rows else 0
+        else:  # genres
+            rows = await _query_db(
+                "SELECT COUNT(DISTINCT genre) AS n FROM tracks WHERE genre != ''"
+            )
+            value = int(rows[0]["n"]) if rows else 0
+    except Exception:  # noqa: BLE001
+        value = 0
+    return _command_line(["info", "total", key], [], [],
+                         results=[(f"_{key}", value)])
 
 
 # ---------------------------------------------------------------------------
@@ -3037,11 +3622,21 @@ async def cmd_playlists(
     ctx: CLIContext,
     args: list[str],
 ) -> list[str]:
+    """playlists [<index> <quantity>] | playlists <new|delete|rename|tracks> — ONE line.
+
+    ``addDispatch(['playlists','_index','_quantity'],[0,1,1,playlistsQuery])``
+    (``Slim/Control/Request.pm:593``); ``playlistsQuery`` (Queries.pm:2855-2900)
+    fills ``playlists_loop`` with the keys ``id`` and ``playlist`` (:2888-2889)
+    and adds ``count`` *after* the loop (:2930).  ``playlists tracks`` is a query
+    of its own (``playlistsTracksQuery``, Request.pm:598) and uses the loop name
+    ``playlisttracks_loop`` with ``count`` last (Queries.pm:2776-2850).
+    ``playlists new`` (Commands.pm:playlistsNewCommand) adds ``playlist_id`` /
+    ``overwritten_playlist_id``, ``rename`` (playlistsRenameCommand) likewise.
+    Live Perl 9.1.1, read-only, 2026-09-12: ``playlists 0 2`` →
+    ``playlists 0 2 rescan%3A1`` (nothing indexed while the scan runs).
     """
-    playlists [<offset> <limit>] — list saved playlists
-    playlists tracks <id> — list the tracks of a playlist
-    playlists new <name> | delete <id> | rename <id> <newname>
-    """
+    if not args:
+        args = ["0", "100"]
     sub = str(args[0]).lower() if args else ""
     if sub == "tracks" and len(args) >= 2 and str(args[1]).isdigit():
         pid = int(args[1])
@@ -3051,24 +3646,25 @@ async def cmd_playlists(
             "WHERE pi.playlist = ? ORDER BY pi.position",
             (pid,),
         )
-        out = [f"playlists tracks {pid} count:{len(rows)}"]
+        loop = []
         for r in rows:
-            line = f"id:{r['track'] or r['url'] or ''} position:{r['position']}"
+            entry: dict[str, Any] = {}
             if r["title"]:
-                line += f" title:{r['title']}"
+                entry["title"] = r["title"]
             if r["url"]:
-                line += f" url:{r['url']}"
+                entry["url"] = r["url"]
             if r["duration"]:
-                line += f" duration:{int(r['duration'])}"
-            out.append(line)
-        out.append("")
-        return out
+                entry["duration"] = int(r["duration"])
+            loop.append(entry)
+        return _command_line(["playlists", "tracks", str(pid)], [], [],
+                             results=[("playlisttracks_loop", loop),
+                                      ("count", len(rows))])
     if sub == "new" and len(args) >= 2:
-        name = " ".join(args[1:])
+        name = " ".join(str(a) for a in args[1:])
         if name.startswith("name:"):
             name = name[5:]
         if not name.strip():
-            return ["playlists new: error: empty name", ""]
+            return _command_echo(["playlists", "new"], args[1:], [], has_tags=True)
         # remote/disabled are NOT NULL without DB defaults — omitting them
         # raised IntegrityError on every 'playlists new'.
         await _write_db(
@@ -3080,21 +3676,22 @@ async def cmd_playlists(
             "SELECT id FROM playlists WHERE name = ? ORDER BY id DESC LIMIT 1", (name,)
         )
         new_id = row[0]["id"] if row else "?"
-        return [f"playlists new: {new_id}", ""]
+        return _command_line(["playlists", "new"], args[1:], [], has_tags=True,
+                             results=[("playlist_id", new_id)])
     if sub == "delete" and len(args) >= 2 and str(args[1]).isdigit():
         pid = int(args[1])
         await _write_db("DELETE FROM playlist_items WHERE playlist = ?", (pid,))
         await _write_db("DELETE FROM playlists WHERE id = ?", (pid,))
-        return [f"playlists delete: {pid}", ""]
+        return _command_echo(["playlists", "delete"], args[1:], [], has_tags=True)
     if sub == "rename" and len(args) >= 3 and str(args[1]).isdigit():
         pid = int(args[1])
-        name = " ".join(args[2:])
+        name = " ".join(str(a) for a in args[2:])
         await _write_db(
             "UPDATE playlists SET name = ?, playlist = ? WHERE id = ?",
             (name, name, pid),
         )
-        return [f"playlists rename: {pid} {name}", ""]
-    # default: list playlists (LMS tagged format)
+        return _command_echo(["playlists", "rename"], args[1:], [], has_tags=True)
+    # default: list playlists
     offset, limit, _ = _parse_query_args(args)
     rows = await _query_db(
         "SELECT id, name FROM playlists ORDER BY name COLLATE NOCASE "
@@ -3103,16 +3700,36 @@ async def cmd_playlists(
     )
     total = await _query_db("SELECT COUNT(*) AS n FROM playlists")
     total_n = total[0]["n"] if total else 0
-    out = [f"playlists {offset} {limit} count:{total_n}"]
-    for r in rows:
-        out.append(f"id:{r['id']} playlist:{r['name']}")
-    out.append("")
-    return out
+    loop = [{"id": r["id"], "playlist": r["name"]} for r in rows]
+    return _command_line(
+        ["playlists"], args, ["_index", "_quantity"], has_tags=True,
+        results=[("playlists_loop", loop), ("count", total_n)],
+    )
 
 
 # ---------------------------------------------------------------------------
 # Internet radio
 # ---------------------------------------------------------------------------
+
+
+def _station_loop_entry(s: Any) -> dict[str, Any]:
+    """One radio-station item for the CLI loop (our own shape).
+
+    Perl has no 'radio' CLI request (``Slim/Control/Request.pm:474-637``);
+    radio lives in ``Slim::Plugin::InternetRadio``.  The keys follow the
+    browse convention Perl uses for plugin menus (``item_loop`` items with
+    ``id``/``name``/``url``), so a line stays parsable like every other answer.
+    """
+    entry: dict[str, Any] = {
+        "id": s.id if getattr(s, "id", None) is not None else "-",
+        "name": getattr(s, "name", "") or "",
+        "url": getattr(s, "url", "") or "",
+    }
+    for field in ("genre", "country", "bitrate", "codec"):
+        val = getattr(s, field, None)
+        if val:
+            entry[field] = val
+    return entry
 
 
 @register_command("radio")
@@ -3121,11 +3738,17 @@ async def cmd_radio(
     ctx: CLIContext,
     args: list[str],
 ) -> list[str]:
-    """radio [list|add|delete|search|top|play] — manage internet radio.
+    """radio [list|add|delete|search|top|play] — ONE escaped line per answer.
 
-    The CLI parser matches the bare "radio" command and passes the rest
-    in args, so this router dispatches the sub-commands itself.
+    Perl has no 'radio' request (``Slim/Control/Request.pm:474-637``); the
+    internet-radio menu is served by ``Slim::Plugin::InternetRadio``.  Every
+    answer here therefore follows the Perl *wire* shape of the browse menus
+    (request terms + ``count`` + an unrolled ``item_loop``,
+    ``Slim/Control/Request.pm:2264-2281``).
     """
+    if args and not _is_query_echo(args) and str(args[0]).isdigit():
+        # 'radio <n> …' from the browse menus → treat the number as the index.
+        return await cmd_radio_list(handler, ctx, args)
     sub = str(args[0]).lower() if args else "list"
     rest = args[1:] if args else []
 
@@ -3141,7 +3764,7 @@ async def cmd_radio(
         return await cmd_radio_top(handler, ctx, rest)
     if sub == "play":
         return await cmd_radio_play(handler, ctx, rest)
-    return [f"radio: unknown sub-command '{sub}'", "radio [list|add|delete|search|top|play]", ""]
+    return _command_echo(["radio", sub], rest, [])
 
 
 async def cmd_radio_list(
@@ -3149,15 +3772,20 @@ async def cmd_radio_list(
     ctx: CLIContext,
     args: list[str],
 ) -> list[str]:
-    """radio list — list saved radio stations."""
+    """radio list — ONE line: ``radio list <index> <quantity> count:<n> <loop>``."""
     from lyrion.music.radio import get_radio_manager
 
-    stations = await get_radio_manager().list_stations()
-    out = [f"radio count: {len(stations)}"]
-    for s in stations:
-        out.extend(s.to_cli_lines())
-    out.append("")
-    return out
+    try:
+        stations = await get_radio_manager().list_stations()
+    except Exception:  # noqa: BLE001
+        stations = []
+    offset, limit, _ = _parse_query_args(args)
+    page = stations[offset:offset + limit]
+    return _command_line(
+        ["radio", "list"], args, ["_index", "_quantity"], has_tags=True,
+        results=[("count", len(stations)),
+                 ("item_loop", [_station_loop_entry(s) for s in page])],
+    )
 
 
 # Sub-command "radio add" — routed via the base handler, not the registry.
@@ -3166,25 +3794,21 @@ async def cmd_radio_add(
     ctx: CLIContext,
     args: list[str],
 ) -> list[str]:
-    """radio add <url> [name] — manually add a radio stream."""
+    """radio add <url> [name] — ONE line (our own verb; Perl has no 'radio')."""
     if not args:
-        return ["radio add <url> [name] — missing URL", ""]
-    url = args[0]
-    name = " ".join(args[1:]) if len(args) > 1 else url
+        return _command_echo(["radio", "add"], args, [])
+    url = str(args[0])
+    name = " ".join(str(a) for a in args[1:]) if len(args) > 1 else url
+    new_id: Any = ""
     try:
         from lyrion.music.radio import get_radio_manager
+
         station = await get_radio_manager().add_station(name, url)
-        return [
-            "added",
-            f"id: {station.id}",
-            f"name: {station.name}",
-            f"url: {station.url}",
-            "",
-        ]
-    except ValueError as e:
-        return [f"cli error: {e}", ""]
-    except Exception as e:  # noqa: BLE001
-        return [f"cli error: {e}", ""]
+        new_id = station.id if station.id is not None else ""
+    except Exception:  # noqa: BLE001
+        pass
+    return _command_line(["radio", "add"], args, [],
+                         results=[("id", new_id)])
 
 
 # Sub-command "radio delete" — routed via the base handler, not the registry.
@@ -3193,16 +3817,16 @@ async def cmd_radio_delete(
     ctx: CLIContext,
     args: list[str],
 ) -> list[str]:
-    """radio delete <id> — remove a saved station."""
-    if not args:
-        return ["radio delete <id> — missing id", ""]
+    """radio delete <id> — ONE line (our own verb; Perl has no 'radio')."""
+    if not args or not str(args[0]).isdigit():
+        return _command_echo(["radio", "delete"], args, [])
     try:
-        station_id = int(args[0])
         from lyrion.music.radio import get_radio_manager
-        ok = await get_radio_manager().remove_station(station_id)
-        return ["deleted" if ok else "not found", ""]
-    except ValueError:
-        return ["cli error: id must be a number", ""]
+
+        await get_radio_manager().remove_station(int(str(args[0])))
+    except Exception:  # noqa: BLE001
+        pass
+    return _command_echo(["radio", "delete"], args, [])
 
 
 # Sub-command "radio search" — routed via the base handler, not the registry.
@@ -3211,35 +3835,38 @@ async def cmd_radio_search(
     ctx: CLIContext,
     args: list[str],
 ) -> list[str]:
-    """radio search <query> [limit] [tag:<tag>] [country:<CC>] — search radio directory."""
+    """radio search <query> [limit] [tag:<tag>] [country:<CC>] — ONE line."""
     if not args:
-        return ["radio search <query> [limit] [tag:<tag>] [country:<CC>] — missing query", ""]
+        return _command_echo(["radio", "search"], args, [], has_tags=True)
     name_parts: list[str] = []
     tag = ""
     country = ""
     limit = 20
     for a in args:
-        if a.lower().startswith("tag:") and len(a) > 4:
-            tag = a[4:]
-        elif a.lower().startswith("country:") and len(a) > 8:
-            country = a[8:]
-        elif str(a).isdigit():
-            limit = min(int(str(a)), 100)
+        s = str(a)
+        if s.lower().startswith("tag:") and len(s) > 4:
+            tag = s[4:]
+        elif s.lower().startswith("country:") and len(s) > 8:
+            country = s[8:]
+        elif s.isdigit():
+            limit = min(int(s), 100)
         else:
-            name_parts.append(a)
+            name_parts.append(s)
     query = " ".join(name_parts).strip()
+    stations: list[Any] = []
     try:
         from lyrion.music.radio import get_radio_manager
+
         stations = await get_radio_manager().directory.search(
             name=query, tag=tag, country=country, limit=limit
         )
-        out = [f"radio search results: {len(stations)}"]
-        for s in stations:
-            out.extend(s.to_cli_lines())
-        out.append("")
-        return out
-    except Exception as e:  # noqa: BLE001
-        return [f"cli error: {e}", ""]
+    except Exception:  # noqa: BLE001
+        stations = []
+    return _command_line(
+        ["radio", "search"], args, ["_index", "_quantity"], has_tags=True,
+        results=[("count", len(stations)),
+                 ("item_loop", [_station_loop_entry(s) for s in stations])],
+    )
 
 
 # Sub-command "radio top" — routed via the base handler, not the registry.
@@ -3248,20 +3875,22 @@ async def cmd_radio_top(
     ctx: CLIContext,
     args: list[str],
 ) -> list[str]:
-    """radio top [n] — top stations from public directory."""
+    """radio top [n] — ONE line (our own verb; Perl has no 'radio')."""
     limit = 20
     if args and str(args[0]).isdigit():
         limit = min(int(str(args[0])), 100)
+    stations: list[Any] = []
     try:
         from lyrion.music.radio import get_radio_manager
+
         stations = await get_radio_manager().directory.top(limit=limit)
-        out = [f"radio top: {len(stations)}"]
-        for s in stations:
-            out.extend(s.to_cli_lines())
-        out.append("")
-        return out
-    except Exception as e:  # noqa: BLE001
-        return [f"cli error: {e}", ""]
+    except Exception:  # noqa: BLE001
+        stations = []
+    return _command_line(
+        ["radio", "top"], args, ["_index", "_quantity"], has_tags=True,
+        results=[("count", len(stations)),
+                 ("item_loop", [_station_loop_entry(s) for s in stations])],
+    )
 
 
 # Sub-command "radio play" — routed via the base handler, not the registry.
@@ -3270,27 +3899,26 @@ async def cmd_radio_play(
     ctx: CLIContext,
     args: list[str],
 ) -> list[str]:
-    """radio play <station_id> [player_id] — play a saved station.
+    """radio play <station_id> [player_id] — ONE line (our own verb)."""
+    if not args or not str(args[0]).isdigit():
+        return _command_echo(["radio", "play"], args, [], has_tags=True)
+    station_id = int(str(args[0]))
+    player_id = str(args[1]) if len(args) > 1 else ctx.player_id
+    station: Any = None
+    if player_id:
+        try:
+            from lyrion.music.radio import get_radio_manager
 
-    The player defaults to the request context (LMS style:
-    slim.request <player_id> ["radio", "play", "<station_id>"]).
-    """
-    if not args:
-        return ["radio play <station_id> [player_id] — missing station id", ""]
-    try:
-        station_id = int(args[0])
-        player_id = args[1] if len(args) > 1 else ctx.player_id
-        if not player_id:
-            return ["no player selected — pass player_id or call via slim.request <player_id>", ""]
-        from lyrion.music.radio import get_radio_manager
-        station = await get_radio_manager().play_station(player_id, station_id=station_id)
-        if station is None:
-            return ["cli error: station not found", ""]
-        return [f"playing: {station.name}", f"url: {station.url}", ""]
-    except ValueError:
-        return ["cli error: station id must be a number", ""]
-    except Exception as e:  # noqa: BLE001
-        return [f"cli error: {e}", ""]
+            station = await get_radio_manager().play_station(
+                player_id, station_id=station_id)
+        except Exception:  # noqa: BLE001
+            station = None
+    results: list[tuple[str, Any]] = []
+    if station is not None:
+        results = [("name", getattr(station, "name", "") or ""),
+                   ("url", getattr(station, "url", "") or "")]
+    return _command_line(["radio", "play"], args, [], has_tags=True,
+                         results=results)
 
 
 # ---------------------------------------------------------------------------
@@ -3350,11 +3978,7 @@ async def cmd_favorites(
         return await _fav_exists(handler, ctx, rest)
     if sub == "playlist":
         return await _fav_playlist(handler, ctx, rest)
-    return [
-        f"favorites: unknown sub-command '{sub}'",
-        "favorites [items|add|addfolder|delete|move|rename|play|exists|playlist]",
-        "",
-    ]
+    return _command_echo(["favorites", sub], rest, [])
 
 
 async def _fav_items(
@@ -3362,22 +3986,41 @@ async def _fav_items(
     ctx: CLIContext,
     args: list[str],
 ) -> list[str]:
+    """favorites items [<parent>] [want_url:1] — ONE line, ``item_loop`` inline.
+
+    ``Slim::Plugin::Favorites::Plugin`` builds the CLI answer like every other
+    browse menu (``Slim/Control/Request.pm:2264-2281``); live Perl 9.1.1,
+    read-only, 2026-09-12::
+
+        favorites items 0 5 title%3AFavorites id%3Aab9c31e0.0 name%3AChill
+        image%3Ahtml%2Fimages%2Ffavorites.png isaudio%3A0 hasitems%3A1 …
+        count%3A8
+
+    i.e. the menu ``title`` first, then one ``item_loop`` run per entry with
+    ``id``/``name``/``image``/``isaudio``/``hasitems``, then ``count`` last.
+    """
     parent = _parse_parent_id(args[0]) if args else None
     try:
         from lyrion.music.favorites import get_favorites_manager
+
         items = await get_favorites_manager().list_items(parent)
-        out = [f"favorites count: {len(items)}"]
-        for item in items:
-            out.append(f"favorite id: {item['id']}")
-            out.append(f"  title: {item['title']}")
-            out.append(f"  type: {item['type']}")
-            if item["url"]:
-                out.append(f"  url: {item['url']}")
-            out.append(f"  position: {item['position']}")
-        out.append("")
-        return out
-    except Exception as e:  # noqa: BLE001
-        return [f"cli error: {e}", ""]
+    except Exception:  # noqa: BLE001
+        items = []
+    loop = []
+    for item in items:
+        is_folder = item.get("type") == "folder"
+        loop.append({
+            "id": item["id"],
+            "name": item["title"],
+            "image": "html/images/favorites.png",
+            "isaudio": 0 if is_folder else 1,
+            "hasitems": 1 if is_folder else 0,
+        })
+    return _command_line(
+        ["favorites", "items"], args, ["_index", "_quantity"], has_tags=True,
+        results=[("title", "Favorites"), ("item_loop", loop),
+                 ("count", len(items))],
+    )
 
 
 async def _fav_add(
@@ -3385,8 +4028,14 @@ async def _fav_add(
     ctx: CLIContext,
     args: list[str],
 ) -> list[str]:
+    """favorites add … — ONE escaped line (the new id as a result).
+
+    ``Slim::Plugin::Favorites::Plugin`` reports the created item through the
+    request results; Perl's CLI never prints a multi-line answer
+    (``Slim/Control/Request.pm:2226-2296``).
+    """
     if not args:
-        return ["favorites add [url:<u> title:<t> parent:<id>] — missing url/title", ""]
+        return _command_echo(["favorites", "add"], args, [], has_tags=True)
     filters: dict[str, str] = {}
     positional: list[str] = []
     for a in args:
@@ -3405,15 +4054,16 @@ async def _fav_add(
         title = positional[1]
         parent = _parse_parent_id(positional[2]) if len(positional) > 2 else None
     else:
-        return ["favorites add [url:<u> title:<t> parent:<id>] — missing url/title", ""]
+        return _command_echo(["favorites", "add"], args, [], has_tags=True)
+    new_id: Any = ""
     try:
         from lyrion.music.favorites import get_favorites_manager
+
         new_id = await get_favorites_manager().add(title, url, parent)
-        if new_id is None:
-            return ["cli error: could not add favorite", ""]
-        return [f"added: {new_id}", ""]
-    except Exception as e:  # noqa: BLE001
-        return [f"cli error: {e}", ""]
+    except Exception:  # noqa: BLE001
+        new_id = None
+    return _command_line(["favorites", "add"], args, [], has_tags=True,
+                         results=[("id", new_id if new_id is not None else "")])
 
 
 async def _fav_add_folder(
@@ -3421,18 +4071,20 @@ async def _fav_add_folder(
     ctx: CLIContext,
     args: list[str],
 ) -> list[str]:
+    """favorites addfolder <title> [parent_id] — ONE escaped line."""
     if not args:
-        return ["favorites addfolder <title> [parent_id] — missing title", ""]
+        return _command_echo(["favorites", "addfolder"], args, [], has_tags=True)
     title = str(args[0])
     parent = _parse_parent_id(args[1]) if len(args) > 1 else None
+    new_id: Any = ""
     try:
         from lyrion.music.favorites import get_favorites_manager
+
         new_id = await get_favorites_manager().add(title, None, parent)
-        if new_id is None:
-            return ["cli error: could not add folder", ""]
-        return [f"added: {new_id}", ""]
-    except Exception as e:  # noqa: BLE001
-        return [f"cli error: {e}", ""]
+    except Exception:  # noqa: BLE001
+        new_id = None
+    return _command_line(["favorites", "addfolder"], args, [], has_tags=True,
+                         results=[("id", new_id if new_id is not None else "")])
 
 
 async def _fav_resolve_id(fm: Any, val: str) -> Optional[int]:
@@ -3449,18 +4101,20 @@ async def _fav_delete(
     ctx: CLIContext,
     args: list[str],
 ) -> list[str]:
+    """favorites delete <id> — ONE escaped line."""
     if not args:
-        return ["favorites delete <id> — missing id", ""]
+        return _command_echo(["favorites", "delete"], args, [], has_tags=True)
     try:
         from lyrion.music.favorites import get_favorites_manager
+
         fm = get_favorites_manager()
         fav_id = await _fav_resolve_id(fm, str(args[0]))
         if fav_id is None:
-            return ["favorites delete <id> — missing id", ""]
-        ok = await fm.delete(fav_id)
-        return ["deleted"] if ok else ["cli error: favorite not found", ""]
-    except Exception as e:  # noqa: BLE001
-        return [f"cli error: {e}", ""]
+            return _command_echo(["favorites", "delete"], args, [], has_tags=True)
+        await fm.delete(fav_id)
+    except Exception:  # noqa: BLE001
+        pass
+    return _command_echo(["favorites", "delete"], args, [], has_tags=True)
 
 
 async def _fav_move(
@@ -3468,22 +4122,24 @@ async def _fav_move(
     ctx: CLIContext,
     args: list[str],
 ) -> list[str]:
+    """favorites move <id> <parent_id> [position] — ONE escaped line."""
     if not args:
-        return ["favorites move <id> <parent_id> [position] — missing id", ""]
+        return _command_echo(["favorites", "move"], args, [], has_tags=True)
     try:
         from lyrion.music.favorites import get_favorites_manager
+
         fm = get_favorites_manager()
         fav_id = await _fav_resolve_id(fm, str(args[0]))
         if fav_id is None:
-            return ["favorites move <id> <parent_id> [position] — missing id", ""]
+            return _command_echo(["favorites", "move"], args, [], has_tags=True)
         parent = None
         if len(args) > 1:
             parent = await _fav_resolve_id(fm, str(args[1])) if str(args[1]) != "0" else None
         position = int(str(args[2])) if len(args) > 2 and str(args[2]).isdigit() else None
-        ok = await fm.move(fav_id, parent, position)
-        return ["moved"] if ok else ["cli error: move failed", ""]
-    except Exception as e:  # noqa: BLE001
-        return [f"cli error: {e}", ""]
+        await fm.move(fav_id, parent, position)
+    except Exception:  # noqa: BLE001
+        pass
+    return _command_echo(["favorites", "move"], args, [], has_tags=True)
 
 
 async def _fav_rename(
@@ -3491,19 +4147,21 @@ async def _fav_rename(
     ctx: CLIContext,
     args: list[str],
 ) -> list[str]:
+    """favorites rename <id> <title> [url] — ONE escaped line."""
     if len(args) < 2:
-        return ["favorites rename <id> <title> [url] — missing id/title", ""]
+        return _command_echo(["favorites", "rename"], args, [], has_tags=True)
     try:
         from lyrion.music.favorites import get_favorites_manager
+
         fm = get_favorites_manager()
         fav_id = await _fav_resolve_id(fm, str(args[0]))
         if fav_id is None:
-            return ["favorites rename <id> <title> [url] — missing id/title", ""]
+            return _command_echo(["favorites", "rename"], args, [], has_tags=True)
         url = str(args[2]) if len(args) > 2 else None
-        ok = await fm.rename(fav_id, str(args[1]), url)
-        return ["renamed"] if ok else ["cli error: favorite not found", ""]
-    except Exception as e:  # noqa: BLE001
-        return [f"cli error: {e}", ""]
+        await fm.rename(fav_id, str(args[1]), url)
+    except Exception:  # noqa: BLE001
+        pass
+    return _command_echo(["favorites", "rename"], args, [], has_tags=True)
 
 
 async def _fav_play(
@@ -3511,27 +4169,21 @@ async def _fav_play(
     ctx: CLIContext,
     args: list[str],
 ) -> list[str]:
+    """favorites play <id> [player_id] — ONE escaped line."""
     if not args:
-        return ["favorites play <id> — missing id", ""]
-    player_id = args[1] if len(args) > 1 else ctx.player_id
-    if not player_id:
-        return ["no player selected — pass player_id or call via slim.request <player_id>", ""]
-    try:
-        from lyrion.music.favorites import get_favorites_manager
-        fm = get_favorites_manager()
-        fav_id = await _fav_resolve_id(fm, str(args[0]))
-        if fav_id is None:
-            return ["favorites play <id> — missing id", ""]
-        ok = await fm.play(player_id, fav_id)
-        if ok:
-            return []
-        return [
-            "cli error: could not start playback",
-            "(favorite missing, not a stream, or player not connected)",
-            "",
-        ]
-    except Exception as e:  # noqa: BLE001
-        return [f"cli error: {e}", ""]
+        return _command_echo(["favorites", "play"], args, [], has_tags=True)
+    player_id = str(args[1]) if len(args) > 1 else ctx.player_id
+    if player_id:
+        try:
+            from lyrion.music.favorites import get_favorites_manager
+
+            fm = get_favorites_manager()
+            fav_id = await _fav_resolve_id(fm, str(args[0]))
+            if fav_id is not None:
+                await fm.play(player_id, fav_id)
+        except Exception:  # noqa: BLE001
+            pass
+    return _command_echo(["favorites", "play"], args, [], has_tags=True)
 
 
 async def _fav_exists(
@@ -3539,18 +4191,29 @@ async def _fav_exists(
     ctx: CLIContext,
     args: list[str],
 ) -> list[str]:
-    """favorites exists <url|id> — 'exists:1' if the favorite exists, else 'exists:0'."""
+    """favorites exists <url|id> — ONE escaped line with ``exists``/``index``.
+
+    ``Slim/Plugin/Favorites/Plugin.pm:811-815`` adds ``exists`` (1/0) and, on a
+    hit, ``index``.
+    """
     if not args:
-        return ["favorites exists <url|id> — missing value", ""]
+        return _command_echo(["favorites", "exists"], args, [], has_tags=True)
     val = str(args[0])
+    rows: list[dict] = []
     try:
         if val.isdigit():
-            rows = await _query_db("SELECT id FROM favorites WHERE id = ? LIMIT 1", (int(val),))
+            rows = await _query_db(
+                "SELECT id FROM favorites WHERE id = ? LIMIT 1", (int(val),))
         else:
-            rows = await _query_db("SELECT id FROM favorites WHERE url = ? LIMIT 1", (val,))
-        return [f"exists: {1 if rows else 0}", ""]
-    except Exception as e:  # noqa: BLE001
-        return [f"cli error: {e}", ""]
+            rows = await _query_db(
+                "SELECT id FROM favorites WHERE url = ? LIMIT 1", (val,))
+    except Exception:  # noqa: BLE001
+        rows = []
+    results: list[tuple[str, Any]] = [("exists", 1 if rows else 0)]
+    if rows:
+        results.append(("index", rows[0]["id"]))
+    return _command_line(["favorites", "exists"], args, [], has_tags=True,
+                         results=results)
 
 
 async def _fav_playlist(
@@ -3558,9 +4221,9 @@ async def _fav_playlist(
     ctx: CLIContext,
     args: list[str],
 ) -> list[str]:
-    """favorites playlist <play|load|insert|add> item_id:<id> [player:<mac>]."""
+    """favorites playlist <play|load|insert|add> item_id:<id> [player:<mac>] — ONE line."""
     if not args:
-        return ["favorites playlist <play|load|insert|add> item_id:<id>", ""]
+        return _command_echo(["favorites", "playlist"], args, [], has_tags=True)
     action = str(args[0]).lower()
     filters: dict[str, str] = {}
     for a in args[1:]:
@@ -3570,34 +4233,30 @@ async def _fav_playlist(
             filters[k] = v
     fav_id_raw = filters.get("item_id")
     if not fav_id_raw:
-        return ["favorites playlist: missing item_id:<id>", ""]
+        return _command_echo(["favorites", "playlist"], args, [], has_tags=True)
     player_id = filters.get("player") or ctx.player_id
-    if not player_id:
-        return ["no player selected", ""]
     try:
-        from lyrion.music.favorites import get_favorites_manager
         from lyrion.player.manager import PlayerManager
+
+        from lyrion.music.favorites import get_favorites_manager
+
         fm = get_favorites_manager()
         fav_id = await _fav_resolve_id(fm, fav_id_raw)
-        if fav_id is None:
-            return ["favorites playlist: unknown item_id", ""]
+        if fav_id is None or not player_id:
+            return _command_echo(["favorites", "playlist"], args, [], has_tags=True)
         if action in ("play", "load"):
-            ok = await fm.play(player_id, fav_id)
-            return [] if ok else ["cli error: could not start playback", ""]
-        if action in ("insert", "add"):
+            await fm.play(player_id, fav_id)
+        elif action in ("insert", "add"):
             items = await fm.list_items(None)
             target = next((i for i in items if int(i["id"]) == fav_id), None)
-            if not target or not target["url"]:
-                return ["cli error: favorite not a stream", ""]
-            player = PlayerManager().get_player(player_id)
-            if player is None:
-                return ["player not found", ""]
-            player.playlist.append(target["url"])
-            player.playlist_total = len(player.playlist)
-            return []
-        return [f"favorites playlist: unknown action '{action}'", ""]
-    except Exception as e:  # noqa: BLE001
-        return [f"cli error: {e}", ""]
+            if target and target["url"]:
+                player = PlayerManager().get_player(player_id)
+                if player is not None:
+                    player.playlist.append(target["url"])
+                    player.playlist_total = len(player.playlist)
+    except Exception:  # noqa: BLE001
+        pass
+    return _command_echo(["favorites", "playlist"], args, [], has_tags=True)
 
 
 __all__ = [
