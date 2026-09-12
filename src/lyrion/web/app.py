@@ -97,7 +97,9 @@ async def _handle_streaming_connect(
         "successful": True,
         "clientId": cid,
         "id": msg.get("id", ""),
-        "advice": {"reconnect": "retry", "interval": 0, "timeout": 25},
+        # Perl LONG_POLLING_TIMEOUT (Cometd.pm:48) = 60 s
+        "advice": {"reconnect": "retry", "interval": 0,
+                   "timeout": LONG_POLL_TIMEOUT},
     }
     # Perl puts the (re)connect reply FIRST in the response (Cometd.pm:279-292,
     # "first_event"). We keep the shipped order — batch acks, then the connect

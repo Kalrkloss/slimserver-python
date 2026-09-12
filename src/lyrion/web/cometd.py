@@ -40,7 +40,9 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-LONG_POLL_TIMEOUT = 25  # seconds a /meta/connect request is held open
+LONG_POLL_TIMEOUT = 60  # Perl Cometd.pm:48 LONG_POLLING_TIMEOUT => 60000 ms
+# ("server will wait up to 60s for events to send", then answers the
+# /meta/connect so the client polls again). Was an invented 25 s.
 
 # Perl Slim::Web::Cometd LONG_POLLING_AUTOKILL (Cometd.pm:49, 693): after a
 # long-polling response is sent, a timer is armed for this many seconds and
@@ -382,6 +384,17 @@ class CometdManager:
             client_id = "1" + uuid.replace("-", "")[:15]
         else:
             client_id = f"lyrion-{next(self._counter)}"
+        existing = self._clients.get(client_id)
+        if existing is not None:
+            # Re-handshake of a KNOWN clientId (jive re-handshakes after a
+            # server restart): keep the SAME object. Replacing it threw away
+            # its subscriptions AND its open-transport count, so the fresh
+            # object had connections == 0 while its stream was still open —
+            # the idle reaper then killed a live client after
+            # LONG_POLLING_AUTOKILL and Now-Playing stopped updating (live
+            # 2026-09-12: "Player spielt, Fenster aktualisiert nicht").
+            existing.last_seen = self._clock()
+            return existing
         client = CometdClient(client_id=client_id)
         client.last_seen = self._clock()
         self._clients[client_id] = client

@@ -21,7 +21,7 @@ import asyncio
 import json
 import logging
 
-from lyrion.web.cometd import _client_id_from_channel
+from lyrion.web.cometd import LONG_POLL_TIMEOUT, _client_id_from_channel
 
 
 logger = logging.getLogger(__name__)
@@ -91,7 +91,17 @@ async def _read_http_request(reader: asyncio.StreamReader) -> dict | None:
 
 
 async def _push_events(manager, cid: str, writer: asyncio.StreamWriter) -> None:
-    """Push event batches into the open chunked stream as they arrive."""
+    """Push event batches into the open chunked stream as they arrive.
+
+    Perl answers a /meta/connect after at most LONG_POLLING_TIMEOUT
+    (Cometd.pm:48 = 60 s, Cometd.pm:318-322 "Waiting N seconds on
+    long-poll connection"). We mirror that: with nothing to send we emit an
+    empty batch so the poll completes and the client re-polls, which also
+    refreshes its autokill timer (Cometd.pm:693). Waiting forever left the
+    client's request unanswered — its session was reaped after
+    LONG_POLLING_AUTOKILL while the socket stayed open, and Now-Playing
+    stopped updating (live 2026-09-12).
+    """
     try:
         while True:
             # A vanished client (meta/disconnect) makes wait_for_events
@@ -99,11 +109,12 @@ async def _push_events(manager, cid: str, writer: asyncio.StreamWriter) -> None:
             # loop would spin at 100% CPU and freeze the whole server.
             if manager.get(cid) is None:
                 break
-            events = await manager.wait_for_events(cid, timeout=None)
-            if events:
-                data = json.dumps(events).encode("utf-8")
-                writer.write(f"{len(data):x}\r\n".encode() + data + b"\r\n")
-                await writer.drain()
+            events = await manager.wait_for_events(cid, timeout=LONG_POLL_TIMEOUT)
+            if not events and manager.get(cid) is None:
+                break
+            data = json.dumps(events).encode("utf-8")
+            writer.write(f"{len(data):x}\r\n".encode() + data + b"\r\n")
+            await writer.drain()
     except (ConnectionError, OSError, RuntimeError):
         pass
 
@@ -326,8 +337,10 @@ async def _handle_connection(manager, reader: asyncio.StreamReader,
                     connect_ack = {
                         "channel": "/meta/connect", "successful": True,
                         "clientId": cid, "id": msg.get("id", ""),
+                        # Perl LONG_POLLING_TIMEOUT (Cometd.pm:48) advertised
+                        # to the client as the connect hold time, in seconds.
                         "advice": {"reconnect": "retry", "interval": 0,
-                                   "timeout": 25},
+                                   "timeout": LONG_POLL_TIMEOUT},
                     }
                     # handle_messages() deliberately does NOT answer
                     # /meta/connect, so this is the one and only connect ack.
@@ -357,6 +370,14 @@ async def _handle_connection(manager, reader: asyncio.StreamReader,
                             if nxt is None:
                                 break
                             nb = nxt["body"]
+                            # Every POST on this client's socket counts as
+                            # activity: Perl re-arms the autokill timer on
+                            # each new poll (Cometd.pm:693). Without this a
+                            # client that keeps sending /jsonrpc.js requests
+                            # but no /cometd poll looked idle and was reaped
+                            # after LONG_POLLING_AUTOKILL (live 2026-09-12).
+                            if stream_cid:
+                                manager.touch(stream_cid)
                             if nb[:1] == b"[":
                                 try:
                                     nmsgs = json.loads(

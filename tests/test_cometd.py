@@ -62,3 +62,45 @@ def test_notify_player_status_uses_stored_request():
     captured = asyncio.run(run())
     assert captured, "notify_player_status must dispatch"
     assert captured[0][1] == ["playerstatus", "-", "1", "tags:al"]
+
+def test_rehandshake_keeps_the_existing_client_object():
+    """A second /meta/handshake with the same clientId must NOT replace the
+    client: jive re-handshakes after a server restart, and the replacement
+    dropped its subscriptions and its open-transport count, so the idle
+    reaper (Perl LONG_POLLING_AUTOKILL = 180 s, Cometd.pm:49) killed a live
+    client whose stream was still open — Now-Playing stopped updating while
+    the audio kept playing (live 2026-09-12)."""
+    async def run():
+        mgr = CometdManager(JSONRPCAPI())
+        first = await mgr.handle_messages([
+            {"channel": "/meta/handshake", "id": 1,
+             "ext": {"uuid": "14ff96e6-6d08-4eb6-9a11-223344556677"}},
+        ])
+        cid = first[0]["clientId"]
+        client = mgr.get(cid)
+        await mgr.handle_messages([
+            {"channel": "/meta/subscribe", "clientId": cid, "id": 2,
+             "subscription": "/slim/playerstatus", "data": {}},
+        ])
+        mgr.connection_open(cid)                      # its stream is open
+
+        again = await mgr.handle_messages([
+            {"channel": "/meta/handshake", "id": 3,
+             "ext": {"uuid": "14ff96e6-6d08-4eb6-9a11-223344556677"}},
+        ])
+        assert again[0]["clientId"] == cid
+        assert mgr.get(cid) is client, "re-handshake replaced the client"
+        assert "/slim/playerstatus" in mgr.get(cid).subscriptions
+        assert mgr.get(cid).connections == 1, (
+            "the open transport count was reset — the reaper would drop a "
+            "streaming client"
+        )
+        mgr.remove(cid)
+
+    asyncio.run(run())
+
+
+def test_long_poll_timeout_is_perls_sixty_seconds():
+    # Perl Slim::Web::Cometd Cometd.pm:48 LONG_POLLING_TIMEOUT => 60000
+    from lyrion.web.cometd import LONG_POLL_TIMEOUT
+    assert LONG_POLL_TIMEOUT == 60
