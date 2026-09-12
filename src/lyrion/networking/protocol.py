@@ -1562,6 +1562,55 @@ class SlimProtoClient:
         except Exception:
             pass
 
+    async def _stop_before_switch(self, mac: str) -> None:
+        """Perl's switch sequence: stop the player, then start the new song.
+
+        Perl's controller stops the player on every song change:
+        ``_StopGetNext`` → ``_Stop`` → ``_stopClient``
+        (StreamingController.pm:599-601, :622-627) → ``$client->stop`` =
+        ``stream('q')`` (Squeezebox.pm:206-216), followed by
+        ``@{$client->chunks} = ()`` and ``closeStream()``.
+
+        The stop frame is what makes a switch IMMEDIATE. jive's ``'q'``
+        handler runs ``_stopPauseAndStopTimers()`` + ``stopInternal()``
+        (Playback.lua:966-970) and tears the DECODED audio pipeline down;
+        a bare new ``'s'`` only flushes the network buffer
+        (``_streamDisconnect(nil, true)`` → ``Stream:flush()``,
+        Playback.lua:896, :777-779) and lets the already-decoded audio play
+        out. Measured live before this fix: ~4.5 s of the old stream kept
+        sounding (player elapsed 11.3 s → 15.4 s), then only STMs for the new
+        one — user-visible as "der Puffer wird erst leergespielt".
+        """
+        writer = self._player_writers.get(mac.upper().replace(":", ""))
+        if writer is None or writer.is_closing():
+            return
+        try:
+            writer.write(self._build_strm_control_frame("q"))
+            await writer.drain()
+            logger.info("Sent strm 'q' (switch stop) to %s", mac)
+        except (ConnectionError, OSError, RuntimeError):
+            pass
+
+    async def _cancel_if_switching(self, mac: str) -> None:
+        """Stop + close the previous stream when a DIFFERENT song starts.
+
+        Perl only stops when there is a streaming song to stop, so a first
+        play (nothing streaming) sends no ``'q'``.
+        """
+        try:
+            from lyrion.player.manager import PlayerManager
+            player = PlayerManager().get_player(mac)
+        except Exception:
+            player = None
+        switching = bool(
+            player is not None
+            and (player.mode in ("play", "pause")
+                 or getattr(player, "strm_sent_track", None) is not None)
+        )
+        if switching:
+            await self._stop_before_switch(mac)
+        self.cancel_active_stream(mac)
+
     @staticmethod
     def cancel_active_stream(mac: str) -> bool:
         """Abort the player's running ``/stream.mp3`` response.
@@ -1805,18 +1854,16 @@ class SlimProtoClient:
             pcm_params=pcm_params,
             threshold=threshold,
         )
-        # Close the previous /stream.mp3 response for this player (Perl's
-        # ``closeStream()`` — Squeezebox2.pm:398-403 "always use a new
-        # stream") so it cannot keep filling the player's buffers.
-        #
-        # NO ``strm 'f'`` here: Perl sends a flush ONLY from
-        # ``_FlushGetNext`` (StreamingController.pm:990-998, song-queue
-        # flush), never on a normal track/stream switch. Sending 'f' tore
-        # the player's buffers down ahead of the new stream; for a DIRECT
-        # (radio) stream the player then kept buffering the source while its
-        # decoder stayed stopped — live symptom: ``mode=play`` with the
-        # elapsed time frozen and the old title on screen.
-        self.cancel_active_stream(mac)
+        # Perl's switch sequence: stop the player (``stream('q')`` —
+        # _StopGetNext/_Stop/_stopClient, StreamingController.pm:599-627 →
+        # Squeezebox.pm:206-216) and close the previous /stream.mp3 response
+        # (``closeStream()``, Squeezebox2.pm:398-403). The stop is what cuts
+        # the already-decoded audio of the OLD stream in the player; without
+        # it the switch only flushed the network buffer and the old audio
+        # played out (measured ~4.5 s live). NO ``strm 'f'``: Perl flushes
+        # only from ``_FlushGetNext`` (song-queue flush), and a stray 'f'
+        # left the decoder stopped while the source kept buffering.
+        await self._cancel_if_switching(mac)
         try:
             writer.write(frame)
             await writer.drain()
@@ -1978,13 +2025,12 @@ class SlimProtoClient:
             logger.warning("No active connection for player %s", mac)
             return False
 
-        # Close the player's previous /stream.mp3 response (Perl
-        # ``closeStream()``) so it cannot race the new direct stream. No
-        # ``strm 'f'``: Perl never flushes on a normal switch
-        # (StreamingController.pm:990-998 is the queue-flush case only) —
-        # a flush here left the player's decoder stopped while it kept
-        # buffering the source (elapsed frozen, old title on screen).
-        self.cancel_active_stream(mac)
+        # Stop the player and close its previous /stream.mp3 response before
+        # the new direct stream — Perl's _stopClient (stream('q') +
+        # closeStream(), StreamingController.pm:622-627) so the old audio is
+        # cut immediately instead of playing out of the player's decoded
+        # buffer. No ``strm 'f'`` (Perl flushes only in _FlushGetNext).
+        await self._cancel_if_switching(mac)
 
         # Resolve redirects / M3U/PLS playlists server-side (Squeezelite
         # can do neither) — like the Perl LMS does before direct streams.
