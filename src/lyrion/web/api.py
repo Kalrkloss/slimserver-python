@@ -178,9 +178,44 @@ def _playctl_index(value: str) -> int:
     return int(num)  # int use truncates toward zero, like Perl
 
 
+def _genres_table_populated(db=None) -> bool:
+    """True when the ``genres`` table exists **and** holds rows (LIB-10).
+
+    Perl's ``genresQuery`` reads ``genres`` unconditionally and hands out
+    ``DISTINCT(genres.id)`` (``Slim/Control/Queries.pm:1809-1911``); the table
+    is only filled by a (re)scan (``Slim/Schema/Genre.pm:91-132``, our
+    ``media/importer.py``).  Libraries imported before LIB-10 therefore have an
+    empty (or, for very old fixtures, no) ``genres`` table — callers degrade to
+    the DISTINCT track-genre text list then (documented divergence: offsets
+    instead of real ids until the next rescan).
+    """
+    try:
+        if db is not None:
+            return db.execute("SELECT 1 FROM genres LIMIT 1").fetchone() is not None
+        return bool(_db_query("SELECT 1 FROM genres LIMIT 1"))
+    except Exception:  # noqa: BLE001  (legacy DB without the genres table)
+        return False
+
+
 def _genre_id_to_text(genre_id) -> str:
-    """Resolve a browselibrary genre_id (index into the DISTINCT track-genre
-    list, stable order) to the genre text — the genres table is empty."""
+    """Resolve a genre id to the genre name.
+
+    LIB-10: the id Perl hands out is the real ``genres.id`` (``genresQuery``,
+    ``Slim/Control/Queries.pm:1910-1973``) and every drill filter uses
+    ``genres.id IN (…)`` (:1832-1836) / ``JOIN genre_track`` (:1828).  The id
+    resolves against the ``genres`` table whenever it is populated; on a legacy
+    library (empty table, no rescan yet) it falls back to the index into the
+    sorted DISTINCT track-genre list — the order ``_library_rows`` /
+    ``browselibrary`` emit in that mode (``ORDER BY genre COLLATE NOCASE``).
+    """
+    try:
+        if str(genre_id).isdigit():
+            rows = _db_query("SELECT name FROM genres WHERE id = ? LIMIT 1",
+                             (int(genre_id),))
+            if rows:
+                return rows[0]["name"] or ""
+    except Exception:  # noqa: BLE001  (legacy DB without the genres table)
+        pass
     try:
         if str(genre_id).isdigit():
             rows = _db_query("SELECT DISTINCT genre FROM tracks "
@@ -5639,15 +5674,17 @@ class JSONRPCAPI:
                 f"file:{_library_db_path()}?mode=ro", uri=True)
             db.row_factory = sqlite3.Row
 
-            # genre_id: the genres table is empty — resolve the id as the
-            # index into the DISTINCT track-genre list (stable order).
-            if filters.get("genre_id") and str(filters["genre_id"]).isdigit():
-                g = db.execute(
-                    "SELECT DISTINCT genre FROM tracks WHERE genre != '' "
-                    "ORDER BY genre COLLATE NOCASE LIMIT 1 OFFSET ?",
-                    (int(filters["genre_id"]),)).fetchone()
-                if g:
-                    filters["genre"] = g["genre"]
+            # genre_id:<n> — Perl restricts ``genres.id`` (Queries.pm:1832-1836)
+            # and reaches the track tables over ``JOIN genre_track``
+            # (:1828/1843-1854).  We resolve the id through the ``genres``
+            # table (LIB-10, filled by the rescan importer) and hand the NAME
+            # to the track-text filters of artists/albums below; on a legacy
+            # library the id stays the index into the DISTINCT track-genre
+            # list (documented divergence, no rescan in this build).
+            if filters.get("genre_id"):
+                name = _genre_id_to_text(filters["genre_id"])
+                if name:
+                    filters["genre"] = name
 
             def _conds(name_col: str) -> tuple[str, tuple]:
                 c: list[str] = []
@@ -5805,36 +5842,140 @@ class JSONRPCAPI:
                     params).fetchone()[0]
                 plural = "titles_loop"
             elif cmd == "genres":
-                # The genres table is not populated by the importer — use the
-                # track genre text (same source as the CLI command).
-                where, params = _conds("genre")
-                if where:
-                    where = where.replace(" WHERE ", " WHERE genre != '' AND ", 1)
+                # ── Perl ``genresQuery`` (Slim/Control/Queries.pm:1781-1985) ──
+                # SQL :1910-1911 ``SELECT DISTINCT(genres.id), genres.name,
+                # genres.namesort FROM genres … ORDER BY genres.namesort``:
+                # the ids are the REAL ``genres`` rows, not an offset.  Search
+                # matches ``genres.namesearch LIKE`` with searchStringSplit word
+                # prefixes (:1814-1823, Text.pm:209-236), ``genre_id:a,b``
+                # restricts ``genres.id IN (…)`` (:1832-1836) and the ORDER is
+                # the namesort collation (:1911).  count is ``COUNT(1) FROM
+                # ( $sql )`` WITHOUT the LIMIT (:1919-1925) → the total, never
+                # the window.  Loop ``genres_loop`` (:1945) with exactly
+                # id/genre/favorites_url (:1971-1973) + ``textkey`` for
+                # ``tags:s`` (:1974); an empty name goes out as JSON ``null``
+                # with the bare ``db:genre.name=`` url.  Live 2026-09-12
+                # ``genres 0 2`` → ``{"result":{"count":762,"genres_loop":
+                # [{"genre":null,"favorites_url":"db:genre.name=","id":1727},
+                #  {"genre":null,"favorites_url":"db:genre.name=","id":1728}]}}``.
+                # NOT ported here: ``tags:Z`` (indexList :1901-1908,
+                # _createIndexList :6875-6915) and the album_id/year/work_id/
+                # library_id joins (:1857-1887) — no client of ours sends them
+                # for ``genres``.
+                from urllib.parse import quote as _qg
+                real_ids = _genres_table_populated(db)
+                if tags == "CC":
+                    # ``unless $tags eq 'CC'`` skips ORDER BY + the loop
+                    # (:1911/:1943) but still returns the count (:1919-1925).
+                    # Live ``genres 0 2 tags:CC`` → ``{"count":762}``.
+                    total = db.execute(
+                        "SELECT COUNT(*) FROM genres" if real_ids else
+                        "SELECT COUNT(DISTINCT genre) FROM tracks "
+                        "WHERE genre != ''").fetchone()[0]
+                    return {"count": total}
+                gwhere, gparams = "", ()
+                if real_ids:
+                    gc: list[str] = []
+                    gp: list = []
+                    if filters.get("search"):
+                        from lyrion.control.queries import search_string_split
+                        patterns = search_string_split(filters["search"])
+                        # Queries.pm:1817 — the split tokens are ONE condition
+                        # joined with OR ('(' . join(' OR ', …) . ')').
+                        if patterns:
+                            gc.append("(" + " OR ".join(
+                                "g.namespell LIKE ?" for _ in patterns) + ")")
+                            gp += patterns
+                    gids = [g.strip() for g in
+                            str(filters.get("genre_id", "")).split(",")
+                            if g.strip()]                     # :1833 split ','
+                    if gids:
+                        gc.append("g.id IN (" + ", ".join("?" * len(gids)) + ")")
+                        gp += gids                                    # :1834
+                    gwhere = (" WHERE " + " AND ".join(gc)) if gc else ""
+                    gparams = tuple(gp)
+                    total = db.execute(
+                        "SELECT COUNT(*) FROM genres g" + gwhere,
+                        gparams).fetchone()[0]
                 else:
-                    where = " WHERE genre != ''"
-                rows = db.execute(
-                    "SELECT DISTINCT genre FROM tracks" + where +
-                    " ORDER BY genre COLLATE NOCASE LIMIT ? OFFSET ?",
-                    params + (count, start)).fetchall()
+                    # Degradation (LIB-10): libraries imported BEFORE the
+                    # genres importer ran have an empty ``genres`` table and
+                    # are only fixed by the next rescan (never triggered here).
+                    # Until then the DISTINCT track-genre text list is the
+                    # source — the SAME pre-LIB-10 behaviour, so the genre
+                    # list never goes blank; ``id`` is then the OFFSET into
+                    # that list (documented divergence: no real ids).
+                    lwhere, lparams = _conds("genre")
+                    if lwhere:
+                        lwhere = lwhere.replace(
+                            " WHERE ", " WHERE genre != '' AND ", 1)
+                    else:
+                        lwhere = " WHERE genre != ''"
+                    gwhere, gparams = lwhere, lparams
+                    total = db.execute(
+                        "SELECT COUNT(DISTINCT genre) FROM tracks" + gwhere,
+                        gparams).fetchone()[0]
+
+                # Window/validity — Perl ``normalize`` (Request.pm:1805-1839):
+                # a missing quantity with an index means "all remaining"
+                # (:1815); quantity 0 or an index past the last hit ⇒ no loop,
+                # count only (:1816-1822).  Live: ``genres``, ``genres 0 0``
+                # and ``genres 762 2`` all answer ``{"count":762}``; ``genres 0``
+                # answers the full loop.
+                idx_given = bool(args) and str(args[0]).isdigit()
+                qty_given = len(args) > 1 and str(args[1]).isdigit()
+                if not idx_given:
+                    return {"count": total}
+                if total <= 0 or start > total - 1 or (qty_given and count <= 0):
+                    return {"count": total}
+                limit = count if qty_given else total - start
+
+                if real_ids:
+                    rows = db.execute(
+                        "SELECT g.id AS id, g.name AS name, "
+                        "g.sortkey AS namesort FROM genres g" + gwhere +
+                        " ORDER BY g.sortkey COLLATE NOCASE LIMIT ? OFFSET ?",
+                        gparams + (limit, start)).fetchall()
+                    entries = [(r["id"], r["name"], r["namesort"]) for r in rows]
+                else:
+                    rows = db.execute(
+                        "SELECT DISTINCT genre AS name FROM tracks" + gwhere +
+                        " ORDER BY genre COLLATE NOCASE LIMIT ? OFFSET ?",
+                        gparams + (limit, start)).fetchall()
+                    entries = [(start + i, r["name"], r["name"])
+                               for i, r in enumerate(rows)]
+
                 loop = []
-                for i, r in enumerate(rows):
-                    gid = start + i
-                    gname = r["genre"] or ""
-                    from urllib.parse import quote as _qg
+                for gid, gname, gsort in entries:
+                    # Queries.pm:1971-1973 in source order (Perl's JSON object
+                    # order is hash-random — live shows ``id`` sometimes last).
                     item = {
-                        "id": gid, "genre": r["genre"],
-                        # Perl parity: favorites_url in genres_loop.
-                        "favorites_url": f"db:genre.name={_qg(gname)}",
-                        # Jive actions: go opens the genre's artists.
-                        "actions": {
-                            "go": {"player": 0, "cmd": ["artists"],
-                                   "params": {"genre_id": gid, "menu": "albums"}},
-                        },
+                        "id": gid,
+                        # NULL name stays JSON null (live); never invent a
+                        # ``(None)``/'' placeholder.
+                        "genre": gname or None,
+                        # :1973 uri_escape_utf8 — '/', is %2F, '.' stays
+                        # (live: db:genre.name=Alternative%20%2F%20Indie…).
+                        "favorites_url": "db:genre.name=" +
+                                         _qg(gname or "", safe=""),
+                    }
+                    if "s" in tags:                       # :1974
+                        item["textkey"] = (gsort or "")[:1]
+                    # Additive fields Perl's genresQuery does not send: the feed
+                    # layer sets ``name``/``type`` on the loop item and drills
+                    # with genre_id:<id> (Slim/Menu/BrowseLibrary.pm:1305-1313,
+                    # :1318); ``text``/``title``/``type``/``hasitems`` are what
+                    # the Android controllers read (SqueezeClient/Squeezer — see
+                    # _browse_response docstring; unknown keys are ignored).
+                    item["name"] = gname or ""
+                    item["actions"] = {
+                        "go": {"player": 0, "cmd": ["artists"],
+                               "params": {"genre_id": gid, "menu": "albums"}},
                     }
                     loop.append(item)
-                total = db.execute(
-                    "SELECT COUNT(DISTINCT genre) FROM tracks" + where,
-                    params).fetchone()[0]
+                # The response-level extras (``offset``/``loop_loop``/
+                # ``item_loop``) come from ``_browse_response`` for those same
+                # clients — Perl sends only ``count`` + ``genres_loop`` here.
                 plural = "genres_loop"
             elif cmd == "musicfolder":
                 # folder browser derived from the track URLs
