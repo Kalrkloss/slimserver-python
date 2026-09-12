@@ -975,13 +975,21 @@ class SlimProtoClient:
                 # Taverne SqueezePlay, put their player name there).
                 model = "squeezelite"
                 display_name = ""
+                firmware = ""
                 can_https = False
                 for part in cap_text.split(","):
                     part = part.strip()
                     if part.startswith("Model="):
                         model = part[6:]
                     elif part.startswith("ModelName="):
+                        # Perl: SqueezePlay.pm:79-85 maps the HELO caps
+                        # ModelName to _modelName (the players loop
+                        # 'modelname' field) and Firmware to 'firmware'.
+                        # jive sends e.g. ModelName=SB Player,
+                        # Firmware=9.0.0-r1583 — NOT the player name.
                         display_name = part[10:]
+                    elif part.startswith("Firmware="):
+                        firmware = part[9:]
                     elif part == "CanHTTPS=1":
                         # Player can do TLS itself (SqueezeLite/ESP32 builds
                         # with OpenSSL, SqueezePlay). https radio streams may
@@ -1049,6 +1057,13 @@ class SlimProtoClient:
                         self.revision = r
                 hello = TempHello(mac_str, model[:8], str(revision)[:8])
 
+                # HELO uuid: Perl unpacks it as H32 (16 bytes -> 32 hex
+                # chars, Slimproto.pm:962) and drops an all-zero uuid
+                # (Client.pm:167-168 "if ($uuid =~ /0000000000/) { undef }").
+                uuid_str = ""
+                if uuid_raw and uuid_raw != b"\x00" * 16:
+                    uuid_str = uuid_raw.hex().lower()
+
                 # Register with PlayerManager
                 try:
                     from lyrion.player.manager import (
@@ -1067,8 +1082,17 @@ class SlimProtoClient:
                         src = "display" if display_name else "device"
                     PlayerManager().register_player(
                         mac=mac_str, name=reg_name, ip=peer_ip,
-                        port=peer[1] if peer else 0, model=model, firmware="2.0.0",
+                        port=peer[1] if peer else 0, model=model,
+                        # Perl reports the caps Firmware token here
+                        # (SqueezePlay.pm:85); fall back to the HELO
+                        # revision byte, which is what a client without the
+                        # cap sends (jive: 0).
+                        firmware=firmware or str(revision),
                         name_source=src, can_https=can_https,
+                        # HELO uuid: 16 bytes -> 32 lowercase hex chars.
+                        # All-zero means "no uuid" (Client.pm:167-168).
+                        uuid=uuid_str,
+                        model_name=display_name,
                         # The player DECLARES its codecs in the HELO caps
                         # string (Perl SqueezePlay.pm:170-200); fall back to
                         # the model's static list only when it declares none.

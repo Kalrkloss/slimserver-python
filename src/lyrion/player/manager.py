@@ -18,6 +18,64 @@ logger = logging.getLogger(__name__)
 # narrower. Used to decide whether a source must be transcoded.
 _COMMON_FORMATS = {"mp3", "flac", "aac", "ogg", "wav", "aiff", "pcm"}
 
+# ── Perl's modelName() / vfdmodel() per player class ──────────────────────
+# modelName: Client.pm:936 returns nothing by default, each class overrides it
+#   SqueezePlay.pm:58 'SqueezePlay', Boom.pm:209 'Squeezebox Boom',
+#   Receiver.pm:43 'Squeezebox Receiver', HTTP.pm:70 'Web Client',
+#   Disconnected.pm:59 'Dummy Client'.
+MODEL_NAMES: dict[str, str] = {
+    "squeezeplay": "SqueezePlay",
+    "controller": "SqueezePlay",
+    "boom": "Squeezebox Boom",
+    "softboom": "Squeezebox Boom",
+    "receiver": "Squeezebox Receiver",
+    "http": "Web Client",
+    "web": "Web Client",
+    "disconnected": "Dummy Client",
+}
+
+# displaytype = $client->display->vfdmodel(), and the display class is chosen
+# from the HELO device id in Slim/Networking/Slimproto.pm:1027-1120:
+#   squeezebox2/softsqueeze -> Slim::Display::Squeezebox2 -> 'graphic-320x32'
+#   boom/softboom           -> Slim::Display::Boom       -> 'graphic-160x32'
+#   transporter/softsq3     -> Slim::Display::Transporter-> 'graphic-320x32'
+#   receiver                -> Slim::Display::NoDisplay  -> 'none'
+#   squeezeplay/controller  -> Slim::Display::NoDisplay  -> 'none'
+#   squeezebox (SB1)        -> SqueezeboxG 'graphic-280x16' (bitmapped) or Text
+# The values are NoDisplay.pm:59, Boom.pm:165, Squeezebox2.pm:206,
+# SqueezeboxG.pm:132, Transporter.pm:197.
+DISPLAY_TYPES: dict[str, str] = {
+    "squeezebox2": "graphic-320x32",
+    "squeezebox3": "graphic-320x32",
+    "softsqueeze": "graphic-320x32",
+    "transporter": "graphic-320x32",
+    "softsqueeze3": "graphic-320x32",
+    "boom": "graphic-160x32",
+    "softboom": "graphic-160x32",
+    "squeezebox": "graphic-280x16",     # SB1 bitmapped (SqueezeboxG)
+    "receiver": "none",
+    "squeezeplay": "none",
+    "controller": "none",
+}
+
+
+def model_name_for(model: str) -> str:
+    """Perl ``modelName()`` — empty when the class does not override it."""
+    return MODEL_NAMES.get((model or "").lower(), "")
+
+
+def display_type_for(model: str) -> str | None:
+    """Perl ``vfdmodel()`` for a HELO device id.
+
+    ``None`` means "stay silent": Perl only omits the field for the ``http``
+    model (Queries.pm:2647-2649), and an unknown device id is one we cannot
+    name honestly.
+    """
+    m = (model or "").lower()
+    if m in ("http", "web"):
+        return None
+    return DISPLAY_TYPES.get(m, "none")
+
 
 def _perl_model_formats(model: str) -> set[str] | None:
     """Perl's static ``formats()`` list per player class.
@@ -135,6 +193,8 @@ class PlayerManager:
         name_source: str = "device",
         can_https: bool = False,
         supported_formats: set[str] | None = None,
+        uuid: str = "",
+        model_name: str = "",
     ) -> PlayerState:
         """Register a new player or update an existing one.
 
@@ -155,6 +215,12 @@ class PlayerManager:
             supported_formats: Audio extensions this player can decode
                 natively; used to decide whether a source must be transcoded.
                 Falsy means "assume the common set" (see _formats_for_model).
+            uuid: The player's own UUID as sent in its HELO frame. Perl keeps
+                it on the client and reports it in the players loop
+                (Queries.pm:2627) — not the MAC address.
+            model_name: The client's self-declared model name from the HELO
+                caps (ModelName=, SqueezePlay.pm:82) — e.g. "SB Player",
+                "SqueezeLite". Reported as 'modelname' in the players loop.
 
         Returns:
             The PlayerState for this player.
@@ -178,6 +244,10 @@ class PlayerManager:
             player.model = model or player.model
             player.firmware = firmware
             player.can_https = can_https
+            if uuid:
+                player.uuid = uuid
+            if model_name:
+                player.model_name = model_name
             if supported_formats:
                 player.supported_formats = set(supported_formats)
             elif not player.supported_formats:
@@ -197,6 +267,8 @@ class PlayerManager:
                 connected=True,
                 can_https=can_https,
                 supported_formats=supported_formats or _formats_for_model(model),
+                uuid=uuid,
+                model_name=model_name,
             )
             self.players[mac] = player
             logger.info("Player registered: %s (%s) [%s:%d] src=%s", name, mac, ip, port, name_source)

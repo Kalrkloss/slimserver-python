@@ -126,6 +126,14 @@ class PlayerState:
     # 'Model' capability, like Perl LMS). Empty/falsy means "assume the
     # common set". Used to decide whether a source must be transcoded.
     supported_formats: set[str] = field(default_factory=set)
+    # The player's own UUID from its HELO frame. Perl stores it on the client
+    # and reports it as the ``uuid`` field of the players loop
+    # (Queries.pm:2627 ``$eachclient->uuid()``) — it is NOT the MAC address.
+    uuid: str = ""
+    # Client's self-declared model name (HELO caps ModelName=, Perl
+    # SqueezePlay.pm:82 _modelName) — the players loop 'modelname' field.
+    # Empty means "fall back to the per-class modelName() table".
+    model_name: str = ""
 
     # SlimProto STAT bookkeeping (set by the protocol handler):
     _last_stmd: Optional[float] = None        # last DECODE_COMPLETE time

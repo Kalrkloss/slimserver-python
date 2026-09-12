@@ -1016,7 +1016,11 @@ class JSONRPCAPI:
             self._cache_hit = False
 
         try:
-            from lyrion.player.manager import PlayerManager
+            from lyrion.player.manager import (
+                PlayerManager,
+                display_type_for,
+                model_name_for,
+            )
             pm = PlayerManager()
         except Exception:
             pm = None
@@ -1026,32 +1030,51 @@ class JSONRPCAPI:
             players = pm.get_all_players() if pm else []
             start = int(args[0]) if args and str(args[0]).isdigit() else 0
             count = int(args[1]) if len(args) > 1 and str(args[1]).isdigit() else 100
-            loop = [
-                {
-                    "playerindex": i,
+            loop = []
+            for i, p in enumerate(players[start:start + count]):
+                # Field set and ORDER copied from Perl's players_loop
+                # (Slim/Control/Queries.pm:2624-2663): playerindex, playerid,
+                # uuid, ip, name, seq_no (if defined), model, modelname,
+                # power, isplaying, displaytype (unless model eq 'http'),
+                # isplayer, canpoweroff, connected, firmware.
+                model = getattr(p, "model", "squeezebox") or "squeezebox"
+                entry: dict = {
+                    "playerindex": start + i,
                     "playerid": p.mac,
-                    "name": getattr(p, "name", "") or p.mac,
-                    "model": getattr(p, "model", "squeezebox") or "squeezebox",
-                    "modelname": getattr(p, "model", "squeezebox") or "Squeezebox",
+                    # Perl: $eachclient->uuid() — null when the client
+                    # sent none (live Perl LMS answers null, not the MAC).
+                    "uuid": getattr(p, "uuid", "") or None,
                     "ip": f"{p.ip}:{p.port}" if getattr(p, "port", 0) else p.ip,
-                    "uuid": p.mac,
-                    "firmware": getattr(p, "firmware", "2.0.0") or "1",
+                    "name": getattr(p, "name", "") or p.mac,
+                    "model": model,
+                    # Perl: caps ModelName (SqueezePlay.pm:82), else the
+                    # per-class modelName() — empty for classes that do not
+                    # override it (Client.pm:936).
+                    "modelname": getattr(p, "model_name", "")
+                    or model_name_for(model),
+                    "power": 1 if p.power else 0,
                     "isplaying": 1 if p.mode == "play" else 0,
                     "isplayer": 1 if getattr(p, "is_player", True) else 0,
                     "canpoweroff": 1 if getattr(p, "can_power_off", True) else 0,
                     "connected": 1 if p.connected else 0,
-                    "power": 1 if p.power else 0,
-                    # Perl emits the client's stored sequence number
-                    # (Queries.pm:2637) — SqueezePlay needs its own value
-                    # back to consider volume/power in sync.
-                    "seq_no": int(getattr(p, "seq_no", 0) or 0),
+                    "firmware": getattr(p, "firmware", "2.0.0") or "1",
                 }
-                for i, p in enumerate(players[start:start + count])
-            ]
-            # playerindex must be the GLOBAL index (LMS semantics), not
-            # the position within the paginated slice.
-            for i, entry in enumerate(loop):
-                entry["playerindex"] = start + i
+                # seq_no is emitted only when the client has one
+                # (Queries.pm:2633-2637); SqueezePlay needs its own value back
+                # to consider volume/power in sync.
+                seq_no = getattr(p, "seq_no", None)
+                if seq_no is not None:
+                    entry["seq_no"] = int(seq_no or 0)
+                # displaytype = vfdmodel(); omitted for the 'http' model
+                # (Queries.pm:2647-2649).
+                dtype = display_type_for(model)
+                if dtype is not None:
+                    entry["displaytype"] = dtype
+                if getattr(p, "needs_upgrade", False):
+                    entry["player_needs_upgrade"] = 1
+                if getattr(p, "is_upgrading", False):
+                    entry["player_is_upgrading"] = 1
+                loop.append(entry)
             result = {"count": len(players), "players_loop": loop}
             if cacheable:
                 self._status_cache[cache_key] = (time.time(), result)
@@ -1152,28 +1175,35 @@ class JSONRPCAPI:
             # player list in players_loop (like the real LMS). Also
             # return it without args (Squeezer queries plain serverstatus).
             result["count"] = len(players)
-            result["players_loop"] = [
-                {
-                    # Perl parity: playerindex/uuid/seq_no are STRINGS in
-                    # players_loop (int elsewhere), displaytype present.
+            # Same field values as the players loop above — Perl builds both
+            # from Queries.pm:2624-2663, so modelname/uuid/displaytype/firmware
+            # must not diverge (an invented "None"/None here showed up in the
+            # jive app's server info).
+            ss_loop = []
+            for i, p in enumerate(players):
+                model = getattr(p, "model", "squeezebox") or "squeezebox"
+                entry: dict = {
                     "playerindex": str(i),
                     "playerid": p.mac,
-                    "name": p.name,
-                    "model": getattr(p, "model", "squeezebox"),
-                    "modelname": getattr(p, "model", "squeezebox"),
+                    "uuid": getattr(p, "uuid", "") or None,
                     "ip": f"{p.ip}:{p.port}" if p.port else p.ip,
-                    "uuid": None,
-                    "firmware": getattr(p, "firmware", "2.0.0"),
+                    "name": p.name,
+                    "model": model,
+                    "modelname": getattr(p, "model_name", "")
+                    or model_name_for(model),
+                    "power": 1 if p.power else 0,
                     "isplaying": 1 if p.mode == "play" else 0,
                     "isplayer": 1,
                     "canpoweroff": 1,
                     "connected": 1 if p.connected else 0,
-                    "power": 1 if p.power else 0,
-                    "displaytype": "None",
-                    "seq_no": int(getattr(p, "seq_no", 0) or 0),
+                    "firmware": getattr(p, "firmware", "") or 0,
                 }
-                for i, p in enumerate(players)
-            ]
+                dtype = display_type_for(model)
+                if dtype is not None:
+                    entry["displaytype"] = dtype
+                entry["seq_no"] = int(getattr(p, "seq_no", 0) or 0)
+                ss_loop.append(entry)
+            result["players_loop"] = ss_loop
             if cacheable:
                 self._status_cache[cache_key] = (time.time(), result)
             return result
