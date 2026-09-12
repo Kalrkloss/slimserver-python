@@ -126,6 +126,18 @@ class PlayerState:
     # 'Model' capability, like Perl LMS). Empty/falsy means "assume the
     # common set". Used to decide whether a source must be transcoded.
     supported_formats: set[str] = field(default_factory=set)
+    # Mixer control values (Perl keeps them as client prefs):
+    # bass/treble are tone controls, pitch is a speed/preamp setting, and
+    # mute is a TEMPORARY gain of 0 that keeps the volume pref
+    # (Commands.pm:559-640 ``fade_volume`` + 'tempVolume').
+    # Defaults reproduce the live Perl LMS for our player types
+    # (read-only ``mixer <entity> ?`` probe 2026-09-12: bass 0, treble 0,
+    # pitch 100; ``mixer volume ?`` -> the volume pref).
+    bass: int = 0
+    treble: int = 0
+    pitch: int = 100
+    mute: bool = False
+
     # The player's own UUID from its HELO frame. Perl stores it on the client
     # and reports it as the ``uuid`` field of the players loop
     # (Queries.pm:2627 ``$eachclient->uuid()``) — it is NOT the MAC address.

@@ -414,6 +414,50 @@ class JSONRPCError(Exception):
         }
 
 
+def _mixer_value(player, entity: str):
+    """Value of a mixer entity, Perl ``mixerQuery`` (Queries.pm:2118-2141).
+
+    ``volume``/``muting`` come from the client prefs (mute = pref 'mute'),
+    ``bass``/``treble``/``pitch`` from the player getters. ``None`` = unknown
+    entity: Perl answers a bad dispatch (i.e. no result at all).
+    """
+    if entity == "volume":
+        return int(getattr(player, "volume", 0) or 0) if player else 0
+    if player is None:
+        return None
+    if entity == "muting":
+        return 1 if getattr(player, "mute", False) else 0
+    if entity in ("bass", "treble", "pitch"):
+        return int(getattr(player, entity, 0) or 0)
+    return None
+
+
+def _mixer_range(entity: str) -> tuple[int, int]:
+    """Perl's min/max for a mixer entity.
+
+    bass/treble: Player.pm:366-367 (minBass 0 / maxBass 100); pitch:
+    Client.pm:682-683 (minPitch == maxPitch == 100 — players without a real
+    pitch control clamp every value to 100); volume: Player.pm:360-361.
+    """
+    if entity in ("bass", "treble"):
+        return 0, 100
+    if entity == "pitch":
+        return 100, 100
+    return 0, 100           # volume
+
+
+def _mixer_new_value(old: int, raw: str):
+    r"""Absolute or RELATIVE mixer value (Perl Commands.pm:601-606).
+
+    ``if ($newvalue =~ /^[\+\-]/) { $newval = $oldval + $newvalue } else
+    { $newval = $newvalue }``. ``None`` = not a number.
+    """
+    try:
+        return old + int(raw) if raw[:1] in ("+", "-") else int(raw)
+    except (TypeError, ValueError):
+        return None
+
+
 class JSONRPCAPI:
     """JSON-RPC 2.0 API handler.
 
@@ -1284,11 +1328,18 @@ class JSONRPCAPI:
                 return {"_version": __version__}
             return {f"_{cmd}": ""}
 
-        # mixer volume ? → {"_volume": N}
-        if cmd == "mixer" and args and len(args) == 2 \
-                and str(args[0]) == "volume" and str(args[1]) == "?":
+        # mixer <entity> ?  (Perl mixerQuery, Queries.pm:2118-2141)
+        # Live-Probe Perl 2026-09-12: {"_volume": "23"}, {"_bass": "0"},
+        # {"_treble": "0"}, {"_pitch": "100"} — Werte als Strings.
+        if cmd == "mixer" and len(args) >= 2 and str(args[1]) == "?":
+            entity = str(args[0]).lower()
             player = pm.get_player(pid) if pid else None
-            return {"_volume": player.volume if player else 0}
+            value = _mixer_value(player, entity)
+            if value is None:
+                # Perl: isNotQuery -> bad dispatch (keine Antwort). Ein leeres
+                # Result verhindert, dass ein Client auf eine Antwort wartet.
+                return {}
+            return {f"_{entity}": str(value)}
 
         # prefset — Material Skin + controllers subscribe to the player's
         # preference set; return the per-player prefs as {key: value}.
@@ -2445,20 +2496,36 @@ class JSONRPCAPI:
             else:
                 send("stop")
         elif cmd == "mixer":
-            # Only 'mixer volume <n>' touches the volume. bass/treble/pitch/
-            # muting are separate mixer controls and must NOT be routed to
-            # volume (Perl registers them independently in Slim/Control/Request.pm).
-            if args and str(args[0]).lower() == "volume" and len(args) > 1:
-                val = str(args[1])
-                if val.isdigit():
-                    player = pm.get_player(pid)
-                    if player is not None:
-                        player.volume = int(val)
-                        # audg frame — text CLI does not exist on the
-                        # SlimProto channel.
-                        await pm.set_volume(pid, int(val))
-                    else:
-                        send(f"mixer volume {val}")
+            # Perl mixerCommand (Commands.pm:545-665): entities volume, muting,
+            # treble, bass, pitch, stereoxl; a leading +/- is RELATIVE to the
+            # current value, every entity is clamped to the player's range.
+            entity = str(args[0]).lower() if args else ""
+            player = pm.get_player(pid)
+            if player is None and args and len(args) > 1:
+                # no local player object: pass the raw command through
+                send(f"mixer {entity} {args[1]}")
+            elif player is not None and len(args) > 1 and entity:
+                raw = str(args[1])
+                if entity == "muting":
+                    # Perl: no value / 'toggle' toggles; a real mute is a
+                    # temporary gain of 0 that keeps the volume pref.
+                    new_mute = (not player.mute) if raw in ("", "toggle") \
+                        else raw not in ("0", "false", "off")
+                    if new_mute != player.mute:
+                        player.mute = new_mute
+                        # fade_volume(±0.3125) in Perl: mute -> gain 0,
+                        # unmute -> the unchanged volume pref.
+                        await pm.set_volume(pid, 0 if new_mute else player.volume)
+                elif entity in ("volume", "bass", "treble", "pitch"):
+                    lo, hi = _mixer_range(entity)
+                    new = _mixer_new_value(int(getattr(player, entity) or 0), raw)
+                    if new is not None:
+                        new = max(lo, min(hi, new))
+                        setattr(player, entity, new)
+                        if entity == "volume":
+                            # audg frame — the SlimProto channel has no text CLI
+                            await pm.set_volume(pid, new)
+
         elif cmd == "playlistcontrol":
             # SqueezePlay's My-Music play/add (base.actions → cmd
             # playlistcontrol cmd:load|add + the item's commonParams ids).
