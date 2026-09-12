@@ -84,8 +84,73 @@ def _tag_value(tags: Any, *keys: str) -> str:
             val = val[0]
         val = str(val).strip()
         if val and val.lower() not in ("", "none", "unknown"):
-            return val
+            return _fix_tag_encoding(val)
     return ""
+
+
+def _fix_tag_encoding(value: str) -> str:
+    """Recover tag text that was decoded with the wrong single-byte charset.
+
+    Perl parity: ``Slim::Utils::Unicode::utf8decode_guess($string,
+    @preferedEncodings)`` (``Slim/Utils/Unicode.pm:154-186``) tries the
+    preferred encodings strictly and then a charset detector
+    (``encodingFromString`` → ``Encode::Detect::Detector::detect``,
+    ``Unicode.pm:482-503``). LMS runs tag strings through it, so a tag whose
+    bytes are CP1251 but whose ID3v2 encoding byte says Latin-1 comes out as
+    readable Cyrillic instead of mojibake.
+
+    Our scanner reads tags with mutagen, which trusts that encoding byte: a
+    Russian ID3v2 tag arrives as 'ßðèëî' (the latin-1 reading of the CP1251
+    bytes of 'Ярило'). The live library had 34 titles, 2 albums and 1
+    contributor like this (2026-09-12).
+
+    Deliberately conservative — a wrong "repair" would corrupt correct tags
+    (French 'Leçon de ténèbres', Finnish 'Jäästä Syntynyt', Turkish 'Gökhan
+    Özoguz' all share the U+00C0-U+00FF range), so a candidate is only
+    accepted when
+
+    * every character is latin-1 encodable (a real Unicode string is already
+      fine and returned untouched), and
+    * at least 3 characters are >= U+0080 and they make up >= 50 % of the
+      string (mojibake is dominated by them; real words are mostly ASCII),
+      and
+    * the CP1251 reading of those bytes is mostly letters in the Cyrillic
+      block (ASCII-art titles and symbol runs are rejected by this).
+
+    UTF-8 read as latin-1 ('Ã©' → 'é') is repaired first, because that is the
+    other common mis-decode and it is unambiguous (strict UTF-8 only).
+    """
+    if not value:
+        return value
+    try:
+        raw = value.encode("latin-1")
+    except UnicodeEncodeError:
+        return value                      # genuine Unicode (Cyrillic, CJK, ...)
+    if raw.isascii():
+        return value
+
+    # 1) UTF-8 bytes that were read as latin-1/cp1252.
+    try:
+        utf8_candidate = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        utf8_candidate = ""
+    if utf8_candidate and utf8_candidate != value and any(
+            ord(ch) > 0x7F for ch in utf8_candidate):
+        # Only accept when the result is not just the same bytes turned into
+        # Latin-1 letters (i.e. real multi-byte sequences were recovered).
+        if utf8_candidate != raw.decode("latin-1"):
+            return utf8_candidate
+
+    # 2) A single-byte charset that is not latin-1 (CP1251 Cyrillic here).
+    high = [ch for ch in value if ord(ch) >= 0x80]
+    if len(high) < 3 or len(high) / len(value) < 0.5:
+        return value
+    candidate = raw.decode("cp1251", errors="replace")
+    cyrillic = sum(1 for ch in candidate if "\u0400" <= ch <= "\u04FF")
+    letters = sum(1 for ch in candidate if ch.isalpha())
+    if cyrillic >= 3 and letters and cyrillic / letters >= 0.8:
+        return candidate
+    return value
 
 # ---------------------------------------------------------------------------
 # Scan configuration
