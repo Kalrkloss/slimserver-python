@@ -512,7 +512,68 @@ _JIVE_STRINGS: dict[str, str] = {
     "FULL_N": "Full Narrow",                              # :15556
     "SMALL": "Small",                                     # :11770
     "LARGE": "Large",                                     # :11750
-    "HUGE": "Huge",                                       # :11809
+    "HUGE": "Huge",                                        # :11809
+    # ── Alarm-/Sync-/Sleep-/Preset-Dialoge (Jive.pm:591-1162, 2412-2830) ──
+    "OFF": "off",                                          # :11183
+    "ON": "on",                                            # :11203
+    "ALARM_ALL_ALARMS": "All Alarms",                      # :1855
+    "ALARM_ADD": "Add Alarm",                              # :1675
+    "ALARM_VOLUME": "Alarm Volume",                        # :1621
+    "ALARM_FADE": "Fade Alarms In",                        # :1891
+    "ALARM_ALARM_ENABLED": "Enabled",                      # :1747
+    "ALARM_SET_TIME": "Set Time",                          # :1910
+    "ALARM_SET_DAYS": "Choose Days",                        # :1928
+    "ALARM_SELECT_PLAYLIST": "Alarm Sound",                # :1585
+    "ALARM_DELETE": "Remove Alarm",                        # :1729
+    "ALARM_ALARM": "Alarm",                                # :1509
+    "ALARM_ALARM_REPEAT": "Repeat Alarm",                  # :1801
+    "ALARM_ALARM_ONETIME": "One Time Alarm",               # :1819
+    "ALARM_OFF": "Off",                                    # :1565
+    "ALARM_DAY0": "Sunday",                                # :2147
+    "ALARM_DAY1": "Monday",                                # :2166
+    "ALARM_DAY2": "Tuesday",                               # :2185
+    "ALARM_DAY3": "Wednesday",                             # :2204
+    "ALARM_DAY4": "Thursday",                              # :2223
+    "ALARM_DAY5": "Friday",                                # :2242
+    "ALARM_DAY6": "Saturday",                              # :2261
+    "ALARM_SHORT_DAY_0": "Su",                             # :2280
+    "ALARM_SHORT_DAY_1": "Mo",                             # :2298
+    "ALARM_SHORT_DAY_2": "Tu",                             # :2316
+    "ALARM_SHORT_DAY_3": "We",                             # :2334
+    "ALARM_SHORT_DAY_4": "Th",                             # :2352
+    "ALARM_SHORT_DAY_5": "Fr",                             # :2370
+    "ALARM_SHORT_DAY_6": "Sa",                             # :2388
+    "JIVE_ALARMSET_HELP": (                                # :22609
+        "Use the scroll wheel to change clock digits, then press the "
+        "center button to select that digit. Press the center button "
+        "after time is entered to set the alarm time."
+    ),
+    "SHUFFLE": "Shuffle",                                  # :11300
+    "SHUFFLE_OFF": "Don't Shuffle Playlist",               # :11380
+    "SHUFFLE_ON_SONGS": "Shuffle by Song",                 # :11320
+    "SHUFFLE_ON_ALBUMS": "Shuffle by Album",               # :11340
+    "CANCEL": "Cancel",                                    # :22746
+    "EMPTY": "Empty",                                      # :445
+    "SLEEP_CANCEL": "Cancel sleep",                        # :1249
+    "SLEEPING_IN_X_MINUTES": "Sleeping in %s minutes",     # :1267
+    "X_MINUTES": "%s minutes",                             # :1285
+    "SLEEP_AT_END_OF_SONG": "Sleep at end of song",        # :1322
+    "NOTHING_CURRENTLY_PLAYING": "Nothing currently playing",   # :1358
+    "SYNC_ABOUT": (                                        # :23921
+        "Add one or more additional Squeezeboxes to use the "
+        "Synchronize feature and realize the full potential of "
+        "multi-room audio. Visit Lyrion.org for more information."
+    ),
+    "SYNC_X_TO": "Sync %s to:",                            # :16814
+    "DO_NOT_SYNC": "No Sync",                              # :16831
+    "SYNCING_WITH": "Syncing with: %s",                    # :16868
+    "UNSYNCING_FROM": "Unsyncing from: %s",                # :16885
+    "RECENT_SEARCHES": "Recent Searches",                  # :22967
+    "PRESET_ADDING": "Saving preset #%s...",               # :23803
+    "JIVE_SET_PRESET_X": "Set Preset %s",                  # :22462
+    "JIVE_OVERWRITE_PRESET_X": "Replace %s?",              # :22445
+    "ADD": "Add",                                          # :11263
+    "DELETE": "Delete",                                    # :16045
 }
 
 #: Perl-Defaults der Helligkeits-Prefs je Displayklasse
@@ -697,6 +758,296 @@ def _jive_brightness_slider(pref: str, key: str, lo: int, hi: int,
                 "params": {"valtag": "value"},
             }},
         }],
+    }
+
+
+# ===========================================================================
+# Jive: Alarme, Sync/Sleep und Listen — Perl Slim/Control/Jive.pm
+# ===========================================================================
+#
+# Dieselben Menü-Regeln wie oben (sliceAndShip/normalize, Jive.pm:1338-1357),
+# aber die Handler lesen zusätzlich Alarme (``Slim::Utils::Alarm``), die
+# Sync-Gruppen (``Slim::Player::Client``/``Sync``) und Client-Prefs.
+# Live-Proben gegen den Perl-LMS 9.1.1 (192.168.1.90:9000, read-only) sind
+# pro Handler im Docstring vermerkt; wo der Live-Server nicht befragt werden
+# konnte, steht die Perl-Quelle als Beleg.
+
+#: Menü-Queries ohne Nebenwirkung (Jive.pm:64-133, 157-162)
+_JIVE_MENU_COMMANDS = frozenset({
+    "alarmsettings", "jiveupdatealarm", "jiveupdatealarmdays",
+    "jivealarmvolume", "syncsettings", "sleepsettings", "jivepresets",
+    "jivefavorites", "jiveplaylists", "jiverecentsearches",
+    "firmwareupgrade", "jiveapplets", "jivewallpapers", "jivesounds",
+    "jivepatches",
+})
+
+#: Jive-Kommandos mit Wirkung (Jive.pm:95-100, 102-104, 124-125) — Antwort {}
+_JIVE_ACTION_COMMANDS = frozenset({"jivealarm", "jiveendoftracksleep", "jivesync"})
+
+#: Modul-Array ``@recentSearches`` (Jive.pm:37); gefüllt wird es in Perl von
+#: ``cacheSearch`` (Jive.pm:2701-2711) aus den Suchmenüs heraus. Unser Server
+#: hat keinen solchen Cache → der Handler antwortet wie Perl bei leerer Liste
+#: (``_jiveNoResults``, Live-Probe).
+_JIVE_RECENT_SEARCHES: list = []
+
+
+def _jive_perl_day(days: str, day: int) -> bool:
+    """Perl ``$alarm->day($day)`` (``Slim/Utils/Alarm.pm:189-203``).
+
+    Perl zählt ``0 = Sonntag .. 6 = Samstag`` (``displayStr`` iteriert
+    ``1..6, 0``, Alarm.pm:952); unser ``Alarm.days`` ist Montag-first
+    (``alarms.py`` ``day_int``: Bit 0 = Montag).
+    """
+    if not days:
+        return False
+    return days[:7].ljust(7, "0")[_jive_day_index(day)] == "1"
+
+
+def _jive_day_index(day: int) -> int:
+    """Perl-Tag (0=So..6=Sa) → Index in unserem ``Alarm.days`` (0=Mo)."""
+    return 6 if day == 0 else day - 1
+
+
+def _jive_alarm_seconds(alarm) -> int:
+    """``$alarm->time`` = Sekunden seit Mitternacht (Alarm.pm:285-305).
+
+    Perl alarms ``time`` ist die Sekundenzahl (das Jive-Zeitfeld
+    ``_inputStyle => 'time'`` bekommt sie als ``initialText``, Live-Probe:
+    25200 = 7:00). Unser Modell speichert 'HH:MM' → hier umgerechnet.
+    """
+    hh, _, mm = str(getattr(alarm, "time", "") or "0:0").partition(":")
+    return _jive_num(hh, 0) * 3600 + _jive_num(mm, 0) * 60
+
+
+def _jive_alarm_days_string(alarm) -> str:
+    """``join(',', @days)`` aus ``getCurrentAlarms`` (Jive.pm:660-663)."""
+    return ",".join(str(d) for d in range(7)
+                    if _jive_perl_day(getattr(alarm, "days", ""), d))
+
+
+def _jive_alarm_playlist(alarm) -> Any:
+    """``$alarm->playlist || 0`` (Jive.pm:687).
+
+    Perls Alarm-``playlist`` ist eine URL (oder 0 für „aktuelle
+    Wiedergabeliste“, Commands.pm:169-176). Unser Modell kennt nur ``wake``;
+    ``url:``/``fr:``-Quellen werden auf ihre URL abgebildet, alles andere
+    (inkl. 'track:') auf 0.
+    """
+    wake = str(getattr(alarm, "wake", "") or "")
+    if wake.startswith("url:"):
+        return wake[4:]
+    return 0
+
+
+def _jive_alarm_display_str(alarm) -> str:
+    """``$alarm->displayStr`` (``Slim/Utils/Alarm.pm:946-963``).
+
+    ``timeStr`` (unsere 'HH:MM') + Kurztage in der Reihenfolge ``1..6, 0``,
+    wenn nicht jeden Tag; ausgeschaltete Alarme bekommen ``ALARM_OFF`` davor.
+    """
+    text = str(getattr(alarm, "time", "") or "")
+    all_days = [getattr(alarm, "days", "") or ""][0]
+    if not (len(all_days) == 7 and all_days == "1" * 7):
+        for day in [1, 2, 3, 4, 5, 6, 0]:
+            if _jive_perl_day(all_days, day):
+                text += " " + _jive_string(f"ALARM_SHORT_DAY_{day}")
+    if not getattr(alarm, "enabled", False):
+        text = f"{_jive_string('ALARM_OFF')} ({text})"
+    return text
+
+
+def _jive_current_alarms(player) -> list[dict]:
+    """``getCurrentAlarms`` (Jive.pm:658-693).
+
+    Eine Zeile je Alarm: ``"<ALARM_ALARM> <n>: <displayStr>"``; die Aktion
+    springt mit id/enabled/days/time/playlist nach ``jiveupdatealarm``.
+    Perls ``enabled`` kommt aus der Prefs-Datei und ist dort ein String ("1");
+    unser Alarm-Modell hält einen Bool, deshalb steht im Menü die ZAHL 1/0
+    (Perl-Literal ``$alarm->enabled || 0`` würde als Zahl ebenfalls passen).
+    Perl sortiert nach ``_createTime`` (Alarm.pm:1269-1291); wir haben keine
+    Anlegezeit und sortieren nach Alarm-Index.
+    """
+    from lyrion.alarms import AlarmManager
+
+    mgr = AlarmManager()
+    mac = getattr(player, "mac", "") or ""
+    items: list[dict] = []
+    count = 0
+    for idx in sorted(mgr.alarms_for(mac)):
+        alarm = mgr.get(mac, idx)
+        if alarm is None:                                  # Perl: next unless id
+            continue
+        count += 1
+        items.append({
+            "text": f"{_jive_string('ALARM_ALARM')} {count}: "
+                    f"{_jive_alarm_display_str(alarm)}",
+            "actions": {"go": {
+                "cmd": ["jiveupdatealarm"],
+                "params": {
+                    "id": str(idx),
+                    "enabled": 1 if getattr(alarm, "enabled", False) else 0,
+                    "days": _jive_alarm_days_string(alarm),
+                    "time": _jive_alarm_seconds(alarm),
+                    "playlist": _jive_alarm_playlist(alarm),
+                },
+                "player": 0,
+            }},
+        })
+    return items
+
+
+def _jive_str(key: str, *args: Any) -> str:
+    """``$client->string($token, @args)`` — sprintf, wenn Argumente kommen."""
+    text = _jive_string(key)
+    return text % args if args else text
+
+
+def _jive_sleep_hash(minutes: int) -> dict:
+    """``sleepInXHash`` (Jive.pm:2282-2300).
+
+    ``SLEEP_CANCEL`` bei 0 Minuten, sonst ``X_MINUTES``; die Aktion setzt den
+    Sleep-Timer mit Sekunden (``$sleepTime*60``), ``setSelectedIndex`` ist in
+    Perl das STRING-Literal ``'1'``.
+    """
+    return {
+        "text": _jive_str("SLEEP_CANCEL") if minutes == 0
+                else _jive_str("X_MINUTES", minutes),
+        "actions": {"go": {"player": 0, "cmd": ["sleep", minutes * 60]}},
+        "nextWindow": "refresh",
+        "setSelectedIndex": "1",                           # Jive.pm:2298
+    }
+
+
+def _jive_sync_group_names(pm, player, include_self: bool) -> str:
+    """``syncedWithNames`` (``Slim/Player/Client.pm:1398-1410``).
+
+    ``join(' & ', …)`` über alle anderen Player derselben Sync-Gruppe; mit
+    ``include_self`` steht der Player selbst am Ende (Live-Probe:
+    „Squeezebox Radio & Schlafzimmer“ für den Master).
+    """
+    group = [p for p in pm.get_sync_group(player.mac) if p.mac != player.mac]
+    if include_self:
+        group = group + [player]
+    return " & ".join(str(getattr(p, "name", "") or p.mac) for p in group)
+
+
+def _jive_is_synced(player) -> bool:
+    """``$client->isSynced()`` (``Slim/Player/Client.pm:1375-1381``)."""
+    value = getattr(player, "is_synced", False)
+    return bool(value() if callable(value) else value)
+
+
+def _jive_players_to_sync_with(pm, player) -> list[dict]:
+    """``getPlayersToSyncWith`` (Jive.pm:1993-2086).
+
+    Erste Zeile: ``SYNC_X_TO`` mit dem eigenen Namen (``itemNoAction``).
+    Danach alle Optionen: die eigene Sync-Gruppe (wenn gesynct, Radio=1),
+    fremde Master mit ihrem Gruppennamen (``syncedWithNames(1)``) und freie
+    Player — sortiert nach Namen (Perl ``sort { $a->{name} cmp … }``); zuletzt,
+    nur wenn gesynct, ``DO_NOT_SYNC`` mit ``syncWith 0``.
+    """
+    items: list[dict] = [{
+        "text": _jive_str("SYNC_X_TO", getattr(player, "name", "") or ""),
+        "style": "itemNoAction",
+    }]
+
+    own_group = {p.mac for p in pm.get_sync_group(player.mac)}
+    currently_synced_with: Any = 0                        # Jive.pm:2010
+    options: list[dict] = []
+
+    if _jive_is_synced(player):
+        name = _jive_sync_group_names(pm, player, False)
+        options.append({"id": player.mac, "name": name, "isSyncedWith": 1})
+        currently_synced_with = name
+
+    for other in list(pm.players.values()):
+        if not getattr(other, "is_player", True):
+            continue
+        # Perl: next if $eachclient->isSyncedWith($client) → dieselbe Gruppe
+        # (unser eigenes Konto eingeschlossen).
+        if other.mac in own_group:
+            continue
+        other_synced = _jive_is_synced(other)
+        other_is_master = bool(getattr(other, "sync_slaves", None)) \
+            and not getattr(other, "sync_master", None)
+        if other_synced and other_is_master:              # Sync.pm:123-128
+            options.append({"id": other.mac,
+                            "name": _jive_sync_group_names(pm, other, True),
+                            "isSyncedWith": 0})
+        elif not other_synced:
+            options.append({"id": other.mac,
+                            "name": getattr(other, "name", "") or other.mac,
+                            "isSyncedWith": 0})
+
+    for opt in sorted(options, key=lambda o: o["name"]):
+        items.append({
+            "text": opt["name"],
+            "radio": 1 if opt["isSyncedWith"] == 1 else 0,
+            "actions": {"do": {
+                "player": 0,
+                "cmd": ["jivesync"],
+                "params": {
+                    "syncWith": opt["id"],
+                    "syncWithString": opt["name"],
+                    "unsyncWith": currently_synced_with,
+                },
+            }},
+            "nextWindow": "refresh",
+        })
+
+    if _jive_is_synced(player):       # Jive.pm:2066-2082
+        items.append({
+            "text": _jive_str("DO_NOT_SYNC"),
+            "radio": 0,
+            "actions": {"do": {
+                "player": 0,
+                "cmd": ["jivesync"],
+                "params": {
+                    "syncWith": 0,
+                    "syncWithString": 0,
+                    "unsyncWith": currently_synced_with,
+                },
+            }},
+            "nextWindow": "refresh",
+        })
+    return items
+
+
+def _jive_presets_pref(player) -> list | None:
+    """Client-Pref ``presets`` (``$prefs->client($client)->get('presets')``).
+
+    Perl hält dort eine ARRAY-Ref mit 10 Slots (Jive.pm:2532); unser
+    per-Player-Store kann zusätzlich einen JSON-String enthalten.
+    """
+    raw = _jive_client_pref(player, "presets", None)
+    if isinstance(raw, str):
+        try:
+            import json as _json
+            raw = _json.loads(raw)
+        except (TypeError, ValueError):
+            return None
+    return raw if isinstance(raw, list) else None
+
+
+def _jive_preset_actions(player, jive_preset: int, title, url, ptype,
+                         parser) -> dict:
+    """``key => $jive_preset; favorites_{url,title,type}; parser`` (Jive.pm:2546-2570).
+
+    Live-Probe: ``key`` ist ein STRING (Perl stringifiziert ``$preset + 1``
+    vorher für ``JIVE_SET_PRESET_X``), ``parser`` ist ``null`` ohne Angabe.
+    """
+    return {
+        "go": {
+            "player": 0,
+            "cmd": ["jivefavorites", "set_preset"],
+            "params": {
+                "key": str(jive_preset),                   # Live: "1".."10"
+                "favorites_url": url,
+                "favorites_title": title,
+                "favorites_type": ptype,
+                "parser": parser,
+            },
+        },
     }
 
 
@@ -1534,6 +1885,24 @@ class JSONRPCAPI:
         if cmd in _JIVE_QUERY_COMMANDS:
             return await self._jive_settings_query(cmd, pm, pid, args)
 
+        # ── Jive-Alarm-/Sync-/Sleep-/Listen-Menüs (Jive.pm:64-133) ──
+        # SqueezePlay-Controller: Wecker, Synchronisieren, Sleep-Timer,
+        # Presets/Favoriten/Playlists, Firmware- und Applet-Listen.
+        if cmd in _JIVE_MENU_COMMANDS:
+            return await self._jive_menu_query(cmd, pm, pid, args)
+
+        # ── Jive-Aktionen mit Wirkung (Jive.pm:2459-2488, 1091-1114,
+        #    2088-2131): Alarm-Snooze/Stop, Sleep am Titelende, Sync/Unsync.
+        #    Perl antwortet nach setStatusDone ohne Ergebnis → {}.
+        if cmd in _JIVE_ACTION_COMMANDS:
+            if cmd == "jivealarm":
+                self._jive_alarm_action(pm, pid, args)
+            elif cmd == "jiveendoftracksleep":
+                await self._jive_end_of_track_sleep(pm, pid)
+            else:  # jivesync
+                self._jive_sync_action(pm, pid, args)
+            return {}
+
         # ── Control commands (return {} — LMS convention) ──────────
         # ── CLI query commands: <cmd> ? → {"_<cmd>": value} ──────
         # LMS JSON-RPC convention (ioBroker.squeezeboxrpc, Squeezer,
@@ -1988,6 +2357,650 @@ class JSONRPCAPI:
             return {"count": len(items), "offset": 0, "item_loop": items}
 
         return {}
+
+    async def _jive_menu_query(self, cmd: str, pm, pid: str | None,
+                               args: list) -> Any:
+        """Jive-Alarm-/Sync-/Sleep-/Listen-Menüs des SqueezePlay-Controllers.
+
+        Perl-Handler in ``Slim/Control/Jive.pm``: ``alarmSettingsQuery``
+        (:591-696), ``jiveAlarmVolumeSlider`` (:1029-1062), ``alarmUpdateMenu``
+        (:700-923), ``alarmUpdateDays`` (:925-1005), ``syncSettingsQuery``
+        (:1064-1089), ``sleepSettingsQuery`` (:1116-1162), ``jivePresetsMenu``
+        (:2490-2596), ``jiveFavoritesCommand`` (:2601-2690),
+        ``jivePlaylistsCommand`` (:2412-2457), ``jiveRecentSearchQuery``
+        (:2768-2797), ``firmwareUpgradeQuery`` (:2196-2229),
+        ``extensionsQuery`` (:2830-2885). Menü-Loop/Slicing: ``sliceAndShip``
+        (:1338-1357) + ``normalize`` (Request.pm:1805-1839).
+
+        Feldtypen gegen den Perl-LMS 9.1.1 (192.168.1.90:9000, read-only)
+        verifiziert: ``alarmsettings`` (count 5 mit Alarm, offset "0"),
+        ``jiveupdatealarm``/``jiveupdatealarmdays`` (8 bzw. 7 Items),
+        ``jivealarmvolume`` (``offset`` 0 als ZAHL, ``initial`` "50" STRING),
+        ``syncsettings`` (count 3, offset "0"), ``sleepsettings`` (5 Items,
+        ``setSelectedIndex`` "1"), ``jivepresets`` (10 Items, ``key`` STRING),
+        ``jivefavorites``/``jiveplaylists`` (count 2, ``offset`` 0 als ZAHL),
+        ``jiverecentsearches`` (count "1" STRING + Empty-Item), ``firmwareupgrade``
+        (``firmwareUpgrade`` 0), ``jivewallpapers``/``jivesounds`` (``count`` 0).
+
+        Ohne Client (Perl ``needClient = 1`` → Status 103) kommt keine Antwort,
+        d. h. leeres Dict.
+        """
+        player = pm.get_player(pid) if (pm is not None and pid) else None
+
+        # ── extension queries (Jive.pm:2830-2885, needClient = 0) ─────
+        # Perl zieht den Typ aus dem Kommandonamen; ohne registrierten
+        # Provider (``registerExtensionProvider``, Jive.pm:2807-2817 — unser
+        # Server hat keine Applet-/Wallpaper-Quelle) bleibt nur ``count 0``.
+        if cmd in ("jiveapplets", "jivewallpapers", "jivesounds",
+                   "jivepatches"):
+            import re
+            if re.search(r"jive(applet|wallpaper|sound|patche)s", cmd) is None:
+                return {}                      # setStatusBadDispatch
+            return {"count": 0}                # Live: jivewallpapers/jivesounds
+
+        # ── firmwareupgrade (Jive.pm:2196-2229, needClient = 0) ───────
+        # Perl liefert firmwareUrl/relativeFirmwareUrl nur, wenn für das
+        # Modell ein Firmware-File vorliegt (Firmware.pm:288-310); ohne
+        # Download-Quelle ist ``need_upgrade`` undef → 0. Unser Server
+        # verteilt keine Jive-Firmware (kein /firmware/-Route) → keinen URL
+        # anbieten, sonst schickt der Client ein Upgrade ins Leere.
+        if cmd == "firmwareupgrade":
+            return {"firmwareUpgrade": 0}
+
+        # ── jiverecentsearches (Jive.pm:2768-2797, needClient = 0) ────
+        if cmd == "jiverecentsearches":
+            total = len(_JIVE_RECENT_SEARCHES)
+            if total == 0:                     # _jiveNoResults (Jive.pm:2692-2699)
+                return {
+                    "count": "1",              # Perl-Literal STRING
+                    "offset": 0,
+                    "item_loop": [{
+                        "text": _jive_string("EMPTY"),
+                        "style": "itemNoAction",
+                        "action": "none",
+                    }],
+                }
+            total = 199 if total > 200 else total     # Jive.pm:2779-2780
+            items: list[dict] = []
+            for i in range(total + 1):         # Jive.pm:2783-2789
+                if i >= len(_JIVE_RECENT_SEARCHES) or not _JIVE_RECENT_SEARCHES[i]:
+                    break
+                items.append(dict(_JIVE_RECENT_SEARCHES[i]))
+            return {"count": total, "offset": 0, "item_loop": items}
+
+        if player is None:
+            return {}
+
+        # ── alarmsettings (Jive.pm:591-696) ───────────────────────────
+        if cmd == "alarmsettings":
+            pos, _tagged = _jive_params(args, ["_index", "_quantity"])
+            index = _jive_num(pos.get("_index"))
+            quantity = _jive_num(pos.get("_quantity"))
+            items = []
+            # All Alarms on/off: choiceStrings sind ucfirst(string(OFF|ON))
+            strings = ["OFF", "ON"]                              # Jive.pm:601
+            choices = [(s := _jive_string(k))[:1].upper() + s[1:]
+                       for k in strings]
+            enabled = _jive_num(                                 # Client.pm:42
+                _jive_client_pref(player, "alarmsEnabled", None), 1)
+            alarm_items = _jive_current_alarms(player)            # Jive.pm:611
+            items.append({
+                "text": _jive_string("ALARM_ALL_ALARMS"),
+                "choiceStrings": choices,
+                "selectedIndex": enabled + 1,      # Jive.pm:604 (+1 wie Lua)
+                "actions": {"do": {"choices": [
+                    {"player": 0, "cmd": ["alarm", "disableall"]},
+                    {"player": 0, "cmd": ["alarm", "enableall"]},
+                ]}},
+            })
+            items += alarm_items
+            items.append({                                       # Jive.pm:622-650
+                "text": _jive_string("ALARM_ADD"),
+                "input": {
+                    "initialText": 25200,                        # 7:00
+                    "title": _jive_string("ALARM_ADD"),
+                    "_inputStyle": "time",
+                    "len": 1,
+                    "help": {"text": _jive_string("JIVE_ALARMSET_HELP")},
+                },
+                "actions": {"do": {
+                    "player": 0,
+                    "cmd": ["alarm", "add"],
+                    "params": {"time": "__TAGGEDINPUT__", "enabled": 1},
+                }},
+                "nextWindow": "refresh",
+            })
+            # Bug 9226: bei fester Lautstärke (digitalVolumeControl == 0)
+            # keine Weckerlautstärke anbieten (Jive.pm:654-661).
+            dvc = _jive_client_pref(player, "digitalVolumeControl", None)
+            if dvc is None:
+                dvc = 1 if getattr(player, "digital_volume_control", True) else 0
+            if _jive_num(dvc, 1) != 0:
+                items.append({
+                    "text": _jive_string("ALARM_VOLUME"),
+                    "actions": {"go": {"player": 0, "cmd": ["jivealarmvolume"]}},
+                })
+            fade = _jive_num(                                    # Client.pm:45
+                _jive_client_pref(player, "alarmfadeseconds", None), 1)
+            items.append({                                       # Jive.pm:663-689
+                "text": _jive_string("ALARM_FADE"),
+                "checkbox": 0 if fade == 0 else 1,
+                "actions": {
+                    "on": {"player": 0, "cmd": ["jivealarm"],
+                           "params": {"fadein": 1}},
+                    "off": {"player": 0, "cmd": ["jivealarm"],
+                            "params": {"fadein": 0}},
+                },
+            })
+            return _jive_slice(items, index, quantity)
+
+        # ── jiveupdatealarm (Jive.pm:700-923) ─────────────────────────
+        if cmd == "jiveupdatealarm":
+            pos, tagged = _jive_params(args, ["_index", "_quantity"])
+            index = _jive_num(pos.get("_index"))
+            quantity = _jive_num(pos.get("_quantity"))
+            aid = tagged.get("id")
+            alarm = self._jive_find_alarm(player, aid)
+            if alarm is None:
+                # Perl: getAlarm → undef, dann stirbt ``$alarm->enabled()``
+                # (Live-Probe: Verbindung schließt ohne Antwort).
+                return {}
+            enabled = 1 if getattr(alarm, "enabled", False) else 0
+            items = [{                                           # Jive.pm:711-738
+                "text": _jive_string("ALARM_ALARM_ENABLED"),
+                "checkbox": enabled,
+                "onClick": "refreshOrigin",
+                "actions": {
+                    "on": {"player": 0, "cmd": ["alarm", "update"],
+                           "params": {"id": aid, "enabled": 1}},
+                    "off": {"player": 0, "cmd": ["alarm", "update"],
+                            "params": {"id": aid, "enabled": 0}},
+                },
+            }, {                                                 # Jive.pm:740-769
+                "text": _jive_string("ALARM_SET_TIME"),
+                "input": {
+                    # Live: der vom Client mitgeschickte time-Parameter
+                    # (Sekunden), z. B. "22500"; ohne Angabe null.
+                    "initialText": tagged.get("time"),
+                    "title": _jive_string("ALARM_SET_TIME"),
+                    "_inputStyle": "time",
+                    "len": 1,
+                    "help": {"text": _jive_string("JIVE_ALARMSET_HELP")},
+                },
+                "actions": {"do": {
+                    "player": 0,
+                    "cmd": ["alarm", "update"],
+                    "params": {"id": aid, "time": "__TAGGEDINPUT__"},
+                }},
+                "nextWindow": "parent",
+            }, {                                                 # Jive.pm:772-786
+                "text": _jive_string("ALARM_SET_DAYS"),
+                "actions": {"go": {
+                    "player": 0,
+                    "cmd": ["jiveupdatealarmdays"],
+                    "params": {"id": aid},
+                }},
+            }, {                                                 # Jive.pm:788-802
+                "text": _jive_string("ALARM_SELECT_PLAYLIST"),
+                "actions": {"go": {
+                    "player": 0,
+                    "cmd": ["alarm", "playlists"],
+                    "params": {"id": aid, "menu": 1},
+                }},
+            }]
+            # Zufallsmodus: unser Alarm-Modell hat kein ``shufflemode``
+            # (Perl Alarm.pm:268-283), der Client kann es also nur setzen —
+            # die Wirkung fehlt (UNKLAR). Angezeigt wird Index 0.
+            shuffle = [("SHUFFLE_OFF", 0), ("SHUFFLE_ON_SONGS", 1),
+                       ("SHUFFLE_ON_ALBUMS", 2)]
+            items.append({                                       # Jive.pm:804-870
+                "text": _jive_string("SHUFFLE"),
+                "count": len(shuffle),
+                "offset": 0,
+                "item_loop": [{
+                    "text": _jive_string(key),
+                    "radio": 1 if mode == 0 else 0,
+                    "onClick": "refreshOrigin",
+                    "actions": {"do": {
+                        "player": 0,
+                        "cmd": ["alarm", "update"],
+                        "params": {"id": aid, "shufflemode": mode},
+                    }},
+                    "nextWindow": "refresh",
+                } for key, mode in shuffle],
+            })
+            repeat = 1 if getattr(alarm, "repeat", False) else 0
+            for key, value in (("ALARM_ALARM_REPEAT", 1),
+                               ("ALARM_ALARM_ONETIME", 0)):      # :873-914
+                items.append({
+                    "text": _jive_string(key),
+                    "radio": 1 if repeat == value else 0,
+                    "onClick": "refreshOrigin",
+                    "actions": {"do": {
+                        "player": 0,
+                        "cmd": ["alarm", "update"],
+                        "params": {"id": aid, "repeat": value},
+                    }},
+                })
+            items.append({                                       # Jive.pm:916-943
+                "text": _jive_string("ALARM_DELETE"),
+                "count": 2,
+                "offset": 0,
+                "item_loop": [
+                    {
+                        "text": _jive_string("CANCEL"),
+                        "actions": {"go": {"player": 0,
+                                           "cmd": ["jiveblankcommand"]}},
+                        "nextWindow": "parent",
+                    },
+                    {
+                        "text": _jive_string("ALARM_DELETE"),
+                        "actions": {"go": {
+                            "player": 0,
+                            "cmd": ["alarm", "delete"],
+                            "params": {"id": aid},
+                        }},
+                        "nextWindow": "grandparent",
+                    },
+                ],
+            })
+            return _jive_slice(items, index, quantity)
+
+        # ── jiveupdatealarmdays (Jive.pm:925-1005) ────────────────────
+        if cmd == "jiveupdatealarmdays":
+            pos, tagged = _jive_params(args, ["_index", "_quantity"])
+            index = _jive_num(pos.get("_index"))
+            quantity = _jive_num(pos.get("_quantity"))
+            aid = tagged.get("id")
+            alarm = self._jive_find_alarm(player, aid)
+            if alarm is None:
+                return {}
+            days = getattr(alarm, "days", "") or ""
+            items = []
+            # Perl zählt 0=Sonntag..6=Samstag (Alarm.pm:189-203, ALARM_DAY0..6);
+            # unser Alarm-Modell ist Montag-first, deshalb rechnet
+            # ``dowAdd``/``dowDel`` (Commands.pm:200-207) den Tag auf unseren
+            # Index um (UNKLAR/Ablage: Perl würde hier 0=So senden).
+            for day in range(7):
+                active = 1 if _jive_perl_day(days, day) else 0
+                items.append({
+                    "text": _jive_string(f"ALARM_DAY{day}"),
+                    "checkbox": active,                          # Jive.pm:960
+                    "onClick": "refreshGrandparent",
+                    "actions": {
+                        "on": {"player": 0, "cmd": ["alarm", "update"],
+                               "params": {"id": aid,
+                                          "dowAdd": str(_jive_day_index(day))}},
+                        "off": {"player": 0, "cmd": ["alarm", "update"],
+                                "params": {"id": aid,
+                                           "dowDel": str(_jive_day_index(day))}},
+                    },
+                })
+            return _jive_slice(items, index, quantity)
+
+        # ── jivealarmvolume (Jive.pm:1029-1062) ───────────────────────
+        if cmd == "jivealarmvolume":
+            vol = _jive_num(                                     # Client.pm:43
+                _jive_client_pref(player, "alarmDefaultVolume", None), None)
+            vol = vol or 50                                      # Jive.pm:1035
+            return {
+                "offset": 0,                                     # addResult-Zahl
+                "count": 1,
+                "item_loop": [{
+                    "slider": 1,
+                    "min": 1,
+                    "max": 100,
+                    "sliderIcons": "volume",
+                    "initial": str(vol),       # Pref-Getter → STRING (Live "50")
+                    "actions": {"do": {
+                        "player": 0,
+                        "cmd": ["alarm", "defaultvolume"],
+                        "params": {"valtag": "volume"},
+                    }},
+                }],
+            }
+
+        # ── syncsettings (Jive.pm:1064-1089) ──────────────────────────
+        if cmd == "syncsettings":
+            others = [p for p in pm.players.values()
+                      if p.mac != player.mac
+                      and getattr(p, "is_player", True)]
+            if not others:                       # Bug 16030: kein Sync-Partner
+                return {
+                    "window": {"textarea": _jive_string("SYNC_ABOUT")},
+                    "count": 0,
+                }
+            pos, _tagged = _jive_params(args, ["_index", "_quantity"])
+            index = _jive_num(pos.get("_index"))
+            quantity = _jive_num(pos.get("_quantity"))
+            return _jive_slice(_jive_players_to_sync_with(pm, player),
+                               index, quantity)
+
+        # ── sleepsettings (Jive.pm:1116-1162) ─────────────────────────
+        if cmd == "sleepsettings":
+            pos, _tagged = _jive_params(args, ["_index", "_quantity"])
+            index = _jive_num(pos.get("_index"))
+            quantity = _jive_num(pos.get("_quantity"))
+            remaining = int(getattr(player, "sleep_remaining", 0) or 0)
+            items: list[dict] = []
+            if remaining > 0:
+                # currentSleepTime ist in MINUTEN (Commands.pm:2955) und
+                # sleepTime ein Epochenwert (Client.pm:302-303) → Anzeige
+                # int(($then-$now)/60)+1 (Jive.pm:1126-1130).
+                items.append({
+                    "text": _jive_str("SLEEPING_IN_X_MINUTES",
+                                      int(remaining / 60) + 1),
+                    "style": "itemNoAction",
+                })
+                items.append(_jive_sleep_hash(0))                # SLEEP_CANCEL
+            # Bug 15675: „Ende des Titels“ nur bei laufendem Titel mit Dauer.
+            if (getattr(player, "mode", "") == "play"
+                    and int(getattr(player, "duration", 0) or 0)):
+                items.append({                                   # Jive.pm:1137-1149
+                    "text": _jive_string("SLEEP_AT_END_OF_SONG"),
+                    "actions": {"go": {"player": 0,
+                                       "cmd": ["jiveendoftracksleep"]}},
+                    "nextWindow": "refresh",
+                    "setSelectedIndex": 1,   # Perl-Literal → ZAHL
+                })
+            for minutes in (15, 30, 45, 60, 90):                 # Jive.pm:1151-1155
+                items.append(_jive_sleep_hash(minutes))
+            return _jive_slice(items, index, quantity)
+
+        # ── jivepresets (Jive.pm:2490-2596) ───────────────────────────
+        if cmd == "jivepresets":
+            _pos, tagged = _jive_params(args, ["_index", "_quantity"])
+            title = tagged.get("title")
+            url = tagged.get("url")
+            ptype = tagged.get("type")
+            parser = tagged.get("parser")
+            if tagged.get("playlist_index") is not None:         # Jive.pm:2513-2518
+                track = await self._jive_playlist_track(
+                    player, tagged.get("playlist_index"))
+                if track is not None:
+                    url, title, ptype = track[0], track[1], "audio"
+            if ptype is not None and ptype != "playlist":        # Jive.pm:2521-2523
+                ptype = "audio"
+            if title is None or url is None:                     # Jive.pm:2524-2527
+                return {}
+            presets = _jive_presets_pref(player)
+            items = []
+            for slot in range(10):                               # Jive.pm:2530 onward
+                jive_preset = slot + 1
+                entry = (presets[slot]
+                         if presets is not None and slot < len(presets)
+                         else None)
+                if entry is not None:
+                    cur_text = (entry.get("text") if isinstance(entry, dict)
+                                else "") or ""
+                    items.append({
+                        "text": _jive_str("JIVE_SET_PRESET_X", jive_preset),
+                        "count": 2,
+                        "offset": 0,
+                        "isContextMenu": 1,
+                        "item_loop": [
+                            {
+                                "text": _jive_string("CANCEL"),
+                                "actions": {"go": {"player": 0,
+                                                   "cmd": ["jiveblankcommand"]}},
+                                "nextWindow": "parent",
+                            },
+                            {
+                                "text": _jive_str("JIVE_OVERWRITE_PRESET_X",
+                                                  cur_text),
+                                "actions": _jive_preset_actions(
+                                    player, jive_preset, title, url, ptype, parser),
+                                "nextWindow": "presets",
+                            },
+                        ],
+                    })
+                else:
+                    items.append({
+                        "text": _jive_str("JIVE_SET_PRESET_X", jive_preset),
+                        "actions": _jive_preset_actions(
+                            player, jive_preset, title, url, ptype, parser),
+                        "nextWindow": "presets",
+                    })
+            # addResult-Literale: offset 0 und count 10 als ZAHLEN.
+            return {"offset": 0, "count": len(items), "item_loop": items}
+
+        # ── jivefavorites (Jive.pm:2601-2690) ─────────────────────────
+        if cmd == "jivefavorites":
+            pos, tagged = _jive_params(args, ["_cmd"])
+            command = pos.get("_cmd")
+            if command == "set_preset":
+                # Jive.pm:2615-2655: Preset auf dem Client ablegen
+                preset = _jive_num(tagged.get("key"), 0) or 0
+                if preset == 0:
+                    preset = 10                                  # Jive.pm:2617-2619
+                title = tagged.get("favorites_title")
+                url = tagged.get("favorites_url")
+                ptype = tagged.get("favorites_type")
+                parser = tagged.get("parser")
+                if tagged.get("playlist_index") is not None:
+                    track = await self._jive_playlist_track(
+                        player, tagged.get("playlist_index"))
+                    if track is not None:
+                        url, title, ptype = track[0], track[1], "audio"
+                if ptype is not None and ptype != "playlist":
+                    ptype = "audio"
+                if title is None or url is None:
+                    return {}
+                self._jive_set_preset(player, preset, title, url, ptype, parser)
+                self._popup = {"jive": {
+                    "type": "popupplay",
+                    "text": [_jive_str("PRESET_ADDING", preset), title],
+                }}
+                self._popup_expires = time.time() + 5
+                return {}
+            # Jive.pm:2657-2687: Bestätigungs-Menü ADD/DELETE
+            title = tagged.get("title")
+            url = tagged.get("url")
+            ptype = tagged.get("type")
+            parser = tagged.get("parser")
+            token = str(command or "").upper()
+            params: dict = {"title": title, "url": url, "type": ptype,
+                            "parser": parser}
+            if tagged.get("icon"):
+                params["icon"] = tagged["icon"]                  # Jive.pm:2678
+            if tagged.get("item_id") is not None:
+                params["item_id"] = tagged["item_id"]            # Jive.pm:2679
+            return {
+                "offset": 0,
+                "count": 2,
+                "item_loop": [
+                    {
+                        "text": _jive_string("CANCEL"),
+                        "actions": {"go": {"player": 0,
+                                           "cmd": ["jiveblankcommand"]}},
+                        "nextWindow": "parent",
+                    },
+                    {
+                        "text": f"{_jive_string(token)} {title}",
+                        "actions": {"go": {
+                            "player": 0,
+                            "cmd": ["favorites", command],
+                            "params": params,
+                        }},
+                        "nextWindow": "grandparent",
+                    },
+                ],
+            }
+
+        # ── jiveplaylists (Jive.pm:2412-2457) ─────────────────────────
+        if cmd == "jiveplaylists":
+            pos, tagged = _jive_params(args, ["_cmd"])
+            command = pos.get("_cmd")
+            token = str(command or "").upper()
+            return {
+                "offset": 0,
+                "count": 2,
+                "item_loop": [
+                    {
+                        "text": _jive_string("CANCEL"),
+                        "actions": {"go": {"player": 0,
+                                           "cmd": ["jiveblankcommand"]}},
+                        "nextWindow": "parent",
+                    },
+                    {
+                        "text": f"{_jive_string(token)} {tagged.get('title')}",
+                        "actions": {"go": {
+                            "player": 0,
+                            "cmd": ["playlists", "delete"],
+                            "params": {
+                                "playlist_id": tagged.get("playlist_id"),
+                                "title": tagged.get("title"),
+                                "url": tagged.get("url"),
+                            },
+                        }},
+                        "nextWindow": "grandparent",
+                    },
+                ],
+            }
+
+        return {}
+
+    # ------------------------------------------------------------------
+    # Jive-Aktionen (Alarm-Snooze/Stop, Sleep am Titelende, Sync)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _jive_find_alarm(player, aid):
+        """``Slim::Utils::Alarm->getAlarm($client, $id)`` (Alarm.pm:1298-1306).
+
+        Jive/SqueezePlay reicht die Alarm-``id`` durch; unsere Alarme sind mit
+        dem Index adressiert (``alarms.py``), den ``getCurrentAlarms`` als
+        ``id`` ausgibt (auch in der ``<idx>-``-Form der Clients).
+        """
+        if aid is None:
+            return None
+        try:
+            idx = int(str(aid).split("-")[0])
+        except (TypeError, ValueError):
+            return None
+        from lyrion.alarms import AlarmManager
+        return AlarmManager().get(getattr(player, "mac", "") or "", idx)
+
+    async def _jive_playlist_track(self, player, playlist_index):
+        """``Slim::Player::Playlist::track($client, $index)`` (Jive.pm:2513-2517).
+
+        Liefert ``(url, title)`` des Titels an dieser Wiedergabelisten-Position
+        oder ``None``, wenn wir ihn nicht auflösen können.
+        """
+        try:
+            idx = int(str(playlist_index).split("-")[0])
+        except (TypeError, ValueError):
+            return None
+        playlist = list(getattr(player, "playlist", None) or [])
+        if idx < 0 or idx >= len(playlist):
+            return None
+        try:
+            info = await self._load_tracks([playlist[idx]])
+        except Exception:                      # noqa: BLE001 — ohne DB kein Titel
+            return None
+        track = info.get(playlist[idx]) or {}
+        url = track.get("url") or ""
+        if not url:
+            return None
+        return url, (track.get("title") or "")
+
+    def _jive_set_preset(self, player, slot: int, title, url, ptype,
+                         parser) -> None:
+        """``$client->setPreset({slot, URL, text, type, parser})`` (Client.pm:1323-1340).
+
+        Perl legt den Eintrag in ``presets->[slot-1]`` ab (Schlüssel URL/text/
+        type, ``parser`` nur wenn gesetzt). Unser Player-Pref-Store ist
+        ``playerprefs``; die Wiedergabe eines Presets (Perl: Preset-Taste
+        startet die URL) hat unser Server nicht — die Ablage wirkt nur auf
+        dieses Menü (UNKLAR).
+        """
+        from lyrion.player.playerprefs import apply_player_pref
+
+        presets = _jive_presets_pref(player)
+        presets_list: list[Any] = list(presets) if presets is not None else [None] * 10
+        while len(presets_list) < 11:
+            presets_list.append(None)
+        preset: dict[str, Any] = {
+            "URL": url,
+            "text": title,
+            "type": ptype or "audio",                            # Client.pm:1331
+        }
+        if parser:
+            preset["parser"] = parser                            # Client.pm:1333
+        presets_list[slot - 1] = preset
+        apply_player_pref(player, "presets", presets_list)
+
+    def _jive_alarm_action(self, pm, pid: str | None, args: list) -> None:
+        """``jiveAlarmCommand`` (Jive.pm:2459-2488) — Snooze/Stop/Fadein.
+
+        Perl wirkt mit ``snooze``/``stop`` auf den gerade klingenden Alarm
+        (``Alarm->getCurrentAlarm``, Alarm.pm:1241-1248) — unser AlarmManager
+        kennt keinen aktuellen Alarm/Klingelzustand, diese beiden Tags bleiben
+        deshalb wirkungslos (UNKLAR). ``fadein`` ist ein Client-Pref
+        (``alarmfadeseconds``) und wird gespeichert.
+        """
+        player = pm.get_player(pid) if (pm is not None and pid) else None
+        if player is None:
+            return
+        _, tagged = _jive_params(args, [])
+        if tagged.get("fadein") is not None:
+            from lyrion.player.playerprefs import apply_player_pref
+            apply_player_pref(player, "alarmfadeseconds", tagged["fadein"])
+
+    async def _jive_end_of_track_sleep(self, pm, pid: str | None) -> None:
+        """``endOfTrackSleepCommand`` (Jive.pm:1091-1114).
+
+        Läuft ein Titel, setzt Perl den Sleep-Timer auf die Restlaufzeit
+        (``$client->execute(['sleep', $remaining])`` → unser
+        ``player.sleep_remaining``, cli_commands.py:1602-1631). Sonst zeigt es
+        den Popup ``NOTHING_CURRENTLY_PLAYING`` (``showBriefly`` mit
+        jive-Typ ``popupplay``).
+        """
+        player = pm.get_player(pid) if (pm is not None and pid) else None
+        if player is None:
+            return
+        if getattr(player, "mode", "") == "play":
+            duration = float(getattr(player, "duration", 0) or 0)
+            elapsed = float(getattr(player, "elapsed", 0) or 0)
+            player.sleep_remaining = int(duration - elapsed)
+        else:
+            self._popup = {"jive": {
+                "type": "popupplay",
+                "text": [_jive_string("NOTHING_CURRENTLY_PLAYING")],
+            }}
+            self._popup_expires = time.time() + 5
+
+    def _jive_sync_action(self, pm, pid: str | None, args: list) -> None:
+        """``jiveSyncCommand`` (Jive.pm:2088-2131).
+
+        Erst unsyncen (``unsyncWith``, Perl ``sync -`` auf dem Client), dann
+        syncen: Perl lässt den *anderen* Client ``sync <unsere id>`` ausführen
+        — unser ``PlayerManager.sync_players(master, [slave])`` (manager.py:640)
+        bildet genau das ab. Abschließend der Popup-Text aus
+        ``UNSYNCING_FROM``/``SYNCING_WITH`` (mit ``\n`` verbunden).
+        """
+        player = pm.get_player(pid) if (pm is not None and pid) else None
+        if player is None:
+            return
+        _, tagged = _jive_params(args, [])
+        messages: list[str] = []
+        # Perl: $request->getParam('unsyncWith') || undef → "0" ist falsy.
+        unsync_with = tagged.get("unsyncWith")
+        if unsync_with and str(unsync_with) != "0":
+            pm.unsync_player(player.mac)
+            messages.append(_jive_str("UNSYNCING_FROM", unsync_with))
+        sync_with = tagged.get("syncWith")
+        if sync_with and str(sync_with) != "0":
+            other = pm.get_player(str(sync_with))
+            if other is not None:
+                pm.sync_players(player.mac, [other.mac])
+                messages.append(_jive_str("SYNCING_WITH",
+                                          tagged.get("syncWithString")))
+        self._popup = {"jive": {
+            "type": "popupplay",
+            "text": ["\n".join(messages)],
+        }}
+        self._popup_expires = time.time() + 5
 
     def _jive_brightness_items(self, player) -> list[dict]:
         """Menüpunkte von ``playerBrightnessMenu`` (Jive.pm:1774-1838).
