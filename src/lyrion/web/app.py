@@ -274,8 +274,11 @@ import re as _re
 
 _COVER_PATH_RE = _re.compile(
     r"^/music/(\d+)/(?:"
-    r"cover\.(?:jpg|png)"                    # plain: cover.jpg
-    r"|cover_(\d+)x(\d+)(?:_[a-z])?\.(?:jpg|png)"  # LMS sized: cover_40x40_m.jpg
+    r"cover\.(?:jpg|png)"                          # plain: cover.jpg
+    # LMS sized form. Jive omits the extension when it fetches a browser
+    # thumbnail (fetchArtwork without imgFormat) — SqueezePlay asked for
+    # '/music/2441/cover_40x40_m' and our strict '.jpg' rule answered 404.
+    r"|cover_(\d+)x(\d+)(?:_[a-z])?(?:\.(?:jpg|png))?"
     r")$"
 )
 

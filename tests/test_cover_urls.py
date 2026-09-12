@@ -56,3 +56,13 @@ def test_resize_leaves_small_images_untouched():
 
 def test_resize_survives_garbage_input():
     assert _resize_cover(b"not an image", (40, 40)) == b"not an image"
+
+
+def test_sized_cover_without_extension_is_accepted():
+    """Jive fetches browser thumbnails WITHOUT a file extension
+    (`fetchArtwork(iconId, icon, size)` with no imgFormat): SqueezePlay
+    requested '/music/2441/cover_40x40_m' and a strict '\.jpg' rule
+    answered 404, so the cover stayed a placeholder."""
+    assert _parse_cover_path("/music/2441/cover_40x40_m") == (2441, (40, 40))
+    assert _parse_cover_path("/music/2441/cover_300x300_f") == (2441, (300, 300))
+    assert _parse_cover_path("/music/2441/cover_40x40_m.png") == (2441, (40, 40))
