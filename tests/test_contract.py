@@ -217,8 +217,17 @@ def test_cli_ping(server_up):
 
 
 def test_cli_ver(server_up):
-    out = cli("ver 0 ?")
-    assert out and "9." in out, f"CLI 'ver' must return a version string, got {out!r}"
+    """Perl has no 'ver' dispatch (Request.pm:474-637), and an unknown CLI
+    request is echoed back verbatim (Plugin/CLI/Plugin.pm:657-663 +
+    Request.pm:1095-1100) — live Perl 9.1.1 answers ``ver 0 %3F``.  The
+    version comes from ``version ?`` (addDispatch Request.pm:630, result
+    ``_version`` Queries.pm:4941-4943) → live Perl ``version 9.1.1``.
+    """
+    assert cli("ver 0 ?") == "ver 0 %3F", (
+        "unknown CLI requests must be echoed like Perl ('ver 0 %3F')")
+    out = cli("version ?")
+    assert out.startswith("version ") and "9." in out, (
+        f"CLI 'version ?' must return the version string like Perl, got {out!r}")
 
 
 def test_cli_client(server_up):

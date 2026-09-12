@@ -2,7 +2,9 @@
 Query handler for Pyrion Music Server CLI.
 
 Handles query-style CLI commands (often preceded by '?') that return
-library data in a structured, line-oriented format.
+library data in Perl's CLI text format: ONE line per answer, the request
+terms first, then percent-escaped ``key:value`` pairs, loops unrolled
+inline.  See :func:`render_line` for the Perl citations.
 """
 from __future__ import annotations
 
@@ -10,13 +12,16 @@ import asyncio
 import logging
 import re
 from dataclasses import dataclass
-from typing import Any, Callable, Optional
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Optional
+from urllib.parse import quote
 
 import orjson
 
-from lyrion.control.cli import CLIContext, CLIHandler, ResponseFormat
-
-if False:
+if TYPE_CHECKING:
+    # Only used in annotations (deferred by ``from __future__ import
+    # annotations``): importing cli at runtime would make the module
+    # unimportable on its own (cli imports cli_commands, which imports us).
+    from lyrion.control.cli import CLIContext, CLIHandler, ResponseFormat
     from lyrion.control.request import RequestDispatcher
 
 logger = logging.getLogger(__name__)
@@ -172,6 +177,167 @@ def format_tags(
 
 
 # ---------------------------------------------------------------------------
+# Perl CLI wire format  (Slim/Control/Stdio.pm + Slim/Control/Request.pm)
+# ---------------------------------------------------------------------------
+#
+# Perl builds every CLI answer from the request object and serialises it as a
+# SINGLE escaped line:
+#
+#   Slim/Plugin/CLI/Plugin.pm:692-698
+#     my @elements = $request->renderAsArray();
+#     my $output   = Slim::Control::Stdio::array_to_string($request->clientid(), \@elements);
+#     ... $output . $connections{$client_socket}{'terminator'}   # LF
+#
+#   renderAsArray — Slim/Control/Request.pm:2226-2296
+#     :2242       the request verbs (command + matched verbs) come first
+#     :2245-2255  params: '__*' suppressed, '_*' bare value, else 'key:value'
+#     :2258-2293  results: same rules, plus
+#                 :2264-2281 key ending in '_loop' → every item of the loop is
+#                            unrolled inline (no loop name, no per-item line)
+#                 :2284-2286 a plain ARRAY value is joined with ','
+#
+#   array_to_string — Slim/Control/Stdio.pm:123-138
+#     :131  the client id is unshifted in front when it is defined
+#     :134  every element is uri_escape_utf8()-escaped (':' → '%3A', ' ' → '%20')
+#     :137  elements are joined with a single space
+#
+# ``?`` semantics — Slim/Control/Request.pm:1021-1061: a query runs only when
+# the LAST token is '?'; the '?' occupies the declared parameter slot of the
+# request and is consumed without being echoed (:1036), a '_'-named slot echoes
+# its token bare (:1027) and every surplus token is echoed as a positional
+# parameter ``_p<i>`` (:1059) or, for tag-capable requests, as ``key:value``
+# (:1054).
+
+# What URI::Escape::uri_escape_utf8() leaves alone (URI::Escape's default
+# unsafe pattern "^A-Za-z0-9\-\._~"): the RFC 3986 unreserved set.
+_UNRESERVED = "-._~"
+
+
+def escape(value: Any) -> str:
+    """URI-escape one CLI token exactly like Perl does.
+
+    Perl: ``map { $_ = URI::Escape::uri_escape_utf8($_) } @elements;``
+    (``Slim/Control/Stdio.pm:134``).  Live probe 2026-09-12 against the Perl
+    LMS (:9090) — ``name%3ASchlafzimmer``, ``uuid%3A`` (empty value),
+    ``modelname%3ASB%20Player``, ``name%3AK%EF%BF%BDche`` (UTF-8 bytes).
+
+    ``None`` (Perl ``undef``) renders as the empty string, booleans as
+    ``1``/``0`` (Perl numbers).
+    """
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        value = 1 if value else 0
+    return quote(str(value), safe=_UNRESERVED)
+
+
+def result_tokens(key: str, value: Any) -> list[Any]:
+    """Return the CLI tokens one ``(key, value)`` result contributes.
+
+    Perl: ``Slim/Control/Request.pm:2258-2293`` — ``__*`` keys are not output
+    (:2261), a key ending in ``_loop`` is unrolled item by item (:2264-2281),
+    a plain array is joined with ',' (:2284-2286), a ``_``-prefixed key
+    outputs its value alone (:2288-2290), everything else ``key:value``
+    (:2291) — without a space, unlike our old ``key: value`` lines.
+    """
+    if key.startswith("__"):
+        return []
+
+    if key.endswith("_loop"):
+        tokens: list[Any] = []
+        for item in value or ():
+            if isinstance(item, dict):
+                for sub_key, sub_value in item.items():
+                    tokens.extend(result_tokens(sub_key, sub_value))
+            else:
+                tokens.append(item)
+        return tokens
+
+    if isinstance(value, (list, tuple)):
+        value = ",".join("" if v is None else str(v) for v in value)
+
+    if value is None:
+        value = ""
+
+    if key.startswith("_"):
+        return [value]
+    return [f"{key}:{value}"]
+
+
+def render_line(
+    clientid: Optional[str] = None,
+    terms: Any = (),
+    params: Any = (),
+    results: Any = (),
+) -> str:
+    """Render one CLI answer the way Perl does: a single escaped line.
+
+    ``clientid`` is prefixed only when the request resolved to a client
+    (``Slim/Control/Stdio.pm:131``), ``terms`` are the request verbs
+    (``Slim/Control/Request.pm:2242``), ``params`` the echoed request
+    parameters (:2245-2255, see :func:`query_params`) and ``results`` the
+    answer fields (:2258-2293).  ``params``/``results`` are sequences of
+    ``(key, value)`` pairs, values may be lists (→ ``key:value`` per item for
+    ``_loop`` keys).
+
+    Callers pass the *whole* answer, so a CLI handler returns
+    ``[render_line(...)]`` — one element, one line.
+    """
+    elements: list[Any] = []
+    if clientid:
+        elements.append(clientid)
+    elements.extend(terms)
+    for key, value in params:
+        elements.extend(result_tokens(key, value))
+    for key, value in results:
+        elements.extend(result_tokens(key, value))
+    return " ".join(escape(element) for element in elements)
+
+
+def query_params(
+    tokens: Any,
+    declared: Any = (),
+    has_tags: bool = True,
+) -> list[tuple[str, Any]]:
+    """Echo the tokens after the verb the way Perl's parser does.
+
+    Perl splits a request into the matched verbs and everything after them
+    (``Slim/Control/Request.pm:1004-1061``).  ``declared`` are the parameter
+    names of the matching ``addDispatch`` entry, in order:
+
+    * a ``_``-prefixed name takes the token at its position and is echoed as
+      its bare value (:1026-1028) — e.g. ``status <mac> - 1`` echoes
+      ``<mac> - 1`` because ``['status','_index','_quantity']`` is declared;
+    * the ``?`` name consumes its slot without echoing anything (:1036) —
+      that is why ``players ?`` echoes ``players %3F`` (the ``?`` is a surplus
+      token there) while ``mixer volume ?`` does not (:523);
+    * every surplus token becomes ``key:value`` when the request accepts tags
+      and the token contains a colon (``tags:al`` → ``tags%3Aal``, :1051-1054),
+      otherwise the positional parameter ``_p<i>`` → bare value (:1059).
+    """
+    out: list[tuple[str, Any]] = []
+    index = 0
+
+    for name in declared:
+        if name == "?":
+            index += 1  # slot consumed, value dropped (Request.pm:1036)
+            continue
+        out.append((name if name.startswith("_") else "_" + name,
+                    tokens[index] if index < len(tokens) else None))
+        index += 1
+
+    for position in range(index, len(tokens)):
+        token = tokens[position]
+        if has_tags and ":" in token and token.split(":", 1)[0]:
+            key, value = token.split(":", 1)
+            out.append((key, value))
+        else:
+            out.append((f"_p{position}", token))
+
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Query handler
 # ---------------------------------------------------------------------------
 
@@ -186,7 +352,9 @@ class QueryHandler:
         albums 0 100 tags:aAlL
         tracks 0 100 genre_id:5 artist_id:10
 
-    Responses are one line per item, blank line terminated.
+    Responses are ONE percent-escaped line, as in Perl (see
+    :func:`render_line`); loops are unrolled inline by
+    :meth:`_format_items`.
     """
 
     # Regex to parse filter param: field:value or field:value:value...
@@ -414,24 +582,43 @@ class QueryHandler:
     # -----------------------------------------------------------------------
 
     def _empty_response(self, query_name: str) -> list[str]:
-        """Return an empty result set."""
-        return [f"{query_name} 0", ""]
+        """Return an empty result set as Perl's single-line answer."""
+        return [render_line(terms=[query_name], results=[("count", 0)])]
 
     def _count_response(self, query_name: str, count: int) -> list[str]:
-        return [f"{query_name} {count}", ""]
+        return [render_line(terms=[query_name], results=[("count", count)])]
 
     def _format_items(
         self,
         items: list[dict[str, Any]],
         tag_str: str,
         count_line: str,
+        loop_key: str = "item_loop",
     ) -> list[str]:
-        """Format a list of items as CLI response lines."""
-        lines = [count_line]
-        for item in items:
-            lines.append(format_tags(item, tag_str))
-        lines.append("")
-        return lines
+        """Format a list of items as Perl does: ONE line, loop unrolled.
+
+        Perl never prints a loop name or one line per item — the loop items are
+        appended to the same line, each as a run of ``key:value`` tokens
+        (``Slim/Control/Request.pm:2264-2281``).  Live Perl probe 2026-09-12
+        (:9090): ``artists 0 1 id%3A5620 artist%3A%3F favorites_url%3A…
+        count%3A11151`` — ``artists 0 1`` are the request terms, ``count`` the
+        last result (``Slim/Control/Queries.pm:989`` adds it after the loop;
+        ``playersQuery`` adds it before the loop, ``Queries.pm:2602``).
+
+        ``count_line`` carries the request terms (e.g. ``'artists 0 1'``) as the
+        Echo of the request (``Slim/Control/Request.pm:2242``).
+        """
+        loop = [
+            {field: ("" if row.get(field) is None else row.get(field))
+             for field in expand_tags(tag_str)}
+            for row in items
+        ]
+        return [
+            render_line(
+                terms=count_line.split(),
+                results=[("count", len(items)), (loop_key, loop)],
+            )
+        ]
 
 
 # ---------------------------------------------------------------------------
@@ -448,5 +635,9 @@ __all__ = [
     "register_query",
     "expand_tags",
     "format_tags",
+    "escape",
+    "result_tokens",
+    "render_line",
+    "query_params",
     "DEFAULT_TAGS",
 ]
