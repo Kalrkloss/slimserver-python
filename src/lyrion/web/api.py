@@ -458,6 +458,248 @@ def _mixer_new_value(old: int, raw: str):
         return None
 
 
+# ===========================================================================
+# Jive settings menus — Perl Slim/Control/Jive.pm
+# ===========================================================================
+#
+# Die Kommandos werden vom SqueezePlay-Controller für seine Einstellungsmenüs
+# aufgerufen (Dispatch-Tabelle Jive.pm:57-162). Antwortform ist überall der
+# Menü-Loop (count/offset/item_loop) aus sliceAndShip (Jive.pm:1338-1357) bzw.
+# direkt addResult/addResultLoop. Die Feldtypen wurden gegen den Perl-LMS 9.x
+# verifiziert (read-only Proben 192.168.1.90:9000, jsonrpc.js) — u. a. ist
+# `offset` bei sliceAndShip-Antworten ein STRING (Perl reicht den rohen
+# CLI-Parameter durch), `slider.initial` ist ein STRING (Pref-Getter) und
+# `cmd`-Werte sind bei crossfade/replaygain STRINGS, sonst ZAHLEN.
+
+#: Englische Fallback-Texte der Perl-Strings (`$client->string($key)`); die
+#: Zeilennummern sind die Schlüsselzeilen in /tmp/lms-ref/strings.txt.
+_JIVE_STRINGS: dict[str, str] = {
+    "CHOICE_OFF": "Off",                                  # :1153
+    "LOW": "Low",                                         # :11846
+    "MEDIUM": "Medium",                                   # :11790
+    "HIGH": "High",                                       # :11863
+    "FIXED_VOLUME_100": "Fixed Volume 100%",              # :11662
+    "ANALOGOUTMODE_HEADPHONE": "Headphones",              # :20213
+    "ANALOGOUTMODE_SUBOUT": "Subwoofer",                  # :20205
+    "ANALOGOUTMODE_ALWAYS_ON": "Always On",               # :20230
+    "ANALOGOUTMODE_ALWAYS_OFF": "Always Off",             # :20247
+    "TRANSITION_NONE": "None",                            # :6056
+    "TRANSITION_CROSSFADE": "Crossfade",                  # :6074
+    "TRANSITION_FADE_IN": "Fade in",                      # :6092
+    "TRANSITION_FADE_OUT": "Fade out",                    # :6110
+    "TRANSITION_FADE_IN_OUT": "Fade in and out",          # :6128
+    "REPLAYGAIN_DISABLED": "No Volume Adjustment",        # :5672
+    "REPLAYGAIN_TRACK_GAIN": "Track Gain",                # :5707
+    "REPLAYGAIN_ALBUM_GAIN": "Album Gain",                # :5725
+    "REPLAYGAIN_SMART_GAIN": "Smart Gain",                # :5743
+    "SORT_ARTISTALBUM": "Artist, Album",                  # :19031
+    "SORT_ARTISTYEARALBUM": "Artist, Year, Album",        # :19049
+    "ALBUM": "Album",                                     # :12438
+    "BRIGHTNESS_DARK": "Dark",                            # :15573
+    "BRIGHTNESS_DIMMEST": "Dimmest",                      # :15487
+    "BRIGHTNESS_BRIGHTEST": "Brightest",                  # :15593
+    "BRIGHTNESS_AMBIENT": "Automatic",                    # :15504
+    "SETUP_POWERONBRIGHTNESS_ABBR": "While Active",       # :4468
+    "SETUP_POWEROFFBRIGHTNESS_ABBR": "While Off",         # :4486
+    "SETUP_IDLEBRIGHTNESS_ABBR": "Idle",                  # :4504
+    "SETUP_MINAUTOBRIGHTNESS": "Minimal Brightness (Automatic)",     # :4522
+    "SETUP_SENSAUTOBRIGHTNESS": "Brightness Sensitivity (Automatic)",  # :4576
+    "LIGHT": "Light",                                     # :11899
+    "STANDARD": "Standard",                               # :11936
+    "FULL": "Full",                                       # :11881
+    "LIGHT_N": "Light Narrow",                            # :15521
+    "STANDARD_N": "Standard Narrow",                      # :15539
+    "FULL_N": "Full Narrow",                              # :15556
+    "SMALL": "Small",                                     # :11770
+    "LARGE": "Large",                                     # :11750
+    "HUGE": "Huge",                                       # :11809
+}
+
+#: Perl-Defaults der Helligkeits-Prefs je Displayklasse
+#: (Display/Boom.pm:118-120, Display/Graphics.pm:41-43, Display/Display.pm:68).
+#: ``none`` = NoDisplay: dort gibt es nur idleBrightness; powerOn/powerOff sind
+#: undef und ``undef == 0`` macht in Perl das Radio bei Option 0 aktiv
+#: (Live-Probe gegen SqueezePlay und Squeezebox Radio).
+_JIVE_BRIGHTNESS_DEFAULTS: dict[str, dict[str, int]] = {
+    "boom": {"powerOnBrightness": 6, "powerOffBrightness": 6, "idleBrightness": 6},
+    "graphics": {"powerOnBrightness": 4, "powerOffBrightness": 1, "idleBrightness": 2},
+    "squeezeboxg": {"powerOnBrightness": 4, "powerOffBrightness": 1, "idleBrightness": 2},
+    "none": {"powerOnBrightness": 0, "powerOffBrightness": 0, "idleBrightness": 1},
+}
+
+#: Alle Jive-Settings-Menü-Queries (Jive.pm:75-133)
+_JIVE_QUERY_COMMANDS = frozenset({
+    "jivetonesettings", "jivefixedvolumesettings", "jivestereoxl",
+    "jivelineout", "crossfadesettings", "replaygainsettings",
+    "jiveplayerbrightnesssettings", "jiveplayertextsettings",
+    "jivealbumsortsettings", "date",
+})
+
+
+def _jive_string(key: str) -> str:
+    """Perl ``$client->string($key)`` (Slim/Utils/Strings.pm:525-536).
+
+    Perl macht ``uc($token)`` vor dem Lookup ('light' → 'LIGHT'); ohne
+    geladene Übersetzungstabelle liefert die Registry den englischen Fallback
+    aus strings.txt (Default des Aufrufs).
+    """
+    from lyrion.utils.strings import get_string
+    token = str(key).upper()
+    return get_string(token, default=_JIVE_STRINGS.get(token, token))
+
+
+def _jive_params(args, names: list[str]) -> tuple[dict, dict]:
+    """CLI-Token auf eine Perl-Dispatch-Paramliste abbilden (Request.pm:1006-1024).
+
+    Die ersten ``len(names)`` Token sind die positionalen Parameter
+    (``_index``, ``_quantity``, ``_whatFont``), alle weiteren sind „tagged“
+    Parameter ``name:wert``; Token ohne Doppelpunkt werden ignoriert.
+    """
+    positional: dict[str, Any] = {}
+    i = 0
+    for name in names:
+        positional[name] = args[i] if i < len(args) else None
+        i += 1
+    tagged: dict[str, str] = {}
+    for tok in args[i:]:
+        s = str(tok)
+        if ":" in s:
+            k, _, v = s.partition(":")
+            tagged[k] = v
+    return positional, tagged
+
+
+def _jive_num(value, default=None):
+    """Zahlenwert eines Perl-Skalars (undef/'?'/Text -> ``default``)."""
+    if value is None:
+        return default
+    s = str(value).strip()
+    if not s or s == "?":
+        return default
+    try:
+        return int(s)
+    except ValueError:
+        return default
+
+
+def _jive_slice(items: list, index, quantity) -> dict:
+    """Perl ``sliceAndShip`` (Jive.pm:1338-1357) + ``normalize`` (Request.pm:1805-1839).
+
+    ``count`` ist die Gesamtzahl, ``offset`` der Startindex — als STRING, weil
+    Perl den rohen CLI-Parameter durchreicht (Live-Probe: ``"offset":"1"``;
+    bei negativem Index klemmt Perl auf die Zahl 0). Ungültige Anfragen
+    (Index hinter dem Listenende, Quantity 0, kein Index) liefern nur ``count``.
+    """
+    count = len(items)
+    if index is None:
+        return {"count": count}
+    num = quantity if quantity is not None else count
+    if not num or not count or index > count - 1:
+        return {"count": count}
+    start = 0 if index < 0 else index
+    end = min(start + num - 1, count - 1)
+    return {
+        "count": count,
+        "offset": 0 if index < 0 else str(index),
+        "item_loop": items[start:end + 1],
+    }
+
+
+def _jive_client_pref(player, key: str, default=None):
+    """Perl ``$prefs->client($client)->get($key)``.
+
+    Unser per-Player-Pref-Store ist ``PlayerState.playerprefs`` — derselbe
+    Speicher, den das ``playerpref``-CLI-Kommando schreibt (cli_commands.py:963).
+    """
+    prefs = getattr(player, "playerprefs", None) or {}
+    if key in prefs:
+        return prefs[key]
+    return default
+
+
+def _jive_display_class(model: str) -> str:
+    """Perl-Displayklasse eines Players, abgeleitet aus dem vfdmodel.
+
+    ``squeezeplay``/``controller``/``receiver`` u. a. → NoDisplay,
+    ``squeezebox2``/``3``/``transporter`` → Squeezebox2 (Grafik),
+    ``boom`` → Boom, ``squeezebox`` (SB1) → SqueezeboxG.
+    """
+    from lyrion.player.manager import display_type_for
+    dt = display_type_for(model)
+    if dt == "graphic-160x32":
+        return "boom"
+    if dt == "graphic-280x16":
+        return "squeezeboxg"
+    if dt == "graphic-320x32":
+        return "graphics"
+    return "none"
+
+
+def _jive_brightness_options(model: str) -> dict[int, str]:
+    """Perl ``getBrightnessOptions`` (Display.pm:401-438).
+
+    NoDisplay liefert ``maxBrightness() == undef`` → unveränderte Basis-Tabelle
+    (0..4); Grafik-Displays haben eine brightnessMap mit 5 Einträgen
+    (Squeezebox2.pm:209-211, SqueezeboxG.pm:135-137) → maxBrightness 4 und
+    derselbe Text; nur Boom (brightnessMap mit 7 Einträgen, Display/Boom.pm:
+    180-192) bekommt die Umgebungsstufe „Automatic" (Display.pm:425-437).
+    """
+    dark = _jive_string("BRIGHTNESS_DARK")
+    dimmest = _jive_string("BRIGHTNESS_DIMMEST")
+    brightest = _jive_string("BRIGHTNESS_BRIGHTEST")
+    if _jive_display_class(model) == "boom":
+        return {
+            0: f"0 ({dark})", 1: f"1 ({dimmest})", 2: "2", 3: "3", 4: "4",
+            5: f"5 ({brightest})", 6: _jive_string("BRIGHTNESS_AMBIENT"),
+        }
+    return {
+        0: f"0 ({dark})", 1: f"1 ({dimmest})", 2: "2", 3: "3",
+        4: f"4 ({brightest})",
+    }
+
+
+def _jive_fonts(display: str) -> dict[str, tuple[list[str], int]]:
+    """Font-Prefs der Displayklasse: ``{pref: (fontnamen, default _curr)}``.
+
+    Boom: Display/Boom.pm:126-131 (light_n/standard_n/full_n, idleFont_curr 2),
+    Squeezebox2: Squeezebox2.pm:136-140 (light/standard/full, _curr 1),
+    SqueezeboxG: SqueezeboxG.pm:45-50 (small/medium/large/huge, _curr 1).
+    NoDisplay hat keine Font-Prefs (Perl iteriert dort ein undef-Array und
+    stirbt → keine Antwort).
+    """
+    if display == "boom":
+        narrow = ["light_n", "standard_n", "full_n"]
+        return {"activeFont": (narrow, 1), "idleFont": (narrow, 2)}
+    if display == "squeezeboxg":
+        gfonts = ["small", "medium", "large", "huge"]
+        return {"activeFont": (gfonts, 1), "idleFont": (gfonts, 1)}
+    if display == "graphics":
+        sfonts = ["light", "standard", "full"]
+        return {"activeFont": (sfonts, 1), "idleFont": (sfonts, 1)}
+    return {}
+
+
+def _jive_brightness_slider(pref: str, key: str, lo: int, hi: int,
+                            initial: int) -> dict:
+    """Perl ``minAutoBrightness``/``sensAutoBrightness`` (Jive.pm:1706-1772)."""
+    return {
+        "text": _jive_string(key),
+        "count": 1,
+        "offset": 0,
+        "item_loop": [{
+            "slider": 1,
+            "min": lo,
+            "max": hi,
+            "initial": initial,
+            "actions": {"do": {
+                "player": 0,
+                "cmd": ["playerpref", pref],
+                "params": {"valtag": "value"},
+            }},
+        }],
+    }
+
+
 class JSONRPCAPI:
     """JSON-RPC 2.0 API handler.
 
@@ -1285,6 +1527,13 @@ class JSONRPCAPI:
         if cmd == "menustatus":
             return [None, self._home_menu(), "add", pid or ""]
 
+        # ── Jive-Settings-/Menü-Queries (Slim/Control/Jive.pm) ─────
+        # SqueezePlay/Controller rufen sie für ihre Einstellungsmenüs auf
+        # (Ton, feste Lautstärke, Stereo XL, Line-Out, Crossfade, ReplayGain,
+        # Display-Helligkeit/-Schrift, Album-Sortierung, Uhrzeit).
+        if cmd in _JIVE_QUERY_COMMANDS:
+            return await self._jive_settings_query(cmd, pm, pid, args)
+
         # ── Control commands (return {} — LMS convention) ──────────
         # ── CLI query commands: <cmd> ? → {"_<cmd>": value} ──────
         # LMS JSON-RPC convention (ioBroker.squeezeboxrpc, Squeezer,
@@ -1362,7 +1611,8 @@ class JSONRPCAPI:
         if cmd in ("pause", "power", "play", "stop", "mixer", "sync",
                    "unsync", "pref", "playerpref", "display", "button",
                    "signalstrength", "client", "mode", "name",
-                   "playlist", "playlistcontrol"):
+                   "playlist", "playlistcontrol",
+                   "jivesetalbumsort", "jiveblankcommand", "jivedummycommand"):
             # Invalidate the status cache: a poll right after a control
             # command must see the NEW state, not the stale cached one
             # (Squeezer otherwise shows 'playing' until the TTL expires).
@@ -1480,6 +1730,316 @@ class JSONRPCAPI:
                 return result if isinstance(result, list) else [str(result)]
         except Exception as e:
             return {"error": str(e)}
+
+    async def _jive_settings_query(self, cmd: str, pm, pid: str | None,
+                                   args: list) -> Any:
+        """Jive-Settings-Menüs des SqueezePlay-Controllers.
+
+        Perl-Handler in ``Slim/Control/Jive.pm``: ``toneSettingsQuery``
+        (:1259-1292), ``fixedVolumeSettingsQuery`` (:1221-1256),
+        ``stereoXLQuery`` (:1164-1190), ``lineOutQuery`` (:1192-1218),
+        ``crossfadeSettingsQuery`` (:1294-1315), ``replaygainSettingsQuery``
+        (:1317-1335), ``playerBrightnessMenu`` (:1774-1838),
+        ``playerTextMenu`` (:1840-1877), ``albumSortSettingsMenu`` (:339-369),
+        ``dateQuery`` (:2136-2181). Feldtypen/Leerantworten: Live-Proben gegen
+        Perl-LMS 9.x (siehe tests/test_jive_settings_commands.py).
+
+        Die Handler brauchen (bis auf ``date``) einen Client (Dispatch
+        ``needClient = 1``); ohne Player antwortet Perl mit Status 103, also
+        ohne Result → hier leeres Dict.
+        """
+        player = pm.get_player(pid) if (pm is not None and pid) else None
+
+        # ── date (Jive.pm:132-133, needClient = 0) ────────────────────
+        if cmd == "date":
+            _, tagged = _jive_params(args, [])
+            new_time = tagged.get("set")
+            # Jive.pm:2149-2161: $newTime = getParam('set') || 0 — "0"/"" sind
+            # falsy, dann time(); ein gesetztes Datum wird als String
+            # durchgereicht (Live-Probe: date_epoch "1700000000").
+            if new_time not in (None, "", "0"):
+                epoch: Any = new_time
+            else:
+                epoch = int(time.time())
+            return {
+                "date_epoch": epoch,
+                # 7.3-und-älter-Platzhalter (Jive.pm:2173)
+                "date": "0000-00-00T00:00:00+00:00",
+            }
+
+        if player is None:
+            return {}
+
+        model = getattr(player, "model", "") or ""
+        index, quantity = None, None
+
+        # ── Ton-Einstellungen (Jive.pm:1259-1292) ─────────────────────
+        if cmd == "jivetonesettings":
+            pos, tagged = _jive_params(args, ["_index", "_quantity"])
+            index = _jive_num(pos.get("_index"))
+            quantity = _jive_num(pos.get("_quantity"))
+            tone = tagged.get("cmd")
+            # Jive.pm:1264-1266: $tone = getParam('cmd'); $val = $client->$tone()
+            if tone not in ("bass", "treble", "pitch"):
+                # Perl: $client->undef() stirbt → gar keine Antwort
+                return {}
+            item = {
+                "slider": 1,
+                "min": -23,          # Jive.pm:1271
+                "max": 23,           # Jive.pm:1272
+                "adjust": 24,        # Jive.pm:1273
+                # $val ist der Pref-Getter → STRING (Live: initial "50")
+                "initial": str(_mixer_value(player, tone) or 0),
+                "actions": {"do": {
+                    "player": 0,
+                    "cmd": ["playerpref", tone],
+                    "params": {"valtag": "value"},   # Jive.pm:1281
+                }},
+            }
+            return _jive_slice([item], index, quantity)
+
+        # ── Feste Lautstärke (Jive.pm:1221-1256) ──────────────────────
+        if cmd == "jivefixedvolumesettings":
+            pos, _tagged = _jive_params(args, ["_index", "_quantity"])
+            index = _jive_num(pos.get("_index"))
+            quantity = _jive_num(pos.get("_quantity"))
+            dvc = _jive_client_pref(player, "digitalVolumeControl", None)
+            if dvc is None:
+                # Player.pm:38 digitalVolumeControl => 1; unser PlayerState-
+                # Feld ist das Modell dieses Prefs (protocol.py:2617).
+                dvc = 1 if getattr(player, "digital_volume_control", True) else 0
+            # Jive.pm:1230-1233: checkbox 1 nur wenn digitalVolumeControl == 0
+            checkbox = 1 if _jive_num(dvc, 1) == 0 else 0
+            item = {
+                "text": _jive_string("FIXED_VOLUME_100"),
+                "checkbox": checkbox,
+                "actions": {
+                    "on": {"player": 0,
+                           "cmd": ["playerpref", "digitalVolumeControl", 0]},
+                    "off": {"player": 0,
+                            "cmd": ["playerpref", "digitalVolumeControl", 1]},
+                },
+            }
+            return _jive_slice([item], index, quantity)
+
+        # ── Stereo XL (Jive.pm:1164-1190) ─────────────────────────────
+        if cmd == "jivestereoxl":
+            pos, _tagged = _jive_params(args, ["_index", "_quantity"])
+            index = _jive_num(pos.get("_index"))
+            quantity = _jive_num(pos.get("_quantity"))
+            # Boom.pm:41 'stereoxl' => minXL() (0); ohne gesetztes Pref ist es
+            # ein undef → Perl zählt 0 als aktuellen Wert (Live-Probe).
+            cur = _jive_num(_jive_client_pref(player, "stereoxl", None), 0)
+            strings = ["CHOICE_OFF", "LOW", "MEDIUM", "HIGH"]   # Jive.pm:1170
+            items = [
+                {
+                    "text": _jive_string(key),
+                    "radio": 1 if cur == i else 0,          # Jive.pm:1175
+                    "actions": {"do": {
+                        "player": 0,
+                        "cmd": ["playerpref", "stereoxl", i],   # Zahl (Jive.pm:1179)
+                    }},
+                }
+                for i, key in enumerate(strings)
+            ]
+            return _jive_slice(items, index, quantity)
+
+        # ── Line-Out (Jive.pm:1192-1218) ──────────────────────────────
+        if cmd == "jivelineout":
+            pos, _tagged = _jive_params(args, ["_index", "_quantity"])
+            index = _jive_num(pos.get("_index"))
+            quantity = _jive_num(pos.get("_quantity"))
+            raw = _jive_client_pref(player, "analogOutMode", None)
+            if raw is None:
+                # Boom.pm:38 analogOutMode => -1 (kein Radio aktiv); bei allen
+                # anderen Klassen ist das Pref undef und `undef == 0` in Perl
+                # wahr → Radio bei Option 0 (Live-Probe).
+                cur = -1 if _jive_display_class(model) == "boom" else 0
+            else:
+                cur = _jive_num(raw, 0)
+            strings = [                                     # Jive.pm:1198
+                "ANALOGOUTMODE_HEADPHONE", "ANALOGOUTMODE_SUBOUT",
+                "ANALOGOUTMODE_ALWAYS_ON", "ANALOGOUTMODE_ALWAYS_OFF",
+            ]
+            items = [
+                {
+                    "text": _jive_string(key),
+                    "radio": 1 if cur == i else 0,
+                    "actions": {"do": {
+                        "player": 0,
+                        "cmd": ["playerpref", "analogOutMode", i],  # Zahl (Jive.pm:1207)
+                    }},
+                }
+                for i, key in enumerate(strings)
+            ]
+            return _jive_slice(items, index, quantity)
+
+        # ── Crossfade (Jive.pm:1294-1315 + transitionHash 2302-2316) ──
+        if cmd == "crossfadesettings":
+            pos, _tagged = _jive_params(args, ["_index", "_quantity"])
+            index = _jive_num(pos.get("_index"))
+            quantity = _jive_num(pos.get("_quantity"))
+            # Squeezebox2.pm:44 transitionType => 0
+            cur = _jive_num(_jive_client_pref(player, "transitionType", None), 0)
+            strings = [                                     # Jive.pm:1300-1304
+                "TRANSITION_NONE", "TRANSITION_CROSSFADE",
+                "TRANSITION_FADE_IN", "TRANSITION_FADE_OUT",
+                "TRANSITION_FADE_IN_OUT",
+            ]
+            items = [
+                {
+                    "text": _jive_string(key),
+                    "radio": 1 if cur == i else 0,          # Jive.pm:2307
+                    "actions": {"do": {
+                        "player": 0,
+                        # Jive.pm:2311 cmd => ['playerpref','transitionType',"$thisValue"]
+                        "cmd": ["playerpref", "transitionType", str(i)],
+                    }},
+                }
+                for i, key in enumerate(strings)
+            ]
+            return _jive_slice(items, index, quantity)
+
+        # ── ReplayGain (Jive.pm:1317-1335 + replayGainHash 2318-2332) ─
+        if cmd == "replaygainsettings":
+            pos, _tagged = _jive_params(args, ["_index", "_quantity"])
+            index = _jive_num(pos.get("_index"))
+            quantity = _jive_num(pos.get("_quantity"))
+            # Squeezebox2.pm:47 replayGainMode => 0
+            cur = _jive_num(_jive_client_pref(player, "replayGainMode", None), 0)
+            strings = [                                     # Jive.pm:1323-1326
+                "REPLAYGAIN_DISABLED", "REPLAYGAIN_TRACK_GAIN",
+                "REPLAYGAIN_ALBUM_GAIN", "REPLAYGAIN_SMART_GAIN",
+            ]
+            items = [
+                {
+                    "text": _jive_string(key),
+                    "radio": 1 if cur == i else 0,          # Jive.pm:2323
+                    "actions": {"do": {
+                        "player": 0,
+                        "cmd": ["playerpref", "replayGainMode", str(i)],  # :2327 String
+                    }},
+                }
+                for i, key in enumerate(strings)
+            ]
+            return _jive_slice(items, index, quantity)
+
+        # ── Helligkeit (Jive.pm:1774-1838) ────────────────────────────
+        if cmd == "jiveplayerbrightnesssettings":
+            pos, _tagged = _jive_params(args, ["_index", "_quantity"])
+            index = _jive_num(pos.get("_index"))
+            quantity = _jive_num(pos.get("_quantity"))
+            return _jive_slice(self._jive_brightness_items(player), index, quantity)
+
+        # ── Schriftgrößen (Jive.pm:1840-1877) ─────────────────────────
+        if cmd == "jiveplayertextsettings":
+            pos, _tagged = _jive_params(args, ["_whatFont", "_index", "_quantity"])
+            index = _jive_num(pos.get("_index"))
+            quantity = _jive_num(pos.get("_quantity"))
+            what_font = pos.get("_whatFont")
+            entry = _jive_fonts(_jive_display_class(model)).get(what_font or "")
+            if entry is None:
+                # Jive.pm:1851 iteriert $prefs->client($client)->get($whatFont):
+                # bei NoDisplay (und bei unbekanntem Pref) ist das undef und der
+                # Handler stirbt → keine Antwort (Live-Probe).
+                return {}
+            names, default_curr = entry
+            cur = _jive_num(
+                _jive_client_pref(player, f"{what_font}_curr", None), default_curr)
+            items = [
+                {
+                    "text": _jive_string(name),
+                    "radio": 1 if cur == value else 0,      # Jive.pm:1862
+                    "actions": {"do": {
+                        "player": 0,
+                        # Jive.pm:1865 cmd => ['playerpref',$whatFont.'_curr',$value]
+                        "cmd": ["playerpref", f"{what_font}_curr", value],
+                    }},
+                }
+                for value, name in enumerate(names)
+            ]
+            return _jive_slice(items, index, quantity)
+
+        # ── Album-Sortierung (Jive.pm:339-369) ────────────────────────
+        if cmd == "jivealbumsortsettings":
+            from lyrion.config import get_prefs
+            # Prefs.pm:271 jivealbumsort => 'album' (Server-Pref, nicht pro Client)
+            sort = get_prefs().get("jivealbumsort", "album")
+            methods = {                                     # Jive.pm:344-348
+                "artistalbum": "SORT_ARTISTALBUM",
+                "artflow": "SORT_ARTISTYEARALBUM",
+                "album": "ALBUM",
+            }
+            items = [
+                {
+                    "text": _jive_string(methods[key]),
+                    "radio": 1 if str(sort or "") == key else 0,   # Jive.pm:354
+                    "actions": {"do": {
+                        "player": 0,
+                        "cmd": ["jivesetalbumsort"],            # Jive.pm:359
+                        "params": {"sortMe": key},
+                    }},
+                }
+                for key in sorted(methods)     # Jive.pm:352 sort keys
+            ]
+            # Jive.pm:349-350: count/offset direkt — KEIN sliceAndShip, deshalb
+            # werden _index/_quantity ignoriert (Live-Probe: "… 3 1" liefert
+            # trotzdem count 3, offset 0 und alle Items).
+            return {"count": len(items), "offset": 0, "item_loop": items}
+
+        return {}
+
+    def _jive_brightness_items(self, player) -> list[dict]:
+        """Menüpunkte von ``playerBrightnessMenu`` (Jive.pm:1774-1838).
+
+        Drei Pref-Gruppen (While Active / While Off / Idle), jede mit den
+        Helligkeits-Optionen des Displays als Radio-Loop; Boom bekommt
+        zusätzlich die beiden Automatik-Slider (Jive.pm:1826-1832).
+        """
+        model = getattr(player, "model", "") or ""
+        display = _jive_display_class(model)
+        options = _jive_brightness_options(model)
+        defaults = _JIVE_BRIGHTNESS_DEFAULTS.get(
+            display, _JIVE_BRIGHTNESS_DEFAULTS["none"])
+
+        items: list[dict] = []
+        for pref, key in (                                  # Jive.pm:1782-1795
+            ("powerOnBrightness", "SETUP_POWERONBRIGHTNESS_ABBR"),
+            ("powerOffBrightness", "SETUP_POWEROFFBRIGHTNESS_ABBR"),
+            ("idleBrightness", "SETUP_IDLEBRIGHTNESS_ABBR"),
+        ):
+            cur = _jive_num(_jive_client_pref(player, pref, None), defaults.get(pref))
+            radios = [
+                {
+                    "text": options[level],
+                    "radio": 1 if cur == level else 0,      # Jive.pm:1806
+                    "actions": {"do": {
+                        "player": 0,
+                        # Jive.pm:1809 cmd => ['playerpref',$pref,$setting] — $setting
+                        # ist der HASH-KEY der Optionsliste, in Perl also ein
+                        # STRING (Live-Probe: "powerOnBrightness","4").
+                        "cmd": ["playerpref", pref, str(level)],
+                    }},
+                }
+                for level in sorted(options, reverse=True)   # Jive.pm:1803
+            ]
+            items.append({
+                "text": _jive_string(key),
+                "count": len(radios),
+                "offset": 0,                                 # Hash-Literal → Zahl
+                "item_loop": radios,
+            })
+
+        if display == "boom":                                # Jive.pm:1826-1832
+            mab = _jive_num(_jive_client_pref(player, "minAutoBrightness", None), 2)
+            sab = _jive_num(_jive_client_pref(player, "sensAutoBrightness", None), 10)
+            # Boom.pm:57-58 minAutoBrightness 2 / sensAutoBrightness 10
+            items.append(_jive_brightness_slider(
+                "minAutoBrightness", "SETUP_MINAUTOBRIGHTNESS", 1, 5, mab))
+            items.append(_jive_brightness_slider(
+                "sensAutoBrightness", "SETUP_SENSAUTOBRIGHTNESS", 1, 20, sab))
+
+        return items
 
     async def _rescan(self, mode: str = "full") -> Any:
         """Direct rescan — triggers MusicImporter in background.
@@ -2686,6 +3246,27 @@ class JSONRPCAPI:
                         player.repeat = max(0, min(2, int(str(rest[0]))))
                     except ValueError:
                         pass
+        elif cmd == "jivesetalbumsort":
+            # Perl jiveSetAlbumSort (Jive.pm:329-335): Server-Pref
+            # 'jivealbumsort' auf den sortMe-Parameter setzen.
+            sort = ""
+            for tok in args:
+                s = str(tok)
+                if s.startswith("sortMe:"):
+                    sort = s.split(":", 1)[1]
+            if sort:
+                from lyrion.config import get_prefs
+                try:
+                    await get_prefs().set("jivealbumsort", sort)
+                except RuntimeError:
+                    # Prefs-Store ohne DB (z. B. Test-/CLI-Prozess): Wert wie
+                    # set() im Cache halten, damit die Menü-Abfrage ihn sieht.
+                    get_prefs()._cache["jivealbumsort"] = sort
+        elif cmd in ("jiveblankcommand", "jivedummycommand"):
+            # Perl-Stubs: jiveblankcommand => sub { return 1 } (Jive.pm:159-160),
+            # jiveDummyCommand => return (Jive.pm:2799-2801) → kein Result
+            # (Live-Probe: beide antworten mit {}).
+            return
         else:
             send(f"{cmd} {' '.join(args)}")
 
