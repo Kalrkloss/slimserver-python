@@ -54,6 +54,25 @@ class PlayerState:
     # track end, stop/pause, disconnect/reconnect) — a stale value makes a
     # replay of the same track a silent no-op.
     strm_sent_track: Optional[int] = None
+    # Wall-clock time the last strm 's' frame was written. The player
+    # answers our OWN strm with a start handshake whose first frame is an
+    # ``STMf`` (it closes the OLD stream — Squeezebox2.pm:398-403 "always
+    # use a new stream"). An STMf inside this window is that ack, NOT
+    # "stream lost": it must keep the guard and must not report a stop
+    # (live: `Sent strm track=9900` → STMf → mode=stop, frozen elapsed,
+    # 99.8 % full output buffer = the wedge).
+    strm_sent_at: float = 0.0
+    # Track id the player DEMONSTRABLY plays: set by ``STMs`` (track started,
+    # Squeezebox2.pm:162-163) or by an ``STMt`` whose ``elapsed`` advanced —
+    # a frozen elapsed is not playback (the wedge repeats STMt forever with
+    # a frozen clock). Second, handshake-independent criterion for "already
+    # playing → send nothing" (Perl StreamingController: state PLAYING +
+    # same song → ``_Stream`` :1144 does nothing), so a stray stop-ack that
+    # drops ``strm_sent_track`` cannot re-arm a redundant flush+strm.
+    # Cleared with ``forget_stream()``.
+    playing_track_id: Optional[int] = None
+    # Last STAT ``elapsed`` seen for this player (progress detection).
+    _last_elapsed_seen: float = 0.0
     # Track id a send_strm_to_player call is CURRENTLY sending. Claimed
     # synchronously before the first await and released in `finally`, so two
     # concurrent calls for the same track cannot both flush+stream.
@@ -117,6 +136,22 @@ class PlayerState:
     def update_activity(self) -> None:
         """Mark the last activity timestamp to now."""
         self.last_activity = time.time()
+
+    def forget_stream(self) -> None:
+        """The player demonstrably no longer holds the stream we sent.
+
+        Drops BOTH halves of the strm idempotency guard
+        (``strm_sent_track`` + ``playing_track_id``). Call it on every path
+        where the stream is gone — an STMf that is NOT our own start
+        handshake, STMn, a stop/track end, a disconnect/reconnect — but
+        NEVER while the player merely holds its output (STMp/pause): a
+        resume continues the same stream (strm 'u', Squeezebox2.pm:1104-1110).
+
+        Keeping the guard armed too long is the worse failure: the play
+        request reports success while the player stays silent.
+        """
+        self.strm_sent_track = None
+        self.playing_track_id = None
 
     def to_dict(self) -> dict:
         """Return a plain dict representation."""

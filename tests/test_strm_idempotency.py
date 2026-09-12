@@ -40,7 +40,12 @@ STAT_JIFFIES_OFF = 25
 STAT_OUT_FULLNESS_OFF = 33
 
 
-def _stat_frame(event: str, out_fullness: int = 0, jiffies: int = 0) -> bytes:
+STAT_ELAPSED_SEC_OFF = 37
+STAT_ELAPSED_MS_OFF = 43
+
+
+def _stat_frame(event: str, out_fullness: int = 0, jiffies: int = 0,
+                elapsed_ms: int = 0) -> bytes:
     """A 53-byte STAT frame (Perl unpack layout) for ``event``."""
     buf = bytearray(53)
     buf[0:4] = event.encode("ascii")
@@ -48,6 +53,11 @@ def _stat_frame(event: str, out_fullness: int = 0, jiffies: int = 0) -> bytes:
     buf[
         STAT_OUT_FULLNESS_OFF:STAT_OUT_FULLNESS_OFF + 4
     ] = struct.pack(">I", out_fullness)
+    if elapsed_ms:
+        buf[STAT_ELAPSED_SEC_OFF:STAT_ELAPSED_SEC_OFF + 4] = struct.pack(
+            ">I", elapsed_ms // 1000)
+        buf[STAT_ELAPSED_MS_OFF:STAT_ELAPSED_MS_OFF + 4] = struct.pack(
+            ">I", elapsed_ms)
     return bytes(buf)
 
 
@@ -410,3 +420,212 @@ def test_in_flight_claim_released_after_failure(monkeypatch):
     client._player_writers[MAC_CLEAN] = writer
     assert asyncio.run(client.send_strm_to_player(MAC, 51997)) is True
     assert _stream_frames(writer)
+
+
+# ──────────────────────────────────────────────────────────────────────
+# P0-FIX: "already playing" — the player's START HANDSHAKE must not disarm
+# the guard (LIVE-WEDGE: frozen elapsed + full output buffer)
+# ──────────────────────────────────────────────────────────────────────
+#
+# LIVE evidence (/tmp/lyrion-live.log, SqueezePlay 1C:87:2C:47:FC:36,
+# 2026-09-12). Track 9900 was ALREADY playing (elapsed 49.411 s since
+# 13:45:40). The user picked "Wiedergabe" on that same track:
+#
+#   13:45:40 ... event=STMt elapsed=49.411s out_fullness=3520512/3528000 fullness=2883060
+#   13:45:45 cometd <playlistcontrol cmd:load track_id:9900 useContextMenu:1>
+#   13:45:45 [INFO] protocol: Sent strm to 1C872C47FC36: track=9900 codec=m
+#   13:45:45 ... event=STMf jiffies=74902301 elapsed=49.411s out_fullness=3520512/3528000 fullness=0
+#   13:45:45 ... event=STMc jiffies=74902301 elapsed=49.411s
+#   13:45:45 ... event=STMo jiffies=74902335 elapsed=49.411s
+#   13:45:45 ... event=cont jiffies=74902350 elapsed=49.411s
+#   13:45:46 ... event=STMt jiffies=74903414 elapsed=49.411s out_fullness=3520512/3528000
+#   (minutes of STMt with FROZEN elapsed=49.411s and out_fullness pinned at
+#    99.8 %; mode=stop, no audio, only a client restart helped)
+#
+# Cause: the STMf above is the player's ACK of our own strm (it closes the
+# OLD stream, Perl Squeezebox2.pm:398-403 "always use a new stream"). The
+# old handler treated ANY STMf as "stream lost" → cleared
+# ``strm_sent_track`` (the R0.5-P1 guard) and set ``mode="stop"`` mid-start.
+# Exactly the same user action then re-sent strm on the next attempt — the
+# wedge in the log. Perl does nothing for the song that is already playing
+# (StreamingController.pm PLAYING + same song: ``_Stream`` :1144 stays
+# put, ``_Playing`` :331 → ``_PlayIfReady`` :1359 only for a NEW song).
+
+
+def _start_handshake(client, player, *, track_id: int = 9900) -> None:
+    """Drive the live start handshake: STMf → STMc → STMo → STMs."""
+    client._handle_stat_frame(MAC, _stat_frame("STMf", out_fullness=3520512))
+    client._handle_stat_frame(MAC, _stat_frame("STMc"))
+    client._handle_stat_frame(MAC, _stat_frame("STMo", out_fullness=3520512))
+    client._handle_stat_frame(MAC, _stat_frame("STMs", jiffies=74902400,
+                                               elapsed_ms=89))
+
+
+def test_start_handshake_stmf_does_not_report_stop(monkeypatch):
+    """(d) The STMf that ACKs our own strm must not flip ``mode`` to stop.
+
+    Live: ``Sent strm ... track=9900`` is immediately followed by
+    ``event=STMf`` and the client showed the old title with mode=stop while
+    the track was running. Perl's flush ack does not stop the player.
+    """
+    player = _new_player()
+    player.mode = "play"
+    client, writer, _pm = _make_client(player, monkeypatch)
+
+    assert asyncio.run(client.send_strm_to_player(MAC, 9900)) is True
+    assert len(_stream_frames(writer)) == 1
+
+    client._handle_stat_frame(MAC, _stat_frame("STMf", out_fullness=3520512))
+
+    assert player.mode == "play", (
+        "the start-handshake STMf must not report a stop mid-start"
+    )
+    assert player.strm_sent_track == 9900, (
+        "the start-handshake STMf must not disarm the strm guard"
+    )
+
+
+def test_replay_after_start_handshake_sends_nothing(monkeypatch):
+    """(a) Track already playing + start handshake seen → a second
+    ``send_strm_to_player`` for the SAME track sends 0 frames.
+
+    This is the LIVE-WEDGE replay: SqueezePlay's context menu "Wiedergabe"
+    on the current track. Red on HEAD: the handshake STMf cleared
+    ``strm_sent_track``, so the replay flushed/restarted the buffers.
+    """
+    player = _new_player()
+    player.mode = "play"
+    client, writer, _pm = _make_client(player, monkeypatch)
+
+    assert asyncio.run(client.send_strm_to_player(MAC, 9900)) is True
+    _start_handshake(client, player)
+
+    assert player.mode == "play"
+    assert player.playing_track_id == 9900, (
+        "STMs must mark the track the player demonstrably started"
+    )
+
+    # The user picks "Wiedergabe" for the same, currently playing track:
+    player.mode = "play"
+    player.current_track_id = 9900
+    writer.frames.clear()
+    assert asyncio.run(client.send_strm_to_player(MAC, 9900)) is True
+    assert _stream_frames(writer) == [], (
+        "an already playing track must not be re-streamed"
+    )
+    assert _flush_frames(writer) == []
+
+
+def test_switch_after_handshake_still_streams_once(monkeypatch):
+    """(b) A REAL switch (different track) must still send exactly one strm
+    frame — the playing criterion must not glue playback to the old title.
+    """
+    player = _new_player()
+    player.mode = "play"
+    client, writer, _pm = _make_client(player, monkeypatch)
+
+    assert asyncio.run(client.send_strm_to_player(MAC, 9900)) is True
+    _start_handshake(client, player)
+    writer.frames.clear()
+
+    assert asyncio.run(client.send_strm_to_player(MAC, 9901)) is True
+    assert len(_stream_frames(writer)) == 1, "a real switch must stream once"
+
+
+def test_stop_after_handshake_streams_again(monkeypatch):
+    """(c) Stop ends the stream: the guard is dropped and the next play of
+    the same track streams again (space / play-again must not stick).
+    """
+    player = _new_player()
+    player.mode = "play"
+    client, writer, _pm = _make_client(player, monkeypatch)
+
+    assert asyncio.run(client.send_strm_to_player(MAC, 9900)) is True
+    _start_handshake(client, player)
+
+    client._handle_stat_frame(MAC, _stat_frame("stop"))
+    assert player.strm_sent_track is None
+    assert player.playing_track_id is None, "stop must drop the playing criterion"
+
+    player.mode = "play"
+    player.current_track_id = 9900
+    writer.frames.clear()
+    assert asyncio.run(client.send_strm_to_player(MAC, 9900)) is True
+    assert len(_stream_frames(writer)) == 1, "after a stop the same track must stream"
+
+
+def test_late_stmf_still_clears_the_guard(monkeypatch):
+    """(e) A player-initiated STMf long after our strm (not the start
+    handshake) really means "stream lost" — guard dropped, mode stop, and
+    the replay streams again (R0.5-P1 must keep working).
+    """
+    player = _new_player()
+    player.mode = "play"
+    player.strm_sent_track = 9900
+    player.playing_track_id = 9900      # STMs/STMt had confirmed it
+    player.strm_sent_at = time.time() - 30.0   # 30 s ago → not the handshake
+    client, writer, _pm = _make_client(player, monkeypatch)
+
+    client._handle_stat_frame(MAC, _stat_frame("STMf", out_fullness=0))
+
+    assert player.strm_sent_track is None, (
+        "a late STMf: the player flushed — the guard must not stay armed"
+    )
+    assert player.playing_track_id is None
+    assert player.mode == "stop"
+    assert _replay_sends(client, writer, player)
+
+
+def test_radio_switch_then_same_track_streams_again(monkeypatch):
+    """(3) A DIRECT stream (radio/favourite) is a REAL switch: the guard of
+    the replaced file stream must not survive it — playing the old track
+    again has to stream instead of sitting silent behind a stale guard
+    ("klebt am alten Titel").
+    """
+    player = _new_player()
+    player.mode = "play"
+    client, writer, _pm = _make_client(player, monkeypatch)
+
+    assert asyncio.run(client.send_strm_to_player(MAC, 9900)) is True
+    _start_handshake(client, player)
+    assert player.playing_track_id == 9900
+
+    assert asyncio.run(
+        client.send_remote_stream(MAC, "http://example.com/radio.mp3")
+    ) is True
+    assert player.strm_sent_track is None
+    assert player.playing_track_id is None
+    assert player.current_track_id is None
+
+    player.mode = "play"
+    writer.frames.clear()
+    assert asyncio.run(client.send_strm_to_player(MAC, 9900)) is True
+    assert len(_stream_frames(writer)) == 1, (
+        "after a radio switch the file track must stream again"
+    )
+
+
+def test_frozen_elapsed_does_not_arm_the_playing_criterion(monkeypatch):
+    """The wedged player repeats STMt with a FROZEN elapsed forever
+    (LIVE log: elapsed=49.411s for minutes). A frozen clock is not
+    playback, so it must never mark the track as playing — only advancing
+    elapsed or an STMs does.
+    """
+    player = _new_player()
+    player.mode = "play"
+    player.strm_sent_track = 9900
+    player.playing_track_id = None
+    player._last_elapsed_seen = 49.411
+    client, _writer, _pm = _make_client(player, monkeypatch)
+
+    client._handle_stat_frame(
+        MAC, _stat_frame("STMt", out_fullness=3520512, elapsed_ms=49411))
+    assert player.playing_track_id is None, (
+        "a frozen elapsed must not count as 'playing'"
+    )
+
+    client._handle_stat_frame(
+        MAC, _stat_frame("STMt", out_fullness=3520512, elapsed_ms=50411))
+    assert player.playing_track_id == 9900, (
+        "advancing elapsed proves the player is really playing this track"
+    )

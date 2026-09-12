@@ -702,7 +702,7 @@ class PlayerManager:
         # authoritative in that case, and a stale guard would make the play
         # after the next reconnect a silent no-op (R0.5-P1, g4). Re-streaming
         # an unchanged track is harmless, staying silent is not.
-        player.strm_sent_track = None
+        player.forget_stream()
         if ok:
             player.mode = "stop"
             player.last_activity = time.time()

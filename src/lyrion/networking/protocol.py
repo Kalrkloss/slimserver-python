@@ -1327,11 +1327,12 @@ class SlimProtoClient:
         """Forget the track we streamed for ``mac`` (idempotency guard).
 
         Call this on EVERY path where the player demonstrably no longer holds
-        the stream we sent: an incoming ``STMf``/``STMn``, the track-end path
-        (``_advance_after_track``), a stop/pause, and a disconnect/
-        reconnect. Otherwise the guard stays armed and a replay of the SAME
-        track sends 0 frames while reporting success — the player stays
-        silent and nothing but a track change can repair it (R0.5-P1).
+        the stream we sent: an incoming ``STMf``/``STMn`` that is NOT our own
+        start handshake, the track-end path (``_advance_after_track``), a
+        stop/pause, and a disconnect/reconnect. Otherwise the guard stays
+        armed and a replay of the SAME track sends 0 frames while reporting
+        success — the player stays silent and nothing but a track change can
+        repair it (R0.5-P1).
 
         It deliberately does NOT touch ``stream_in_flight``: that flag
         belongs to the send currently in progress and is released by its own
@@ -1340,11 +1341,12 @@ class SlimProtoClient:
         try:
             from lyrion.player.manager import PlayerManager
             p = PlayerManager().get_player(mac)
-            if p is not None and p.strm_sent_track is not None:
+            if p is not None and (p.strm_sent_track is not None
+                                  or p.playing_track_id is not None):
                 logger.debug(
                     "strm guard reset for %s (%s)", mac, reason or "stream lost",
                 )
-                p.strm_sent_track = None
+                p.forget_stream()
         except Exception as exc:  # noqa: BLE001
             logger.debug("strm guard reset failed for %s: %s", mac, exc)
 
@@ -1480,7 +1482,20 @@ class SlimProtoClient:
             logger.debug("strm idempotency check failed for %s: %s", mac, exc)
 
         if existing is not None:
-            if existing.mode == "play" and existing.strm_sent_track == track_id:
+            # "already playing → nothing to do" (Perl StreamingController:
+            # state PLAYING + the same song → `_Stream` :1144 does not
+            # restart anything). TWO criteria, because the player's start
+            # handshake used to disarm the first one:
+            #   * ``strm_sent_track`` — the track we ACTUALLY streamed last,
+            #   * ``playing_track_id`` — the track the player DEMONSTRABLY
+            #     runs (STMs / advancing elapsed).
+            # Anything else (a different track, a stop/flush/track end, a
+            # lost stream) is a genuine (re)start and must stream.
+            _already_playing = (
+                existing.strm_sent_track == track_id
+                or existing.playing_track_id == track_id
+            )
+            if existing.mode == "play" and _already_playing:
                 logger.info(
                     "strm for %s track=%d already playing — skipping re-stream",
                     mac, track_id,
@@ -1642,12 +1657,19 @@ class SlimProtoClient:
             writer.write(frame)
             await writer.drain()
             # Remember what we actually streamed (the idempotency guard
-            # above must not re-send for the SAME track while it plays).
+            # above must not re-send for the SAME track while it plays) and
+            # WHEN — the player's start handshake (STMf/STMc/STMs) follows
+            # within milliseconds and must not be mistaken for "stream lost".
             try:
                 from lyrion.player.manager import PlayerManager
                 _p = PlayerManager().get_player(mac)
                 if _p is not None:
                     _p.strm_sent_track = track_id
+                    _p.strm_sent_at = time.time()
+                    if _p.playing_track_id != track_id:
+                        # A new stream replaces whatever ran before: the old
+                        # track is no longer the one the player runs.
+                        _p.playing_track_id = None
             except Exception:  # noqa: BLE001
                 pass
             logger.info("Sent strm to %s: track=%d codec=%s", mac, track_id, codec)
@@ -1820,6 +1842,11 @@ class SlimProtoClient:
             if player is not None:
                 player.current_url = url
                 player.current_track_id = None
+                # A DIRECT (radio/favourite) stream replaces the file stream
+                # we last sent a strm for: the idempotency guard must not
+                # survive into a later play of that track — it would be
+                # skipped into silence while the player runs the radio URL.
+                player.forget_stream()
         except Exception:
             pass
 
@@ -2334,6 +2361,13 @@ class SlimProtoClient:
             out["elapsed_seconds_precise"] = float(out["elapsed_seconds"])
         return out
 
+    # An ``STMf`` arriving within this many seconds of our own ``strm 's'``
+    # frame is the player's START HANDSHAKE (the ack that closes the OLD
+    # stream, Perl Squeezebox2.pm:398-403 "always use a new stream"), not a
+    # lost stream. Live: the STMf arrived in the SAME second as
+    # ``Sent strm to 1C872C47FC36: track=9900 codec=m`` (13:45:45).
+    STRM_START_HANDSHAKE_WINDOW_S = 3.0
+
     def _handle_stat_frame(self, mac_str: str, payload: bytes) -> None:
         """Parse a STAT frame from a player and drive the UI state machine.
 
@@ -2442,6 +2476,25 @@ class SlimProtoClient:
                         #    play — remote streams only, they never "end".
                         stmd_at = getattr(player, "_last_stmd", None)
                         started_at = getattr(player, "_track_started_at", None)
+                        # "already playing" evidence: the player's clock is
+                        # MOVING. A frozen elapsed is NOT playback — the
+                        # wedge repeats STMt for minutes with elapsed pinned
+                        # at 49.411s (LIVE, 13:45:46+), so only an advancing
+                        # clock may arm the criterion.
+                        try:
+                            _prog = stat["elapsed_seconds_precise"]
+                            _prev = player._last_elapsed_seen
+                            if (player.mode == "play" and _prog > 0
+                                    and _prog > _prev + 0.25):
+                                player.playing_track_id = (
+                                    player.strm_sent_track
+                                    if player.strm_sent_track is not None
+                                    else player.current_track_id
+                                )
+                            if _prog > 0:
+                                player._last_elapsed_seen = _prog
+                        except Exception:
+                            pass
                         # squeezelite sends STMd just BEFORE STMs at track
                         # start; only an STMd from after the start is "decoder
                         # is really dry".
@@ -2451,7 +2504,7 @@ class SlimProtoClient:
                         if (player.mode == "play" and out_fullness == 0
                                 and stmd_after_start):
                             player._last_stmd = None  # consume the signal
-                            player.strm_sent_track = None
+                            player.forget_stream()
                             asyncio.create_task(_advance_after_track(pm, mac_str))
                         elif player.mode != "play" and getattr(player, "remote", 0):
                             player.mode = "play"
@@ -2479,23 +2532,64 @@ class SlimProtoClient:
                         player.mode = "play"
                         player.pause_requested = False
                         player._track_started_at = time.time()
+                        # The player demonstrably runs the track we streamed
+                        # (Perl `playerStarted`, Squeezebox2.pm:162-163): this
+                        # is the handshake-independent "already playing"
+                        # criterion. Fall back to the current track when a
+                        # stray stop-ack already dropped ``strm_sent_track``
+                        # — otherwise the next re-play would flush+restart the
+                        # very track that is running (the LIVE wedge).
+                        player.playing_track_id = (
+                            player.strm_sent_track
+                            if player.strm_sent_track is not None
+                            else player.current_track_id
+                        )
+                        player._last_elapsed_seen = 0.0  # elapsed restarts
                     elif event == "STMf":
                         # FLUSH/CLOSE ack — the player flushed its buffers and
                         # closed the stream. Perl: flush() = stream('f') +
                         # readyToStream(1) (Squeezebox2.pm:387-396), stop() =
                         # stream('q') + streamingsocket(undef) +
-                        # readyToStream(1) (Squeezebox.pm:206-216). The player
-                        # no longer holds the stream we sent, so drop the strm
-                        # guard (R0.5-P1) — a replay of the SAME track must
-                        # stream again.
-                        player.strm_sent_track = None
-                        # Mark stop only if the server didn't already
-                        # (natural end vs. user stop / pause-stop).
-                        if player.mode not in ("pause",):
-                            player.mode = "stop"
-                            player.pause_requested = False
+                        # readyToStream(1) (Squeezebox.pm:206-216).
+                        #
+                        # BUT the player ALSO sends an STMf as the FIRST frame
+                        # of its start handshake for our OWN strm: Perl's
+                        # play() is ``streamBytes(0); closeStream(); new strm``
+                        # (Squeezebox2.pm:398-403, "always use a new stream").
+                        # Treating that ack as "stream lost" disarmed the
+                        # guard AND reported a stop mid-start — LIVE at
+                        # 13:45:45: `Sent strm ... track=9900` → STMf → STMc →
+                        # STMo → minutes of STMt with a FROZEN elapsed=49.411s
+                        # and out_fullness pinned at 3520512/3528000 (99.8 %):
+                        # no audio, mode=stop, old title on screen. An STMf
+                        # inside the handshake window therefore keeps both the
+                        # guard and the mode.
+                        _handshake_ack = bool(
+                            player.strm_sent_track is not None
+                            and player.strm_sent_at
+                            and (time.time() - player.strm_sent_at)
+                            <= self.STRM_START_HANDSHAKE_WINDOW_S
+                        )
+                        if _handshake_ack:
+                            logger.debug(
+                                "STMf from %s within %.1fs of our strm — start "
+                                "handshake, keeping the guard (track=%s)",
+                                mac_str, self.STRM_START_HANDSHAKE_WINDOW_S,
+                                player.strm_sent_track,
+                            )
                         else:
-                            player.pause_requested = False  # pause-ack
+                            # A player-initiated flush/close: the player no
+                            # longer holds the stream we sent, so drop the
+                            # guard (R0.5-P1) — a replay of the SAME track
+                            # must stream again.
+                            player.forget_stream()
+                            # Mark stop only if the server didn't already
+                            # (natural end vs. user stop / pause-stop).
+                            if player.mode not in ("pause",):
+                                player.mode = "stop"
+                                player.pause_requested = False
+                            else:
+                                player.pause_requested = False  # pause-ack
                     elif event == "STMp":
                         # PAUSE ack. The player merely holds its output: the
                         # stream (and the idempotency guard) stays valid, so
@@ -2516,7 +2610,7 @@ class SlimProtoClient:
                         # (Squeezebox2.pm:153-157) — the track is gone, so
                         # drop the strm guard too (R0.5-P1).
                         logger.warning("STAT STMn (decode error) from %s", mac_str)
-                        player.strm_sent_track = None
+                        player.forget_stream()
                         player.mode = "stop"
                         player.pause_requested = False
                     elif event in ("STMo", "STMu"):
@@ -2529,7 +2623,7 @@ class SlimProtoClient:
                         stmd_at = getattr(player, "_last_stmd", None)
                         if player.mode == "play" and out_fullness == 0 and stmd_at:
                             player._last_stmd = None  # consume the signal
-                            player.strm_sent_track = None
+                            player.forget_stream()
                             asyncio.create_task(_advance_after_track(pm, mac_str))
                     elif event == "pause":
                         # Player-initiated pause (the user pressed pause on
@@ -2542,7 +2636,7 @@ class SlimProtoClient:
                         # not honour strm 'p') — the resulting STAT stop is
                         # the pause-ack and must keep mode="pause". Either
                         # way the player flushed its stream (R0.5-P1).
-                        player.strm_sent_track = None
+                        player.forget_stream()
                         if player.pause_requested:
                             player.pause_requested = False
                             player.mode = "pause"
@@ -2663,7 +2757,7 @@ async def _advance_after_track(pm, mac_str: str) -> None:
     try:
         player = pm.get_player(mac_str)
         if player is not None:
-            player.strm_sent_track = None
+            player.forget_stream()
         if player is None or not player.playlist:
             return
         if getattr(player, "remote", 0):
