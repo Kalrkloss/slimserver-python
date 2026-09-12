@@ -103,6 +103,14 @@ class CLIContext:
     subscribed_player: Optional[str] = None
     subscribe_interval: int = 0  # seconds between keep-alive status pushes
     command: str = ""  # the command name actually invoked (for aliases)
+    # Der Client, den DIESER Request aus der Request-Zeile aufgelöst hat — nur
+    # wenn das erste Token ein Player ist (``Slim/Control/Stdio.pm:96-116``
+    # ``string_to_array``: ``getClient($elements[0])``, das Token wird dann aus
+    # dem Request entfernt).  ``player_id`` dagegen ist der Default-Player der
+    # Sitzung; Perl kennt den für einen nicht-dispatchbaren Request nicht und
+    # präfixt dessen Echo deshalb ohne Client (``Stdio.pm:131`` präfixt nur
+    # ``if defined $clientid``, ``Request.pm:1063-1101``).
+    request_clientid: Optional[str] = None
     # Antwort-Terminator dieser Verbindung. Perl startet mit LF und übernimmt
     # dann den Terminator, den der CLIENT benutzt hat (Slim/Plugin/CLI/Plugin.pm
     # :260 ``= $LF``, :388-409 "Remember the terminator used"); jede Antwort
@@ -167,7 +175,6 @@ class CLIHandler:
 
     RE_REQUEST_END = re.compile(r"^$")
     # LMS uses \n as line terminator; blank line signals end of request
-    REQUEST_END = b"\n\n"
     LINE_END = b"\n"
 
     def __init__(self, dispatcher: Optional["RequestDispatcher"] = None) -> None:
@@ -267,9 +274,11 @@ class CLIHandler:
             self._active_handlers.discard(self)
             # Drop subscriptions for this client
             self._subscriptions.clear()
-            # Send final blank line
-            writer.write(self.REQUEST_END)
-            await writer.drain()
+            # KEINE Extra-Bytes beim Schließen: Perl schreibt genau einen
+            # Terminator pro Antwort (Slim/Plugin/CLI/Plugin.pm:698) und
+            # schließt dann ohne weitere Ausgabe
+            # (Slim/Plugin/CLI/Plugin.pm:318-333 client_socket_close).
+            # Live: ``exit`` → exakt b"exit\n".
             writer.close()
             await writer.wait_closed()
 
@@ -369,8 +378,15 @@ class CLIHandler:
         # LMS CLI format: <playerid> <command> <args...>. A leading token in
         # MAC shape (or a known player id) binds the player to the context,
         # e.g. "CA:C8:C7:26:6D:38 status - 2".
+        #
+        # Ein Player-Token in der Zeile ist der EINZIGE Weg, auf dem ein
+        # nicht-dispatchbarer Request an einen Client kommt
+        # (``Slim/Control/Stdio.pm:96-116``).  Der Sitzungs-Default
+        # (``ctx.player_id``) darf ein Echo NICHT präfixen.
+        ctx.request_clientid = None
         if args and _looks_like_player_id(cmd):
             ctx.player_id = cmd
+            ctx.request_clientid = cmd
             cmd = str(args[0]).lower()
             args = args[1:]
 
@@ -398,7 +414,17 @@ class CLIHandler:
         cmd: str,
         args: list[str],
     ) -> list[str]:
-        """Try to match compound commands like 'playlist play'."""
+        """Try to match compound commands like 'playlist play'.
+
+        Kein Treffer heißt in Perl NICHT „unbekannt“: ein Request ohne
+        Dispatch-Eintrag bekommt Status 104, jedes Token wird zum positional
+        ``_p<i>`` und der Request wird unverändert zurückgegeben
+        (``Slim/Control/Request.pm:1063-1101``; ``Slim/Plugin/CLI/Plugin.pm:
+        657-663`` „Request [$cmd] unknown or missing client -- will echo as
+        is...“).  Ein Client ist dabei nie zugeordnet, das Echo ist also ohne
+        Präfix — außer die Zeile begann mit einer Player-MAC
+        (``Slim/Control/Stdio.pm:96-116`` + :131).
+        """
         # Try two-word compound
         # The cmd already includes the first word; check for space-joined variants
         for registry_cmd, (func, _) in _COMMAND_REGISTRY.items():
@@ -412,7 +438,9 @@ class CLIHandler:
                 except Exception as exc:
                     logger.exception("CLI compound command %s raised: %s", registry_cmd, exc)
                     return [f"cli error: {exc}"]
-        return [f"unknown command: {cmd}"]
+        from lyrion.control.queries import render_line
+
+        return [render_line(clientid=ctx.request_clientid, terms=[cmd, *args])]
 
     # -----------------------------------------------------------------------
     # Response writing

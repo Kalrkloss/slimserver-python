@@ -1886,7 +1886,17 @@ async def cmd_mode(
     ``mode ?`` → ``24%3A0a%3Ac4%3A29%3A77%3A90 mode stop``.
     """
     if not _is_query_echo(args):
-        return _echo("mode", args, clientid=ctx.player_id)
+        # ``addDispatch(['mode','pause'|'play'|'stop'])`` (Request.pm:664-666)
+        # are *literal* children of the 'mode' node — command entries with
+        # requiresClient=1.  Any other shape (bare 'mode', 'mode foo') reaches
+        # no leaf → status 104 → bare echo
+        # (Request.pm:1093-1100, Plugin/CLI/Plugin.pm:657-663).
+        # Live Perl 2026-09-12 (read-only): ``mode`` → ``mode``.
+        word = str(args[0]).lower() if args else ""
+        if word in ("pause", "play", "stop"):
+            return _command_echo(["mode", word], args[1:], [],
+                                 clientid=ctx.player_id)
+        return _echo("mode", args, clientid=ctx.request_clientid)
     mode = "stop"
     try:
         from lyrion.player import PlayerManager
@@ -2015,7 +2025,12 @@ async def cmd_signalstrength(
     ``24%3A0a%3Ac4%3A29%3A77%3A90 signalstrength 44``.
     """
     if not _is_query_echo(args):
-        return _echo("signalstrength", args, clientid=ctx.player_id)
+        # ``['signalstrength','?']`` (Request.pm:613) is the only entry — a
+        # query variant.  The bare word selects the missing command variant →
+        # status 104 → bare echo (Request.pm:1093-1100,
+        # Plugin/CLI/Plugin.pm:657-663).  Live Perl 2026-09-12:
+        # ``signalstrength`` → ``signalstrength``.
+        return _echo("signalstrength", args, clientid=ctx.request_clientid)
     sig = 0
     try:
         from lyrion.player import PlayerManager
@@ -2035,12 +2050,15 @@ async def cmd_randomplay(
     ctx: CLIContext,
     args: list[str],
 ) -> list[str]:
-    """randomplay [<mode>] — Perl has no such request; it is echoed.
+    """randomplay [<mode>] — dispatched without '?', echoed bare with one.
 
-    No entry in the dispatch table (``Slim/Control/Request.pm:474-637``) —
-    Perl's DJ mode lives in ``Slim/Plugin/RandomPlay`` and is driven through
-    ``playlist``/``pref``.  Live Perl 9.1.1, read-only, 2026-09-12:
-    ``randomplay ?`` → ``randomplay %3F``.  We still store the mode on the
+    ``Slim/Plugin/RandomPlay/Plugin.pm:178`` registers
+    ``addDispatch(['randomplay','_mode'], …)``; the core table
+    (``Slim/Control/Request.pm:474-637``) has no entry.  A trailing '?' picks
+    the query variant that this command-only entry does not have → status 104 →
+    bare echo (``Slim/Control/Request.pm:1036`` + :1093-1100).  Live Perl 9.1.1,
+    read-only, 2026-09-12: ``randomplay ?`` → ``randomplay %3F``,
+    ``randomplay`` → ``<mac> randomplay ``.  We still store the mode on the
     player so telnet users keep working.
     """
     if ctx.player_id and args and str(args[0]) != "?":
@@ -2052,8 +2070,22 @@ async def cmd_randomplay(
                 player.randomplay = max(0, min(2, int(str(args[0]))))
         except Exception:  # noqa: BLE001
             pass
-    # Live Perl 2026-09-12: 'randomplay' → '<clientid> randomplay '.
-    return _echo("randomplay", args, clientid=ctx.player_id)
+    # ``Slim/Plugin/RandomPlay/Plugin.pm:178`` registers
+    # ``addDispatch(['randomplay','_mode'], …)`` — a *command* entry: its last
+    # token is '_mode', not '?', so the query variant ``::[1]``
+    # (``Slim/Control/Request.pm:1036``) stays unset.  A trailing '?' therefore
+    # selects a variant that does not exist → status 104 → the request is
+    # echoed VERBATIM and without a client id
+    # (``Slim/Control/Request.pm:1093-1100`` + ``Slim/Plugin/CLI/Plugin.pm:
+    # 657-663``).  Without a '?' the command entry is used (:1026) and the
+    # entry's requiresClient=1 flag gives the echo the client id, while the
+    # unset '_mode' still occupies its slot (:1026-1028).
+    # Live Perl 9.1.1, read-only, 2026-09-12: ``randomplay ?`` →
+    # ``randomplay %3F`` (bare), ``randomplay`` → ``<mac> randomplay `` (one
+    # trailing space from the unset slot).
+    if _is_query_echo(args):
+        return _echo("randomplay", args, clientid=ctx.request_clientid)
+    return _command_echo(["randomplay"], args, ["_mode"], clientid=ctx.player_id)
 
 
 @register_command("current_title")
@@ -2293,7 +2325,14 @@ async def cmd_playlist(
                 await pm.playlist_next(ctx.player_id)
             else:
                 await pm.playlist_prev(ctx.player_id)
-            return _echo(f"playlist {sub}", rest, clientid=ctx.player_id)
+            # ``playlist next``/``playlist prev`` have no Perl dispatch leaf
+            # (Request.pm:548-591 — every playlist entry has a literal
+            # sub-verb) → status 104 → the request is echoed token by token and
+            # without a client id (Request.pm:1093-1100,
+            # Plugin/CLI/Plugin.pm:657-663).  Live Perl 2026-09-12:
+            # ``playlist next`` → ``playlist next``.
+            return [render_line(clientid=ctx.request_clientid,
+                                terms=["playlist", sub, *rest])]
         if sub == "tracks":
             player = pm.get_player(ctx.player_id)
             tracks = player.playlist if player else []
@@ -2400,7 +2439,8 @@ async def cmd_playlist(
                     ["playlist", "loop"], [], [], clientid=ctx.player_id,
                     results=[("_repeat", rep), ("_shuffle", shu)],
                 )
-            return _echo("playlist loop", rest, clientid=ctx.player_id)
+            return [render_line(clientid=ctx.request_clientid,
+                                terms=["playlist", "loop", *rest])]
         if sub in ("genres", "genre"):
             # LMS: 'playlist genre ?' → the comma-joined genre list (Queries.pm
             # playlistXQuery 'genre' → bare _genre).
@@ -2420,8 +2460,17 @@ async def cmd_playlist(
             return _command_line(["playlist", "genre"], [], [],
                                  clientid=ctx.player_id,
                                  results=[("_genre", names)])
-        return _command_echo(["playlist", sub], rest, [], clientid=ctx.player_id)
+        # No dispatch leaf for this shape ('playlist ?', 'playlist foo', …):
+        # Perl echoes the request verbatim, without a client id — the request
+        # never becomes dispatchable (Request.pm:1063-1101,
+        # Plugin/CLI/Plugin.pm:657-663).  Live Perl 2026-09-12: ``playlist ?``
+        # → ``playlist %3F``.
+        return _command_echo(["playlist", sub], rest, [],
+                             clientid=ctx.request_clientid)
     except Exception:  # noqa: BLE001
+        # Der Fehlerpfad trägt weiter den Sitzungs-Client: der Request war
+        # dispatch-förmig (nur die Ausführung schlug lokal fehl), Perl würde ihn
+        # mit Client beantworten (needsClient=1, Request.pm:548-591).
         return _echo("playlist", args, clientid=ctx.player_id)
 
 
@@ -3115,7 +3164,13 @@ async def cmd_alarms(
     exist for 'alarms', so ``alarms ?`` is echoed.
     """
     if _is_query_echo(args):
-        return _echo("alarms", args, clientid=ctx.player_id)
+        # ``['alarms','_index','_quantity']`` (Request.pm:477) is a *command*
+        # entry, so '?' selects a query variant that does not exist → status
+        # 104 → the request is echoed bare (Request.pm:1093-1100,
+        # Plugin/CLI/Plugin.pm:657-663).  Live Perl 2026-09-12:
+        # ``alarms ?`` → ``alarms %3F``; ``<mac> alarms ?`` → prefixed, because
+        # the id then comes from the request line (Stdio.pm:96-116).
+        return _echo("alarms", args, clientid=ctx.request_clientid)
     from lyrion.alarms import AlarmManager
 
     mac = ctx.player_id or ""

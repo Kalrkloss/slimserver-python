@@ -53,10 +53,16 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
     try:
         async with handler.connect(reader, writer) as ctx:
             async for cmd, args in handler.read_commands(reader, ctx):
-                if cmd in ("exit", "quit"):
-                    break
                 lines = await handler.dispatch(ctx, (cmd, args))
                 await handler.write_responses(writer, ctx, lines)
+                # 'exit' (and 'quit', which Perl has no dispatch entry for)
+                # is echoed FIRST, then the connection is closed:
+                # Slim/Plugin/CLI/Plugin.pm:618-619 sets $exit = 1 and falls
+                # through to cli_request_write (:665, :692-698); the socket is
+                # closed by the caller (:318-333).  Live Perl 2026-09-12:
+                # `exit` → b"exit\n", `quit` → b"quit\n".
+                if cmd in ("exit", "quit"):
+                    break
     except (ConnectionResetError, BrokenPipeError, asyncio.CancelledError):
         pass
     except Exception as exc:  # noqa: BLE001
