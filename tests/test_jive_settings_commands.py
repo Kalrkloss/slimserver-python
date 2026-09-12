@@ -76,6 +76,7 @@ import time
 from typing import Any
 
 import aiosqlite
+import pytest
 
 from lyrion.config import _PREF_DB_SCHEMA, get_prefs
 from lyrion.player.manager import PlayerManager
@@ -119,6 +120,27 @@ def _req(command: list[str], player: PlayerState | None = None) -> Any:
     if player is not None:
         _pm_with(player)
     return asyncio.run(JSONRPCAPI()._slim_request(MAC, command))
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _close_server_prefs():
+    """Schließt den globalen Prefs-Store am Modulende.
+
+    ``_init_server_prefs()`` hängt eine aiosqlite-Verbindung an den GLOBALEN
+    Prefs-Store. Dessen Worker-Thread lebt bis zum Prozessende weiter und
+    blockiert den Interpreter-Shutdown (faulthandler: ``threading._shutdown``
+    wartet auf ``aiosqlite/core.py:59 _connection_worker_thread``) — pytest
+    meldet „38 passed", der Prozess beendet sich aber nicht mehr.
+    """
+    yield
+    store = get_prefs()
+    db = getattr(store, "_db", None)
+    if db is not None:
+        try:
+            asyncio.run(db.close())
+        except Exception:  # noqa: BLE001 — Aufräumen darf nicht scheitern
+            pass
+        store._db = None
 
 
 def _init_server_prefs():
