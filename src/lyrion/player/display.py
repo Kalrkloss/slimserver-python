@@ -34,21 +34,27 @@ Wer sendet in Perl was — und an wen?
   ``drawFrameBuf``/``visualizer``/``visualizerParams`` (``EmulatedSqueezebox2.pm:25-29``).
   Ein Client ohne Display bekommt deshalb **keinen** dieser Frames.
 
-Was diese Verdrahtung NICHT erfindet
-------------------------------------
-Die Nutzlast von ``grfe``/``grfd``/``vfdc`` entsteht in Perl im Font-Renderer
-(``Graphics.pm:106-489`` + ``Display/Lib/Fonts.pm``) bzw. im TextVFD-Encoder
-(``TextVFD.pm:312-357``). Beides gibt es im Port nicht, deshalb nimmt die
-Verdrahtung die fertigen Bytes als Argument (``bits=``/``vfd=``) und sendet
-lieber nichts als eine erfundene Bitmap. Ohne Renderer bleiben reale Frames
-übrig, die Perl ohne Renderer baut: die Visualizer- und Helligkeitsframes.
+Was diese Verdrahtung rendert — und was nicht
+---------------------------------------------
+Die Nutzlasten entstehen jetzt in :mod:`lyrion.player.fonts`, einem Port von
+``Slim/Display/Lib/Fonts.pm`` (Bitmap-Schriften aus ``graphics/*.font.bmp``,
+``string`` :292-522) und ``Slim/Display/Lib/TextVFD.pm`` (``vfdUpdate``
+:147-363). ``grfe``/``grfd`` bekommen die gerenderten Screen-Bits,
+``vfdc`` den VFD-Strom — aber **nur**, wenn der Aufrufer die Displaytexte
+übergibt (``text=``). Wer welchen Text auf welche Zeile schreibt, entscheidet
+in Perl das jeweilige Button-Modul (``Slim/Buttons/Playlist.pm:398-480`` mit
+``Player.pm:488-560`` ``currentSongLines``); diese Screen-Zusammenstellung ist
+nicht portiert. Ohne ``text`` geht deshalb weiterhin nur der Visualizer-/
+Helligkeitsframe raus statt einer erfundenen Bitmap.
 """
 
 from __future__ import annotations
 
 import inspect
 import logging
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Sequence, Union
+
+from . import fonts
 
 logger = logging.getLogger(__name__)
 
@@ -229,9 +235,15 @@ class DisplayWiring:
         (Squeezebox2.pm:209-211). SqueezeboxG: ``(0, 1, 4, 16, 30)``
         (SqueezeboxG.pm:135-137). Boom überschreibt die Map sensorabhängig
         (Boom.pm:180-196) — ``maxBrightness`` ist dort 6 (``$#map``).
+        Text: ``(0 .. $MAXBRIGHTNESS)`` = ``(0, 1, 2, 3, 4)``
+        (``Text.pm:585-591`` mit ``TextVFD.pm:30``); dort geht **kein** ``grfb``
+        raus, sondern nur ein Neuzeichnen (``Text.pm:575-580``), die Tabelle
+        liefert also bloß die Klemmgrenze 0..4.
         """
         if display_class == SQUEEZEBOXG:
             return (0, 1, 4, 16, 30)
+        if display_class == TEXT:
+            return tuple(range(fonts.VFD_MAX_BRIGHTNESS + 1))
         if display_class == BOOM:
             # Boom.pm:180-196: (0,1,2,3,4,5, divisor*256 + offset) mit
             # sensAutoBrightness (1..20) und minAutoBrightness (1..7).
@@ -294,6 +306,97 @@ class DisplayWiring:
         return None
 
     # ------------------------------------------------------------------
+    # Nutzlasten (Font-Renderer + TextVFD-Encoder)
+    # ------------------------------------------------------------------
+
+    def display_mode(self, player: Any, display_class: Optional[str] = None) -> int:
+        """Modusnummer für ``displayWidth`` — ``Squeezebox2.pm:195-203``.
+
+        ``if ($display->showVisualizer() && !defined($client->modeParam('visu')))
+        { $mode = $cprefs->get('playingDisplayModes')->[$cprefs->get(
+        'playingDisplayMode')]; }``. ``showVisualizer`` wird hier wie in
+        :meth:`_show_visualizer` allein aus dem Wiedergabemodus abgeleitet
+        (der Button-Modus-Teil ist PROT-19), ``modeParam('visu')`` setzt der
+        Port nicht. Transporter/SqueezeboxG ignorieren den Modus
+        (``Transporter.pm:192-193`` = 320, ``SqueezeboxG.pm:127-129`` = 280).
+        """
+        display_class = display_class or self.display_class(player)
+        if display_class not in (SQUEEZEBOX2, BOOM):
+            return 0
+        if not self._show_visualizer(player, display_class):
+            return 0
+        modes = _pref(player, "playingDisplayModes",
+                      DEFAULT_PLAYING_DISPLAY_MODES.get(display_class, (0,)))
+        index = _as_int(_pref(player, "playingDisplayMode",
+                              DEFAULT_PLAYING_DISPLAY_MODE.get(display_class, 0)), -1)
+        if not isinstance(modes, (list, tuple)) or not 0 <= index < len(modes):
+            return 0
+        return _as_int(modes[index], 0)
+
+    def screen_width(self, player: Any, display_class: Optional[str] = None) -> int:
+        """``displayWidth`` in Pixelspalten (``Squeezebox2.pm:188-203``)."""
+        display_class = display_class or self.display_class(player)
+        return fonts.screen_width(display_class, self.display_mode(player, display_class))
+
+    def vfd_model(self, player: Any) -> str:
+        """``$client->vfdmodel`` für Text-Displays — ``Text.pm:85-107``.
+
+        ``SqueezeSlave`` -> ``squeezeslave`` (:100-101); sonst (SB1, das in
+        ``Slimproto.pm:1058-1067`` ``Slim::Player::Squeezebox1`` ist, also nicht
+        die SLIMP3-Klasse) -> ``noritake-european`` (:105-106). Die
+        SLIMP3-MAC-Tabelle (:90-98, futaba/noritake je MAC) bleibt unportiert,
+        weil der Port keine SLIMP3-Device-ID kennt
+        (``display_class_for`` -> ``NoDisplay``).
+        """
+        model = (getattr(player, "model", "") or "").lower()
+        if model in ("squeezeslave", "softsqueeze"):
+            return "squeezeslave" if model == "squeezeslave" else "noritake-european"
+        return "noritake-european"
+
+    def _payloads(
+        self,
+        player: Any,
+        display_class: str,
+        *,
+        bits: Optional[bytes],
+        text: Union[str, Sequence[str], None],
+        vfd: Optional[bytes],
+    ) -> tuple[Optional[bytes], Optional[bytes]]:
+        """Rendert fehlende Nutzlasten aus ``text`` (nichts wird erfunden).
+
+        Grafik: ``fonts.render_display_text`` (Font-Renderer, ``Fonts.pm``).
+        Text: ``fonts.vfd_update`` (``TextVFD.pm:147-363``) mit dem
+        VFD-Modell (:meth:`vfd_model`), der Zeichenbreite
+        (``Text.pm:80-83``) und der zuletzt gesetzten Helligkeit
+        (``$client->brightness()``, ``Display.pm:378-398``).
+        """
+        if text is None:
+            return bits, vfd
+        try:
+            if bits is None and display_class in FRAMEBUF_CLASSES:
+                bits = fonts.render_display_text(
+                    display_class, text, mode=self.display_mode(player, display_class))
+            if vfd is None and display_class == TEXT:
+                lines = [text] if isinstance(text, str) else list(text)
+                mac = str(getattr(player, "mac", ""))
+                brightness = self._brightness.get(mac)
+                if brightness is None:
+                    brightness = self.brightness_for_power(
+                        player, bool(getattr(player, "power", False)))
+                vfd = fonts.vfd_update(
+                    lines[0] if lines else None,
+                    lines[1] if len(lines) > 1 else None,
+                    model=self.vfd_model(player),
+                    width=fonts.TEXT_DISPLAY_WIDTH,
+                    brightness=brightness,
+                )
+        except Exception as exc:  # noqa: BLE001 — kein Displayfehler nach außen
+            logger.debug("Display-Nutzlast für %s nicht renderbar: %s",
+                         getattr(player, "mac", ""), exc)
+            return bits, vfd
+        return bits, vfd
+
+    # ------------------------------------------------------------------
     # Zustandswechsel -> Frames
     # ------------------------------------------------------------------
 
@@ -302,6 +405,7 @@ class DisplayWiring:
         player: Any,
         *,
         bits: Optional[bytes] = None,
+        text: Union[str, Sequence[str], None] = None,
         vfd: Optional[bytes] = None,
         force_visu: bool = False,
     ) -> list[str]:
@@ -312,14 +416,20 @@ class DisplayWiring:
         ``grfd``); Text-Displays bekommen ``vfdc``. ``NoDisplay`` bekommt
         nichts (``NoDisplay.pm:32 sub update {}``).
 
-        ``bits``/``vfd`` sind die fertig gerenderten Nutzlasten; fehlen sie,
-        geht nur der Visualizer-Frame raus (wir erfinden keine Bitmap).
+        ``text`` sind die Displayzeilen (Perl ``line[0..]``); daraus rendert
+        :meth:`_payloads` die fehlenden Nutzlasten — ``grfe``/``grfd`` über den
+        Font-Renderer (``Fonts.pm:292-522``, ``Graphics.pm:398-414``),
+        ``vfdc`` über ``TextVFD.pm:147-363``. ``bits``/``vfd`` überstimmen das
+        (fertige Bytes); fehlen beide und ``text``, geht nur der
+        Visualizer-Frame raus (wir erfinden keine Bitmap).
         """
         display_class = self.display_class(player)
         mac = str(getattr(player, "mac", ""))
         if display_class == NODISPLAY:
             logger.debug("Display: %s ist NoDisplay — kein Frame (NoDisplay.pm:32)", mac)
             return []
+
+        bits, vfd = self._payloads(player, display_class, bits=bits, text=text, vfd=vfd)
 
         sent: list[str] = []
 
@@ -349,7 +459,8 @@ class DisplayWiring:
 
     async def power(
         self, player: Any, on: bool,
-        *, bits: Optional[bytes] = None, vfd: Optional[bytes] = None,
+        *, bits: Optional[bytes] = None, text: Union[str, Sequence[str], None] = None,
+        vfd: Optional[bytes] = None,
     ) -> list[str]:
         """Perl ``Player::power`` — ``Player.pm:255-290``.
 
@@ -364,14 +475,15 @@ class DisplayWiring:
         sent: list[str] = []
         if on:
             await self.set_brightness(player, self.brightness_for_power(player, True))
-            sent += await self.update(player, bits=bits, vfd=vfd)
+            sent += await self.update(player, bits=bits, text=text, vfd=vfd)
         else:
-            sent += await self.update(player, bits=bits, vfd=vfd)
+            sent += await self.update(player, bits=bits, text=text, vfd=vfd)
             await self.set_brightness(player, self.brightness_for_power(player, False))
         return sent
 
     async def on_connect(
         self, player: Any, *, bits: Optional[bytes] = None,
+        text: Union[str, Sequence[str], None] = None,
         vfd: Optional[bytes] = None,
     ) -> list[str]:
         """Perl-Connect — ``Player.pm:114-124`` + ``Squeezebox.pm:124-134``.
@@ -388,7 +500,7 @@ class DisplayWiring:
         sent: list[str] = []
         await self.set_brightness(player, self.brightness_for_power(
             player, bool(getattr(player, "power", False))))
-        sent += await self.update(player, bits=bits, vfd=vfd, force_visu=True)
+        sent += await self.update(player, bits=bits, text=text, vfd=vfd, force_visu=True)
         return sent
 
     async def show_briefly(
@@ -396,7 +508,9 @@ class DisplayWiring:
         player: Any,
         *,
         bits: Optional[bytes] = None,
+        text: Union[str, Sequence[str], None] = None,
         previous_bits: Optional[bytes] = None,
+        previous_text: Union[str, Sequence[str], None] = None,
         duration: Optional[int] = None,
         sleep: Optional[Callable[[float], Any]] = None,
     ) -> list[str]:
@@ -414,13 +528,14 @@ class DisplayWiring:
         if self.display_class(player) == NODISPLAY:
             return []
         delay = DISPLAY_DURATION_DEFAULT if not duration else duration
-        sent = await self.update(player, bits=bits)
+        sent = await self.update(player, bits=bits, text=text)
         # Perl's restore runs from a timer (Display.pm:325) — only await it when
         # the caller hands in a sleeper (tests); a request path must not block.
         if sleep is not None:
             await sleep(delay)
-            if previous_bits is not None:
-                sent += await self.update(player, bits=previous_bits)
+            if previous_bits is not None or previous_text is not None:
+                sent += await self.update(player, bits=previous_bits,
+                                          text=previous_text)
         return sent
 
     def brightness_for_power(self, player: Any, on: bool) -> int:
