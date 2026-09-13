@@ -36,8 +36,19 @@ for i in $(seq 1 90); do
 done
 
 if [ "$(port_count)" != "0" ] || [ -n "$(server_pids)" ]; then
-    echo "WARNUNG: alte Instanz gibt nicht frei (Ports=$(port_count) PIDs=$(server_pids)) — kein Neustart"
-    exit 2
+    # Beobachtet: der Server ignoriert SIGTERM und hält die Ports (Shutdown-Pfad
+    # blockiert). Ohne hartes Nachfassen ist danach kein sauberer Neustart
+    # möglich — und ein zweiter Start führt zum Doppelbetrieb mit toten
+    # Listenern. Deshalb nach der Gnadenfrist SIGKILL auf die Reste.
+    left="$(server_pids)"
+    echo "WARNUNG: gibt nach ${i}s nicht frei (Ports=$(port_count) PIDs=$left) — SIGKILL"
+    for pid in $left; do kill -KILL "$pid" 2>/dev/null; done
+    sleep 3
+    if [ "$(port_count)" != "0" ] || [ -n "$(server_pids)" ]; then
+        echo "FEHLER: Reste halten weiter (Ports=$(port_count) PIDs=$(server_pids)) — kein Neustart"
+        exit 2
+    fi
+    echo "Reste hart beendet"
 fi
 
 setsid nohup .venv/bin/python3 -m lyrion --loglevel debug > "$LOG" 2>&1 &
