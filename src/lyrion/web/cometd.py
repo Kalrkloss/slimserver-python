@@ -93,6 +93,11 @@ class CometdClient:
     # ``$conn->[HTTP_CLIENT] == $httpClient`` before disconnectClient), so a
     # stale connection closing cannot kill a reconnected client.
     owner: object | None = None
+    # The transport of the client's current connect: ``"streaming"`` or
+    # ``"long-polling"`` (Perl stores exactly this on the HTTP client at the
+    # /meta/(re)connect branch, Cometd.pm:295/300, and routes a finished
+    # request by it, Cometd.pm:584-589).
+    transport: str = ""
 
 
 # Module-level manager singleton — lets the slimproto layer wake
@@ -618,6 +623,33 @@ class CometdManager:
         logger.info("Cometd connection close -> removing client %s", client_id)
         self.remove(client_id)
         return True
+
+    def set_transport(self, client_id: str, transport: str) -> None:
+        """Record the transport of the client's current connect.
+
+        Perl keeps this on the HTTP client (Cometd.pm:295 ``streaming``,
+        Cometd.pm:300 ``long-polling``) and consults it when a request result
+        has to be routed (Cometd.pm:584-589: a long-polling transport carries
+        the result in the request's own response, anything else goes through
+        ``$manager->deliver_events``).
+        """
+        client = self._clients.get(client_id)
+        if client is not None:
+            client.transport = transport
+            client.last_seen = self._clock()
+
+    def has_live_connection(self, client_id: str) -> bool:
+        """True while a connect owns this client — Perl's ``$manager->{conn}``.
+
+        ``Manager::deliver_events`` (Manager.pm:247-263) writes an event into
+        the client's registered connection the moment it is produced; only
+        when there is none does it queue the event for the next connect.
+        Transports use this to decide whether a freshly finished request reply
+        belongs to the OPEN connection (streaming chunk / held long-poll) or
+        has to ride in the request's own response.
+        """
+        client = self._clients.get(client_id)
+        return bool(client and (client.connections or client.owner is not None))
 
     def connection_open(self, client_id: str) -> None:
         """Record an open transport so the idle reaper spares the client.

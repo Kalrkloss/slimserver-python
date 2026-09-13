@@ -15,6 +15,7 @@ import uvicorn
 
 from .api import JSONRPCAPI, WebAPIHandler
 from .cometd import (
+    LONG_POLL_TIMEOUT,
     CometdManager,
     _client_id_from_channel,
     connect_ack,
@@ -96,22 +97,47 @@ async def _send_cometd_reply(send, replies: list[dict]) -> None:
                 "body": _json.dumps(replies).encode("utf-8")})
 
 
+async def _watch_disconnect(receive) -> None:
+    """Resolve once uvicorn reports the peer gone (``http.disconnect``).
+
+    uvicorn does NOT cancel a held-open ASGI task when the socket dies — it
+    signals the death on the ``receive()`` channel instead. Nothing else in
+    the streaming handler reads that channel after the request body, so
+    without this watcher a vanished client kept its ``CometdManager`` entry
+    (and the idle reaper spared it, ``connections > 0``) forever. Perl learns
+    the same fact from the socket close handler (``webCloseHandler``,
+    ``Slim/Web/Cometd.pm:1003`` -> ``disconnectClient``).
+    """
+    while True:
+        event = await receive()
+        if event.get("type") == "http.disconnect":
+            return
+
+
 async def _handle_streaming_connect(
     cometd: CometdManager,
     cid: str,
     msg: dict,
     replies: list[dict],
     send,
+    receive,
 ) -> None:
     """Streaming /meta/connect: reply immediately (acks + any queued
     events), then hold the response open and push events as chunks.
 
     SqueezeClient expects the connect + subscribe acks within 5 seconds
-    and then reads the body as a stream of JSON arrays. The ASGI transport
-    never sees a /meta/disconnect, so when the client vanishes (a send
-    raises, or the request task is cancelled) the client is removed here —
-    the same cleanup Perl does from webCloseHandler -> disconnectClient.
+    and then reads the body as a stream of JSON arrays.
+
+    Perl reference: Cometd.pm:264-297 keeps the response chunked
+    (``Transfer-Encoding: chunked`` at :292) and ``Manager::deliver_events``
+    (Manager.pm:247-263) writes every event into the client's registered
+    connection the moment it is produced — the stream is woken BY the event,
+    it never waits for a timeout. ``CometdManager.push`` does exactly that
+    here (append + ``notify.set()``). ``advice.timeout`` is only honoured by
+    the *long-polling* branch (Cometd.pm:302-306); a streaming connect keeps
+    ``LONG_POLLING_TIMEOUT``, used below as the liveness re-check interval.
     """
+    import asyncio as _asyncio
     import json as _json
 
     # Perl Cometd.pm:271-280 stores this frame as ``first_event`` with
@@ -132,7 +158,12 @@ async def _handle_streaming_connect(
 
     owner = object()
     cometd.register_connection(cid, owner)
+    cometd.set_transport(cid, "streaming")
     cometd.connection_open(cid)
+    # The ASGI transport never sees a /meta/disconnect: a client that dies
+    # is reported as ``http.disconnect`` (Perl's webCloseHandler ->
+    # disconnectClient, Cometd.pm:1003).
+    gone = _asyncio.ensure_future(_watch_disconnect(receive))
     try:
         await send({
             "type": "http.response.start",
@@ -149,21 +180,57 @@ async def _handle_streaming_connect(
         # :9000 (Squeezer manual address) — closing after 0.6 s broke their
         # connection. Orange Squeeze (pipelined POSTs over one socket) is
         # served by the native server on 9080.
-        while True:
+        #
+        # The wait for events races the disconnect watcher: a push wakes the
+        # wait (Perl Manager::deliver_events -> sendResponse), a vanished peer
+        # ends it at once (http.disconnect), and a silent-but-alive client
+        # ends it after LONG_POLLING_TIMEOUT (Cometd.pm:48) so a half-dead
+        # socket that never delivered http.disconnect is caught by the write.
+        while not gone.done():
             # A vanished client (meta/disconnect) makes wait_for_events
             # return [] immediately — without the existence check the
             # loop would spin at 100% CPU and freeze the whole server.
             if cometd.get(cid) is None:
                 break
-            events = await cometd.wait_for_events(cid, timeout=None)
+            events_task = _asyncio.ensure_future(
+                cometd.wait_for_events(cid, timeout=LONG_POLL_TIMEOUT))
+            try:
+                done, _pending = await _asyncio.wait(
+                    {events_task, gone},
+                    return_when=_asyncio.FIRST_COMPLETED)
+            finally:
+                if not events_task.done():
+                    # Cancelling is lossless: the queued events stay in
+                    # ``client.events`` for the next call.
+                    events_task.cancel()
+                    try:
+                        await events_task
+                    except (_asyncio.CancelledError, Exception):  # noqa: BLE001
+                        pass
+            if gone.done() or cometd.get(cid) is None:
+                break
+            events = events_task.result() if events_task in done else []
             if not events:
-                continue
+                # A whole hold window passed with nothing to say: emit the
+                # empty batch the native stream emits (cometd_stream.py
+                # ``_push_events``, Perl's 60 s LONG_POLLING_TIMEOUT). The
+                # write is also a liveness probe — a half-dead socket raises
+                # here — and the poll re-arms the client's autokill window
+                # (``sendHTTPResponse``, Cometd.pm:687-695).
+                cometd.touch(cid)
             await send({"type": "http.response.body",
                         "body": _json.dumps(events).encode("utf-8"),
                         "more_body": True})
     except Exception:
         pass
     finally:
+        # ``gone.cancel()`` first: the watcher is parked in ``receive()`` and
+        # would otherwise keep the task alive after this handler returns.
+        gone.cancel()
+        try:
+            await gone
+        except (_asyncio.CancelledError, Exception):  # noqa: BLE001
+            pass
         cometd.connection_closed(cid)
         cometd.remove_if_owner(cid, owner)
         try:
@@ -246,7 +313,8 @@ async def _handle_cometd(cometd: CometdManager, path: str, receive, send) -> Non
                 if not cid:
                     continue
                 if msg.get("connectionType") == "streaming":
-                    await _handle_streaming_connect(cometd, cid, msg, replies, send)
+                    await _handle_streaming_connect(cometd, cid, msg, replies,
+                                                    send, receive)
                     return
                 # long-polling: this POST IS the client's connect connection —
                 # it owns the client until a newer connect takes over (Perl
@@ -254,6 +322,10 @@ async def _handle_cometd(cometd: CometdManager, path: str, receive, send) -> Non
                 # /meta/(re)connect branch, Cometd.pm:286).
                 owner = object()
                 cometd.register_connection(cid, owner)
+                # Perl Cometd.pm:300 records the transport as soon as the
+                # long-polling connect is accepted; it decides where a later
+                # request result goes (Cometd.pm:584-589).
+                cometd.set_transport(cid, "long-polling")
                 poll_owners[cid] = owner
                 # Hold until events arrive or the timeout expires. Perl lets
                 # the CLIENT pick the hold time (Cometd.pm:302-306,
@@ -270,9 +342,18 @@ async def _handle_cometd(cometd: CometdManager, path: str, receive, send) -> Non
                 # A completed poll restarts Perl's autokill window.
                 cometd.touch(cid)
         else:
-            # No connect in this batch: deliver events pushed by
-            # subscribe/request immediately (Jive expects the response in
-            # the same reply batch when the request was sent standalone).
+            # No connect in this batch: a freshly finished request reply is
+            # handed to the client's LIVE connection when one exists — Perl
+            # Manager::deliver_events (Manager.pm:247-263) writes it into the
+            # registered connection, and the native stream does the same (its
+            # in-stream POST branch sends only the acks and lets push_task
+            # deliver the events, cometd_stream.py:471-485). Swallowing the
+            # events here made the app wait for its next poll cycle, because
+            # it reads the result off the connect channel, not off this POST's
+            # own response (live symptom: Squeezer showed albums only after
+            # the 60 s hold had elapsed). With NO live connection the events
+            # ride in this reply (standalone request — a documented deviation;
+            # Perl would queue them for the next connect).
             for msg in messages:
                 if not isinstance(msg, dict):
                     continue
@@ -283,6 +364,8 @@ async def _handle_cometd(cometd: CometdManager, path: str, receive, send) -> Non
                     cid = _client_id_from_channel(
                         (msg.get("data") or {}).get("response", ""))
                 if not cid:
+                    continue
+                if cometd.has_live_connection(cid):
                     continue
                 events = await cometd.wait_for_events(cid, timeout=0)
                 replies.extend(events)
