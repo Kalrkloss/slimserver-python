@@ -23,6 +23,14 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 MAX_ALARMS = 16
+# Client prefs the alarm clock reads (``Slim/Player/Client.pm``):
+#   'alarmSnoozeSeconds'  => 540,  # 9 minutes   (Client.pm:44)
+#   'alarmTimeoutSeconds' => 3600, # (Client.pm:46) — not modelled, see UNKLAR
+DEFAULT_SNOOZE_SECONDS = 540
+# Perl restores volume/shuffle/power in a timer "+1 s" after the alarm ends
+# ("Restore in a second in order to avoid a blip that can occur …", Alarm.pm:896;
+# the volume/shuffle/power block at Alarm.pm:905-921 uses the same delay).
+RESTORE_DELAY_SECONDS = 1.0
 # Default Prefs dir mirrors config.py / utils.prefs.
 PREFS_DIR = Path.home() / ".lyrion" / "Lyrion" / "Prefs"
 
@@ -66,6 +74,41 @@ class Alarm:
         return n
 
 
+@dataclass
+class PreAlarmState:
+    """Player state ``fireAlarm`` grabs before the alarm takes over.
+
+    Perl keeps these on the alarm object and ``stop`` puts them back:
+    ``$self->{_originalPower}`` (``Slim/Utils/Alarm.pm:593``, read BEFORE
+    ``['power', 1]`` :594), ``_originalVolume`` (:610-611) and the alarm
+    level ``_activeVolume`` (:615-616), ``_originalShuffleMode`` (:627-628).
+    Restore: Alarm.pm:890-921 (only when ``stop`` runs without
+    ``$continueAudio``).
+    """
+
+    original_power: bool = False
+    original_volume: int = 0
+    # The volume the alarm set (:615-616); the restore keeps a user change
+    # during the alarm (Alarm.pm:908-912 compares against it).
+    active_volume: int = 0
+    original_shuffle: int = 0
+
+
+def _spawn(coro) -> None:
+    """Run ``coro`` on the running loop, else in a fresh one.
+
+    ``fire``/``snooze``/``stop`` are called from sync code (button handlers,
+    CLI) as well as from the event loop; Perl does the same work in
+    ``Slim::Utils::Timers`` callbacks.
+    """
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        asyncio.run(coro)
+        return
+    loop.create_task(coro)
+
+
 def _perl_day_to_index(day: int) -> int:
     """Perl alarm day (0 = Sunday .. 6 = Saturday) → index in ``Alarm.days``.
 
@@ -85,7 +128,7 @@ class AlarmManager:
     """Singleton store of per-player alarms, persisted as JSON."""
 
     __slots__ = ("_db_path", "_data", "_lock", "_init_done", "_alarm_loop",
-                 "_current", "_snooze")
+                 "_current", "_snooze", "_saved")
 
     _instance: "AlarmManager | None" = None
 
@@ -103,10 +146,14 @@ class AlarmManager:
         self._data: dict[str, dict[str, dict]] = {}
         # Transient (NOT persisted, Perl keeps them on the client object): the
         # alarm currently sounding (``$client->alarmData->{currentAlarm}``,
-        # Alarm.pm:578-579/872-874/1241-1246) and the snooze expiry per player
-        # (``_snoozeActive`` + the stopSnooze timer, Alarm.pm:781-784/810-847).
+        # Alarm.pm:578-579/872-874/1241-1246), the snooze state per player
+        # (``_snoozeActive`` + the stopSnooze timer, Alarm.pm:781-784/810-847)
+        # as ``mac -> (expires_at, snooze_seconds)``, and the pre-alarm
+        # volume/power/shuffle state (``_original*``/``_activeVolume``,
+        # Alarm.pm:593-628) that ``stop`` puts back (:890-921).
         self._current: dict[str, int] = {}
-        self._snooze: dict[str, float] = {}
+        self._snooze: dict[str, tuple[float, int]] = {}
+        self._saved: dict[str, PreAlarmState] = {}
 
     def load(self) -> None:
         """Load persisted alarms (idempotent)."""
@@ -172,6 +219,7 @@ class AlarmManager:
             if self._current.get(mac) == index:
                 self._current.pop(mac, None)
                 self._snooze.pop(mac, None)
+                self._saved.pop(mac, None)
 
     # ---- the alarm currently sounding (snooze/stop, jiveAlarmCommand) ----
 
@@ -193,44 +241,151 @@ class AlarmManager:
         idx = self._current.get(mac)
         return None if idx is None else self.get(mac, idx)
 
+    def saved_state(self, mac: str) -> PreAlarmState | None:
+        """Pre-alarm power/volume/shuffle saved for a ringing alarm.
+
+        ``$self->{_originalPower}``/``_originalVolume``/``_activeVolume``/
+        ``_originalShuffleMode`` (Alarm.pm:593/611/616/628); dropped by
+        :meth:`stop` after the restore (:890-921).
+        """
+        return self._saved.get(mac)
+
+    def capture_pre_alarm_state(self, mac: str, player, alarm: "Alarm") -> PreAlarmState:
+        """Remember power/volume/shuffle before the alarm changes them.
+
+        Perl reads them in ``fireAlarm`` right before powering on / setting
+        volume / setting shuffle (``Alarm.pm:593``, ``:610-616``, ``:627-628``)
+        — power is captured BEFORE ``['power', 1]`` (:594).  Our ``volume = -1``
+        means "leave as-is"; Perl has no such value, so ``active_volume`` then
+        falls back to the current volume (which is what the player keeps).
+        """
+        original_volume = int(getattr(player, "volume", 0) or 0)
+        state = PreAlarmState(
+            original_power=bool(getattr(player, "power", False)),
+            original_volume=original_volume,
+            active_volume=(alarm.volume if alarm.volume >= 0 else original_volume),
+            original_shuffle=int(getattr(player, "shuffle", 0) or 0),
+        )
+        with self._lock:
+            self._saved[mac] = state
+        return state
+
     def is_snoozing(self, mac: str) -> bool:
         """Perl ``$alarm->{_snoozeActive}`` (Alarm.pm:747-784)."""
-        until = self._snooze.get(mac)
-        return until is not None and until > time.time()
+        state = self._snooze.get(mac)
+        return state is not None and state[0] > time.time()
 
     def snooze(self, mac: str, seconds: int) -> int | None:
         """``$alarm->snooze()`` (Alarm.pm:734-797).
 
-        No-op unless an alarm is currently sounding (:741). The snooze length
-        comes from the client pref ``alarmSnoozeSeconds`` (Client.pm:44), the
-        caller reads it and passes it in. Returns the snooze length used, or
-        ``None`` when nothing was sounding.
+        No-op unless an alarm is currently sounding (:741). While a snooze is
+        already running a second call only logs and leaves the ORIGINAL expiry
+        alone (:747-749) — it returns the length of the running snooze. Otherwise
+        the snooze length (client pref ``alarmSnoozeSeconds``, :750, default
+        ``DEFAULT_SNOOZE_SECONDS`` — Client.pm:44) is armed (:781-784), the wake
+        source is paused (:775-778) — stopped instead for a remote stream, so
+        internet radio comes back live (:768-772) — and the alarm sounds again on
+        expiry via :meth:`pop_expired_snoozes`.
 
-        Perl additionally pauses/stops the wake source (:768-779) and re-sounds
-        after the timer (:784) — the rescheduling itself is out of scope here
-        (our ``AlarmScheduler`` has no re-arm hook).
+        Perl additionally resets the alarm-timeout timer to
+        ``alarmTimeoutSeconds + snoozeSeconds`` (:759-766) and fires the
+        ``['alarm','snooze']`` notification (:754); neither the alarm timeout
+        nor the alarm notifications exist in this port yet (UNKLAR).
         """
         with self._lock:
             if mac not in self._current:
                 return None           # Perl: return unless $self->{_active}
-            self._snooze[mac] = time.time() + max(0, int(seconds))
-            return int(seconds)
+            running = self._snooze.get(mac)
+            if running is not None:
+                return running[1]     # Alarm.pm:747-749 — kein zweites Snooze
+            length = max(0, int(seconds))
+            self._snooze[mac] = (time.time() + length, length)   # :781-784
+        self._pause_for_snooze(mac)                              # :768-779
+        return length
+
+    def _pause_for_snooze(self, mac: str) -> None:
+        """Pause (remote URL: stop) the wake source (Alarm.pm:768-779)."""
+        async def _pause() -> None:
+            from lyrion.player.manager import PlayerManager
+
+            pm = PlayerManager()
+            player = pm.get_player(mac)
+            if player is None:
+                return
+            if int(getattr(player, "remote", 0) or 0):
+                # :768-772 — remote urls are STOPPED rather than paused
+                # "in order to keep radio in real time after a snooze".
+                await pm.stop_player(mac)
+            elif getattr(player, "mode", "") == "play":
+                # :773-778 — only pause when it is actually playing, or the
+                # player answers with a "playlist jump".
+                await pm.pause_player(mac, True)
+
+        _spawn(_pause())
+
+    def pop_expired_snoozes(self, now: float | None = None) -> list[str]:
+        """Players whose snooze timer fired — Perl's ``stopSnooze`` (Alarm.pm:810-847).
+
+        Perl sets one timer per snooze (:784); this port polls the expiry from
+        :class:`AlarmScheduler` instead. Only ``_snoozeActive`` is cleared
+        (:823) — ``_active`` and ``currentAlarm`` survive, so the alarm is NOT
+        over: it rings again once the caller resumes it.
+        """
+        now = time.time() if now is None else now
+        with self._lock:
+            expired = [mac for mac, (until, _) in self._snooze.items()
+                       if until <= now]
+            for mac in expired:
+                self._snooze.pop(mac, None)
+        return expired
 
     def stop(self, mac: str, continue_audio: bool = False) -> bool:
         """``$alarm->stop($continueAudio)`` (Alarm.pm:862-936).
 
-        Clears the current alarm and the snooze state (:872-876); no-op when no
-        alarm is sounding (:868). ``continue_audio`` only controls Perl's
-        restore of volume/shuffle/power (:890-922) — our port never touched
-        those while the alarm sounded, so there is nothing to restore.
-        Returns whether an alarm was stopped.
+        No-op when no alarm is sounding (:868). Clears the current alarm and
+        both transient states (:872-876). Without ``continue_audio`` the
+        pre-alarm power/volume/shuffle state captured at fire time is restored
+        (:890-921) — asynchronously and after ``RESTORE_DELAY_SECONDS``, like
+        Perl's +1 s timer. Returns whether an alarm was stopped.
         """
         with self._lock:
             if mac not in self._current:
                 return False
             self._current.pop(mac, None)
             self._snooze.pop(mac, None)
-            return True
+            saved = self._saved.pop(mac, None)
+        if saved is not None and not continue_audio:
+            _spawn(self._restore_pre_alarm_state(mac, saved))
+        return True
+
+    async def _restore_pre_alarm_state(self, mac: str, saved: PreAlarmState) -> None:
+        """Put volume/shuffle/power back (Alarm.pm:905-921).
+
+        Perl runs this one second after the stop "to allow any volume fades to
+        complete" (:902-904). Our port has no ``analogOutMode``/
+        ``lineOutConnected`` (the restore at :891-900) — UNKLAR.
+        """
+        if RESTORE_DELAY_SECONDS > 0:
+            await asyncio.sleep(RESTORE_DELAY_SECONDS)
+        from lyrion.player.manager import PlayerManager
+
+        pm = PlayerManager()
+        player = pm.get_player(mac)
+        if player is None:
+            return
+        # Volume only when the music is stopped AND the level is still the one
+        # the alarm set — a change the user made during the alarm wins
+        # (Alarm.pm:908-912).
+        if (getattr(player, "mode", "") != "play"
+                and int(getattr(player, "volume", 0) or 0) == saved.active_volume):
+            await pm.set_volume(mac, saved.original_volume)
+        # Shuffle is always restored (:914-916). Perl runs
+        # ``['playlist','shuffle',$mode]``; this port's playlist-shuffle path
+        # sets ``player.shuffle`` directly (web/api.py:4594).
+        player.shuffle = saved.original_shuffle
+        # Power last — "Bug: 12760, 9569 - Return power state to that prior to
+        # the alarm" (:918-920).
+        pm.set_power(mac, saved.original_power)
 
 
 # ---------------------------------------------------------------------------
@@ -264,6 +419,12 @@ class AlarmScheduler:
     def _check_once(self, mgr: AlarmManager) -> None:
         from datetime import datetime
 
+        # Perl's stopSnooze timer runs on its own (Alarm.pm:784 → :810-847);
+        # this port polls the expiry with the minute check and lets the alarm
+        # ring again (unpause).
+        for mac in mgr.pop_expired_snoozes():
+            self._resume_after_snooze(mac)
+
         now = datetime.now()
         now_min = now.strftime("%H:%M")
         weekday = now.weekday()  # 0 = Monday (matches day mask bit 0)
@@ -282,6 +443,26 @@ class AlarmScheduler:
                     continue
                 self._last_fired.add(key)
                 self.fire(raw_mac, alarm)
+
+    def _resume_after_snooze(self, mac: str) -> None:
+        """``stopSnooze(1)``: unpause so the alarm sounds again (Alarm.pm:810-847).
+
+        Only ``_snoozeActive`` was cleared by :meth:`AlarmManager.pop_expired_snoozes`
+        (:823); the alarm stays ``_active``/``currentAlarm`` (:875-876 only clears
+        it on ``stop``). Perl unpauses with a fade-in (:825-828) and sets a
+        ``_checkPlaying`` fallback ~20 s later for an internet radio stream that
+        failed to restart (:830-833) — that fallback is not modelled (UNKLAR).
+        """
+        async def _resume() -> None:
+            from lyrion.player.manager import PlayerManager
+
+            pm = PlayerManager()
+            try:
+                await pm.pause_player(mac, False)     # Alarm.pm:827
+            except Exception as exc:                  # pragma: no cover
+                logger.warning("alarm snooze resume failed for %s: %s", mac, exc)
+
+        _spawn(_resume())
 
     def _snapshot_alarms(self, mgr: AlarmManager) -> dict[str, list[Alarm]]:
         out: dict[str, list[Alarm]] = {}
@@ -340,10 +521,16 @@ class AlarmScheduler:
             return
 
         logger.info("alarm firing on %s at %s (wake=%s)", mac, alarm.time, alarm.wake)
+        mgr = AlarmManager()
         # Perl marks the ringing alarm on the client: ``$self->{_active} = 1;
         # $client->alarmData->{currentAlarm} = $self;`` (Alarm.pm:578-579).
         # jiveAlarmCommand's snooze/stop act on exactly this alarm.
-        AlarmManager().set_current(mac, alarm.index)
+        mgr.set_current(mac, alarm.index)
+        # ... and remembers what the player looked like BEFORE the alarm takes
+        # over (power Alarm.pm:593, volume :610-616, shuffle :627-628) so that
+        # ``stop`` can put it back (:890-921). Captured here, synchronously,
+        # because ``_wake`` below changes all three.
+        mgr.capture_pre_alarm_state(mac, player, alarm)
 
         async def _wake() -> None:
             try:
@@ -352,6 +539,14 @@ class AlarmScheduler:
                 # Apply wake volume if requested.
                 if alarm.volume >= 0:
                     await pm.set_volume(mac, alarm.volume)
+                # Shuffle mode for the alarm playlist (Alarm.pm:629-632
+                # ``$client->execute(['playlist','shuffle', $self->shufflemode])``).
+                # Our port sets the field directly, like its playlist-shuffle
+                # path does (web/api.py:4594).
+                try:
+                    player.shuffle = max(0, min(2, int(alarm.shufflemode)))
+                except (TypeError, ValueError):       # pragma: no cover
+                    logger.warning("alarm: bad shufflemode %r", alarm.shufflemode)
                 # Start the wake source.
                 if alarm.wake.startswith("url:"):
                     await pm.play_url(mac, alarm.wake[4:], title=alarm.time)

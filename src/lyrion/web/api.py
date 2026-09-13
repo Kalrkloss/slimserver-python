@@ -3100,12 +3100,13 @@ class JSONRPCAPI:
         if player is None:
             return
         _, tagged = _jive_params(args, [])
-        from lyrion.alarms import AlarmManager
+        from lyrion.alarms import DEFAULT_SNOOZE_SECONDS, AlarmManager
 
         mgr = AlarmManager()
         if tagged.get("snooze"):            # Perl: getParam('snooze') ? 1 : undef
             seconds = _jive_num(            # Client.pm:44 alarmSnoozeSeconds
-                _jive_client_pref(player, "alarmSnoozeSeconds", None), 540)
+                _jive_client_pref(player, "alarmSnoozeSeconds", None),
+                DEFAULT_SNOOZE_SECONDS)
             mgr.snooze(player.mac, seconds)
         elif tagged.get("stop"):            # Perl: elsif (defined $stop)
             mgr.stop(player.mac, bool(tagged.get("continueAudio")))
