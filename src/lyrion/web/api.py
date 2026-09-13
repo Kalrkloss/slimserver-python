@@ -10,6 +10,7 @@ import posixpath
 import re
 import time
 import urllib.parse
+import zlib
 from typing import Any, Callable, Optional
 
 logger = logging.getLogger(__name__)
@@ -256,6 +257,28 @@ def _playctl_index(value: str) -> int:
 #: (``Slim/Utils/Prefs.pm:272``: ``'defeatDestructiveTouchToPlay' => 4``).
 _DEFEAT_DEFAULT = 4
 
+
+def _defeat_pref_default() -> Any:
+    """The server pref ``defeatDestructiveTouchToPlay`` (Perl ``:1966``).
+
+    ``XMLBrowser.pm:1966`` falls back to ``$prefs->get(
+    'defeatDestructiveTouchToPlay')`` — the *server* pref, registered with
+    the default ``4`` (``Slim/Utils/Prefs.pm:272``).  Reading the runtime
+    store instead of the constant keeps an operator's setting effective
+    (``1`` = always defeat, i.e. every station row becomes a play-control
+    row); an unset/empty value keeps Perl's default.  Tests monkeypatch this
+    function (pattern: ``_bmf_musicdir_pref``).
+    """
+    try:
+        from lyrion.config import get_config
+        value = get_config().get("defeatDestructiveTouchToPlay")
+    except Exception:  # noqa: BLE001
+        return _DEFEAT_DEFAULT
+    if value is None or str(value).strip() == "":
+        return _DEFEAT_DEFAULT
+    return value
+
+
 #: url → Perl-style negative remote-track id, and its reverse index.
 _REMOTE_TRACK_IDS: dict[str, int] = {}
 _REMOTE_TRACK_URLS: dict[int, str] = {}
@@ -324,13 +347,15 @@ _PLAYLIST_EXT_RE = re.compile(r"\.(?:m3u8?|pls|asx|b4s|wpl)(?:$|[?#])",
                               re.IGNORECASE)
 
 
-def _defeat_destructive_touch_to_play(rest: list, player=None) -> bool:
+def _defeat_destructive_touch_to_play(rest: list, player=None,
+                                      *, client_named: bool | None = None
+                                      ) -> bool:
     """Perl ``_defeatDestructiveTouchToPlay`` (``XMLBrowser.pm:1951-1983``).
 
     Decides whether a *tap* on a touch-to-play row must NOT start playback
     blindly, but open the play-control context menu instead
-    (``goAction: "playControl"`` + ``playControlParams``).  Order of
-    resolution, verbatim from Perl:
+    (``goAction: "playControl"`` + ``playControlParams`` — ``:1268-1272``).
+    Order of resolution, verbatim from Perl:
 
     1. the request param ``defeatDestructiveTouchToPlay:<n>``
        (``:1964``) — controllers send it to force a branch;
@@ -340,13 +365,49 @@ def _defeat_destructive_touch_to_play(rest: list, player=None) -> bool:
 
     Values (``:1968-1973``): ``0`` never, ``1`` always, ``2`` playlist length
     > 1, ``3`` playing and length > 1, ``4`` playing and the current item is
-    not a radio stream.  ``$pref != 0`` with **no** client at all returns 1
-    (``:1976``) — which is why a plain controller/CLI request gets the
-    play-control branch from Perl.
+    not a radio stream.
+
+    ``client_named`` is ``$request->client``: ``False`` for a request that
+    names no player at all, ``None`` (default) derives it from ``player``.
+    Perl ``:1976`` ``return 1 if $pref == 1 || !$client`` — **a request with
+    no client at all gets the defeated branch for every ``pref != 0``**, which
+    is exactly what the live Perl server answers a plain
+    ``favorites items 0 50 menu:favorites`` with (read-only probe
+    2026-09-13: stream rows ``{"goAction": "playControl", "playControlParams":
+    {"xmlbrowserPlayControl": "6"}, "params": {"item_id": "30a91dbd.6",
+    "isContextMenu": 1}, "type": "audio"}``, no ``style``, no
+    ``touchToPlay``).
+
+    Documented deviations (measured, not assumed):
+
+    * **a named but unknown client** (``player is None`` while the request
+      carries a ``pid``) keeps the non-defeated branch, while Perl would not
+      even answer such a request.  Perl resolves ``$request->client`` from the
+      socket (live probe with an unregistered MAC: the connection is closed
+      without a result), so "no client" and "client we do not know" are two
+      different things there.  The favourites parity fixtures drive the API
+      with a ``pid`` but without an installed ``PlayerState``, and a request
+      can always force the branch with ``defeatDestructiveTouchToPlay:1``
+      (:1964).
+
+    What this does **not** do: force the play-control branch for a *known*
+    client.  Perl answers a client-attributed favourites request with the
+    blind ``goAction: "play"`` row whenever the client is idle or playing a
+    radio stream — measured live 2026-09-13 with the idle client
+    ``00:00:00:00:00:00``: ``{"goAction": "play", "style": "itemplay",
+    "params": {"item_id": …, "isContextMenu": 1, "touchToPlay": …,
+    "touchToPlaySingle": 1}}``, because the ``$pref == 4`` clause (:1977)
+    needs a *playing* item with a duration that is not a playlist, and a live
+    stream reports ``duration 0``.  That branch stays as it is — the
+    "favourites tap does nothing" symptom of the controllers is therefore
+    *not* explained by the play/playControl choice for their own requests
+    (their rows are field-for-field Perl's).
 
     The Perl ``< 7.6``-SqueezePlay exception (``:1955-1962``, UA sniffing)
     is not ported: the app version is not part of the request.
     """
+    if client_named is None:
+        client_named = player is not None
     pref: Any = None
     for a in rest or []:
         s = str(a)
@@ -357,7 +418,7 @@ def _defeat_destructive_touch_to_play(rest: list, player=None) -> bool:
         pref = (getattr(player, "playerprefs", None) or {}).get(
             "defeatDestructiveTouchToPlay")
     if pref is None:
-        pref = _DEFEAT_DEFAULT
+        pref = _defeat_pref_default()
     try:
         # Perl numifies the param: a non-numeric string becomes 0.
         num = int(str(pref).strip() or 0)
@@ -367,18 +428,10 @@ def _defeat_destructive_touch_to_play(rest: list, player=None) -> bool:
         return False                     # :1975 `return 0 if !$pref`
     if num == 1:
         return True                      # :1976 `$pref == 1`
+    if not client_named:
+        return True                      # :1976 `|| !$client`
     if player is None:
-        # Documented divergence: Perl's second clause (:1976
-        # ``|| !$client``) defeats the tap for *any* pref as soon as the
-        # request has no client at all.  Our port cannot separate "no client"
-        # from "player the server does not know" (both arrive as an
-        # unresolvable ``pid``), and every existing favourites parity fixture
-        # drives the API without an installed ``PlayerState`` — Perl's rule
-        # would flip those to the play-control branch.  An unresolvable
-        # player therefore keeps the non-defeated branch; a request that
-        # *does* want the play-control menu can ask for it explicitly with
-        # ``defeatDestructiveTouchToPlay:1`` (:1964).
-        return False
+        return False                     # deviation: named, unknown client
     if num == 4:
         # :1977 `$client->isPlaying() && $client->playingSong()->duration()
         #        && !$client->playingSong()->isPlaylist()`
@@ -582,9 +635,17 @@ def _bmf_resolve_dir(token: str, root: str) -> str:
     """Directory a ``mode:bmf`` drill token (folder_id/search/url) points at.
 
     Accepts an absolute path below ``root``, a ``file://`` URI or a path
-    relative to ``root``; anything else falls back to ``root`` (browse the
-    top level instead of leaking a foreign directory).
+    relative to ``root``; a purely numeric token is one of our virtual
+    folder ids (:func:`_folder_numeric_id`) and is inverted over the folder
+    tree.  Anything else falls back to ``root`` (browse the top level
+    instead of leaking a foreign directory).
     """
+    raw = str(token or "").strip()
+    if raw and raw.lstrip("-").isdigit():
+        hit = _folder_dir_by_id(raw, root)
+        if hit:
+            return hit
+        return root
     p = _bmf_path(token)
     if not p or p == "/":
         return root
@@ -596,16 +657,74 @@ def _bmf_resolve_dir(token: str, root: str) -> str:
     return root
 
 
-def _bmf_children(directory: str, start: int = 0,
-                  count: int = 200) -> tuple[list, int]:
-    """Children of ``directory``, aggregated from the track URLs.
+# ---------------------------------------------------------------------------
+# Folder ids
+#
+# Perl stores every directory it has browsed as a row in ``tracks``
+# (``content_type = 'dir'``) and hands out that row's ``id``: live Perl
+# ``musicfolder 0 3`` → ``{"id": 204573, "filename": "Accept", "type":
+# "folder"}`` (``Slim/Control/Queries.pm:2429-2430`` id/filename,
+# ``:2472-2487`` type, ``:2311-2316`` ``findAndTrackDirectoryTree`` resolves
+# a ``folder_id`` back through such a row).  Our port never creates ``dir``
+# rows, so a directory id was its ``file://`` URL — a value the controllers
+# cannot use: Squeeze Client shows the subdirectories but a tap sends no
+# drill request at all (cometd log 2026-09-13 19:25/19:27: only
+# ``browselibrary items 0 1|512 mode:bmf useContextMenu:1 menu:1``, never a
+# ``folder_id:`` follow-up).
+#
+# We hand out the same *shape* instead: a positive integer, derived from the
+# path so that it is stable across restarts and identical for every spelling
+# of one directory.  It is NOT Perl's ``tracks.id`` (there is no directory
+# row to borrow one from); the server resolves it back through
+# :func:`_folder_dir_by_id` over the same tree the browse is built from.
+# ---------------------------------------------------------------------------
 
-    Returns ``(rows, total)``: ``type 'folder'`` subdirectories (``id`` =
-    absolute path, ``name`` = decoded folder name) followed by ``type
-    'audio'`` files directly in the directory (``id`` = track id) — Perl's
-    bmf lists files there too. Everything comes from one prefix ``LIKE``
-    over ``tracks.url`` (``DISTINCT``/``GROUP BY`` on the path segment);
-    the filesystem is never touched.
+#: int32 mask — Perl's ``tracks.id`` is a 32-bit AUTOINCREMENT, so a folder id
+#: is a positive integer; ``crc32`` is already unsigned, the mask just keeps
+#: the value inside the range a client parses without sign trouble.
+_FOLDER_ID_MASK = 0x7FFFFFFF
+
+#: ``root → {numeric folder id: directory}`` — see :func:`_bmf_dir_index`.
+_DIR_INDEX: dict[str, dict[int, str]] = {}
+
+#: Cap on the directories one index build walks: a folder tap must never
+#: turn into a full-library tree walk (the SMB library holds 100k+ files).
+_DIR_INDEX_LIMIT = 20000
+
+
+def _folder_numeric_id(directory: str) -> int:
+    """Stable positive integer id for a directory path.
+
+    ``crc32`` of the decoded path — a pure function of the directory, so
+    ``/mnt/Musik``, ``file:///mnt/Musik`` and a percent-encoded spelling all
+    yield the same id, and it survives restarts (the client caches it).
+    """
+    return zlib.crc32(_bmf_path(directory).encode("utf-8")) & _FOLDER_ID_MASK
+
+
+def _folder_row_numeric_id(row: dict) -> int | None:
+    """Virtual id for a directory row of a browse loop, ``None`` = keep ``id``.
+
+    Only rows of ``type 'folder'`` whose ``id`` is not already numeric are
+    rewritten: a *file* row carries a real ``tracks.id`` (Perl's own value,
+    ``media/folders.py`` ``_child_item``) and must keep it.
+    """
+    if str(row.get("type") or "") != "folder":
+        return None
+    rid = row.get("id")
+    if isinstance(rid, int) or (isinstance(rid, str) and rid.lstrip("-").isdigit()):
+        return None
+    path = _bmf_path(str(row.get("url") or rid or ""))
+    if not path or path == "/":
+        return None
+    return _folder_numeric_id(path)
+
+
+def _bmf_subdir_paths(directory: str) -> list[str]:
+    """Absolute paths of the immediate subdirectories of ``directory``.
+
+    The one-prefix aggregate over ``tracks.url`` :func:`_bmf_children` is
+    built from; the filesystem is never touched.
     """
     prefix = _bmf_encoded_prefix(directory)
     like = prefix + "%"
@@ -621,14 +740,80 @@ def _bmf_children(directory: str, start: int = 0,
             " GROUP BY seg ORDER BY seg COLLATE NOCASE",
             (off, off, off, like))
     except Exception:  # noqa: BLE001
-        rows = []
-    folders: list[tuple[str, str]] = []
+        return []
+    out: list[str] = []
     for r in rows:
         name = urllib.parse.unquote(str(r["seg"]))
         path = _bmf_path(directory + "/" + name)
         if path == directory or not path.startswith(directory + "/"):
             continue               # encoding drift / foreign tree → drop
-        folders.append((name, path))
+        out.append(path)
+    return out
+
+
+def _bmf_dir_index(root: str) -> dict[int, str]:
+    """``{numeric folder id: directory}`` for the tree below ``root``.
+
+    Built from **one** prefix query over ``tracks.url`` (every URL's ancestor
+    directories, all levels) and cached per root — inverting ``crc32`` needs
+    the candidate paths, and a folder tap must not turn into a per-directory
+    query storm on a 100k-file library.
+    """
+    cached = _DIR_INDEX.get(root)
+    if cached is not None:
+        return cached
+    cached = {}
+    _DIR_INDEX[root] = cached
+    try:
+        rows = _db_query("SELECT DISTINCT url FROM tracks WHERE url LIKE ?",
+                         (_bmf_encoded_prefix(root) + "%",))
+    except Exception:  # noqa: BLE001
+        return cached
+    dirs: set[str] = set()
+    for r in rows:
+        d = posixpath.dirname(_bmf_path(str(r.get("url") or "")))
+        while d and d.startswith(root + "/") and len(dirs) < _DIR_INDEX_LIMIT:
+            dirs.add(d)
+            d = posixpath.dirname(d)
+    for d in dirs:
+        cached[_folder_numeric_id(d)] = d
+    return cached
+
+
+def _folder_dir_by_id(value: object, root: str) -> str | None:
+    """Directory a numeric (virtual) folder id points at, or ``None``.
+
+    Perl resolves a ``folder_id`` through the directory's ``tracks`` row
+    (``Queries.pm:2311-2316``); we invert :func:`_folder_numeric_id` over the
+    tree below ``root``.  A directory that holds no track at all (empty
+    branch, no rows to aggregate from) has no entry — the caller then falls
+    back to the browse root, exactly like an unresolvable id in Perl.
+    """
+    try:
+        wanted = int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+    if wanted < 0:
+        return None
+    return _bmf_dir_index(root).get(wanted)
+
+
+def _bmf_children(directory: str, start: int = 0,
+                  count: int = 200) -> tuple[list, int]:
+    """Children of ``directory``, aggregated from the track URLs.
+
+    Returns ``(rows, total)``: ``type 'folder'`` subdirectories (``id`` =
+    virtual folder id :func:`_folder_numeric_id`, ``path`` = absolute
+    directory, ``name`` = decoded folder name) followed by ``type 'audio'``
+    files directly in the directory (``id`` = track id) — Perl's bmf lists
+    files there too.  Everything comes from one prefix ``LIKE`` over
+    ``tracks.url`` (``DISTINCT``/``GROUP BY`` on the path segment); the
+    filesystem is never touched.
+    """
+    prefix = _bmf_encoded_prefix(directory)
+    like = prefix + "%"
+    off = len(prefix) + 1          # 1-based index behind "<dir>/"
+    folders = [(posixpath.basename(p), p) for p in _bmf_subdir_paths(directory)]
     folders.sort(key=lambda t: t[0].casefold())
     try:
         cnt = _db_query("SELECT COUNT(*) AS n FROM tracks WHERE url LIKE ?"
@@ -639,8 +824,8 @@ def _bmf_children(directory: str, start: int = 0,
     total = len(folders) + loose_total
     # Folders first, then the loose files of this directory (Perl returns
     # both in one list).
-    out: list[dict] = [{"id": path, "name": name, "title": name,
-                        "type": "folder"}
+    out: list[dict] = [{"id": _folder_numeric_id(path), "path": path,
+                        "name": name, "title": name, "type": "folder"}
                        for name, path in folders[start:start + count]]
     left = count - len(out)
     if left > 0:
@@ -2204,7 +2389,9 @@ class JSONRPCAPI:
             # play-control row (goAction "playControl", the shape whose tap
             # opens Play/Add/Play-next).  Perl resolves it per request
             # (:1951-1983); our player object carries the playing state it
-            # looks at.
+            # looks at.  ``client_named`` is Perl's ``$request->client``: a
+            # request without a player token at all always lands on the
+            # defeated branch (:1976 `|| !$client`).
             player = None
             if pid:
                 try:
@@ -2212,7 +2399,8 @@ class JSONRPCAPI:
                     player = PlayerManager().get_player(pid)
                 except Exception:  # noqa: BLE001
                     player = None
-            use_play_control = _defeat_destructive_touch_to_play(rest, player)
+            use_play_control = _defeat_destructive_touch_to_play(
+                rest, player, client_named=bool(pid))
             parent = None
             # Perl's XMLBrowser roots every item id in a fresh browse-session
             # handle: `my @crumbIndex = $sid ? ($sid) : ()` + `push
@@ -6260,10 +6448,26 @@ class JSONRPCAPI:
                           if str(a).startswith("folder_id:")), None)
         url = next((str(a)[4:] for a in args if str(a).startswith("url:")), None)
         tags = next((str(a)[5:] for a in args if str(a).startswith("tags:")), "")
+        # A numeric ``folder_id`` is one of our virtual folder ids
+        # (:func:`_folder_numeric_id`): ``media/folders.resolve_folder_id``
+        # would read it as a ``tracks.id`` and find nothing, so it is
+        # inverted here into the directory path the filesystem lister wants.
+        if url is None and folder_id and folder_id.strip().isdigit():
+            resolved = _folder_dir_by_id(folder_id.strip(), _bmf_music_root())
+            if resolved:
+                folder_id = resolved
         res = musicfolder_result(index, quantity, folder_id=folder_id, url=url,
                                  tags=tags)
         loop = res.get("folder_loop")
         if loop is not None:
+            # Perl's ``id`` is the ``tracks`` row of the directory (:2429) —
+            # a positive integer.  Our port has no ``dir`` rows, so a folder
+            # item's id was its ``file://`` URL; hand out the virtual numeric
+            # id instead (same shape the bmf items and the drill use).
+            for row in loop:
+                num = _folder_row_numeric_id(row)
+                if num is not None:
+                    row["id"] = num
             res["item_loop"] = loop
             res["loop_loop"] = loop
             try:
@@ -6742,11 +6946,20 @@ class JSONRPCAPI:
                 ident = str(r["id"])
                 item["text"] = text
                 item["textkey"] = text[:1].upper()
-                item["id"] = ident
-                # Two drill vocabularies on purpose: 'folder_id' (Perl) and
-                # 'url' (this server's earlier shape) — the bmf branch
-                # accepts both, so the roundtrip works for old and new taps.
-                item["commonParams"] = {"folder_id": ident, "url": ident}
+                # A JSON *number*: the controllers parse folder ids as
+                # integers (Perl hands out a ``tracks.id`` there) — a string
+                # is what made Squeeze Client drop the tap.
+                try:
+                    item["id"] = int(ident)
+                except (TypeError, ValueError):
+                    item["id"] = ident
+                # Two drill vocabularies on purpose: 'folder_id' is the
+                # numeric folder id the controllers parse (Perl's own shape —
+                # a directory is a ``tracks`` row there, Queries.pm:2311),
+                # 'url' keeps the absolute path for older taps; the bmf
+                # branch accepts both (api._bmf_resolve_dir).
+                item["commonParams"] = {"folder_id": ident,
+                                        "url": str(r.get("path") or ident)}
                 # Perl bmf folder item (BrowseLibrary): add/add-hold/play
                 # carry the folder id, so they load the whole folder.
                 item["actions"] = {

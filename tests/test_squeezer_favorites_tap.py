@@ -273,10 +273,10 @@ def _install_player(mode: str = "play", duration: float = 257.533,
     return player
 
 
-def _items(args: list) -> dict:
+def _items(args: list, pid: str | None = PLAYER) -> dict:
     async def run():
-        return await JSONRPCAPI()._json_favorites_items(PLAYER,
-                                                        [str(a) for a in args])
+        return await JSONRPCAPI()._json_favorites_items(
+            pid, [str(a) for a in args])
     return asyncio.run(run())
 
 
@@ -503,7 +503,17 @@ def test_defeat_pref_semantics_match_perl():
     """XMLBrowser.pm:1964-1983 + Prefs.pm:272 (default 4)."""
     playing = _install_player("play")
     idle = _install_player("stop", duration=0)
-    assert _defeat_destructive_touch_to_play([], None) is False
+    # Perl :1976 `return 1 if $pref == 1 || !$client;` — a request that names
+    # no client at all is defeated for every pref != 0 (live Perl
+    # ``favorites items 0 50 menu:favorites`` → goAction "playControl").
+    assert _defeat_destructive_touch_to_play([], None) is True
+    assert _defeat_destructive_touch_to_play(
+        [], None, client_named=False) is True
+    # ... but a *named* client we cannot resolve keeps the touch-to-play
+    # branch (documented divergence: the fixtures drive the API with a pid
+    # and without an installed PlayerState).
+    assert _defeat_destructive_touch_to_play(
+        [], None, client_named=True) is False
     # 0 never defeats, 1 always (the request token wins, :1964)
     assert _defeat_destructive_touch_to_play(
         ["defeatDestructiveTouchToPlay:0"], playing) is False
@@ -523,22 +533,76 @@ def test_defeat_pref_semantics_match_perl():
         ["defeatDestructiveTouchToPlay:2"], playing) is True
     assert _defeat_destructive_touch_to_play(
         ["defeatDestructiveTouchToPlay:3"], idle) is False
+    # The server pref is Perl's ``$prefs->get(...)`` (:1966) — an operator
+    # setting of 1 forces the defeated branch (:1976) for every request.
+    import lyrion.web.api as api_mod
+    prev = api_mod._defeat_pref_default
+    api_mod._defeat_pref_default = lambda: 1
+    try:
+        assert _defeat_destructive_touch_to_play([], idle) is True
+        assert _defeat_destructive_touch_to_play(
+            [], None, client_named=True) is True
+        assert _defeat_destructive_touch_to_play(
+            ["defeatDestructiveTouchToPlay:0"], idle) is False
+    finally:
+        api_mod._defeat_pref_default = prev
 
 
-def test_default_request_keeps_the_touch_to_play_shape_when_idle(favs):
-    """A stopped player gets Perl's ``goAction "play"`` row (:1259-1267)."""
-    _install_player("stop", duration=0)
-    row = _stream_row()
+def test_client_less_request_gets_perls_play_control_row(favs):
+    """XMLBrowser.pm:1976 ``|| !$client`` ↔ live Perl 192.168.1.90.
+
+    A request without a player token (Web UI, CLI probe, SqueezeTray) is
+    answered with the defeated row — live ``favorites items 0 50
+    menu:favorites``: ``{"goAction": "playControl", "playControlParams":
+    {"xmlbrowserPlayControl": "6"}, "params": {"item_id": …, "isContextMenu":
+    1}, "type": "audio"}`` and neither ``style`` nor ``touchToPlay``.
+    """
+    row = _items(MENU_ARGS, pid=None)["item_loop"][1]
+    assert row["goAction"] == "playControl"
+    assert row["playControlParams"] == {"xmlbrowserPlayControl": "1"}
+    assert "style" not in row
+    assert set(row["params"]) == {"item_id", "isContextMenu"}
+
+
+def test_squeezer_app_request_without_positionals_gets_the_same_row(favs):
+    """The exact shape Squeezer sends (cometd log 2026-09-13 19:21).
+
+    ``["favorites","items","menu:favorites","useContextMenu:1"]`` — no
+    ``_index``/``_quantity`` positionals.  The row must be the same one a
+    positioned request produces (the item index is the position *in the feed*,
+    XMLBrowser.pm:1003/1014).
+    """
+    res = _items(["items", "menu:favorites", "useContextMenu:1"], pid=None)
+    row = res["item_loop"][1]
+    assert row["goAction"] == "playControl"
+    assert row["playControlParams"]["xmlbrowserPlayControl"] == "1"
+    assert res["item_loop"][0].get("actions", {}).get("go", {}).get(
+        "params", {}).get("item_id", "").endswith(".0")
+
+
+def test_default_request_keeps_the_touch_to_play_shape_for_an_unknown_client(
+        favs):
+    """A pid we cannot resolve keeps Perl's ``play`` row (divergence, :1976).
+
+    Both favourites parity suites (``test_favorites_menu``,
+    ``test_squeezer_pause_favorites``) drive the API with a pid but without an
+    installed ``PlayerState``; Perl would drop such a request outright (live
+    probe with an unregistered MAC closes the connection), so the port keeps
+    the historical touch-to-play branch there instead of guessing.
+    """
+    assert _defeat_destructive_touch_to_play([], None, client_named=True) is False
+    row = _stream_row()                       # PLAYER pid, no installed player
     assert row["goAction"] == "play"
     assert row["style"] == "itemplay"
     assert row["params"]["touchToPlay"] == row["params"]["item_id"]
 
 
 def test_playing_player_gets_the_play_control_row(favs):
-    """Perl's default pref 4 defeats the tap while a stream plays (:1977).
+    """Perl's default pref 4 defeats the tap while a file plays (:1977).
 
-    This is the branch the user's controllers must reach: the live Perl
-    server answers them with ``goAction: "playControl"``.
+    This is the branch the live Perl server answers a client with that is
+    playing something with a duration (``favorites items 0 50 menu:favorites``
+    with a playing client).
     """
     _install_player("play")
     row = _stream_row()
@@ -557,6 +621,11 @@ def test_all_touch_to_play_window_maps_base_go_onto_the_branch(favs):
     _install_player("stop", duration=0)
     res2 = _items(["items", 0, 10, "menu:favorites", f"item_id:{folder_path}"])
     assert res2["base"]["actions"]["go"] == res2["base"]["actions"]["play"]
+    # a client-less request is defeated (:1976) → the same remap
+    res3 = _items(["items", 0, 10, "menu:favorites", f"item_id:{folder_path}"],
+                  pid=None)
+    assert res3["base"]["actions"]["go"] == res3["base"]["actions"]["playControl"]
+    assert res3["item_loop"][0]["goAction"] == "playControl"
 
 
 def _folder_id() -> str:
@@ -582,3 +651,170 @@ def test_folder_and_stream_rows_differ_in_exactly_the_tap_fields(favs):
                                          "presetParams"}
     assert "presetParams" not in folder
     assert folder["icon-id"] == stream["icon-id"] == favorites_menu.FAVORITES_ICON
+
+
+# ── 6. folder ids: numeric, stable, and resolvable again ──────────────────
+#
+# Symptom (Squeeze Client, live 2026-09-13 19:25): "Eigene Musik /
+# Musikordner" lists the subdirectories, but tapping a folder sends **no**
+# drill request at all.  Perl hands out the ``tracks`` row id of the
+# directory — a positive integer (live ``musicfolder 0 3``:
+# ``{"id": 204573, "filename": "Accept", "type": "folder"}``,
+# ``Slim/Control/Queries.pm:2429-2430``/``:2472-2487``) — and resolves a
+# ``folder_id`` back through that row (``:2311-2316``
+# ``findAndTrackDirectoryTree``).  Our port created no ``dir`` rows, so the
+# id was the directory's ``file://`` URL.
+#
+# The port now hands out ``crc32(path) & 0x7fffffff`` — the same *shape*
+# (positive integer, stable across restarts, identical for every spelling of
+# a path), documented as NOT Perl's ``tracks.id`` — and inverts it over the
+# same tree the browse is built from (``api._folder_dir_by_id``).  Both
+# request paths are covered: the app's ``browselibrary … mode:bmf`` and the
+# plain ``musicfolder`` query.
+
+import sqlite3                                    # noqa: E402
+from pathlib import Path                          # noqa: E402
+
+import lyrion.web.api as api_mod                  # noqa: E402
+
+BMF_ROOT = "/srv/music"
+BMF_ROWS = [
+    (1, "file:///srv/music/Metal/Accept/01-hard_attack.mp3"),
+    (2, "file:///srv/music/Metal/Iron%20Maiden/02-tv_war.flac"),
+    (3, "file:///srv/music/Ambient/Boards%20of%20Canada/03-oktaf.flac"),
+]
+
+
+@pytest.fixture()
+def bmf_library(tmp_path, monkeypatch):
+    """Temp library DB + ``musicdir`` pref (pattern: test_musicdir_bmf)."""
+    db = tmp_path / "lyrion.db"
+    con = sqlite3.connect(db)
+    con.executescript("CREATE TABLE tracks (id INTEGER PRIMARY KEY, url TEXT,"
+                      " title TEXT);")
+    con.executemany("INSERT INTO tracks (id, url, title) VALUES (?, ?, ?)",
+                    [(i, u, u.rsplit("/", 1)[-1]) for i, u in BMF_ROWS])
+    con.commit()
+    con.close()
+    monkeypatch.setattr(api_mod, "_library_db_path", lambda: str(db))
+    monkeypatch.setattr(api_mod, "_bmf_musicdir_pref", lambda: BMF_ROOT)
+    api_mod._DIR_INDEX.clear()
+    yield db
+    api_mod._DIR_INDEX.clear()
+
+
+def _bmf(args: list) -> dict:
+    async def run():
+        return await JSONRPCAPI()._json_browselibrary("browselibrary",
+                                                     [str(a) for a in args])
+    return asyncio.run(run())
+
+
+def _musicfolder(args: list) -> dict:
+    async def run():
+        return await JSONRPCAPI()._json_musicfolder([str(a) for a in args])
+    return asyncio.run(run())
+
+
+def test_bmf_folder_rows_carry_a_numeric_id(bmf_library):
+    """The app's own browse form (cometd log: ``browselibrary items 0 512
+    mode:bmf useContextMenu:1 menu:1``) must name every folder with a number.
+    """
+    res = _bmf(["items", "0", "512", "mode:bmf", "useContextMenu:1", "menu:1"])
+    assert res["count"] == 2
+    assert [r["text"] for r in res["item_loop"]] == ["Ambient", "Metal"]
+    for row in res["item_loop"]:
+        assert isinstance(row["id"], int) and row["id"] > 0, row
+        assert row["commonParams"]["folder_id"] == str(row["id"])
+        assert row["actions"]["play"]["params"]["folder_id"] == str(row["id"])
+        # the path stays reachable for older taps/builders
+        assert row["commonParams"]["url"] == f"{BMF_ROOT}/{row['text']}"
+
+
+def test_bmf_folder_id_drills_into_the_children(bmf_library):
+    """The id the row hands out must resolve back to that directory."""
+    root = _bmf(["items", "0", "512", "mode:bmf", "menu:1"])["item_loop"]
+    metal = next(r for r in root if r["text"] == "Metal")
+    children = _bmf(["items", "0", "512", "mode:bmf", "menu:1",
+                     f"folder_id:{metal['id']}"])
+    assert [r["text"] for r in children["item_loop"]] == ["Accept",
+                                                          "Iron Maiden"]
+    assert children["count"] == 2
+    accept = next(r for r in children["item_loop"] if r["text"] == "Accept")
+    assert accept["commonParams"]["folder_id"] == str(accept["id"])
+    assert accept["commonParams"]["url"] == f"{BMF_ROOT}/Metal/Accept"
+    # … and one level deeper again (no loop, no empty answer)
+    tracks = _bmf(["items", "0", "512", "mode:bmf",
+                   f"folder_id:{accept['id']}"])
+    assert [r["text"] for r in tracks["item_loop"]] == ["01-hard_attack.mp3"]
+
+
+def test_bmf_drill_without_menu_also_carries_the_numeric_id(bmf_library):
+    """The classic (non-menu) drill answer keeps the numeric id, too.
+
+    Its ``actions.go`` params carry ``search``/``folder_id`` — both must be
+    the id the row handed out, otherwise a client that echoes that action
+    lands on a different directory.
+    """
+    metal = next(r for r in _bmf(["items", "0", "512", "mode:bmf"])["item_loop"]
+                 if r["text"] == "Metal")
+    children = _bmf(["items", "0", "512", "mode:bmf",
+                     f"folder_id:{metal['id']}"])
+    assert all(str(r["id"]).isdigit() for r in children["item_loop"])
+    for row in children["item_loop"]:
+        go = row["actions"]["go"]["params"]
+        assert go["folder_id"] == str(row["id"])
+        assert go["search"] == str(row["id"])
+
+
+def test_bmf_legacy_tokens_and_unknown_ids(bmf_library):
+    """Paths keep working; an unknown numeric id falls back to the root."""
+    for token in (f"{BMF_ROOT}/Metal", f"file://{BMF_ROOT}/Metal", "Metal"):
+        res = _bmf(["items", "0", "512", "mode:bmf", f"folder_id:{token}"])
+        assert [r["text"] for r in res["item_loop"]] == ["Accept", "Iron Maiden"]
+    fallback = _bmf(["items", "0", "512", "mode:bmf", "folder_id:1"])
+    assert [r["text"] for r in fallback["item_loop"]] == ["Ambient", "Metal"]
+    assert fallback["count"] == 2
+
+
+def test_folder_id_is_stable_and_path_based(bmf_library):
+    """One directory = one id, whatever spelling the caller uses."""
+    assert (api_mod._folder_numeric_id(f"{BMF_ROOT}/Metal")
+            == api_mod._folder_numeric_id(f"file://{BMF_ROOT}/Metal")
+            == api_mod._folder_numeric_id(f"{BMF_ROOT}/Metal/"))
+    assert api_mod._folder_numeric_id(f"{BMF_ROOT}/Metal") > 0
+    assert (api_mod._folder_numeric_id(f"{BMF_ROOT}/Metal")
+            != api_mod._folder_numeric_id(f"{BMF_ROOT}/Ambient"))
+
+
+def test_musicfolder_rows_are_numeric_like_perl(bmf_library, monkeypatch):
+    """``musicfolder`` (Perl ``mediafolderQuery``) — ``id``/``filename``/``type``.
+
+    Live Perl: ``{"id": 204573, "filename": "Accept", "type": "folder"}``.
+    Our ``media/folders`` lister walks the filesystem, so the temp library is
+    pointed at a real directory through the media-dir pref.
+    """
+    from lyrion.media import folders as folders_mod
+
+    monkeypatch.setattr(folders_mod, "effective_media_dirs",
+                        lambda media_type="": [BMF_ROOT])
+    monkeypatch.setattr(folders_mod, "get_inactive_audio_dirs", lambda: [])
+    monkeypatch.setattr(folders_mod, "list_directory_entries",
+                        lambda directory, recursive=False:
+                        ["Metal"] if directory == BMF_ROOT else ["Accept"])
+    monkeypatch.setattr(folders_mod, "item_type",
+                        lambda path: "folder")
+    top = _musicfolder(["0", "3"])["folder_loop"]
+    assert [sorted(r) for r in top] == [["filename", "id", "type"]]
+    assert top[0]["filename"] == "Metal" and top[0]["type"] == "folder"
+    assert isinstance(top[0]["id"], int) and top[0]["id"] > 0
+    # the numeric id is only the *folder* id: a real tracks row keeps its own
+    assert api_mod._folder_row_numeric_id(
+        {"id": 123456, "type": "track"}) is None
+    # the drill with the numeric id must reach the directory
+    drilled = _musicfolder(["0", "3", f"folder_id:{top[0]['id']}"])
+    assert [r["filename"] for r in drilled["folder_loop"]] == ["Accept"]
+    # ... while the pre-existing path/URL tokens keep working
+    assert [r["filename"] for r in
+            _musicfolder(["0", "3", f"folder_id:{BMF_ROOT}/Metal"])["folder_loop"]] \
+        == ["Accept"]

@@ -50,12 +50,18 @@ Documented deviations from Perl
 * ``base.actions.playControl.cmd`` is the literal ``["favorites","items"]``
   from the fixtures instead of being recomputed from the request tokens.
 * ``defeatDestructiveTouchToPlay`` (``XMLBrowser.pm:1260-1271`` /
-  ``:1430``) is not implemented: with that player pref set, Perl answers an
-  otherwise touch-to-play row with ``goAction: "playControl"`` +
-  ``playControlParams: {xmlbrowserPlayControl: <index>}`` so the tap opens
-  the context menu instead of starting playback (live Perl LMS
-  192.168.1.90: both root stations carry exactly that pair).  We always
-  serve the ``goAction: "play"`` branch (``:1259-1267``).
+  ``:1430``) is resolved by :func:`lyrion.web.api.
+  _defeat_destructive_touch_to_play` and passed in as ``use_play_control``:
+  a station row then carries ``goAction: "playControl"`` +
+  ``playControlParams: {xmlbrowserPlayControl: <index>}`` (the item index is
+  the position *in the feed*, ``XMLBrowser.pm:1003/1014``) and neither
+  ``style`` nor ``touchToPlay``, exactly like Perl's defeated branch.  Live
+  Perl 192.168.1.90 answers a request *without* a client with exactly that
+  pair (``:1976`` ``|| !$client``), while a request the server can attribute
+  to an idle client gets the ``play`` branch (``:1259-1267``) — see the
+  function's docstring for the measured cases and the one remaining
+  divergence (a *named* client this server does not know keeps the
+  ``play`` branch).
 
 Item ids
 --------
