@@ -36,16 +36,19 @@ Wer sendet in Perl was — und an wen?
 
 Was diese Verdrahtung rendert — und was nicht
 ---------------------------------------------
-Die Nutzlasten entstehen jetzt in :mod:`lyrion.player.fonts`, einem Port von
+Die Nutzlasten entstehen in :mod:`lyrion.player.fonts`, einem Port von
 ``Slim/Display/Lib/Fonts.pm`` (Bitmap-Schriften aus ``graphics/*.font.bmp``,
 ``string`` :292-522) und ``Slim/Display/Lib/TextVFD.pm`` (``vfdUpdate``
 :147-363). ``grfe``/``grfd`` bekommen die gerenderten Screen-Bits,
-``vfdc`` den VFD-Strom — aber **nur**, wenn der Aufrufer die Displaytexte
-übergibt (``text=``). Wer welchen Text auf welche Zeile schreibt, entscheidet
-in Perl das jeweilige Button-Modul (``Slim/Buttons/Playlist.pm:398-480`` mit
-``Player.pm:488-560`` ``currentSongLines``); diese Screen-Zusammenstellung ist
-nicht portiert. Ohne ``text`` geht deshalb weiterhin nur der Visualizer-/
-Helligkeitsframe raus statt einer erfundenen Bitmap.
+``vfdc`` den VFD-Strom — aber **nur**, wenn der Aufrufer ``text=`` übergibt.
+Wer welchen Text auf welche Zeile schreibt, entscheidet in Perl das
+Button-Modul ``Slim/Buttons/Playlist.pm:398-483`` (``lines()`` →
+``currentSongLines``) mit ``Slim/Player/Player.pm:488-706``; im Port liefert
+ihn ``lyrion.player.manager`` (``_now_playing_lines``: Statuszeile + Titel).
+Ohne ``text`` geht weiterhin nur der Visualizer-/Helligkeitsframe raus statt
+einer erfundenen Bitmap. ``screen2`` (Album/Interpret, nur Transporter —
+``Display.pm:859`` ``hasScreen2``, ``Transporter.pm:319-325``) ist nicht
+verdrahtet; Perl zeigt es in einem eigenen Screen (``Player.pm:638-665``).
 """
 
 from __future__ import annotations

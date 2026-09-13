@@ -2187,10 +2187,29 @@ class JSONRPCAPI:
         if cmd == "playlists":
             return await self._json_playlists(pid, args)
 
+        # ── info total <entity> ? (Perl infoTotalQuery) ─────────────
+        # Perl registriert GENAU fünf Formen ['info','total','<e>','?'] auf
+        # infoTotalQuery (Slim/Control/Request.pm:501-505 -> Queries.pm:2019-2055).
+        # Ergebnis: genau ein Schlüssel "_<entity>" (:2039-2051), Wert aus
+        # Slim::Schema->totals (Schema.pm:3305-3332: album/contributor/genre/
+        # track) bzw. ->totalTime (Schema.pm:2173-2199) für duration.
+        # Live Perl 9.x, nur lesend 2026-09-13:
+        #   ["info","total","songs","?"]    -> {"_songs":80218}
+        #   ["info","total","albums","?"]   -> {"_albums":7189}
+        #   ["info","total","artists","?"]  -> {"_artists":11170}
+        #   ["info","total","genres","?"]   -> {"_genres":762}
+        #   ["info","total","duration","?"] -> {"_duration":22851708.851}
+        # ALLE anderen Formen (ohne '?', unbekannte Entität, Extra-Argumente)
+        # matchen keinen Dispatch-Eintrag; Perls JSON-RPC schließt dann den
+        # Socket ohne Body ("Empty reply from server") — hier leeres Dict
+        # statt der irreführenden Browse-Leerform (count/offset/loop_loop).
+        if cmd == "info":
+            return await self._json_info_total(args)
+
         # ── Browse commands (library) ──────────────────────────────
         if cmd in ("albums", "artists", "genres", "songs", "titles",
                    "musicfolder", "radios", "songinfo",
-                   "info", "contributors", "browse"):
+                   "contributors", "browse"):
             if cmd == "radios":
                 return await self._json_radios(cmd, args)
             return await self._json_browse(cmd, args)
@@ -5663,6 +5682,57 @@ class JSONRPCAPI:
             return self._browse_response(loop, total, "years_loop")
         except Exception:  # noqa: BLE001
             return self._browse_response([])
+
+    #: Die fünf Entitäten der ``infoTotalQuery``-Dispatch-Einträge
+    #: (``Slim/Control/Request.pm:501-505``).
+    INFO_TOTAL_ENTITIES = ("albums", "artists", "genres", "songs", "duration")
+
+    async def _json_info_total(self, args: list[str]) -> dict:
+        """``info total <entity> ?`` — Perl ``infoTotalQuery``.
+
+        Nur die exakt registrierte Form ``["total", <entity>, "?"]`` antwortet
+        (``Request.pm:501-505``); sonst ist der Request nicht dispatchable und
+        Perl liefert gar kein Result. Der Schlüssel ist immer ``_<entity>``
+        (``Queries.pm:2039-2051``); gezählt wird wie im CLI-Pfad
+        (``control/cli_commands.py:3378-3412``): songs = tracks, albums = albums,
+        artists = DISTINCT contributors mit role 1 (``Schema.pm:3315``,
+        ``tracks_contributors``), genres = nicht-leere ``tracks.genre``,
+        duration = ``SUM(tracks.duration)`` (Perls ``totalTime`` summiert die
+        Sekunden, ``Schema.pm:2190``).
+        """
+        if len(args) != 3 or str(args[0]) != "total" or str(args[2]) != "?":
+            return {}
+        entity = str(args[1])
+        if entity not in self.INFO_TOTAL_ENTITIES:
+            return {}
+        value: Any = 0
+        try:
+            if entity == "songs":
+                rows = _db_query("SELECT COUNT(*) AS n FROM tracks")
+                value = int(rows[0]["n"]) if rows else 0
+            elif entity == "duration":
+                rows = _db_query(
+                    "SELECT COALESCE(SUM(duration),0) AS n FROM tracks")
+                value = rows[0]["n"] if rows else 0
+            elif entity == "albums":
+                rows = _db_query("SELECT COUNT(*) AS n FROM albums")
+                value = int(rows[0]["n"]) if rows else 0
+            elif entity == "artists":
+                rows = _db_query(
+                    "SELECT COUNT(DISTINCT c.id) AS n FROM contributors c "
+                    "JOIN tracks_contributors tc ON tc.contributor = c.id "
+                    "AND tc.role = 1"
+                )
+                value = int(rows[0]["n"]) if rows else 0
+            else:  # genres
+                rows = _db_query(
+                    "SELECT COUNT(DISTINCT genre) AS n FROM tracks "
+                    "WHERE genre != ''")
+                value = int(rows[0]["n"]) if rows else 0
+        except Exception as exc:  # noqa: BLE001 — wie der CLI-Pfad: 0
+            logger.debug("info total %s failed: %s", entity, exc)
+            value = 0
+        return {f"_{entity}": value}
 
     async def _json_browse(self, cmd: str, args: list[str]) -> dict:
         """Browse library tables (albums/artists/songs/genres) as JSON."""

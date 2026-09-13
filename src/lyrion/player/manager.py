@@ -64,6 +64,25 @@ def model_name_for(model: str) -> str:
     return MODEL_NAMES.get((model or "").lower(), "")
 
 
+# ── Now-Playing-Displayzeilen (Perl ``Player.pm:488-706``) ─────────────────
+# ``currentSongLines`` schreibt bei jedem Zustandswechsel die zwei Zeilen des
+# Now-Playing-Screens; die englischen Defaults stehen in LMS' ``strings.txt``.
+NOW_PLAYING_TEXT = "Now Playing"   # strings.txt:761 (Token PLAYING) / :703
+PAUSED_TEXT = "Paused"             # strings.txt:801
+STOPPED_TEXT = "Stopped"           # strings.txt:11107
+NOTHING_TEXT = "Nothing"           # strings.txt:469
+OUT_OF_TEXT = "of"                 # strings.txt:781
+
+
+def _library_db_path() -> str:
+    """Pfad der Bibliotheks-DB (Test-/Dev-Läufe nutzen LYRION_SERVERDATA)."""
+    try:
+        from lyrion.config import get_config
+        return str(get_config().db_path)
+    except Exception:  # noqa: BLE001
+        return "/root/.lyrion/Lyrion/Prefs/lyrion.db"
+
+
 def display_type_for(model: str) -> str | None:
     """Perl ``vfdmodel()`` for a HELO device id.
 
@@ -203,18 +222,103 @@ class PlayerManager:
         """Perl ``$client->update()`` — ``Player.pm:152`` -> ``Display.pm:141``.
 
         Zustandswechsel rufen es direkt (Track-Start ``Player.pm:1115-1116``,
-        ``:1250-1252``). Ohne Renderer im Port gehen nur die Frames raus, die
-        Perl ohne Renderer baut (``visu``; ``grfb`` über
-        :meth:`_display_power`).
+        ``:1250-1252``). Der Screen-Text kommt aus :meth:`_now_playing_lines`
+        (Perl ``Player.pm:488-706`` ``currentSongLines``), damit die Renderer
+        (``player/fonts.py``) echte ``grfe``/``grfd``/``vfdc``-Bits bauen.
         """
         wiring = self.display_wiring()
         if wiring is None:
             return []
         try:
-            return await wiring.update(player)
+            text = await self._now_playing_lines(player)
+            return await wiring.update(player, text=text)
         except Exception as exc:  # noqa: BLE001 — Display darf nie stören
             logger.debug("display update for %s failed: %s", player.mac, exc)
             return []
+
+    # ------------------------------------------------------------------
+    # Now-Playing-Text (Perl currentSongLines, Player.pm:488-706)
+    # ------------------------------------------------------------------
+
+    async def _now_playing_lines(self, player: PlayerState) -> list[str]:
+        """Die zwei Now-Playing-Zeilen — Perl ``currentSongLines``.
+
+        ``Player.pm:509-513`` (leere Playlist) -> ``NOW_PLAYING``/``NOTHING``,
+        ``:521-535`` (pause) -> ``PAUSED``, ``:541-553`` (stop) -> ``STOPPED``,
+        ``:571-585`` (play) -> ``PLAYING``; bei ``playlistlen > 1`` folgt
+        ``" (i OUT_OF n) "`` mit ``playingSongIndex+1`` (``Source.pm:229-233``).
+        ``line[1]`` ist der aktuelle Titel (``:633``).
+
+        Der Modus (``playingDisplayModes[playingDisplayMode]``) bestimmt NUR den
+        Fortschritts-Overlay (``Player.pm:721-733``, geschrieben wird allein
+        ``overlay[0]``, ``:798``) und für den Transporter, ob ``screen2``
+        (Album/Interpret) existiert (``Transporter.pm:319-325``; ``Display.pm:
+        859`` ``hasScreen2`` = 0 für alle anderen Klassen) — NICHT diese Zeilen.
+        """
+        playlist = getattr(player, "playlist", None) or []
+        total = len(playlist)
+        if total < 1:
+            # Player.pm:509-513 — NOTHING / NOTHING
+            return [NOW_PLAYING_TEXT, NOTHING_TEXT]
+        mode = getattr(player, "mode", "stop")
+        if mode == "pause":
+            line0 = PAUSED_TEXT                      # Player.pm:521-535
+        elif mode == "stop":
+            line0 = STOPPED_TEXT                     # Player.pm:541-553
+        else:
+            line0 = NOW_PLAYING_TEXT                 # Player.pm:571-585
+        if total > 1:
+            index = int(getattr(player, "playlist_position", 0) or 0) + 1
+            line0 += f" ({index} {OUT_OF_TEXT} {total}) "   # :531-534/:580-583
+        return [line0, await self._current_song_title(player)]
+
+    @staticmethod
+    def _playing_track_id(player: PlayerState) -> Optional[int]:
+        """Track-ID des laufenden Songs (Perl ``Playlist::track($client)``)."""
+        track_id = getattr(player, "current_track_id", None)
+        if isinstance(track_id, int):
+            return track_id
+        playlist = getattr(player, "playlist", None) or []
+        position = getattr(player, "playlist_position", 0) or 0
+        if 0 <= position < len(playlist) and isinstance(playlist[position], int):
+            return int(playlist[position])
+        return None
+
+    async def _current_song_title(self, player: PlayerState) -> str:
+        """Perl ``Slim::Music::Info::getCurrentTitle`` (``Music/Info.pm:556-583``).
+
+        Der Default-``titleFormat`` ist ``'TITLE'`` (``Utils/Prefs.pm:249-250``,
+        ``Player/Client.pm:52-53`` → ``titleFormat[0]``), also der Track-Titel.
+        Für Radio-Streams setzt der Port den Stations-/ICY-Titel in
+        ``player.current_title`` (``ProtocolHandlers``-Override, Info.pm:562-570).
+        """
+        track_id = self._playing_track_id(player)
+        if track_id is not None:
+            title = await self._track_title(track_id)
+            if title:
+                return title
+        return str(getattr(player, "current_title", "") or "")
+
+    async def _track_title(self, track_id: int) -> str:
+        """Titel eines Bibliothekstracks (lesend, blockiert den Loop nicht)."""
+        def _run() -> str:
+            import sqlite3
+
+            con = sqlite3.connect(
+                f"file:{_library_db_path()}?mode=ro", uri=True, timeout=30)
+            try:
+                row = con.execute(
+                    "SELECT title FROM tracks WHERE id = ?", (track_id,)
+                ).fetchone()
+                return str(row[0] or "") if row else ""
+            finally:
+                con.close()
+
+        try:
+            return await asyncio.to_thread(_run)
+        except Exception as exc:  # noqa: BLE001 — kein Titelfehler nach außen
+            logger.debug("display title lookup for %s failed: %s", track_id, exc)
+            return ""
 
     async def _display_power(self, player: PlayerState, on: bool) -> list[str]:
         """Perl ``Player::power`` — ``Player.pm:255-290`` (Helligkeit + Update)."""
@@ -1103,11 +1207,9 @@ class PlayerManager:
 
         PROT-18: the rendered payload of a graphics display is a Bitmap
         (``grfe``, Squeezebox2.pm:243-248) and of a Text display a TextVFD
-        stream (``vfdc``, Text.pm:437-441). The port has neither renderer, so
-        there are no bytes to send; this runs the Perl update path (visualizer)
-        and returns whether a frame actually went out instead of pushing the
-        invented ``format/duration/line`` text-grfe payload that had no
-        Perl source (see ``SlimProtoClient.send_display_to_player``).
+        stream (``vfdc``, Text.pm:437-441). ``line1``/``line2`` sind Perls
+        ``line[0]``/``line[1]`` aus ``showBriefly`` (``Display.pm:221-327``) und
+        werden dem Renderer (:mod:`lyrion.player.fonts`) übergeben.
 
         Returns:
             True if at least one display frame was sent.
@@ -1121,14 +1223,15 @@ class PlayerManager:
         try:
             # No ``sleep``: the wait for Perl's endShowBriefly timer must not
             # block the CLI/JSON request that called us.
-            sent = await wiring.show_briefly(player, duration=duration)
+            sent = await wiring.show_briefly(
+                player, text=[line1, line2], duration=duration)
         except Exception as exc:  # noqa: BLE001 — Display darf nie stören
             logger.debug("show_display for %s failed: %s", player_id, exc)
             return False
         if not sent:
             logger.info(
-                "show_display %s: %r/%r — kein Frame: der Perl-Renderer "
-                "(Graphics.pm:106-489 / TextVFD.pm:312-357) fehlt im Port",
+                "show_display %s: %r/%r — kein Frame (NoDisplay oder "
+                "nicht renderbarer Text)",
                 player_id, line1, line2,
             )
         return bool(sent)
