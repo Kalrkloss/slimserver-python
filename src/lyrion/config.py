@@ -600,6 +600,22 @@ class LyrionConfig:
         await prefs.init_preference("musicdir", default="", category="library")
         await prefs.init_preference("audiodir", default="", category="library")
         await prefs.init_preference("playlistdir", default="", category="library")
+        # Media folders — Perl: ``Slim/Utils/Prefs.pm:102`` lists ``mediadirs``
+        # among the filepath prefs, ``:163`` gives it the ``defaultMediaDirs``
+        # default (``audiodir`` else the OS music folder, ``:687-712``) and
+        # ``:207`` defaults ``ignoreInAudioScan`` to ``[]``; ``:383-403``
+        # validates both as arrays of unique, existing folders.  Our store
+        # serialises them comma separated (``web/settings.py``
+        # ``_save_server_basic`` mirrors ``Server/Basic.pm:88-121``), hence
+        # ``list``.  ``media/folders.py`` consumes them (``getMediaDirs``,
+        # ``Slim/Utils/Misc.pm:727-756``).
+        await prefs.init_preference(
+            "mediadirs", default="", type_name="list", category="library")
+        await prefs.init_preference(
+            "ignoreInAudioScan", default="", type_name="list", category="library")
+        # ``fileFilter`` skips entries matching this regex
+        # (``Slim/Utils/Misc.pm:859-861``).
+        await prefs.init_preference("ignoreDirRE", default="", category="library")
 
     async def close(self) -> None:
         """Shutdown configuration (close DB, etc.)."""

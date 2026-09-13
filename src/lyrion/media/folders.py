@@ -1,0 +1,689 @@
+"""Music-folder browsing — Perl parity for ``musicfolder`` / ``mediafolder``.
+
+Why this module exists
+----------------------
+``musicfolder 0 N`` must list the children of the configured music folder(s)
+so that *every* controller (Squeezer, SqueezeCtrl, Squeeze Commander,
+SqueezePlay) can browse "Musikordner".  Our old handlers derived the top
+level from the first path component of the ``tracks.url`` values and answered
+``count=1`` (``file:///run``) while Perl answers ``count=303``, because Perl
+starts from the *media dirs* (``mediadirs``) and simply reads that directory.
+This module is that missing piece: it resolves the media dirs, falls back to
+the scanner's library roots when the pref is unset, and emits the Perl loop
+shape.
+
+Perl reference (read-only, /tmp/lms-ref)
+----------------------------------------
+* ``Slim/Control/Queries.pm:2161-2167``  ``musicfolderQuery`` → ``mediafolderQuery``
+* ``Slim/Control/Queries.pm:2169-2350``  parameter handling, media dirs, root vs. child listing
+* ``Slim/Control/Queries.pm:2384-2470``  ``folder_loop`` items: ``id``, ``filename``, ``type``
+* ``Slim/Control/Queries.pm:2507``       ``count`` is added last
+* ``Slim/Utils/Misc.pm:727-756``         ``getMediaDirs`` (mediadirs minus ignoreInAudioScan)
+* ``Slim/Utils/Misc.pm:753-755``         ``getDirsPref`` (``$prefs->get($name) || ['']``)
+* ``Slim/Utils/Misc.pm:758-760``         ``getInactiveAudioDirs`` = ``ignoreInAudioScan``
+* ``Slim/Utils/Misc.pm:973-1043``        ``readDirectory`` — the dirent listing
+* ``Slim/Utils/Misc.pm:835-909``         ``fileFilter`` — dirs always, files only for known types
+* ``Slim/Utils/Misc.pm:292-331``         ``fileURLFromPath`` — URI::file escaping
+* ``Slim/Utils/Misc.pm:1060-1160``       ``findAndScanDirectoryTree`` → ``readDirectory``
+* ``Slim/Utils/OS.pm:334-353``           ``sortFilename`` — locale collation of ``lc(name)``
+* ``Slim/Utils/OS.pm:268-274``           ``ignoredItems`` (linux: ``lost+found``)
+* ``Slim/Utils/Prefs.pm:163,207``        defaults: ``mediadirs``→``defaultMediaDirs``, ``ignoreInAudioScan``→``[]``
+* ``Slim/Utils/Prefs.pm:383-403``        validation: array of unique, existing folders
+* ``Slim/Utils/Prefs.pm:687-712``        ``defaultMediaDirs``: ``audiodir`` else OS music folder
+* ``Slim/Web/Settings/Server/Basic.pm:88-121``  what the settings page stores
+* ``Slim/Control/Request.pm``  ``normalize`` — index/quantity → start..end
+
+Deviation, stated honestly
+--------------------------
+Perl gives every browsed folder a numeric id by *creating* a ``Track`` row of
+content type ``dir`` (``findAndScanDirectoryTree`` → ``objectForUrl(create=>1)``,
+``Slim/Utils/Misc.pm:1082-1087``).  Browsing must stay read-only here, so our
+``tracks`` table holds no ``dir`` rows (verified against the live DB: content
+types are only audio/video).  ``folder_loop`` items therefore carry the
+folder's **file URL** as ``id`` — the same token our browse layer already
+accepts back as ``folder_id``/``url`` (``web/api.py`` ``_json_browselibrary``).
+When a directory *does* have a ``tracks`` row the numeric id is used, like Perl.
+"""
+
+from __future__ import annotations
+
+import locale
+import logging
+import os
+import re
+import sqlite3
+import urllib.parse
+from pathlib import Path
+from typing import Any, Iterable
+
+from lyrion.media.scanner import SUPPORTED_EXTENSIONS
+
+logger = logging.getLogger(__name__)
+
+#: Playlist-ish suffixes Perl accepts through ``validTypeExtensions('list|audio')``
+#: (``Slim/Music/Info.pm:1345-1375``); ``readDirectory`` keeps them next to dirs.
+PLAYLIST_EXTENSIONS: frozenset[str] = frozenset({
+    "m3u", "m3u8", "pls", "wpl", "asx", "xspf", "cue",
+})
+
+#: Perl ``validTypeExtensions`` — the audio + playlist set (Info.pm:1345).
+LISTABLE_EXTENSIONS: frozenset[str] = SUPPORTED_EXTENSIONS | PLAYLIST_EXTENSIONS
+
+#: Perl ``fileFilter`` always drops these (``Slim/Utils/OS.pm:268-274`` + Misc.pm:835-845).
+IGNORED_ITEMS: frozenset[str] = frozenset({"lost+found"})
+
+#: Perl ``fileFilter``: ``return 0 if $item =~ /^__\S+\.m3u$/`` (Misc.pm:853).
+_OLD_HISTORY_RE = re.compile(r"^__\S+\.m3u$")
+
+#: Perl ``getMediaDirs`` maps the media type to its ignore-list pref (Misc.pm:735-738).
+_IGNORE_PREF_FOR_TYPE = {"audio": "ignoreInAudioScan"}
+
+_URL_SCHEMES = ("file://", "tmp://", "http://", "https://", "db:", "spotify:")
+
+
+# ---------------------------------------------------------------------------
+# Preferences
+# ---------------------------------------------------------------------------
+
+
+def _pref(name: str, default: Any = "") -> Any:
+    """Read a preference like Perl ``$prefs->get($name)``.
+
+    ``lyrion.config.get_config()`` checks the ``.conf`` file and then the
+    SQLite preference store — the same order the media settings page uses.
+    Imported lazily so this module stays importable without a running store.
+    """
+    try:
+        from lyrion.config import get_config
+
+        value = get_config().get(name, default)
+    except Exception:  # pragma: no cover - defensive, config is always there
+        return default
+    if value is None:
+        return default
+    return value
+
+
+def as_path_list(value: Any) -> list[str]:
+    """Coerce a stored preference to a list of non-empty paths.
+
+    Perl keeps ``mediadirs``/``ignoreInAudioScan`` as array refs
+    (``Prefs.pm:383-403``); our store serialises them comma separated
+    (``web/settings.py`` ``_save_server_basic``).  Both shapes are accepted.
+
+    NOTE: a path containing a literal comma cannot be represented in the
+    comma-separated form — a known limitation of our store, not of this code.
+    """
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple, set)):
+        raw: Iterable[Any] = value
+    else:
+        raw = str(value).split(",")
+    return [p for p in (str(p).strip() for p in raw) if p]
+
+
+def get_dir_pref(name: str) -> list[str]:
+    """Perl ``getDirsPref`` — ``Slim/Utils/Misc.pm:753-755``."""
+    return as_path_list(_pref(name))
+
+
+def get_media_dirs(media_type: str = "") -> list[str]:
+    """Perl ``getMediaDirs`` — ``Slim/Utils/Misc.pm:727-756``.
+
+    Returns the ``mediadirs`` preference, minus the folders disabled for the
+    requested media type (``audio`` → ``ignoreInAudioScan``, Misc.pm:735-741).
+    """
+    dirs = get_dir_pref("mediadirs")
+    if media_type:
+        ignore_pref = _IGNORE_PREF_FOR_TYPE.get(media_type)
+        if ignore_pref:
+            ignore = {os.path.normpath(p) for p in get_dir_pref(ignore_pref)}
+            dirs = [d for d in dirs if os.path.normpath(d) not in ignore]
+    return dirs
+
+
+def get_inactive_audio_dirs() -> list[str]:
+    """Perl ``getInactiveAudioDirs`` — ``Slim/Utils/Misc.pm:758-760``."""
+    return get_dir_pref("ignoreInAudioScan")
+
+
+# ---------------------------------------------------------------------------
+# Library roots (the fallback when ``mediadirs`` is unset)
+# ---------------------------------------------------------------------------
+
+
+def _scanner_root_candidates() -> list[str]:
+    """Paths the scanner could be configured to walk (see :func:`scanner_configured_roots`).
+
+    Split out so tests can substitute a fake scanner configuration: the
+    dataclass defaults are baked into ``ImportConfig.__init__`` at class
+    creation time, so patching the class attribute has no effect on a fresh
+    instance.
+    """
+    from lyrion.media.importer import ImportConfig
+    from lyrion.media.scanner import ScanConfig
+
+    # Read ScanConfig's dataclass default instead of instantiating it:
+    # ``__post_init__`` logs a warning when the path is missing
+    # (scanner.py:170-174), which would spam the log on every browse request.
+    base_default = ScanConfig.__dataclass_fields__["base_path"].default
+    return [str(ImportConfig().source_path), str(base_default)]
+
+
+def scanner_configured_roots() -> list[str]:
+    """The scanner's own configured library roots.
+
+    ``ImportConfig.source_path`` (``media/importer.py:39-52``) is the folder the
+    importer walks; ``ScanConfig.base_path`` (``media/scanner.py:162``) is the
+    scanner default.  Only roots that exist on this machine are returned so the
+    caller can fall through to :func:`db_library_roots`.
+    """
+    seen: list[str] = []
+    for candidate in _scanner_root_candidates():
+        text = str(candidate or "")
+        if text and text not in seen:
+            seen.append(text)
+    return [p for p in seen if os.path.isdir(p)]
+
+
+def db_library_roots(db_path: str | os.PathLike[str] | None = None) -> list[str]:
+    """Derive the scanned library root from the ``tracks`` table.
+
+    The scanner stores absolute ``file://`` URLs, so the longest common
+    directory prefix of the smallest and largest URL is the folder the scanner
+    actually walked.  Used only when no *configured* root exists on disk (e.g.
+    the library lives on a removable/gvfs mount that is not under the compiled
+    default path).  Read-only: the DB is opened with ``mode=ro``.
+    """
+    if db_path is None:
+        try:
+            from lyrion.config import get_config
+
+            db_path = get_config().db_path
+        except Exception:  # pragma: no cover - defensive
+            return []
+    path = Path(db_path)
+    if not path.exists():
+        return []
+    try:
+        con = sqlite3.connect(
+            f"file:{urllib.parse.quote(str(path))}?mode=ro", uri=True
+        )
+    except sqlite3.Error:
+        return []
+    try:
+        row = con.execute(
+            "SELECT MIN(url), MAX(url) FROM tracks WHERE url LIKE 'file://%'"
+        ).fetchone()
+    except sqlite3.Error:
+        return []
+    finally:
+        con.close()
+
+    if not row or not row[0] or not row[1]:
+        return []
+    low, high = str(row[0]), str(row[1])
+    prefix = []
+    for a, b in zip(low, high):
+        if a != b:
+            break
+        prefix.append(a)
+    longest = "".join(prefix)
+    # Drop the (necessarily partial) last path segment.
+    cut = longest.rfind("/")
+    if cut > len("file://"):
+        longest = longest[:cut]
+
+    root = path_from_file_url(longest)
+    return [root] if root and os.path.isdir(root) else []
+
+
+def library_roots() -> list[str]:
+    """Fallback chain when ``mediadirs`` is unset — the scanner's real roots.
+
+    Order (each step only wins when it yields an existing folder):
+
+    1. ``audiodir`` / ``musicdir`` — an explicitly chosen folder.  Perl
+       migrates ``audiodir`` into ``mediadirs`` (``Prefs.pm:687-698``).
+    2. The scanner's configured roots (``ImportConfig.source_path``,
+       ``ScanConfig.base_path``) — what the importer actually walks.
+    3. The root the current library was scanned from, derived from
+       ``tracks.url`` (``db_library_roots``).
+    4. The OS music folder — Perl's ``defaultMediaDirs`` last resort
+       (``Prefs.pm:700-710`` → ``OSDetect::dirsFor('music')``).
+
+    Deliberate deviation from Perl: Perl's ``defaultMediaDirs`` puts the OS
+    music folder *before* anything else, but it only ever runs when the pref
+    was never set.  Here the pref can be empty while a fully populated library
+    (80k tracks on a gvfs/SMB mount) already exists, and ``~/Music`` on such a
+    host is an empty decoy — preferring it would answer ``musicfolder`` with a
+    single unrelated folder instead of the library.  The scanner's real roots
+    therefore come first, and ``~/Music`` is kept as the last resort, so a
+    fresh install still behaves like Perl.
+    """
+    legacy = str(_pref("audiodir", "") or _pref("musicdir", "") or "").strip()
+    if legacy and os.path.isdir(legacy):
+        return [legacy]
+
+    configured = scanner_configured_roots()
+    if configured:
+        return configured
+
+    scanned = db_library_roots()
+    if scanned:
+        return scanned
+
+    default_music = Path.home() / "Music"
+    if default_music.is_dir():
+        return [str(default_music)]
+
+    return []
+
+
+def effective_media_dirs(media_type: str = "audio") -> list[str]:
+    """``mediadirs`` if set, else the library roots.
+
+    Deliberate deviation from Perl: Perl's ``mediadirs`` default already *is*
+    the OS music folder (``defaultMediaDirs``, ``Prefs.pm:687-712``), so it is
+    never empty as long as a music folder exists.  Our store can hand back an
+    empty list (``pref mediadirs ?`` → ``{"mediadirs": ""}`` on the live
+    server), which used to make ``musicfolder`` answer with a single bogus
+    entry instead of the library.  Answering "nothing" would be worse than
+    answering with the roots the scanner actually uses, so we fall back.
+    """
+    dirs = get_media_dirs(media_type)
+    if dirs:
+        return dirs
+    roots = library_roots()
+    if roots:
+        logger.info(
+            "Preference 'mediadirs' is empty — falling back to the scanner's "
+            "library root(s) %s (Perl defaultMediaDirs, "
+            "Slim/Utils/Prefs.pm:687-712)",
+            roots,
+        )
+    else:
+        logger.warning(
+            "Preference 'mediadirs' is empty and no library root could be "
+            "resolved — folder browsing will be empty"
+        )
+    return roots
+
+
+# ---------------------------------------------------------------------------
+# Path <-> URL
+# ---------------------------------------------------------------------------
+
+
+def file_url_from_path(path: str | os.PathLike[str]) -> str:
+    """Perl ``fileURLFromPath`` — ``Slim/Utils/Misc.pm:292-331``.
+
+    ``URI::file`` escapes ``:``/``=``/``,``/space, so
+    ``/run/.../smb-share:server=x,share=y/Musik`` becomes
+    ``file:///run/.../smb-share%3Aserver%3Dx%2Cshare%3Dy/Musik`` — exactly the
+    encoding our ``tracks.url`` values already use.
+    """
+    text = str(path)
+    if text.startswith(_URL_SCHEMES):
+        return text
+    if not text.startswith("/"):
+        text = "/" + text
+    return "file://" + urllib.parse.quote(text, safe="/")
+
+
+def path_from_file_url(url: str | os.PathLike[str]) -> str:
+    """Perl ``pathFromFileURL`` — inverse of :func:`file_url_from_path`."""
+    text = str(url)
+    for scheme in ("file://", "tmp://"):
+        if text.startswith(scheme):
+            text = text[len(scheme):]
+            break
+    return urllib.parse.unquote(text)
+
+
+# ---------------------------------------------------------------------------
+# Directory listing (Perl ``readDirectory``)
+# ---------------------------------------------------------------------------
+
+
+def sort_filenames(names: list[str]) -> list[str]:
+    """Perl ``sortFilename`` — ``Slim/Utils/OS.pm:334-353``.
+
+    ``use locale`` + ``sort { lc($a) cmp lc($b) }`` under the process
+    collation: on a glibc UTF-8 locale ``Accept`` sorts before ``AC+DC``.
+    Falls back to a plain case-insensitive sort when no collation is available.
+    """
+    try:
+        locale.setlocale(locale.LC_COLLATE, "")
+        if locale.setlocale(locale.LC_COLLATE) not in ("C", "POSIX"):
+            return sorted(names, key=locale.strxfrm)
+    except (locale.Error, TypeError, ValueError):
+        pass
+    return sorted(names, key=lambda n: n.lower())
+
+
+def _entry_is_listable(directory: str, name: str) -> bool:
+    """Perl ``fileFilter`` — ``Slim/Utils/Misc.pm:835-909``."""
+    if name in IGNORED_ITEMS:
+        return False                                   # Misc.pm:856-857 / OS.pm:268
+    if _OLD_HISTORY_RE.match(name):
+        return False                                   # Misc.pm:853
+    if name.startswith(".") and len(name) > 1:         # Misc.pm:854
+        return False
+    ignore_re = str(_pref("ignoreDirRE", "") or "")
+    if ignore_re:
+        try:
+            if re.search(ignore_re, name):
+                return False                           # Misc.pm:859-861
+        except re.error:
+            pass
+    full = os.path.join(directory, name)
+    if os.path.isdir(full):
+        return True                                    # dirs always pass (Misc.pm:895-899)
+    try:
+        if not os.path.isfile(full) or not os.access(full, os.R_OK):
+            return False                               # Misc.pm:879-890
+    except OSError:
+        return False
+    suffix = name.rsplit(".", 1)[-1].lower() if "." in name else ""
+    return suffix in LISTABLE_EXTENSIONS               # Misc.pm:900-903
+
+
+def list_directory_entries(
+    directory: str | os.PathLike[str], *, recursive: bool = False
+) -> list[str]:
+    """Perl ``readDirectory`` — ``Slim/Utils/Misc.pm:973-1043``.
+
+    Returns the entry *names* (not paths) of one directory, filtered by
+    :func:`_entry_is_listable` and sorted with :func:`sort_filenames`.  This is
+    the primitive ``findAndScanDirectoryTree`` feeds into ``mediafolderQuery``
+    (``Misc.pm:1131``) — it is **not** the ``readdirectory`` query (that one is
+    ``Slim/Control/Queries.pm:3093-3213`` and lives in ``web/api.py``).
+    """
+    if recursive:
+        # Perl's recursive branch returns full paths from findFilesMatching
+        # (Misc.pm:999-1003); the browse loop however keeps treating the values
+        # as entry names, so we return basenames for both modes (controllers
+        # never request a recursive BMF root — Queries.pm:2207 keeps
+        # ``$params->{recursive}`` unset unless the client sends it).
+        names: list[str] = []
+        for dirpath, dirnames, filenames in os.walk(directory):
+            dirnames[:] = [d for d in dirnames
+                           if _entry_is_listable(dirpath, d)]
+            for entry in dirnames + filenames:
+                if _entry_is_listable(dirpath, entry):
+                    names.append(entry)
+        return names
+
+    try:
+        entries = os.listdir(str(directory))
+    except OSError:
+        logger.debug("readDirectory: opendir on [%s] failed", directory)
+        return []
+    kept = [name for name in entries
+            if _entry_is_listable(str(directory), name)]
+    return sort_filenames(kept)
+
+
+# ---------------------------------------------------------------------------
+# folder_id resolution
+# ---------------------------------------------------------------------------
+
+
+def resolve_folder_id(folder_id: Any) -> str | None:
+    """Resolve a ``folder_id`` token to a directory path.
+
+    Perl resolves it as a numeric ``Track`` id
+    (``Queries.pm:2311-2316`` → ``findAndTrackDirectoryTree``, ``Misc.pm:1067-1074``).
+    Our browse items carry the file URL as ``id`` (see the module docstring), so
+    a client can send back three shapes: a numeric track id, a ``file://`` URL,
+    or a plain path.  All three are accepted; ``None`` means "not resolvable".
+    """
+    token = str(folder_id).strip()
+    if not token:
+        return None
+
+    if token.lstrip("-").isdigit():                    # Perl: numeric Track id
+        url = _track_url_by_id(int(token))
+        if url is None:
+            return None
+        return path_from_file_url(url)
+
+    if token.startswith(_URL_SCHEMES):
+        return path_from_file_url(token)
+
+    return token
+
+
+_RO_CONN: sqlite3.Connection | None = None
+_RO_CONN_PATH: str | None = None
+
+
+def _ro_connection(db_path: str | os.PathLike[str] | None = None) -> sqlite3.Connection | None:
+    """A cached **read-only** SQLite connection to the library DB.
+
+    Browsing one folder asks for the numeric id of every entry (Perl's
+    ``objectForUrl`` — ``Slim/Utils/Misc.pm:1098-1103``); opening a fresh
+    connection per entry would mean hundreds of opens per request.  The
+    connection is opened with ``mode=ro``: folder browsing never writes.
+    """
+    global _RO_CONN, _RO_CONN_PATH
+    if db_path is None:
+        try:
+            from lyrion.config import get_config
+
+            db_path = get_config().db_path
+        except Exception:  # pragma: no cover - defensive
+            return None
+    path = str(db_path)
+    if not os.path.exists(path):
+        return None
+    if _RO_CONN is not None and _RO_CONN_PATH == path:
+        return _RO_CONN
+    try:
+        con = sqlite3.connect(
+            f"file:{urllib.parse.quote(path)}?mode=ro", uri=True
+        )
+    except sqlite3.Error:
+        return None
+    _RO_CONN = con
+    _RO_CONN_PATH = path
+    return con
+
+
+def reset_caches() -> None:
+    """Drop the cached read-only connection (tests / after a rescan)."""
+    global _RO_CONN, _RO_CONN_PATH
+    if _RO_CONN is not None:
+        try:
+            _RO_CONN.close()
+        except sqlite3.Error:  # pragma: no cover - defensive
+            pass
+    _RO_CONN = None
+    _RO_CONN_PATH = None
+
+
+def _track_url_by_id(track_id: int) -> str | None:
+    """Look up ``tracks.url`` by id (read-only), or ``None``."""
+    con = _ro_connection()
+    if con is None:
+        return None
+    try:
+        row = con.execute(
+            "SELECT url FROM tracks WHERE id = ? LIMIT 1", (track_id,)
+        ).fetchone()
+    except sqlite3.Error:
+        return None
+    return str(row[0]) if row and row[0] else None
+
+
+def _track_id_by_url(url: str) -> int | None:
+    """Numeric ``tracks.id`` for a file URL — Perl uses it as the folder id."""
+    con = _ro_connection()
+    if con is None:
+        return None
+    try:
+        row = con.execute(
+            "SELECT id FROM tracks WHERE url = ? LIMIT 1", (url,)
+        ).fetchone()
+    except sqlite3.Error:
+        return None
+    return int(row[0]) if row and row[0] is not None else None
+
+
+# ---------------------------------------------------------------------------
+# The query itself
+# ---------------------------------------------------------------------------
+
+
+def item_type(path: str) -> str:
+    """The ``type`` Perl puts on a ``folder_loop`` item.
+
+    ``Slim/Control/Queries.pm:2472-2485``: ``folder`` for a directory,
+    ``playlist`` for a playlist file, ``track`` for a song, ``unknown`` for
+    everything else.
+    """
+    if os.path.isdir(path):
+        return "folder"
+    suffix = path.rsplit(".", 1)[-1].lower() if "." in path else ""
+    if suffix in PLAYLIST_EXTENSIONS:
+        return "playlist"
+    if suffix in SUPPORTED_EXTENSIONS:
+        return "track"
+    return "unknown"
+
+
+def _folder_item(folder: str, *, volatile: bool = False, tags: str = "") -> dict:
+    """One ``folder_loop`` entry for a directory, Perl shaped.
+
+    Perl: ``id`` (:2429), ``filename`` (:2430), ``type`` (:2472-2487) and the
+    optional tag fields ``coverid``/``duration``/``textkey``/``url``/``title``
+    (:2489-2497).  ``filename`` is the *basename* (``Info::fileName``), and a
+    not-yet-scanned ("volatile") folder in the browse root is shown bracketed
+    (:2423-2427).
+    """
+    url = file_url_from_path(folder)
+    name = os.path.basename(folder.rstrip("/")) or folder
+    display = f"[{name}]" if volatile else name
+    entry: dict = {
+        "id": _track_id_by_url(url) or url,
+        "filename": display,
+        "type": "folder",
+    }
+    if "s" in tags:
+        entry["textkey"] = display[:1].upper()
+    if "u" in tags:
+        entry["url"] = url
+    if "t" in tags:
+        entry["title"] = display
+    return entry
+
+
+def normalize(index: Any, quantity: Any, count: int) -> tuple[bool, int, int]:
+    """Perl ``Request::normalize`` — index/quantity → ``(valid, start, end)``."""
+    try:
+        index = int(index)
+    except (TypeError, ValueError):
+        index = 0
+    if quantity is None:
+        quantity = count
+    try:
+        quantity = int(quantity)
+    except (TypeError, ValueError):
+        return (False, 0, 0)
+    if not quantity or not count:
+        return (False, 0, 0)
+    last = count - 1
+    if index > last:
+        return (False, 0, 0)
+    if index < 0:
+        index = 0
+    start = index
+    end = start + quantity - 1
+    if end > last:
+        end = last
+    return (True, start, end)
+
+
+def mediafolder_result(
+    index: Any = 0,
+    quantity: Any = 0,
+    *,
+    folder_id: Any = None,
+    url: Any = None,
+    media_type: str = "",
+    recursive: bool = False,
+    tags: str = "",
+) -> dict:
+    """Perl ``mediafolderQuery`` — ``Slim/Control/Queries.pm:2169-2507``.
+
+    Returns exactly the Perl result shape for the JSON-RPC handlers::
+
+        {"count": 303,
+         "folder_loop": [{"id": …, "filename": "Accept", "type": "folder"}, …]}
+
+    ``quantity == 0`` yields ``{"count": n}`` only, like Perl (the ``normalize``
+    guard at ``Queries.pm:2385`` skips the loop).
+    """
+    media_dirs = effective_media_dirs(media_type or "audio")
+
+    # Perl :2208-2215 — folders disabled for audio are browsable "volatile"
+    # (tmp://) entries, but only for the audio/unspecified media type.
+    volatile_dirs: list[str] = []
+    if not media_type or media_type == "audio":
+        volatile_dirs = [d for d in get_inactive_audio_dirs() if d]
+    all_dirs = media_dirs + volatile_dirs
+
+    target: str | None = None
+    listing_roots = False
+    if url:
+        target = path_from_file_url(str(url))
+    elif folder_id not in (None, ""):
+        target = resolve_folder_id(folder_id)
+    elif len(all_dirs) > 1:
+        # Perl :2272-2278 — more than one root and no datum: list the roots.
+        listing_roots = True
+    elif all_dirs:
+        target = all_dirs[0]
+
+    if listing_roots:
+        items = [
+            _folder_item(d, volatile=(d in volatile_dirs), tags=tags)
+            for d in all_dirs
+            if os.path.isdir(d)
+        ]
+    else:
+        items = [_child_item(target, name, tags=tags)
+                 for name in list_directory_entries(target, recursive=recursive)] \
+            if target else []
+
+    count = len(items)
+    valid, start, end = normalize(index, quantity, count)
+    result: dict = {"count": count}
+    if valid:
+        result["folder_loop"] = items[start:end + 1]
+    return result
+
+
+def _child_item(directory: str, name: str, *, tags: str = "") -> dict:
+    """One ``folder_loop`` entry for a child of ``directory`` (Perl :2429-2487)."""
+    full = os.path.join(directory, name)
+    url = file_url_from_path(full)
+    entry: dict = {
+        "id": _track_id_by_url(url) or url,
+        "filename": name,
+        "type": item_type(full),
+    }
+    if "s" in tags:
+        entry["textkey"] = name[:1].upper()
+    if "u" in tags:
+        entry["url"] = url
+    if "t" in tags:
+        entry["title"] = name
+    return entry
+
+
+#: ``musicfolderQuery`` is a thin alias of ``mediafolderQuery``
+#: (``Slim/Control/Queries.pm:2161-2167``).
+musicfolder_result = mediafolder_result
