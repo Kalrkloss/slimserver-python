@@ -34,7 +34,6 @@ def counts():
             return {
                 "tracks": q("SELECT COUNT(*) FROM tracks"),
                 "genres": q("SELECT COUNT(*) FROM genres"),
-                "genre_track": q("SELECT COUNT(*) FROM genre_track"),
                 "tracks_genres": q("SELECT COUNT(*) FROM tracks_genres"),
                 "rg_tracks": q("SELECT COUNT(*) FROM tracks WHERE replay_gain IS NOT NULL"),
                 "albums": q("SELECT COUNT(*) FROM albums"),

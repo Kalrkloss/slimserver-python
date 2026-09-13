@@ -480,6 +480,18 @@ class MusicImporter:
                     select(Album).where(
                         Album.titlesort.in_([k[0] for k in album_keys])))).scalars()
             if not a.albumartist_sort}
+        # Zweite Ebene: ALLE Zeilen des Stapels über (titlesort, year). Nötig,
+        # weil der alte UNIQUE-Index (titlesort, year) jede zweite Zeile mit
+        # gleichem Titel+Jahr verbietet: hat eine Zeile schon einen Artist-Sort
+        # (z. B. durch einen Titel mit anderem Künstler-Tag adoptiert), findet
+        # der exakte Schlüssel sie nicht mehr und der Insert stirbt. Bis der
+        # Altindex entfernt ist, wird die Zeile hier gefunden und
+        # wiederverwendet (ein vorhandener Artist-Sort bleibt stehen).
+        album_by_title_year_all: dict[tuple, Album] = {
+            (a.titlesort, a.year): a for a in (
+                await session.execute(
+                    select(Album).where(
+                        Album.titlesort.in_([k[0] for k in album_keys])))).scalars()}
         contrib_by_name: dict[str, Contributor] = {
             c.namespell: c for c in (
                 await session.execute(
@@ -505,7 +517,8 @@ class MusicImporter:
                                          track_by_url, album_by_key,
                                          contrib_by_name, ta_set, tc_set, ac_set,
                                          genre_by_namespell, tg_set, tg_tracks,
-                                         album_by_title_year)
+                                         album_by_title_year,
+                                         album_by_title_year_all)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Import failed for %s: %s", file_path, exc)
                 self.stats.error_files += 1
@@ -597,6 +610,7 @@ class MusicImporter:
         tg_set: set | None = None,
         tg_tracks: set | None = None,
         album_by_title_year: dict[tuple, Album] | None = None,
+        album_by_title_year_all: dict[tuple, Album] | None = None,
     ) -> None:
         """Album + contributor + genre links for a track (Core inserts only)."""
         url = _file_url(file_path)
@@ -621,6 +635,16 @@ class MusicImporter:
                                              year or None), None)
             if album is not None:
                 album.albumartist_sort = artist_key
+                album_by_key[key] = album
+        if album is None and album_by_title_year_all:
+            # Zweite Ebene (siehe Map): gleiche Titel+Jahr-Zeile wiederverwenden,
+            # statt in den alten UNIQUE-Index zu laufen. Ein bereits gesetzter
+            # Artist-Sort bleibt unangetastet.
+            album = album_by_title_year_all.get((_sort_string(album_name),
+                                                 year or None))
+            if album is not None and not album.albumartist_sort:
+                album.albumartist_sort = artist_key
+            if album is not None:
                 album_by_key[key] = album
         if album is None:
             # Cover artwork: scanner found cover.jpg/png/… in the track's

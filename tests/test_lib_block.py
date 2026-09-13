@@ -405,3 +405,40 @@ async def _run_legacy_album_import():
     assert len(rows) == 1, rows                      # adoptiert, nicht neu
     assert rows[0][1] == "a", rows                   # nachgetragen
     assert len(links) == 1 and links[0][1] == 1, links
+
+
+def test_import_reuses_a_legacy_album_row_that_already_has_another_artist_sort():
+    """Zweite Ebene (Live-Scan): hat die Altzeile schon einen Artist-Sort (z. B.
+    durch einen Titel mit anderem Künstler-Tag), findet der exakte Schlüssel sie
+    nicht mehr — der alte UNIQUE-Index (titlesort, year) verbietet aber jede
+    zweite Zeile. Erwartung: Zeile wiederverwenden, kein Absturz, vorhandener
+    Artist-Sort bleibt stehen.
+    """
+    asyncio.run(_run_legacy_album_other_artist())
+
+
+async def _run_legacy_album_other_artist():
+    from sqlalchemy import text as sqltext
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+        await conn.execute(sqltext(
+            "CREATE UNIQUE INDEX uq_legacy_album ON albums (titlesort, year)"))
+    Session = async_sessionmaker(engine, expire_on_commit=False)
+    async with Session() as session:
+        session.add(Album(title="Al", titlesort="al", year=2000,
+                          albumartist_sort="anderer"))
+        await session.commit()
+    importer = MusicImporter()
+    info = SimpleNamespace(title="Neu", artist="A", album="Al", year=2000,
+                           duration=1000, genre="Rock")
+    async with Session() as session:
+        await importer._import_batch(session, [(Path("/m/neu.mp3"), info)])
+        await session.commit()
+        rows = (await session.execute(
+            select(Album.id, Album.albumartist_sort))).all()
+    await engine.dispose()
+    assert len(rows) == 1, rows                    # wiederverwendet
+    assert rows[0][1] == "anderer", rows           # nicht überschrieben
