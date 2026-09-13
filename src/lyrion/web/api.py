@@ -673,6 +673,18 @@ _ROLE_NAMES = {
     1: "ARTIST",
 }
 
+#: Hard ceiling for one ``browselibrary`` library read. Perl answers a browse
+#: from its cached SQL result sets; ours reads sqlite synchronously inside the
+#: event loop, which also serves one full status push per connected cometd
+#: client per second. Live 2026-09-13 17:34:16 the /cometd POST carrying
+#: Squeezer's ``browselibrary items 0 512 mode:albums useContextMenu:1 menu:1``
+#: never produced a response (dev log /tmp/lyrion-live.log:1519; no uvicorn
+#: access line for 192.168.240.112 afterwards) — the app's album list spun
+#: forever. Same guard as the radios fix (d6653d91c): the request path is
+#: bounded and degrades to the Perl-shaped empty answer instead of holding the
+#: connection open.
+_LIBRARY_QUERY_TIMEOUT = 20.0
+
 #: Entitäten von ``playlist <entity> ?`` mit ``_index`` in der Perl-Dispatch-
 #: Form (``Request.pm:551``, ``:553``, ``:559``, ``:560``, ``:575``, ``:581``,
 #: ``:588``): sie arbeiten auf dem Track an diesem Index, ohne Index auf dem
@@ -3985,6 +3997,51 @@ class JSONRPCAPI:
             _cur_artist = _artist.strip()
             _cur_track = _track.strip()
 
+        # Perl's ``remote_title`` for a URL stream — the station/entry title
+        # (``$parentTrack->title`` resp. ``$track->title``, _songData
+        # Queries.pm:5968-5981). Our store for it is ``remote_media.name``
+        # (the radio row the importer writes), the player's ``stream_titles``
+        # map, else the URL host (this file's earlier stand-in). Perl feeds it
+        # in as the stream's ALBUM when there is no album metadata
+        # (_addJiveSong Queries.pm:5611-5615: ``$album = $remote_title``) and
+        # Squeezer renders that ``album`` as the second Now-Playing line
+        # (Song.java:75 + CurrentTrack.java:54-60).
+        station_title = ""
+        if _cur_tid is not None and _local_id(_cur_tid) is None:
+            _cur_url = str(getattr(player, "current_url", "") or _cur_tid)
+            station_title = (getattr(player, "stream_titles", {}) or {}).get(
+                _cur_url, "") or ""
+            if not station_title:
+                try:
+                    _rows = _db_query(
+                        "SELECT name FROM remote_media WHERE url = ? LIMIT 1",
+                        (_cur_url,))
+                    station_title = (_rows[0]["name"] if _rows else "") or ""
+                except Exception:  # noqa: BLE001
+                    station_title = ""
+            if not station_title:
+                # Perl's ``$track->title`` for a bare URL stream (what the
+                # playlist entry carries): our stand-in is the same URL host
+                # the item title uses below.
+                try:
+                    from urllib.parse import urlparse
+                    station_title = (urlparse(_cur_url).hostname or "").replace(
+                        "www.", "")
+                except Exception:  # noqa: BLE001
+                    station_title = ""
+
+        def np_text(title: str, artist: str, album: str) -> str:
+            """Perl ``_addJiveSong``'s multi-line NP text (Queries.pm:5603-5620).
+
+            ``@secondLine = artist, album`` joined with ' - ' and appended to
+            the title as ``$text = $title . "\\n" . $secondLine`` (:5620).
+            Squeezer splits that text on '\\n' into ``name``/``text2``
+            (JiveItem.java:498-508); ``CurrentTrack.name`` is the title line,
+            ``CurrentTrack.text2()``/``album()`` (CurrentTrack.java:54-60) use
+            the second line — the "artist - album" line the app shows.
+            """
+            return title + "\n" + " - ".join(p for p in (artist, album) if p)
+
         for i, tid in enumerate(playlist_ids):
             tid_local = _local_id(tid)
             if tid_local is not None:
@@ -4144,9 +4201,14 @@ class JSONRPCAPI:
             if _stream_img.startswith("html/"):
                 _stream_img = _stream_img[len("html/"):]
             remote_meta = {
-                "title": cur_info.get("title", ""),
-                "artist": cur_info.get("artist", ""),
+                # Perl's remoteMeta is _songData():5900-5955 over the stream —
+                # title/artist are the ICY-parsed pair (live Perl: title
+                # "pulchra somnium", artist "Goabert"), plus 'N' remote_title
+                # (tagMap :5717 / :5968-5981), the station name.
+                "title": _cur_track or cur_info.get("title", ""),
+                "artist": _cur_artist or cur_info.get("artist", ""),
                 "album": cur_info.get("album", ""),
+                "remote_title": station_title,
                 "duration": cur_info.get("duration", 0) or 0,
                 "url": cur_url,
             }
@@ -4177,7 +4239,52 @@ class JSONRPCAPI:
         # Perl: `my $menuMode = defined $menu;` (Queries.pm:4013) — menu:menu
         # schaltet item_loop/count/offset/preset_loop zu (Request.pm-Param).
         menu_mode = "menu:menu" in (args or [])
-        item_loop = loop[win_start:win_end + 1] if win_start <= win_end else []
+        window_loop = loop[win_start:win_end + 1] if win_start <= win_end else []
+        item_loop = window_loop
+        if menu_mode:
+            # Perl's MENU mode builds its own loop through _addJiveSong
+            # (Queries.pm:4411/:4416 into ``item_loop``, tags forced to
+            # 'aAlKNcxJ' :4358) — NOT through _addSong. Every item carries the
+            # discrete NP fields ``track``/``album``/``artist`` (:5637-5651),
+            # the multi-line ``text`` (:5620/:5653) and ``trackType``
+            # radio|local (:5576). Squeezer's parsePlayerStatus reads
+            # messageData["item_loop"][0] (CometClient.java:419-426) and its
+            # Song takes the title from ``track``, the artist from ``artist``
+            # and the album from ``album`` (Song.java:63-75,
+            # CurrentTrack.java:33) — precisely the fields that were missing
+            # for a hirschmilch.de radio stream ("Unknown artist/album").
+            np_loop: list[dict] = []
+            for it in item_loop:
+                np_it = dict(it)
+                line1 = it.get("title") or ""
+                is_remote = it.get("trackType") != "local"
+                if is_remote and it.get("playlist index") == int(cur):
+                    np_track = _cur_track or line1
+                    np_artist = _cur_artist
+                    # Perl's guard for the station-as-album substitution
+                    # (_addJiveSong :5613): only when the station title
+                    # differs from the track title and no album metadata
+                    # exists (``$remote_title ne $title && !$album``).
+                    np_album = station_title if (station_title
+                                                 and station_title != np_track
+                                                 and not it.get("album")) else ""
+                elif is_remote:
+                    np_track, np_artist, np_album = line1, "", ""
+                else:
+                    np_track = line1
+                    np_artist = it.get("artist", "") or ""
+                    np_album = it.get("album", "") or ""
+                np_it["track"] = np_track
+                np_it["artist"] = np_artist
+                np_it["album"] = np_album
+                np_it["trackType"] = "radio" if is_remote else "local"
+                if is_remote and station_title:
+                    # Perl's 'N' tag / _songData:5968-5981; SqueezeJS reads
+                    # playlist_loop[0].remote_title (SqueezeJS Base.js:718).
+                    np_it["remote_title"] = station_title
+                np_it["text"] = np_text(np_track, np_artist, np_album)
+                np_loop.append(np_it)
+            item_loop = np_loop
 
         result: dict = {
             "mode": player.mode,
@@ -4219,7 +4326,10 @@ class JSONRPCAPI:
             # forever when it does not match.
             "seq_no": int(getattr(player, "seq_no", 0) or 0),
             "playlist_timestamp": time.time(),
-            "playlist_loop": item_loop,
+            # The tags window (Perl's _addSong shape / statusQuery:4425-4470)
+            # stays exactly as it is; the MENU loop above is the separate
+            # _addJiveSong shape Perl serves as item_loop.
+            "playlist_loop": window_loop,
         }
         # Perl adds `can_seek` inside the playingSong() branch and only when
         # the song can actually seek (Queries.pm:4086/4104-4107). Song.pm:
@@ -4290,15 +4400,23 @@ class JSONRPCAPI:
         np_artist = cur_info.get("artist", "")
         np_album = cur_info.get("album", "")
         if cur_local is None:
-            result["current_title"] = np_title
-            # StreamTitle "Artist - Title": Perl liest den ICY-Titel über
-            # getCurrentTitle (Queries.pm:4087-4089).
+            # Perl sends the RAW ICY StreamTitle as ``current_title`` for a
+            # remote stream: Queries.pm:4089-4090
+            # ``Slim::Music::Info::getCurrentTitle($client, $url)`` (Info.pm:
+            # 556-581 formats artist and title with the client separator).
+            # Live Perl 9.1.1 (Player 00:00:00:00:00:00, 1.FM stream):
+            # ``current_title: "Goabert - pulchra somnium"`` while remoteMeta
+            # carries the SPLIT ``title: "pulchra somnium"`` /
+            # ``artist: "Goabert"`` and the playlist item ``artist`` +
+            # ``title``. The player object keeps exactly that raw value in
+            # ``current_title``; the split below only feeds the item fields.
+            raw_icy = getattr(player, "current_title", "") or ""
+            result["current_title"] = raw_icy or np_title
             if not np_artist and np_title and " - " in np_title:
                 head, _, tail = np_title.partition(" - ")
                 if tail:
                     np_artist = head.strip()
                     np_title = tail.strip()
-                    result["current_title"] = np_title
         # Die Felder des laufenden Titels gehören an das Item; die Item-Objekte
         # sind dieselben, die in result["playlist_loop"] hängen.
         for it in item_loop:
@@ -4321,6 +4439,35 @@ class JSONRPCAPI:
         if menu_mode:
             result["count"] = len(item_loop)
             result["offset"] = str(win_start)
+            # Perl's menu-mode jive base (Queries.pm:4322-4343): with
+            # useContextMenu a 'more' action pointing at the item's own
+            # ``params`` (_contextMenuBase :6229-6245 + context 'playlist'
+            # :4325-4327), else a 'go' action for trackinfo (:4329-4341).
+            # Squeezer resolves base.actions.more through itemsParams
+            # (JiveItem.java:280 + :585-596) into ``song.moreAction``, and the
+            # fullscreen player status dereferences it WITHOUT a null check:
+            # NowPlayingFragment.java:805 ``pluginItems(song.moreAction, …)``
+            # → SqueezeService.java:1434 ``action.action.cmd``. Without
+            # ``base`` moreAction stays null and opening the fullscreen
+            # Now-Playing throws the NPE the user sees as a crash.
+            # ``params`` is the itemsParams target; every item_loop item
+            # carries it (:5655-5659).
+            if any(str(a) == "useContextMenu:1" for a in (args or [])):
+                result["base"] = {"actions": {"more": {
+                    "player": 0,
+                    "cmd": ["contextmenu"],
+                    "itemsParams": "params",
+                    "params": {"menu": "track", "context": "playlist"},
+                    "window": {"isContextMenu": 1},
+                }}}
+            else:
+                result["base"] = {"actions": {"go": {
+                    "player": 0,
+                    "cmd": ["trackinfo", "items"],
+                    "itemsParams": "params",
+                    "params": {"menu": "nowhere", "useContextMenu": 1,
+                               "context": "playlist"},
+                }}}
         # Player IP:port (Perl sends 'ip:port' of the control connection).
         try:
             result["player_ip"] = f"{player.ip}:{getattr(player, 'port', 0) or 0}"
@@ -5943,11 +6090,20 @@ class JSONRPCAPI:
                          if str(a).startswith("xmlbrowserPlayControl:")),
                         None)
         is_menu = any(str(a) == "menu:1" for a in args)
+        # A browse must ANSWER (see _LIBRARY_QUERY_TIMEOUT): the fetch is
+        # bounded, a starved/timed-out library read degrades to the
+        # Perl-shaped empty answer (BrowseLibrary: count 0 + empty loop)
+        # instead of holding the /cometd POST open — that was the Squeezer
+        # "Meine Musik / Alben dreht sich endlos" symptom.
         try:
-            rows, total, plural, kind = await self._library_rows(
-                mode, start, count, search, filters or None)
-        except Exception:  # noqa: BLE001
-            return {"count": 0, "loop_loop": []}
+            rows, total, plural, kind = await asyncio.wait_for(
+                self._library_rows(mode, start, count, search, filters or None),
+                timeout=_LIBRARY_QUERY_TIMEOUT)
+        except Exception:  # noqa: BLE001 — incl. asyncio.TimeoutError
+            logger.warning("browselibrary %s: library read failed/timed out",
+                           mode)
+            return ({"count": 0, "item_loop": [], "offset": start}
+                    if is_menu else {"count": 0, "loop_loop": []})
 
         # menu:1 → SqueezePlay/Jive MENU window (Perl BrowseLibrary shape:
         # window.style + base.actions + text/type/commonParams items), NOT
@@ -6257,6 +6413,22 @@ class JSONRPCAPI:
                 item["icon"] = "html/images/musicfolder.png"
             else:
                 continue
+            # Perl ships a textkey with every list row (albums:
+            # ``substr($titleSort, 0, 1)`` Queries.pm:5322; artists :1401;
+            # genres/albums via XMLBrowser.pm:1373) — the live 9.1.1 albums
+            # page carries ``"textkey":"-"`` on its first row. Squeezer stores
+            # it as ``JiveItem.textkey`` (JiveItem.java:249) and drives its
+            # A-Z fast scroller from it (JiveItemListActivity.java:420-421);
+            # without the field the scroller popup stays hidden.
+            if "textkey" not in item:
+                if kind == "albums":
+                    item["textkey"] = (r["title"] or "")[:1]
+                elif kind == "artists":
+                    item["textkey"] = (r["name"] or "")[:1]
+                elif kind == "genres":
+                    item["textkey"] = (r["genre"] or "")[:1]
+                elif kind == "years":
+                    item["textkey"] = str(r["year"])[:1]
             out.append(item)
         return out
 
