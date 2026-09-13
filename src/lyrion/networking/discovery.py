@@ -49,7 +49,8 @@ logger = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 DISCOVERY_PORT = 3483
-DEFAULT_HTTP_PORT = 9000      # Perls Standard-httpport (JSON-TLV unten)
+DEFAULT_HTTP_PORT = 9000      # Perls Standard-httpport (nicht angekündigt)
+DEFAULT_NATIVE_PORT = 9080    # nativer Cometd-Port — wird im JSON-TLV angekündigt
 
 
 def server_uuid() -> str:
@@ -357,15 +358,19 @@ class DiscoveryService:
             # /html/...), so the native server answers non-Cometd GETs with
             # a 302 redirect to the real web port — that keeps cover art
             # working without moving the Cometd endpoint.
-            # Der ``JSON``-TLV ist Perls HTTP-Port (live Perl: "JSON\x049000"
-            # gegen "JSON\x049080" bei uns). Apps, die den angekündigten Port
-            # für JSON-RPC nutzen (Squeeze Client), liefen auf 9080 ins Leere
-            # ("sieht den Server, kann aber nicht verbinden"), weil der native
-            # Server dort nur GETs per 302 umleitet und POST /jsonrpc.js nicht
-            # bedient.
-            http_port = int(get_config().get("httpport")
-                            or get_config().get("web_port")
-                            or DEFAULT_HTTP_PORT)
+            # Angekündigt wird der NATIVE Cometd-Port (9080), nicht Perls
+            # Webport 9000. Grund (gemessen 2026-09-13): SqueezePlay baut aus
+            # dieser Adresse seinen kompletten Bayeux-Verkehr und nutzt dabei
+            # den *Streaming*-Transport — der läuft auf dem nativen Port
+            # nachweislich, auf dem HTTP/ASGI-Pfad (9000) noch nicht belastbar
+            # ("SqueezePlay kann nicht verbinden", sobald 9000 angekündigt war).
+            # Der native Server proxyt POST /jsonrpc.js an 9000 weiter
+            # (cometd_stream.py:202-230) und beantwortet sonst GETs mit 302,
+            # daher funktionieren dort auch JSON-RPC-Clients wie Squeeze Client.
+            # Abweichung von Perl (dort JSON=9000), bewusst und hier begründet;
+            # sobald der ASGI-Streaming-Pfad belastbar ist, kann das zurück.
+            http_port = int(get_config().get("cometd_stream_port")
+                            or DEFAULT_NATIVE_PORT)
         except Exception:
             http_port = DEFAULT_HTTP_PORT
 
