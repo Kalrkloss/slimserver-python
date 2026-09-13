@@ -1008,60 +1008,29 @@ async def cmd_musicfolder(
     """musicfolder [<index> <quantity>] [folder_id:<path>] — ONE line.
 
     ``musicfolderQuery`` is a thin wrapper around ``mediafolderQuery``
-    (``Slim/Control/Queries.pm:2165-2167`` → :2169-2350) which fills the
+    (``Slim/Control/Queries.pm:2165-2167`` → :2169-2507) which fills the
     ``folder_loop`` with ``id``, ``filename`` and ``type`` (``'folder'`` for a
     directory, :2472-2487) and adds ``count`` last (:2507).  Live Perl 9.1.1,
     read-only, 2026-09-12: ``musicfolder 0 1`` → ``musicfolder 0 1 id%3A81408
     filename%3A6MzM6F.Fetenhits_Rock_Classics_Best_Of-3CD-2020-NoGroup.nfo
     type%3Afolder count%3A303``.
+
+    Datenquelle ist dieselbe wie im JSON-Pfad
+    (``lyrion.media.folders.musicfolder_result``, von ``web/api.py``
+    ``_json_musicfolder`` gerufen): media dirs (``Slim/Utils/Misc.pm:727-756``)
+    → ``readDirectory`` (Misc.pm:973-1043). Die alte Ableitung aus
+    ``tracks.url`` lieferte ``count=1``.
     """
     if _is_query_echo(args):
         return _echo("musicfolder", args)
     offset, limit, filters = _parse_query_args(args)
-    folder = filters.get("folder_id", "")
-    parent_prefix = folder.rstrip("/")
-    loop: list[dict[str, Any]] = []
-    count = 0
-    if folder:
-        # tracks directly in this folder + one subfolder level
-        rows = await _query_db(
-            "SELECT DISTINCT url FROM tracks WHERE url LIKE ? "
-            "ORDER BY url LIMIT ? OFFSET ?",
-            (parent_prefix + "/%", limit, offset),
-        )
-        names: list[str] = []
-        for r in rows:
-            rel = r["url"][len(parent_prefix) + 1:]
-            names.append(rel.split("/", 1)[0])
-        total = await _query_db(
-            "SELECT COUNT(DISTINCT url) AS n FROM tracks WHERE url LIKE ?",
-            (parent_prefix + "/%",),
-        )
-        count = total[0]["n"] if total else 0
-        names = list(dict.fromkeys(names))
-        loop = [
-            {"id": offset + i + 1, "filename": name, "type": "folder"}
-            for i, name in enumerate(names)
-        ]
-    else:
-        # root: distinct first path components under file:// roots
-        rows = await _query_db(
-            "SELECT DISTINCT url FROM tracks WHERE url LIKE 'file://%' "
-            "ORDER BY url LIMIT 500",
-        )
-        roots: dict[str, str] = {}
-        for r in rows:
-            path = r["url"][len("file://"):].lstrip("/")
-            parts = path.split("/")
-            if len(parts) >= 2:
-                roots.setdefault(parts[0], f"file:///{parts[0]}")
-        names = sorted(roots.keys())
-        count = len(names)
-        page = names[offset:offset + limit]
-        loop = [
-            {"id": offset + i + 1, "filename": name, "type": "folder"}
-            for i, name in enumerate(page)
-        ]
+    from lyrion.media.folders import musicfolder_result
+
+    folder_id = filters.get("folder_id", "") or None
+    url = filters.get("url", "") or None
+    res = musicfolder_result(offset, limit, folder_id=folder_id, url=url)
+    loop = res.get("folder_loop") or []
+    count = int(res.get("count", 0))
     return _command_line(
         ["musicfolder"], args, ["_index", "_quantity"],
         results=[("folder_loop", loop), ("count", count)],

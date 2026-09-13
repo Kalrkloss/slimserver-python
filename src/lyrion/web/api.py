@@ -1,6 +1,7 @@
 """JSON-RPC API for Pyrion Music Server."""
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -662,6 +663,14 @@ _INFO_FEED_MENUS = {
     "albuminfo": "album",
     "artistinfo": "artist",
     "genreinfo": "genre",
+}
+
+#: Perl ``Slim::Schema::Contributor->roleToType`` (Schema.pm) — the role id → role
+#: name map used by ``roles <i> <q> tags:t`` (Queries.pm:3447-3452). Only the
+#: roles our importer writes exist here (1 = artist); an unknown id keeps the
+#: empty string instead of inventing a name.
+_ROLE_NAMES = {
+    1: "ARTIST",
 }
 
 
@@ -2306,6 +2315,152 @@ class JSONRPCAPI:
                 return {"id": 0}
             return {}
 
+        # player <entity> [?]  — playerXQuery (Queries.pm:2514-2576).
+        # Dispatch Request.pm:534-543: ['player', <entity>, '_IDorIndex', '?']
+        # für address|displaytype|id|uuid|ip|model|isplayer|name|canpoweroff,
+        # ['player','count','?'] ohne _IDorIndex (:535).
+        # Live Perl 9.1.1 (nur lesend, 2026-09-13):
+        #   player count ? -> {"_count":3}         (Client.pm clientCount)
+        #   player ip ?    -> {"_ip":"192.168.1.130:45614"}   (ipport)
+        #   player model ? -> {"_model":"squeezelite"}
+        # Ein unbekannter Client liefert KEIN Result (Perl :2553-2556, da
+        # $client undef bleibt) -> leeres Dict.
+        if cmd == "player" and args:
+            entity = str(args[0]).lower()
+            if entity == "count":
+                return {"_count": len(pm.get_all_players()) if pm else 0}
+            if entity in ("address", "displaytype", "id", "uuid", "ip", "model",
+                          "isplayer", "name", "canpoweroff"):
+                client = None
+                # _IDorIndex: MAC direkt nach der Entität (Queries.pm:2533-2545)
+                if len(args) > 1 and str(args[1]) not in ("", "?"):
+                    client = pm.get_player(str(args[1])) if pm is not None else None
+                if client is None and pm is not None and pid:
+                    client = pm.get_player(pid)
+                if client is None:
+                    return {}
+                if entity in ("address", "id"):
+                    return {f"_{entity}": client.mac}
+                if entity == "name":
+                    return {"_name": client.name or ""}
+                if entity == "model":
+                    return {"_model": getattr(client, "model", "") or ""}
+                if entity == "ip":
+                    # Perl ipport() — "ip:port" der Steuerverbindung.
+                    return {"_ip": f"{client.ip}:{getattr(client, 'port', 0) or 0}"}
+                if entity == "isplayer":
+                    return {"_isplayer": 1 if getattr(client, "is_player", True) else 0}
+                if entity == "canpoweroff":
+                    return {"_canpoweroff": 1
+                            if getattr(client, "can_power_off", True) else 0}
+                if entity == "displaytype":
+                    from lyrion.player.manager import display_type_for
+                    dt = display_type_for(getattr(client, "model", "") or "")
+                    return {"_displaytype": dt} if dt is not None else {}
+                return {"_uuid": getattr(client, "uuid", "") or None}
+
+        # rescanprogress  — rescanprogressQuery (Queries.pm:3231-3357),
+        # Dispatch Request.pm:608 (keine Parameter). Ohne Scan: addResult
+        # 'rescan' 0 (:3355-3357). Live Perl 9.1.1, 2026-09-13:
+        #   rescanprogress -> {"rescan":0}
+        if cmd == "rescanprogress":
+            try:
+                from lyrion.media.scan_state import SCAN_STATE
+                scanning = 1 if SCAN_STATE.snapshot().get("scanning") else 0
+            except Exception:  # noqa: BLE001
+                scanning = 0
+            return {"rescan": scanning}
+
+        # roles [<index> <quantity>] [tags:t]  — rolesQuery (Queries.pm:3302-3473),
+        # Dispatch Request.pm:634. SQL :3393-3400 (ohne track_id):
+        #   SELECT DISTINCT contributor_album.role FROM contributors JOIN
+        #   contributor_album … — bei uns die Rollenspalte der Join-Tabelle
+        #   (tracks_contributors.role, role 1 = Artist).
+        # :3471 count zuletzt; das roles_loop (:3433-3460) enthält role_id
+        # (num) und mit tags:t zusätzlich role_name (:3447-3452).
+        # Live Perl 9.1.1, 2026-09-13: roles -> {"count":6}
+        if cmd == "roles":
+            rows = _db_query(
+                "SELECT DISTINCT role AS r FROM tracks_contributors "
+                "WHERE role IS NOT NULL ORDER BY role")
+            roles = [int(r["r"]) for r in rows if r["r"] is not None]
+            total = len(roles)
+            idx_given = bool(args) and str(args[0]).lstrip("-").isdigit()
+            qty_given = len(args) > 1 and str(args[1]).lstrip("-").isdigit()
+            if not idx_given or total <= 0:
+                return {"count": total}
+            start = max(0, int(str(args[0])))
+            if start > total - 1 or (qty_given and int(str(args[1])) <= 0):
+                return {"count": total}
+            limit = int(str(args[1])) if qty_given else total - start
+            tags = next((str(a)[5:] for a in args if str(a).startswith("tags:")), "")
+            loop = []
+            for role in roles[start:start + limit]:
+                item: dict = {"role_id": role}
+                if "t" in tags:
+                    item["role_name"] = _ROLE_NAMES.get(role, "")
+                loop.append(item)
+            return {"count": total, "roles_loop": loop}
+
+        # years [<index> <quantity>]  — yearsQuery (Queries.pm:4949-5056),
+        # Dispatch Request.pm:632. DISTINCT year (ohne hasAlbums über
+        # tracks.year, :4974-4976), count zuletzt (:5055), Loop
+        # 'years_loop' mit year (num) + favorites_url 'db:year.id=<n>'
+        # (:5051-5054). Dieselbe Datenquelle wie der CLI-Pfad
+        # (control/cli_commands.py cmd_years: year > 0, DESC).
+        # Live Perl 9.1.1, 2026-09-13: years 0 2 -> {"count":65,
+        #   "years_loop":[{"year":0,…},{"year":2026,…}]}
+        if cmd == "years":
+            has_albums = any(str(a) == "hasAlbums:1" for a in args)
+            year_filter = next((str(a)[5:] for a in args
+                                if str(a).startswith("year:")), None)
+            table = "albums" if has_albums else "tracks"
+            where = "year IS NOT NULL AND year > 0"
+            params: tuple = ()
+            if year_filter is not None and str(year_filter).lstrip("-").isdigit():
+                where += " AND year = ?"
+                params = (int(str(year_filter)),)
+            rows = _db_query(
+                f"SELECT DISTINCT year AS y FROM {table} WHERE {where} "
+                "ORDER BY year DESC", params)
+            years = [int(r["y"]) for r in rows if r["y"] is not None]
+            total = len(years)
+            rescan = 0
+            try:
+                from lyrion.media.scan_state import SCAN_STATE
+                rescan = 1 if SCAN_STATE.snapshot().get("scanning") else 0
+            except Exception:  # noqa: BLE001
+                pass
+            result: dict = {} if not rescan else {"rescan": 1}
+            idx_given = bool(args) and str(args[0]).lstrip("-").isdigit()
+            qty_given = len(args) > 1 and str(args[1]).lstrip("-").isdigit()
+            start = int(str(args[0])) if idx_given else 0
+            limit = int(str(args[1])) if qty_given else total
+            if (idx_given or qty_given) and total > 0 and start <= total - 1 \
+                    and limit > 0:
+                result["years_loop"] = [
+                    {"year": y, "favorites_url": f"db:year.id={y}"}
+                    for y in years[start:start + min(limit, total)]
+                ]
+            result["count"] = total
+            return result
+
+        # apps [<index> <quantity>]  — OPML-basierte Menü-Queries.
+        # Dispatch entsteht pro is_app-Plugin als ['apps','_index','_quantity']
+        # (Slim/Plugin/OPMLBased.pm:26-28, :125-132) mit cliRadiosQuery
+        # (:181-280) als Handler; Item-Form ohne menu-Parameter (:252-258)
+        # {cmd, name, type, icon, weight}, weight-Default 1000 (:34),
+        # type 'xmlbrowser' für link / 'xmlbrowser_search' für search
+        # (:249-254). Loop-Name und count kommen aus dynamicAutoQuery
+        # (Queries.pm:5384 '$query . "s_loop"', :5443 count zuletzt).
+        # Live Perl 9.1.1, 2026-09-13: apps 0 5 -> {"count":1,
+        #   "appss_loop":[{"type":"xmlbrowser","cmd":"sounds","weight":90,
+        #                  "name":"Sounds & Effekte","icon":"plugins/…"}]}
+        # Dieser Port hat keine is_app/OPML-Plugins → leere Liste, aber die
+        # Perl-Form (count + appss_loop).
+        if cmd == "apps":
+            return await self._json_apps(args)
+
         # lastscan …  — Perl hat dafür KEINEN Dispatch-Eintrag (Request.pm)
         # und schließt den Socket ohne Body; live für ["lastscan","?"] und
         # ["lastscan"]. Der Controller liest den Wert aus 'serverstatus'
@@ -2574,6 +2729,10 @@ class JSONRPCAPI:
             return await self._json_info_total(args)
 
         # ── Browse commands (library) ──────────────────────────────
+        # tracks → titlesQuery (Request.pm:629) — dieselbe Antwort wie
+        # songs/titles, nur ein anderer Dispatch-Alias.
+        if cmd == "tracks":
+            return await self._json_browse("titles", args)
         if cmd in ("albums", "artists", "genres", "songs", "titles",
                    "musicfolder", "radios", "songinfo",
                    "contributors", "browse"):
@@ -3918,6 +4077,10 @@ class JSONRPCAPI:
         # its absolute "playlist index" so the client can map window → queue.
         # (Perl: normalize($index, $quantity, $songCount), Queries.pm:4425.)
         win_start, win_end = self._status_window(args, int(cur), len(playlist_ids))
+
+        # Perl: `my $menuMode = defined $menu;` (Queries.pm:4013) — menu:menu
+        # schaltet item_loop/count/offset/preset_loop zu (Request.pm-Param).
+        menu_mode = "menu:menu" in (args or [])
         item_loop = loop[win_start:win_end + 1] if win_start <= win_end else []
 
         result: dict = {
@@ -3963,15 +4126,34 @@ class JSONRPCAPI:
             "playlist_loop": item_loop,
         }
         # Perl adds `can_seek` inside the playingSong() branch and only when
-        # the song can actually seek (Queries.pm:4086/4104-4107): for a local
-        # file the format class must implement canSeek (File.pm:403-415), for
-        # a remote URL the bitrate AND duration must be known
-        # (HTTP.pm:1150-1155 — we do not know a live stream's duration, so no
-        # field for radio).
-        if player.mode != "stop" and cur_local is not None:
-            fmt = _local_format_from_url(str(cur_info.get("url") or ""))
-            if fmt in SEEKABLE_FORMATS:
-                result["can_seek"] = 1
+        # the song can actually seek (Queries.pm:4086/4104-4107). Song.pm:
+        # 849-870 (canDoSeek) delegiert an den Protokoll-Handler: für lokale
+        # Dateien an die Formatklasse (`sub canSeek { 1 }`, z. B. MP3.pm:476),
+        # für einen Remote-Stream an Slim/Player/Protocols/HTTP.pm:1150-1165 —
+        # seekbar nur, wenn Bitrate UND Dauer bekannt sind.
+        if player.mode != "stop":
+            if cur_local is not None:
+                fmt = _local_format_from_url(str(cur_info.get("url") or ""))
+                if fmt in SEEKABLE_FORMATS:
+                    result["can_seek"] = 1
+            else:
+                _bitrate = int(
+                    (cur_info.get("bitrate") if isinstance(cur_info, dict) else 0)
+                    or getattr(player, "bitrate", 0) or 0)
+                if not _bitrate:
+                    # Dieselbe Quelle wie die Radio-Liste: die gespeicherte
+                    # Station (remote_media.bitrate).
+                    try:
+                        _rows = _db_query(
+                            "SELECT bitrate FROM remote_media WHERE url = ? "
+                            "LIMIT 1",
+                            (str(getattr(player, "current_url", "") or ""),))
+                        _bitrate = int((_rows[0]["bitrate"] if _rows else 0) or 0)
+                    except Exception:  # noqa: BLE001
+                        _bitrate = 0
+                _stream_dur = float(getattr(player, "duration", 0) or 0)
+                if _bitrate and _stream_dur > 0:
+                    result["can_seek"] = 1
         # Perl: `my $trackGain = $song->replayGain(); if (defined $trackGain)
         # { addResult('replay_gain', $trackGain) }` (Queries.pm:4109-4112). Der
         # Wert ist das Ergebnis von ReplayGain->fetchGainMode (ReplayGain.pm:
@@ -4001,37 +4183,48 @@ class JSONRPCAPI:
         # (Queries.pm:4086-4097); a stopped player has no such field.
         if player.mode == "stop":
             result.pop("rate", None)
-        # Jive/SqueezePlay Now Playing reads the current_* fields (not
-        # 'title'): a radio stream shows its StreamTitle, a local track its
-        # title/artist/album. SqueezePlay otherwise shows a blank line.
+        # Perl sendet die Songfelder des laufenden Titels NICHT auf der
+        # Antwort-Ebene: `current_title` nur beim Remote-Stream
+        # (Queries.pm:4084-4090), album/artist über die tags am Item des
+        # aktuellen Titels in playlist_loop (:4425-4470). Wir reichern daher
+        # das aktuelle Item an, statt Felder nach oben lecken zu lassen
+        # (Harness-Befund: album, artist, count, current_album,
+        # current_artist, current_url).
         np_title = cur_info.get("title", "")
         np_artist = cur_info.get("artist", "")
         np_album = cur_info.get("album", "")
-        result["current_title"] = np_title
-        result["current_artist"] = np_artist
-        result["current_album"] = np_album
-        result["current_url"] = getattr(player, "current_url", "") or ""
-        # Squeezer/SqueezePlay also read the bare 'track'/'artist'/'album'
-        # (and often a 'track' key for the now-playing line). For a radio
-        # stream, give the stream name as track and parse "Artist - Title"
-        # from the StreamTitle so at least the track line is never blank.
-        result["track"] = np_title
-        if not np_artist and np_title and " - " in np_title:
-            head, _, tail = np_title.partition(" - ")
-            if tail:
-                result["artist"] = head.strip()
-                result["track"] = tail.strip()
-                result["current_artist"] = head.strip()
-                result["current_title"] = tail.strip()
-        if not result.get("artist"):
-            result.setdefault("artist", np_artist)
-        if not result.get("album"):
-            result.setdefault("album", np_album)
-        # SqueezeClient's PlayerStatusResponse declares 'count: Int' and
-        # 'offset: String?' WITHOUT defaults — a missing count crashes the
-        # app on connect. Perl parity: count = number of items returned.
-        result["count"] = len(item_loop)
-        result["offset"] = str(win_start)
+        if cur_local is None:
+            result["current_title"] = np_title
+            # StreamTitle "Artist - Title": Perl liest den ICY-Titel über
+            # getCurrentTitle (Queries.pm:4087-4089).
+            if not np_artist and np_title and " - " in np_title:
+                head, _, tail = np_title.partition(" - ")
+                if tail:
+                    np_artist = head.strip()
+                    np_title = tail.strip()
+                    result["current_title"] = np_title
+        # Die Felder des laufenden Titels gehören an das Item; die Item-Objekte
+        # sind dieselben, die in result["playlist_loop"] hängen.
+        for it in item_loop:
+            if it.get("playlist index") == int(cur):
+                it.setdefault("track", np_title)
+                if np_artist:
+                    it.setdefault("artist", np_artist)
+                if np_album:
+                    it.setdefault("album", np_album)
+                if cur_local is None:
+                    it["current_album"] = np_album
+                    it["current_artist"] = np_artist
+                    it["current_url"] = getattr(player, "current_url", "") or ""
+                break
+        # count/offset hängen bei Perl am menuMode (`if ($menuMode) { …
+        # addResult("count", $menuCount) }` Queries.pm:4325-4332; offset
+        # :4401) — der reine Status trägt sie nicht. HINWEIS: Squeezer liest
+        # für ein Jive-Menü weiterhin count (menu:menu), andere Abfragen
+        # bekommen jetzt die Perl-Form.
+        if menu_mode:
+            result["count"] = len(item_loop)
+            result["offset"] = str(win_start)
         # Player IP:port (Perl sends 'ip:port' of the control connection).
         try:
             result["player_ip"] = f"{player.ip}:{getattr(player, 'port', 0) or 0}"
@@ -4040,10 +4233,10 @@ class JSONRPCAPI:
         # Web-UI-only conveniences (the Perl LMS does NOT send these in
         # status; our SPA/SqueezeTray read them). Kept out of the strict
         # parity path — apps that compare key sets see Perl shape.
+        # album/artist stehen bei Perl ausschließlich am playlist_loop-Item
+        # (tags l/a) und wurden oben dorthin verschoben.
         if not tags or True:  # cheap: keep for local UI consumers
-            result.setdefault("artist", cur_info.get("artist", ""))
             result.setdefault("title", cur_info.get("title", ""))
-            result.setdefault("album", cur_info.get("album", ""))
             # Duration: for a LOCAL track the real DB length (Perl
             # `$song->duration()`, Queries.pm:4101) — never 0 and never the
             # elapsed position (that pinned SqueezePlay's progress bar at
@@ -5240,68 +5433,163 @@ class JSONRPCAPI:
         }
 
     async def _radio_stations_loop(self) -> list[dict]:
-        """Build the item_loop for the Radio directory. Falls back to the
-        remote-URL favorites (the user's radio/streams) when the Radio
-        Manager has no persisted stations, so the list is never empty."""
+        """The Radio directory entries, in Perl's ``radioss_loop`` item shape.
+
+        Data sources: persisted stations (``remote_media``) first, else the
+        remote-URL favorites. Both awaits run under a short timeout: the
+        2026-09-13 live incident showed this handler stalling for >25 s when
+        the async DB session/favorites path is starved (a client flood kept
+        the loop busy); ``radios`` must never block the request forever.
+        Perl's item form comes from ``Slim/Plugin/OPMLBased.pm:252-258``
+        (``cmd``/``name``/``type``/``icon``/``weight``, weight default 1000
+        :34); our ``id``/``url``/``text``/``actions`` extras stay because the
+        Android controllers read them.
+        """
+        def _perl_item(name: str, url: str, item_id: str) -> dict:
+            return {
+                # Perl-Form (OPMLBased.pm:252-258): cmd = Plugin-Tag
+                "cmd": url or item_id,
+                "name": name,
+                "type": "xmlbrowser",
+                "icon": "html/images/radio.png",
+                "weight": 1000,
+                # unsere Aliasse für Squeezer/SqueezeCtrl/SPA
+                "id": item_id,
+                "text": name,
+                "url": url,
+                "hasitems": 0,
+                "actions": {
+                    "play": {"player": 0, "cmd": ["playlist", "play"],
+                             "params": {"item_id": item_id}},
+                    "do": {"player": 0, "cmd": ["playlist", "play"],
+                           "params": {"item_id": item_id}},
+                },
+            }
+
         try:
             from lyrion.music.radio import get_radio_manager
-            stations = await get_radio_manager().list_stations()
+            stations = await asyncio.wait_for(
+                get_radio_manager().list_stations(), timeout=2.0)
             if stations:
-                return [
-                    {
-                        "id": str(s.id),
-                        "name": s.name,
-                        "text": s.name,
-                        "url": s.url,
-                        "type": "audio",
-                        "hasitems": 0,
-                        "actions": {
-                            "play": {"player": 0, "cmd": ["playlist", "play"],
-                                     "params": {"item_id": str(s.id)}},
-                            "do": {"player": 0, "cmd": ["playlist", "play"],
-                                   "params": {"item_id": str(s.id)}},
-                        },
-                    }
-                    for s in stations
-                ]
+                return [_perl_item(s.name or "", s.url or "", str(s.id))
+                        for s in stations]
         except Exception:  # noqa: BLE001
             pass
         # Fallback: favorites that point at a remote stream (a URL).
         try:
             from lyrion.music.favorites import get_favorites_manager
             fm = get_favorites_manager()
-            loop = await self._fav_items_loop(fm, None, "0", False)
+            loop = await asyncio.wait_for(
+                self._fav_items_loop(fm, None, "0", False), timeout=2.0)
             out = []
             for it in loop:
                 url = it.get("url") or ""
                 if not str(url).startswith(("http://", "https://", "mms://", "rtp://")):
                     continue
-                name = it.get("text") or it.get("name") or "Radio"
-                out.append({
-                    "id": str(it.get("id", "")),
-                    "name": name,
-                    "text": name,
-                    "url": url,
-                    "type": "audio",
-                    "hasitems": 0,
-                    "actions": {
-                        "play": {"player": 0, "cmd": ["playlist", "play"],
-                                 "params": {"item_id": str(it.get("id", ""))}},
-                        "do": {"player": 0, "cmd": ["playlist", "play"],
-                               "params": {"item_id": str(it.get("id", ""))}},
-                    },
-                })
+                out.append(_perl_item(
+                    str(it.get("text") or it.get("name") or "Radio"),
+                    str(url), str(it.get("id", ""))))
             return out
         except Exception:  # noqa: BLE001
             return []
 
-    async def _json_radios(self, cmd: str, args: list[str]) -> dict:
-        """radios [start count] — the Radio directory as a browse list.
+    async def _json_apps(self, args: list[str]) -> dict:
+        """``apps [<index> <quantity>]`` — OPML-based app menus.
 
-        The controllers open it from the home-menu 'Radio' item
-        (actions.go = ['browse','radios'] or the bare 'radios' query)."""
+        Perl builds the dispatch per ``is_app`` plugin as
+        ``['apps','_index','_quantity']`` (``Slim/Plugin/OPMLBased.pm:26-28``,
+        :125-132) and answers with the item form ``cmd``/``name``/``type``/
+        ``icon``/``weight`` (:252-258, weight default 1000 :34), the loop name
+        ``appss_loop`` and ``count`` last (``Slim/Control/Queries.pm:5384``,
+        :5443). Live Perl 9.1.1, read-only 2026-09-13::
+
+            apps 0 5 -> {"count":1,"appss_loop":[{"type":"xmlbrowser",
+                        "cmd":"sounds","weight":90,"name":"Sounds & Effekte",
+                        "icon":"plugins/Sounds/html/images/icon.png"}]}
+
+        This port ships no ``is_app``/OPML plugin (no equivalent of
+        ``Plugins/Sounds``), so the list is empty — but the Perl form
+        (``count`` + ``appss_loop``) is kept so clients find the loop key.
+        """
+        start = int(str(args[0])) if args and str(args[0]).isdigit() else 0
+        qty = int(str(args[1])) if len(args) > 1 and str(args[1]).isdigit() else 0
+        apps: list[dict] = []
+        count = len(apps)
+        page = apps[start:start + qty] if (qty > 0 and start <= count - 1) else \
+            (apps if qty <= 0 else [])
+        return {"count": count, "appss_loop": page}
+
+    async def _json_musicfolder(self, args: list[str]) -> dict:
+        """``musicfolder [<index> <quantity>] [folder_id:|url:] [tags:]``.
+
+        Shared primitive ``lyrion.media.folders.musicfolder_result`` —
+        Perl ``mediafolderQuery``, of which ``musicfolderQuery`` is a thin
+        alias (``Slim/Control/Queries.pm:2161-2167`` → :2169-2507). It
+        resolves the media dirs (``Slim/Utils/Misc.pm:727-756``), lists the
+        folder through ``readDirectory`` (Misc.pm:973-1043) and emits
+        ``count`` + ``folder_loop`` with item keys ``id``/``filename``/
+        ``type`` (:2384-2470, count last :2507).
+
+        Live (read-only) 2026-09-12/13, Perl 9.1.1: ``musicfolder 0 100`` →
+        ``{"count":303,"folder_loop":[{"id":…,"filename":"Accept","type":
+        "folder"}, …]}``.  ``item_loop``/``loop_loop``/``offset`` are our
+        additive aliases (Jive/Material read ``item_loop``); ``folder_loop``
+        is always present like Perl.
+        """
+        from lyrion.media.folders import musicfolder_result
+
+        index = str(args[0]) if args and str(args[0]).lstrip("-").isdigit() else "0"
+        quantity = (str(args[1])
+                    if len(args) > 1 and str(args[1]).lstrip("-").isdigit()
+                    else "0")
+        folder_id = next((str(a)[10:] for a in args
+                          if str(a).startswith("folder_id:")), None)
+        url = next((str(a)[4:] for a in args if str(a).startswith("url:")), None)
+        tags = next((str(a)[5:] for a in args if str(a).startswith("tags:")), "")
+        res = musicfolder_result(index, quantity, folder_id=folder_id, url=url,
+                                 tags=tags)
+        loop = res.get("folder_loop")
+        if loop is not None:
+            res["item_loop"] = loop
+            res["loop_loop"] = loop
+            try:
+                res["offset"] = int(index)
+            except (TypeError, ValueError):
+                res["offset"] = 0
+        return res
+
+    async def _json_radios(self, cmd: str, args: list[str]) -> dict:
+        """``radios [<start> <count>]`` — Perl ``radioss_loop``.
+
+        The controllers open the Radio directory from the home-menu 'Radio'
+        item (``actions.go`` = ``['browse','radios']`` or the bare ``radios``
+        query). Perl implements it through the OPML plugins: the dispatch is
+        ``['radios','_index','_quantity']`` (``Slim/Plugin/OPMLBased.pm:129-
+        132``), the handler chains ``cliRadiosQuery`` (:181-280) and
+        ``dynamicAutoQuery`` names the loop ``$query . 's_loop'`` with
+        ``count`` last (``Slim/Control/Queries.pm:5384``, :5443).
+
+        Live Perl 9.1.1, read-only 2026-09-13::
+
+            radios 0 10 -> {"count":10,"radioss_loop":[{"cmd":"presets",
+                           "type":"xmlbrowser","icon":"/plugins/TuneIn/…",
+                           "weight":5,"name":"Eigene Voreinstellungen"}, …]}
+        """
         loop = await self._radio_stations_loop()
-        return self._browse_response(loop)
+        start = int(str(args[0])) if args and str(args[0]).isdigit() else 0
+        qty = int(str(args[1])) if len(args) > 1 and str(args[1]).isdigit() else 0
+        count = len(loop)
+        # Ohne Quantity liefern wir die volle Liste (Additiv-Abweichung: Perls
+        # dynamicAutoQuery antwortet dann ohne Result, aber das Jive-Home-
+        # Action 'radios menu:radio' bzw. bar 'radios' muss die Sender zeigen —
+        # vorher kam hier immer die volle Browse-Antwort).
+        if qty > 0:
+            page = loop[start:start + qty] if start <= count - 1 else []
+        else:
+            page = loop
+        # Additive aliases for our Jive/Material/SPA consumers.
+        return {"count": count, "radioss_loop": page,
+                "item_loop": page, "loop_loop": page, "offset": start}
 
     async def _json_radiosearch(self, cmd: str, args: list[str]) -> dict:
         """radiosearch <start> <count> term:<text> — search radio stations.
@@ -6120,8 +6408,13 @@ class JSONRPCAPI:
                 except Exception:
                     return self._browse_response([])
             if target == "radios":
-                loop = await self._radio_stations_loop()
-                return self._browse_response(loop)
+                # Jive's browse wrapper for the Radio node — same Perl form
+                # as the bare 'radios' query (radioss_loop).
+                return await self._json_radios("radios", rest)
+            if target == "apps":
+                return await self._json_apps(rest)
+            if target in ("musicfolder", "bmf", "folder"):
+                return await self._json_musicfolder(rest)
             return self._browse_response([])
 
         start = int(args[0]) if args and str(args[0]).isdigit() else 0
@@ -6448,39 +6741,13 @@ class JSONRPCAPI:
                 # clients — Perl sends only ``count`` + ``genres_loop`` here.
                 plural = "genres_loop"
             elif cmd == "musicfolder":
-                # folder browser derived from the track URLs
-                folder = filters.get("search", "")
-                if folder:
-                    rows = db.execute(
-                        "SELECT DISTINCT url FROM tracks WHERE url LIKE ? "
-                        "ORDER BY url LIMIT ? OFFSET ?",
-                        (folder.rstrip("/") + "/%", count, start)).fetchall()
-                    names: list[str] = []
-                    for r in rows:
-                        rel = r["url"][len(folder.rstrip("/")) + 1:]
-                        names.append(rel.split("/", 1)[0])
-                    loop = [{"id": str(folder.rstrip("/") + "/" + name), "name": name,
-                             "text": name, "type": "folder", "hasitems": 1}
-                            for name in dict.fromkeys(names)]
-                    total = db.execute(
-                        "SELECT COUNT(DISTINCT url) FROM tracks WHERE url LIKE ?",
-                        (folder.rstrip("/") + "/%",)).fetchone()[0]
-                else:
-                    rows = db.execute(
-                        "SELECT DISTINCT url FROM tracks WHERE url LIKE 'file://%' "
-                        "ORDER BY url LIMIT 500").fetchall()
-                    roots: dict[str, str] = {}
-                    for r in rows:
-                        path = r["url"][len("file://"):].lstrip("/")
-                        parts = path.split("/")
-                        if len(parts) >= 2:
-                            roots.setdefault(parts[0], f"file:///{parts[0]}")
-                    names = sorted(roots)
-                    page = names[start:start + count]
-                    loop = [{"id": roots[n], "name": n, "text": n,
-                             "type": "folder", "hasitems": 1} for n in page]
-                    total = len(names)
-                plural = plural or "musicfolder_loop"
+                # mediafolderQuery/musicfolderQuery (Queries.pm:2161-2507) —
+                # the shared primitive lyrion.media.folders reads the media
+                # dirs (Misc.pm:727-756) and emits count + folder_loop with
+                # id/filename/type. The old handler derived the listing from
+                # tracks.url and answered count=1 (live Perl: 303).
+                db.close()
+                return await self._json_musicfolder(args)
             elif cmd == "songinfo":
                 tid = filters.get("track_id") or (args[0] if args and str(args[0]).isdigit() else "")
                 if not str(tid).isdigit():

@@ -589,12 +589,25 @@ def test_years_loop_matches_the_live_perl_line(monkeypatch):
 
 
 def test_musicfolder_loop_matches_the_live_perl_line(monkeypatch):
-    async def stub(sql: str, params: tuple = ()) -> list[dict]:
-        if "DISTINCT url" in sql and "COUNT" not in sql:
-            return [{"url": "file:///home/Musik/track.nfo"}]
-        return [{"n": 303}]
+    """Angepasst 2026-09-13: ``cmd_musicfolder`` liest nicht mehr aus
+    ``tracks.url`` (das lieferte ``count=1``), sondern aus der gemeinsamen
+    Primitive ``lyrion.media.folders.musicfolder_result``
+    (``mediafolderQuery``, Queries.pm:2161-2167 → :2169-2507; media dirs
+    Misc.pm:727-756, ``readDirectory`` Misc.pm:973-1043). Der Stub liefert
+    deshalb die Live-Perl-Werte selbst — die gerenderte Zeile bleibt wörtlich
+    ``PERL_MUSICFOLDER_0_1``."""
+    from lyrion.media import folders
 
-    monkeypatch.setattr(cli_commands, "_query_db", stub)
+    def stub(index: Any = 0, quantity: Any = 0, **kw: Any) -> dict:
+        return {"count": 303,
+                "folder_loop": [{
+                    "id": 81408,
+                    "filename": "6MzM6F.Fetenhits_Rock_Classics_Best_Of-"
+                                "3CD-2020-NoGroup.nfo",
+                    "type": "folder",
+                }]}
+
+    monkeypatch.setattr(folders, "musicfolder_result", stub)
     out = _dispatch("musicfolder", ["0", "1", "folder_id:file:///home"])
     line = out[0]
     assert line.startswith("musicfolder 0 1 folder_id%3Afile%3A%2F%2F%2Fhome ")
