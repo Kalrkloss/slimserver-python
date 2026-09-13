@@ -113,7 +113,7 @@ import struct
 from collections.abc import Coroutine, Sequence
 from dataclasses import dataclass, field
 from enum import IntFlag
-from typing import Any, Callable
+from typing import Any, Callable, Literal
 from urllib.parse import urlparse
 import time
 
@@ -133,6 +133,44 @@ except ImportError:
     pass
 
 logger = logging.getLogger(__name__)
+
+
+# ── StreamingController wiring (PROT-14) ────────────────────────────────────
+# Perl drives every playback transition through one jump table
+# (Slim/Player/StreamingController.pm:110-245, `_eventAction` :249-311). These
+# two helpers feed the live SlimProto paths into that machine
+# (lyrion.player.streaming) so the states/transitions have exactly ONE home.
+# Both are failure-proof: they never raise into the caller and — for
+# `_streaming_mode` — always fall back to the constant this module used before,
+# so a controller that has not seen the full event sequence cannot change the
+# reported `player.mode`.
+PlayerMode = Literal["stop", "play", "pause", "loading"]
+
+
+def _streaming_note(mac: str, event: str, **params) -> None:
+    """Feed a StreamingController event (no status mode is needed)."""
+    try:
+        from lyrion.player import streaming
+        streaming.apply_event(mac, event, **params)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("streaming event %s for %s failed: %s", event, mac, exc)
+
+
+def _streaming_mode(mac: str, event: str, fallback: PlayerMode, **params) -> PlayerMode:
+    """Feed a Perl controller event and return the status ``mode``.
+
+    The event is one Perl reports as a play state (``Started``/``Pause``/
+    ``Resume``/``Stopped``/``StreamingFailed`` → ``EVENT_MODE``); ``fallback``
+    is the value this module assigned before the wiring.
+    """
+    try:
+        from lyrion.player import streaming
+        mode = streaming.apply_event(mac, event, **params)
+        if mode in ("stop", "play", "pause", "loading"):
+            return mode
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("streaming event %s for %s failed: %s", event, mac, exc)
+    return fallback
 
 # Player buffer threshold, in KB of audio the player buffers before it
 # starts decoding — carried in the strm frame. Perl values:
@@ -1904,6 +1942,14 @@ class SlimProtoClient:
             self._player_connections.get(mac_key, 0) + 1
         )
         self._reset_strm_guard(mac_key, "player (re)connected")
+        # PROT-14: a (re)connect starts a fresh controller state (Perl builds
+        # a new controller per client, StreamingController.pm:46-87).
+        try:
+            from lyrion.player import streaming
+            streaming.reset(mac_key)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("streaming reset on connect failed for %s: %s",
+                         mac_key, exc)
 
     async def send_flush_to_player(self, mac: str) -> bool:
         """Send a 'strm' flush command ('f') to a player.
@@ -1927,6 +1973,7 @@ class SlimProtoClient:
             # A flush tears the player's buffers down — the next play of the
             # same track MUST send a fresh strm frame, so clear the guard.
             self._reset_strm_guard(mac, "strm 'f' (flush) sent")
+            _streaming_note(mac, "Flush")
             logger.info("Sent strm 'f' (flush) to %s", mac)
             return True
         except (ConnectionError, OSError, RuntimeError):
@@ -2333,6 +2380,14 @@ class SlimProtoClient:
                         _p.playing_track_id = None
             except Exception:  # noqa: BLE001
                 pass
+            # PROT-14: our strm frame is out, so Perl's `_Stream` tail applies —
+            # nextTrack cleared, playing BUFFERING, streaming STREAMING
+            # (StreamingController.pm:1350-1352).
+            try:
+                from lyrion.player import streaming
+                streaming.note_strm_sent(mac, track_id)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("streaming note_strm_sent failed for %s: %s", mac, exc)
             logger.info("Sent strm to %s: track=%d codec=%s", mac, track_id, codec)
             return True
         except (ConnectionError, OSError, RuntimeError) as exc:
@@ -2713,6 +2768,7 @@ class SlimProtoClient:
             # readyToStream(1) (Squeezebox.pm:206-216). The player has no
             # stream any more, so the next play MUST re-stream (R0.5-P1).
             self._reset_strm_guard(mac, "strm 'q' (stop) sent")
+            _streaming_note(mac, "Stop", suppress_notifications=True)
             logger.info("Sent strm 'q' (stop) to %s", mac)
             return True
         except (ConnectionError, OSError, RuntimeError):
@@ -2736,6 +2792,9 @@ class SlimProtoClient:
         try:
             writer.write(frame)
             await writer.drain()
+            # Perl pause() = stream('p') → controller `Pause` → PAUSED with
+            # resumeTime = playingSongElapsed (StreamingController.pm:1552-1586).
+            _streaming_note(mac, "Pause")
             logger.info("Sent strm 'p' (pause=%d) to %s", pause_ms, mac)
             return True
         except (ConnectionError, OSError, RuntimeError):
@@ -2756,6 +2815,9 @@ class SlimProtoClient:
         try:
             writer.write(frame)
             await writer.drain()
+            # Perl resume() = stream('u') → controller `Resume` → PLAYING,
+            # resumeTime cleared (StreamingController.pm:1620-1656).
+            _streaming_note(mac, "Resume")
             logger.info("Sent strm 'u' (unpause) to %s", mac)
             return True
         except (ConnectionError, OSError, RuntimeError):
@@ -2778,6 +2840,14 @@ class SlimProtoClient:
         try:
             writer.write(frame)
             await writer.drain()
+            # `strm 'a'` is Perl's skipAhead (Squeezebox2.pm:1120-1127) — a
+            # sync correction, NOT the controller `Skip` event. It must not
+            # advance the song, so the machine is only told about it.
+            try:
+                from lyrion.player import streaming
+                streaming.note_skip_ahead_sent(mac, int(seconds) * 1000)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("skipAhead note failed for %s: %s", mac, exc)
             logger.info("Sent strm 'a' (skip-ahead %ds) to %s", seconds, mac)
             return True
         except (ConnectionError, OSError, RuntimeError):
@@ -3637,6 +3707,9 @@ class SlimProtoClient:
                     player._stat = stat
                     if event == "STMt":
                         # TIMING heartbeat (~1/s while the output is RUNNING).
+                        # Perl playerStatusHeartbeat → controller `StatusHeartbeat`
+                        # (StreamingController.pm:2363-2369).
+                        _streaming_note(mac_str, "StatusHeartbeat")
                         # This branch carries BOTH meanings; the former
                         # duplicate `elif event == "STMt"` further down was
                         # unreachable dead code and is merged here (R0.5-P3):
@@ -3715,8 +3788,11 @@ class SlimProtoClient:
                         # exactly like a healthy WAV — compare codecs.
                         player._last_stmd_codec = getattr(player, "_current_codec", "")
                     elif event == "STMs":
-                        # TRACK_STARTED — a new track started playing
-                        player.mode = "play"
+                        # TRACK_STARTED — a new track started playing.
+                        # Perl playerTrackStarted → controller `Started`
+                        # (StreamingController.pm:2250-2266); the resulting
+                        # play state gives the status mode (:1676-1683).
+                        player.mode = _streaming_mode(mac_str, "Started", "play")
                         player.pause_requested = False
                         player._track_started_at = time.time()
                         # The player demonstrably runs the track we streamed
@@ -3770,6 +3846,9 @@ class SlimProtoClient:
                             # guard (R0.5-P1) — a replay of the SAME track
                             # must stream again.
                             player.forget_stream()
+                            # Perl playerStopped → controller `Stopped`
+                            # (StreamingController.pm:2223-2248).
+                            _streaming_note(mac_str, "Stopped")
                             # Mark stop only if the server didn't already
                             # (natural end vs. user stop / pause-stop).
                             if player.mode not in ("pause",):
@@ -3784,11 +3863,11 @@ class SlimProtoClient:
                         # Squeezebox2.pm:1104-1110). The guard must only be
                         # dropped where the player demonstrably lost the
                         # stream (stop/track end/STMf/STMn).
-                        player.mode = "pause"
+                        player.mode = _streaming_mode(mac_str, "Pause", "pause")
                         player.pause_requested = False
                     elif event == "STMr":
-                        # RESUME ack
-                        player.mode = "play"
+                        # RESUME ack — Perl `Resume` → PLAYING (:1620-1656).
+                        player.mode = _streaming_mode(mac_str, "Resume", "play")
                         player.pause_requested = False
                     elif event == "STMn":
                         # DECODE_ERROR — the player could not decode the
@@ -3798,7 +3877,9 @@ class SlimProtoClient:
                         # drop the strm guard too (R0.5-P1).
                         logger.warning("STAT STMn (decode error) from %s", mac_str)
                         player.forget_stream()
-                        player.mode = "stop"
+                        # Perl playerStreamingFailed → `StreamingFailed`
+                        # (StreamingController.pm:2298-2326) → stop.
+                        player.mode = _streaming_mode(mac_str, "StreamingFailed", "stop")
                         player.pause_requested = False
                     elif event in ("STMo", "STMu"):
                         # OUTPUT_UNDERRUN (STMo legacy / STMu current) —
@@ -3807,6 +3888,9 @@ class SlimProtoClient:
                         # with an EMPTY output buffer means the buffered
                         # audio played out completely: natural track end.
                         logger.debug("STAT %s (underrun) from %s", event, mac_str)
+                        # Perl playerOutputUnderrun → `OutputUnderrun` → _Rebuffer
+                        # (StreamingController.pm:2286-2296, :1659-1671).
+                        _streaming_note(mac_str, "OutputUnderrun")
                         stmd_at = getattr(player, "_last_stmd", None)
                         if player.mode == "play" and out_fullness == 0 and stmd_at:
                             player._last_stmd = None  # consume the signal
@@ -3816,6 +3900,8 @@ class SlimProtoClient:
                         # Player-initiated pause (the user pressed pause on
                         # the device): the output is held, not closed — keep
                         # mode and the guard so a resume does not re-stream.
+                        # Perl `Pause` → PAUSED (:133-139 row PLAYING).
+                        _streaming_note(mac_str, "Pause")
                         player.mode = "pause"
                         player.pause_requested = False
                     elif event == "stop":
@@ -3824,6 +3910,8 @@ class SlimProtoClient:
                         # the pause-ack and must keep mode="pause". Either
                         # way the player flushed its stream (R0.5-P1).
                         player.forget_stream()
+                        # Perl playerStopped → controller `Stopped` (:2223-2248).
+                        _streaming_note(mac_str, "Stopped")
                         if player.pause_requested:
                             player.pause_requested = False
                             player.mode = "pause"
