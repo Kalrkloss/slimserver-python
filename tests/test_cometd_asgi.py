@@ -44,12 +44,34 @@ Perl references (read-only ``/tmp/lms-ref``):
 * ``Slim/Web/Cometd.pm:200-212``   — message without clientId is dropped
 * ``Slim/Web/Cometd.pm:228-244``   — unknown clientId -> advice + ``last``
 * ``Slim/Web/Cometd.pm:246-262``   — /meta/handshake ack + advice
+* ``Slim/Web/Cometd.pm:267``       — transport of THIS connect (``connectionType``)
 * ``Slim/Web/Cometd.pm:271-280``   — /meta/(re)connect ``first_event`` ack
 * ``Slim/Web/Cometd.pm:286``       — register_connection on (re)connect
+* ``Slim/Web/Cometd.pm:295/300``   — store the transport (streaming/long-polling)
 * ``Slim/Web/Cometd.pm:302-306``   — client may override the poll timeout
 * ``Slim/Web/Cometd.pm:357/363``   — /meta/subscribe + clientId ack
 * ``Slim/Web/Cometd.pm:427/456``   — /slim/subscribe ack + clientId
+* ``Slim/Web/Cometd.pm:466-475``   — /slim/subscribe result routed by transport
 * ``Slim/Web/Cometd.pm:577``       — /slim/request ack + clientId
+* ``Slim/Web/Cometd.pm:584-589``   — /slim/request result routed by transport
+* ``Slim/Web/Cometd/Manager.pm:247-263`` — deliver_events: registered conn or queue
+
+A third round (live symptom: "Squeeze Client verbindet jetzt und kann abspielen,
+aber nur verzögert") made the *routing* of a finished result exact. Perl sends
+the result of a ``/slim/request`` (Cometd.pm:584-589) or ``/slim/subscribe``
+(:466-475) into the requesting POST's OWN response when the transport is
+``long-polling`` and through ``$manager->deliver_events`` otherwise
+(Manager.pm:247-263). The ASGI path routed everything by
+``has_live_connection``, which every long-polling client has: its result only
+ever appeared on the Connect channel, so the client saw it one poll cycle
+late. The transport is now honoured per client:
+
+* ``long-polling``           -> the result rides in the POST's own response
+  (measured: 0.00045 s, versus "only on the held connect" before);
+* ``streaming``/websocket    -> ``deliver_events`` (unchanged, 0.00088 s on
+  the open stream);
+* no registered connection   -> the POST response (standalone request, the
+  documented deviation).
 
 These tests drive the real ASGI handler with a fake ``receive``/``send``
 (the convention of tests/test_stream_flow.py): no server is started or
@@ -172,6 +194,49 @@ def _post(mgr, payload) -> _Transport:
 
     asyncio.run(run())
     return tr
+
+
+async def _post_async(mgr, payload) -> _Transport:
+    """``_post`` for use inside an already running loop."""
+    tr = _Transport(payload)
+    await asyncio.wait_for(_handle_cometd(mgr, "/cometd", tr.receive,
+                                          tr.send), timeout=10)
+    return tr
+
+
+class _HeldTransport(_Transport):
+    """A POST whose response stays open (a streaming /meta/connect).
+
+    ``receive`` never reports ``http.disconnect``, so the held stream is not
+    torn down behind the test's back — uvicorn signals a vanished peer
+    exactly that way (``_watch_disconnect``).
+    """
+
+    def __init__(self, payload) -> None:
+        super().__init__(payload)
+        self._forever = asyncio.Event()
+
+    async def receive(self) -> dict:
+        if not self._delivered:
+            self._delivered = True
+            return {"type": "http.request",
+                    "body": json.dumps(self.payload).encode(),
+                    "more_body": False}
+        await self._forever.wait()
+        return {"type": "http.disconnect"}
+
+
+async def _wait_for_chunk_channel(tr: "_Transport", channel: str,
+                                  timeout: float = 3.0):
+    """First frame on a held response mentioning ``channel`` (None on timeout)."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        for chunk in list(tr.chunks):
+            for msg in json.loads(chunk):
+                if isinstance(msg, dict) and msg.get("channel") == channel:
+                    return msg
+        await asyncio.sleep(0.02)
+    return None
 
 
 async def _handshake_async(mgr) -> tuple[str, dict]:
@@ -460,6 +525,205 @@ def test_connect_without_clientid_gets_no_fabricated_ack():
                       "connectionType": "long-polling"}])
     payload = tr.json()
     assert not any(m.get("channel") == "/meta/connect" for m in payload), payload
+
+
+# ---------------------------------------------------------------------------
+# Transport routing of a finished result (Perl :584-589 / :466-475)
+#
+# Perl sends the result of a /slim/request or /slim/subscribe into the
+# requesting POST's OWN response when the transport is ``long-polling``
+# (:585-587, :467-469) and through ``$manager->deliver_events`` otherwise
+# (:589, :475 -> Manager.pm:247-263). Routing everything by
+# ``has_live_connection`` — which EVERY long-polling client has after its
+# connect — put a long-polling client's result on the Connect channel only,
+# so it saw it one poll cycle late (the live "nur verzögert" symptom).
+# ---------------------------------------------------------------------------
+
+def test_handshake_alone_does_not_fix_a_transport():
+    """Perl :246-262: the handshake answers, it does not set a transport.
+
+    Only the /meta/(re)connect branch writes ``$conn->[HTTP_CLIENT]
+    ->transport`` (:295 streaming / :300 long-polling); a client that only
+    handshakes must not be classified from ``supportedConnectionTypes``.
+    """
+    mgr, _rec = _manager()
+    cid, _ack = _asgi_handshake(mgr)
+    client = mgr.get(cid)
+    assert client is not None and client.transport == ""
+
+
+def test_long_polling_request_result_rides_in_the_post_reply():
+    """Perl :584-589 — a long-polling request carries the result itself.
+
+    Order is Perl's: the ack (:577) first, the result (:587) after it. The
+    result must NOT be queued for the connect channel as well (Perl pushes it
+    into ``@events`` *instead of* calling deliver_events).
+    """
+    mgr, rec = _manager()
+    cid, _hs = _asgi_handshake(mgr)
+    channel = f"/{cid}/slim/request"
+    conn = _post(mgr, [{"channel": "/meta/connect", "clientId": cid, "id": 2,
+                        "connectionType": "long-polling",
+                        "advice": {"timeout": 0}}])
+    assert any(m.get("channel") == "/meta/connect" for m in conn.json())
+    client = mgr.get(cid)
+    assert client is not None and client.transport == "long-polling"
+
+    started = time.monotonic()
+    tr = _post(mgr, [{"channel": "/slim/request", "clientId": cid, "id": 3,
+                      "data": {"request": [PLAYER, ["status", "-", "1"]],
+                               "response": channel}}])
+    elapsed = time.monotonic() - started
+    payload = tr.json()
+    assert [m["channel"] for m in payload] == ["/slim/request", channel], payload
+    assert payload[0]["successful"] is True and payload[0]["clientId"] == cid
+    assert payload[1]["data"]["current_title"] == "Titel 51994"
+    assert payload[1]["id"] == 3, "libcometd correlates the result by id"
+    assert rec.calls[-1] == [PLAYER, ["status", "-", "1"]]
+    client = mgr.get(cid)
+    assert client is not None and client.events == [], \
+        "the result was queued AND sent twice"
+    assert elapsed < 0.2, f"the long-polling reply took {elapsed:.3f}s"
+
+
+def test_long_polling_subscribe_result_rides_in_the_post_reply():
+    """Perl :466-475 — same routing for /slim/subscribe (+ :472).
+
+    Perl also clears the pending delayed response there, so the POST answers
+    immediately instead of being held like a connect.
+    """
+    mgr, _rec = _manager()
+    cid, _hs = _asgi_handshake(mgr)
+    channel = f"/{cid}/slim/playerstatus/{PLAYER}"
+    _post(mgr, [{"channel": "/meta/connect", "clientId": cid, "id": 2,
+                 "connectionType": "long-polling", "advice": {"timeout": 0}}])
+
+    started = time.monotonic()
+    tr = _post(mgr, [{"channel": "/slim/subscribe", "clientId": cid, "id": 3,
+                      "data": {"request": [PLAYER, JIVE_STATUS_CMD],
+                               "response": channel}}])
+    elapsed = time.monotonic() - started
+    payload = tr.json()
+    assert [m["channel"] for m in payload] == ["/slim/subscribe", channel], payload
+    assert payload[1]["data"]["current_title"] == "Titel 51994"
+    assert payload[0]["subscription"] == channel
+    client = mgr.get(cid)
+    assert client is not None and client.events == []
+    assert elapsed < 0.2, f"the subscribe reply took {elapsed:.3f}s"
+
+
+def test_streaming_request_result_goes_to_the_open_connection():
+    """Perl :589 — anything but long-polling uses ``deliver_events``.
+
+    The result must reach the held stream (Manager.pm:247-263 writes into the
+    registered connection) and must NOT be duplicated into the request POST's
+    own response.
+    """
+    async def run():
+        mgr, _rec = _manager()
+        cid, _hs = await _handshake_async(mgr)
+        channel = f"/{cid}/slim/request"
+        stream = _HeldTransport([{"channel": "/meta/connect", "clientId": cid,
+                                  "id": 2, "connectionType": "streaming"}])
+        task = asyncio.create_task(_handle_cometd(mgr, "/cometd",
+                                                  stream.receive, stream.send))
+        await asyncio.wait_for(stream.first_chunk.wait(), timeout=5)
+        client = mgr.get(cid)
+        assert client is not None and client.transport == "streaming"
+
+        tr = await _post_async(mgr, [{
+            "channel": "/slim/request", "clientId": cid, "id": 3,
+            "data": {"request": [PLAYER, ["status", "-", "1"]],
+                     "response": channel}}])
+        framed = await _wait_for_chunk_channel(stream, channel)
+        task.cancel()
+        return tr.json(), framed
+
+    reply, framed = asyncio.run(run())
+    assert [m["channel"] for m in reply] == ["/slim/request"], reply
+    assert framed is not None, "the result never reached the open stream"
+    assert framed["data"]["current_title"] == "Titel 51994"
+
+
+def test_connect_switch_moves_the_result_to_the_open_stream():
+    """A later /meta/(re)connect overwrites the transport (Perl :295/:300).
+
+    A client that reconnects with ``connectionType: streaming`` (its old
+    long-poll died) must be routed by the NEW connect, not by the one that
+    set ``long-polling`` earlier.
+    """
+    async def run():
+        mgr, _rec = _manager()
+        cid, _hs = await _handshake_async(mgr)
+        channel = f"/{cid}/slim/request"
+        await _post_async(mgr, [{"channel": "/meta/connect", "clientId": cid,
+                                 "id": 2, "connectionType": "long-polling",
+                                 "advice": {"timeout": 0}}])
+        client = mgr.get(cid)
+        assert client is not None and client.transport == "long-polling"
+
+        stream = _HeldTransport([{"channel": "/meta/connect", "clientId": cid,
+                                  "id": 3, "connectionType": "streaming"}])
+        task = asyncio.create_task(_handle_cometd(mgr, "/cometd",
+                                                  stream.receive, stream.send))
+        await asyncio.wait_for(stream.first_chunk.wait(), timeout=5)
+        client = mgr.get(cid)
+        assert client is not None and client.transport == "streaming"
+
+        tr = await _post_async(mgr, [{
+            "channel": "/slim/request", "clientId": cid, "id": 4,
+            "data": {"request": [PLAYER, ["status", "-", "1"]],
+                     "response": channel}}])
+        framed = await _wait_for_chunk_channel(stream, channel)
+        task.cancel()
+        return tr.json(), framed
+
+    reply, framed = asyncio.run(run())
+    assert [m["channel"] for m in reply] == ["/slim/request"], reply
+    assert framed is not None, "the switched client kept the old transport"
+    assert framed["data"]["current_title"] == "Titel 51994"
+
+
+def test_request_with_no_connection_answers_in_the_post_reply():
+    """No registered connection -> the POST response (documented deviation).
+
+    Perl queues the event for the next connect when it has no connection to
+    deliver to (Manager.pm:262 ``queue_events``); the ASGI path answers the
+    standalone request instead, which is what it did before this change.
+    """
+    mgr, _rec = _manager()
+    cid, _hs = _asgi_handshake(mgr)
+    channel = f"/{cid}/slim/request"
+    client = mgr.get(cid)
+    assert client is not None and client.transport == ""
+    tr = _post(mgr, [{"channel": "/slim/request", "clientId": cid, "id": 4,
+                      "data": {"request": [PLAYER, ["status", "-", "1"]],
+                               "response": channel}}])
+    payload = tr.json()
+    assert [m["channel"] for m in payload] == ["/slim/request", channel], payload
+    assert payload[1]["data"]["current_title"] == "Titel 51994"
+
+
+def test_long_poll_advice_timeout_still_holds_the_connect():
+    """Perl :302-306 survives the routing change: the CLIENT picks the hold.
+
+    A long-polling connect with ``advice.timeout`` is held for exactly that
+    time and carries no request result (that now rides in the request POST).
+    """
+    async def run():
+        mgr, _rec = _manager()
+        cid, _hs = await _handshake_async(mgr)
+        tr = _Transport([{"channel": "/meta/connect", "clientId": cid, "id": 2,
+                          "connectionType": "long-polling",
+                          "advice": {"timeout": 150}}])
+        started = time.monotonic()
+        await asyncio.wait_for(_handle_cometd(mgr, "/cometd", tr.receive,
+                                              tr.send), timeout=10)
+        return tr.json(), time.monotonic() - started
+
+    payload, elapsed = asyncio.run(run())
+    assert [m["channel"] for m in payload] == ["/meta/connect"], payload
+    assert 0.1 <= elapsed < 1.0, f"the hold ignored advice.timeout ({elapsed:.3f}s)"
 
 
 # ---------------------------------------------------------------------------
@@ -904,3 +1168,64 @@ def test_live_push_right_after_a_command_reaches_the_open_stream():
     assert push is not None, "the follow-up push never reached the open stream"
     assert cmd_latency < 1.0, f"(a) took {cmd_latency:.3f}s"
     assert push_latency < 1.0, f"(b) took {push_latency:.3f}s"
+
+
+def test_live_long_polling_request_result_rides_in_the_post_response():
+    """The Squeeze Client leg: its own POST carries the result, at once.
+
+    A long-polling client (SqueezeClient: handshake with
+    ``supportedConnectionTypes: ["long-polling"]``, connect
+    ``connectionType: "long-polling"``, one subscription on
+    ``/<cid>/slim/request``) keeps a poll open on one connection and sends its
+    requests on another — the pattern the live dev log shows
+    (``lyrion-8``: handshake -> subscribe -> connect long-polling -> request).
+
+    Perl answers that request POST with the result itself (Cometd.pm:584-589)
+    so the client never has to wait for a poll cycle. Measured here: the reply
+    must contain the result and must arrive in well under the 60 s hold.
+    """
+    async def run():
+        rpc = _LiveRPC()
+        mgr = CometdManager(rpc)
+        async with _live_server(mgr) as port:
+            cid = await _live_handshake(port)
+            channel = f"/{cid}/slim/request"
+
+            # The client's poll: held on its own connection (30 s advice).
+            poll = await _Client.open(port)
+            await poll.post([{"channel": "/meta/connect", "clientId": cid,
+                              "id": 2, "connectionType": "long-polling",
+                              "advice": {"timeout": 30000}}])
+            await asyncio.sleep(0.1)          # let the poll register
+
+            command = await _Client.open(port)
+            t0 = time.monotonic()
+            await command.post([{
+                "channel": "/slim/request", "clientId": cid, "id": 3,
+                "data": {"request": [PLAYER, ["status", "-", "1"]],
+                         "response": channel}}])
+            body = json.loads(await command.read_full(timeout=5.0))
+            latency = time.monotonic() - t0
+            command.close()
+
+            # The held poll must NOT also carry it (no double delivery): if the
+            # result had gone to the connect, the poll would answer right now
+            # instead of staying held for its 30 s advice.
+            poll_answered = True
+            try:
+                await asyncio.wait_for(poll.reader.readuntil(b"\r\n"), 0.5)
+            except asyncio.TimeoutError:
+                poll_answered = False
+            poll.close()
+            return body, latency, poll_answered
+
+    body, latency, poll_answered = asyncio.run(run())
+    print(f"\n[latency] long-polling request reply with the result: {latency:.3f}s")
+    channels = [m.get("channel") for m in body]
+    assert channels == ["/slim/request", f"/{body[0]['clientId']}/slim/request"], body
+    assert body[0]["successful"] is True
+    assert body[1]["data"]["current_title"] == "Titel 51994"
+    assert latency < 0.2, (
+        f"the long-polling client waited {latency:.3f}s for its own reply")
+    assert not poll_answered, (
+        "the result was delivered twice: the held connect answered as well")

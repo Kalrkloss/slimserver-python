@@ -651,6 +651,52 @@ class CometdManager:
         client = self._clients.get(client_id)
         return bool(client and (client.connections or client.owner is not None))
 
+    def result_delivery(self, client_id: str) -> str:
+        """Where a finished /slim/request or /slim/subscribe result belongs.
+
+        Perl routes the result by the transport of the connection that
+        carried the message — never by what a client *declared* it supports:
+
+        * ``long-polling`` -> the result is appended to the events of THIS
+          response and therefore rides in the POST the client just sent
+          (Cometd.pm:584-589 for /slim/request; Cometd.pm:466-475 for
+          /slim/subscribe, which additionally clears the pending delayed
+          response at :472 so the poll answers at once);
+        * anything else (streaming, websocket, CLI) -> ``deliver_events``
+          (Cometd.pm:589/:475), which writes into the client's registered
+          connection immediately and queues the event when there is none
+          (Manager.pm:247-263, ``queue_events``).
+
+        Returns ``"response"`` or ``"connection"``. Perl keeps the transport
+        on the HTTP client (``$conn->[HTTP_CLIENT]->transport``, written only
+        in the /meta/(re)connect branch, Cometd.pm:295/:300) and a Bayeux
+        client's poll and its request POSTs may use different sockets
+        (``webCloseHandler``, Cometd.pm:996-1000: "browsers can use either of
+        2 connections for any given request"); we keep it per client
+        (``CometdClient.transport``), which is the transport the client
+        itself last connected with — the only per-client fact and the one
+        the client's own reader is built around.
+        """
+        client = self._clients.get(client_id)
+        if client is not None and client.transport == "long-polling":
+            return "response"
+        return "connection"
+
+    def deliver_result(self, client_id: str, event: dict,
+                       replies: list[dict]) -> None:
+        """Deliver one finished result the way ``result_delivery`` decides.
+
+        ``replies`` is the reply list of the POST being answered right now:
+        for a long-polling client the result is appended to it (Perl
+        Cometd.pm:587 ``push @{$events}, $result``), otherwise it goes through
+        ``push`` — the Python form of ``$manager->deliver_events``
+        (Manager.pm:247-263).
+        """
+        if self.result_delivery(client_id) == "response":
+            replies.append(event)
+        else:
+            self.push(client_id, event)
+
     def connection_open(self, client_id: str) -> None:
         """Record an open transport so the idle reaper spares the client.
 
@@ -1158,27 +1204,6 @@ class CometdManager:
                 acks = list(subscriptions) if channel == "/meta/subscribe" \
                     else (subscriptions[:1] or [""])
                 for sub in acks:
-                    if sub:
-                        stored = _merged_subscription(
-                            client.subscriptions.get(sub), data)
-                        client.subscriptions[sub] = stored
-                        logger.info("Cometd %s subscribed %s", cid, sub)
-                        # Push the initial result of the subscription request.
-                        # Without a client request fall back to the jive form
-                        # so the seed payload already carries title/playlist
-                        # (a bare `playerstatus - 1` does not — LIVE-01).
-                        seed = _stored_request(stored)
-                        if seed is None:
-                            seed = _default_request(sub)
-                        if seed:
-                            result = await self._dispatch(seed)
-                            self.push(cid, {
-                                "channel": sub,
-                                "data": result,
-                                # SqueezeClient's Message class requires id:
-                                # Int — a missing id breaks the array parse.
-                                "id": msg.get("id", ""),
-                            })
                     ack = dict(reply)
                     ack["successful"] = True
                     ack["error"] = None
@@ -1189,7 +1214,34 @@ class CometdManager:
                     ack["clientId"] = cid
                     if sub:
                         ack["subscription"] = sub
+                    # Perl emits the ack FIRST (Cometd.pm:456) and the
+                    # non-async result of the subscription request after it
+                    # (:462-475, "If the request was not async").
                     replies.append(ack)
+                    if sub:
+                        stored = _merged_subscription(
+                            client.subscriptions.get(sub), data)
+                        client.subscriptions[sub] = stored
+                        logger.info("Cometd %s subscribed %s", cid, sub)
+                        # Deliver the initial result of the subscription
+                        # request, routed by the transport (Perl :466-475:
+                        # long-polling carries it in THIS response and clears
+                        # the delayed response at :472). Without a client
+                        # request fall back to the jive form so the seed
+                        # payload already carries title/playlist (a bare
+                        # `playerstatus - 1` does not — LIVE-01).
+                        seed = _stored_request(stored)
+                        if seed is None:
+                            seed = _default_request(sub)
+                        if seed:
+                            result = await self._dispatch(seed)
+                            self.deliver_result(cid, {
+                                "channel": sub,
+                                "data": result,
+                                # SqueezeClient's Message class requires id:
+                                # Int — a missing id breaks the array parse.
+                                "id": msg.get("id", ""),
+                            }, replies)
                 if not subscriptions:
                     reply.update({"successful": True, "error": None,
                                   "clientId": cid})
@@ -1240,16 +1292,22 @@ class CometdManager:
                 request = data.get("request") or []
                 result = await self._dispatch(request)
                 if client is not None:
-                    self.push(cid, {
+                    # Perl Cometd.pm:575-582: the ack carries clientId (a
+                    # missing one breaks libcometd's correlation) and is the
+                    # FIRST event of the pair — the result follows it
+                    # (:584-589).
+                    reply.update({"successful": True, "clientId": cid})
+                    replies.append(reply)
+                    # Perl Cometd.pm:584-589: a long-polling transport carries
+                    # the result in THIS response, everything else goes through
+                    # $manager->deliver_events (:589, Manager.pm:247-263).
+                    self.deliver_result(cid, {
                         "channel": response_channel,
                         "data": result,
                         "id": msg.get("id", ""),
-                    })
-                    # Perl Cometd.pm:575-580: the /slim/request ack carries
-                    # clientId (a missing one breaks libcometd's correlation).
-                    reply.update({"successful": True, "clientId": cid})
-                else:
-                    reply.update({"successful": False, "clientId": None})
+                    }, replies)
+                    continue
+                reply.update({"successful": False, "clientId": None})
 
             elif channel == "/meta/disconnect":
                 # Remove the client so its subscriptions/events are freed.

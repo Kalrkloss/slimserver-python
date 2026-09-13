@@ -312,6 +312,14 @@ async def _handle_cometd(cometd: CometdManager, path: str, receive, send) -> Non
                 # connect ack for one: its clientId would be empty.
                 if not cid:
                     continue
+                # Perl Cometd.pm:267 decides the transport of THIS connect —
+                # ``connectionType eq 'streaming'`` — and stores it on the
+                # connection (:295 streaming, :300 long-polling). A later
+                # /meta/(re)connect overwrites it, so a client that switches
+                # transport (SqueezeClient: long-polling after a stream died)
+                # is routed by its newest connect. Everything but the literal
+                # 'streaming' is long-polling (Perl's ternary), which is what
+                # ``set_transport`` records for the routing below.
                 if msg.get("connectionType") == "streaming":
                     await _handle_streaming_connect(cometd, cid, msg, replies,
                                                     send, receive)
@@ -324,7 +332,8 @@ async def _handle_cometd(cometd: CometdManager, path: str, receive, send) -> Non
                 cometd.register_connection(cid, owner)
                 # Perl Cometd.pm:300 records the transport as soon as the
                 # long-polling connect is accepted; it decides where a later
-                # request result goes (Cometd.pm:584-589).
+                # request result goes (Cometd.pm:584-589 — its OWN POST
+                # response, see CometdManager.deliver_result).
                 cometd.set_transport(cid, "long-polling")
                 poll_owners[cid] = owner
                 # Hold until events arrive or the timeout expires. Perl lets
@@ -342,18 +351,24 @@ async def _handle_cometd(cometd: CometdManager, path: str, receive, send) -> Non
                 # A completed poll restarts Perl's autokill window.
                 cometd.touch(cid)
         else:
-            # No connect in this batch: a freshly finished request reply is
-            # handed to the client's LIVE connection when one exists — Perl
-            # Manager::deliver_events (Manager.pm:247-263) writes it into the
-            # registered connection, and the native stream does the same (its
-            # in-stream POST branch sends only the acks and lets push_task
-            # deliver the events, cometd_stream.py:471-485). Swallowing the
-            # events here made the app wait for its next poll cycle, because
-            # it reads the result off the connect channel, not off this POST's
-            # own response (live symptom: Squeezer showed albums only after
-            # the 60 s hold had elapsed). With NO live connection the events
-            # ride in this reply (standalone request — a documented deviation;
-            # Perl would queue them for the next connect).
+            # No connect in this batch. The result of a /slim/request or
+            # /slim/subscribe was already routed by ``handle_messages`` —
+            # ``CometdManager.deliver_result`` — according to the client's
+            # transport (Perl Cometd.pm:584-589 / :466-475):
+            #   * long-polling -> it is IN ``replies`` and rides in this POST's
+            #     response, exactly like Perl's ``push @{$events}, $result``
+            #     (:587/:468), so a long-polling client (SqueezeClient) sees
+            #     its result the moment it reads the reply and never waits for
+            #     a poll cycle;
+            #   * streaming -> it was handed to the client's registered
+            #     connection (``$manager->deliver_events``, :589/:475) and the
+            #     open stream frames it (the app reads its results off the
+            #     connect channel).
+            # What is left to drain here are events that were queued while no
+            # connection was registered — Perl's ``get_pending_events`` is
+            # appended to every response in ``sendResponse`` (Cometd.pm:645).
+            # Only a client with NO registered connection gets them in this
+            # reply; with one, ``deliver_events`` already wrote them there.
             for msg in messages:
                 if not isinstance(msg, dict):
                     continue
