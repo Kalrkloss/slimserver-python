@@ -466,6 +466,20 @@ class MusicImporter:
                     select(Album).where(
                         Album.titlesort.in_([k[0] for k in album_keys])))).scalars()
             if (a.titlesort, a.albumartist_sort) in album_keys}
+        # Altbestand: Alben, die vor der Spalte ``albumartist_sort`` entstanden
+        # sind, tragen dort NULL (die Migration füllt nicht nach). Der Import
+        # sucht über (titlesort, artist_sort), findet sie also nie und legt eine
+        # zweite Zeile an — die alte UNIQUE-Bedingung (titlesort, year) lehnt
+        # das ab und reißt die ganze Transaktion mit (im Live-Lauf beobachtet:
+        # "UNIQUE constraint failed: albums.titlesort, albums.year").
+        # Deshalb zusätzlich über (titlesort, year) indexieren, adoptieren und
+        # ``albumartist_sort`` nachtragen.
+        album_by_title_year: dict[tuple, Album] = {
+            (a.titlesort, a.year): a for a in (
+                await session.execute(
+                    select(Album).where(
+                        Album.titlesort.in_([k[0] for k in album_keys])))).scalars()
+            if not a.albumartist_sort}
         contrib_by_name: dict[str, Contributor] = {
             c.namespell: c for c in (
                 await session.execute(
@@ -490,7 +504,8 @@ class MusicImporter:
                 await self._import_links(session, file_path, info,
                                          track_by_url, album_by_key,
                                          contrib_by_name, ta_set, tc_set, ac_set,
-                                         genre_by_namespell, tg_set, tg_tracks)
+                                         genre_by_namespell, tg_set, tg_tracks,
+                                         album_by_title_year)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Import failed for %s: %s", file_path, exc)
                 self.stats.error_files += 1
@@ -581,6 +596,7 @@ class MusicImporter:
         genre_by_namespell: dict[str, Genre] | None = None,
         tg_set: set | None = None,
         tg_tracks: set | None = None,
+        album_by_title_year: dict[tuple, Album] | None = None,
     ) -> None:
         """Album + contributor + genre links for a track (Core inserts only)."""
         url = _file_url(file_path)
@@ -597,6 +613,15 @@ class MusicImporter:
         album_peak = getattr(info, "album_replay_peak", None)
 
         album = album_by_key.get(key)
+        if album is None and album_by_title_year:
+            # Vor der Spalte entstandene Zeile adoptieren (Begründung beim
+            # Aufbau der Map) und den fehlenden Artist-Sort nachtragen, damit
+            # der nächste Lauf den exakten Schlüssel findet.
+            album = album_by_title_year.pop((_sort_string(album_name),
+                                             year or None), None)
+            if album is not None:
+                album.albumartist_sort = artist_key
+                album_by_key[key] = album
         if album is None:
             # Cover artwork: scanner found cover.jpg/png/… in the track's
             # folder — store the path so the API can serve it to players.

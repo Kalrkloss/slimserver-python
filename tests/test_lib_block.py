@@ -37,7 +37,8 @@ from sqlalchemy import select
 from lyrion.control import cli_commands
 from lyrion.control import queries as q
 from lyrion.control.cli import CLIContext, CLIHandler
-from lyrion.database.schema import Base, Genre, tracks_genres
+from lyrion.database.schema import (Album, Base, Genre, tracks_albums,
+                                    tracks_genres)
 from lyrion.media import transcoding
 from lyrion.media.importer import MusicImporter
 
@@ -358,3 +359,49 @@ def test_genres_search_patterns_are_joined_with_or(monkeypatch):
     assert " OR " in sql.upper()
     assert sql.upper().count(" LIKE ") >= 2
     assert len([p for p in (params or []) if isinstance(p, str) and "%" in p]) >= 2
+
+
+def test_import_adopts_a_legacy_album_row_without_albumartist_sort():
+    """Regression (Live-Scan 2026-09-13): Alben aus der Zeit vor der Spalte
+    ``albumartist_sort`` haben dort NULL; die Migration füllt nicht nach. Der
+    Import suchte über (titlesort, artist_sort), legte eine zweite Zeile an und
+    lief in ``UNIQUE constraint failed: albums.titlesort, albums.year`` — die
+    gesamte Import-Transaktion rollte zurück, der Scan brach ab.
+
+    Erwartung: die Altzeile wird adoptiert, ``albumartist_sort`` nachgetragen,
+    es entsteht KEINE zweite Zeile.
+    """
+    asyncio.run(_run_legacy_album_import())
+
+
+async def _run_legacy_album_import():
+    from sqlalchemy import text as sqltext
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+        # den alten UNIQUE-Index nachstellen (er stammt aus einer früheren
+        # Schema-Version und existiert in Bestands-DBs als autoindex)
+        await conn.execute(sqltext(
+            "CREATE UNIQUE INDEX uq_legacy_album ON albums (titlesort, year)"))
+    Session = async_sessionmaker(engine, expire_on_commit=False)
+    async with Session() as session:
+        # Zeile wie vor der Spalte: albumartist_sort bleibt leer
+        legacy = Album(title="Al", titlesort="al", year=2000,
+                       albumartist_sort=None)
+        session.add(legacy)
+        await session.commit()
+    importer = MusicImporter()
+    info = SimpleNamespace(title="Neu", artist="A", album="Al", year=2000,
+                           duration=1000, genre="Rock")
+    async with Session() as session:
+        await importer._import_batch(session, [(Path("/m/neu.mp3"), info)])
+        await session.commit()
+        rows = (await session.execute(
+            select(Album.id, Album.albumartist_sort))).all()
+        links = (await session.execute(select(tracks_albums))).all()
+    await engine.dispose()
+    assert len(rows) == 1, rows                      # adoptiert, nicht neu
+    assert rows[0][1] == "a", rows                   # nachgetragen
+    assert len(links) == 1 and links[0][1] == 1, links
