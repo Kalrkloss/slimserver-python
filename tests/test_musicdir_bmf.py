@@ -150,18 +150,26 @@ def test_bmf_top_level_uses_musicdir_root(tmp_path, monkeypatch):
 
 
 def test_bmf_top_level_items_are_perl_like(tmp_path, monkeypatch):
-    """Ordner-Items: type playlist, id/folder_id = absoluter Pfad, textkey,
-    go/play/add-Aktionen (Perl-BrowseLibrary-Form)."""
+    """Ordner-Items: type playlist, id/folder_id = virtuelle numerische ID,
+    textkey, go/play/add-Aktionen (Perl-BrowseLibrary-Form).
+
+    Perl liefert hier seine ``tracks.id`` (Verzeichnisse liegen bei Perl als
+    ``content_type='dir'`` in ``tracks``); unser Port legt keine dir-Zeilen an
+    und gibt deshalb ``crc32(pfad) & 0x7fffffff`` aus — stabil, numerisch, aber
+    bewusst nicht identisch mit Perls ID. Der Client parst die ID numerisch,
+    deshalb darf hier keine URL/kein Pfad stehen."""
     _setup(tmp_path, monkeypatch, LIB_URLS, ROOT)
     items = _items(["items", "0", "50", "menu:1", "mode:bmf"])
     metal = next(it for it in items if it["text"] == "Metal")
 
     assert metal["type"] == "playlist"
-    assert metal["id"] == f"{ROOT}/Metal"
-    assert metal["commonParams"]["folder_id"] == f"{ROOT}/Metal"
+    assert isinstance(metal["id"], int)
+    # In den Aktions-Params sind die IDs bei Perl Strings (live: "204572"),
+    # das id-Feld selbst numerisch — wir spiegeln beides.
+    assert metal["commonParams"]["folder_id"] == str(metal["id"])
     assert metal["textkey"] == "M"
     assert {"add", "add-hold", "play"} <= set(metal["actions"])
-    assert metal["actions"]["play"]["params"]["folder_id"] == f"{ROOT}/Metal"
+    assert metal["actions"]["play"]["params"]["folder_id"] == str(metal["id"])
     assert metal["actions"]["play"]["params"]["cmd"] == "load"
     assert metal["actions"]["add"]["params"]["cmd"] == "add"
     # the base action that drives a plain tap (Perl base.actions.go)
@@ -283,7 +291,7 @@ def test_bmf_folder_id_roundtrip(tmp_path, monkeypatch):
     accept = _items(["items", "0", "50", "menu:1", "mode:bmf",
                      f"folder_id:{metal['id']}"])
     first = next(it for it in accept if it["text"] == "Accept")
-    assert first["id"] == f"{ROOT}/Metal/Accept"
+    assert isinstance(first["id"], int) and first["id"] != metal["id"]
     assert _browse(["items", "0", "50", "mode:bmf",
                     f"search:{first['id']}"])["count"] == 2
 
@@ -344,7 +352,8 @@ def test_bmf_child_folder_name_is_decoded(tmp_path, monkeypatch):
     items = _items(["items", "0", "50", "menu:1", "mode:bmf",
                     f"folder_id:{ROOT}/Ambient"])
     assert [it["text"] for it in items] == ["Boards of Canada"]
-    assert items[0]["id"] == f"{ROOT}/Ambient/Boards of Canada"
+    # Kindordner-ID ist ebenfalls numerisch (siehe Top-Level-Test)
+    assert isinstance(items[0]["id"], int)
 
 
 def test_bmf_paging_and_total(tmp_path, monkeypatch):
