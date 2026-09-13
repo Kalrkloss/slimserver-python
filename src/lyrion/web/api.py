@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import posixpath
 import re
 import time
@@ -676,6 +677,186 @@ def _jive_string(key: str) -> str:
     token = str(key).upper()
     return get_string(token, lang=resolve_language(),
                       default=_JIVE_STRINGS.get(token, token))
+
+
+# ---------------------------------------------------------------------------
+# Android-/Jive-Controller-Kommandos in Perl-Form (nur lesend)
+# ---------------------------------------------------------------------------
+# Live-Proben gegen das Referenz-Perl-LMS 9.1.1 (192.168.1.90:9000,
+# 2026-09-13, ausschließlich lesende Kommandos); jede wörtliche Antwort steht
+# im Kopf von ``tests/test_controller_commands.py``. Perl beendet einen
+# *nicht dispatchbaren* Aufruf (Status 102/103/104 — ``isNotQuery``/
+# ``isNotCommand`` oder kein Funktionszeiger im Dispatch-Eintrag,
+# Request.pm:1044-1084) mit geschlossenem Socket ohne Body (JSONRPC.pm:
+# 497-517); dieser Port antwortet dann — wie schon bei mixer/info — mit dem
+# leeren Dict.
+
+#: Ein Kategorie-Token für ``debug <flag> ?`` — Perls ``isValidCategory``
+#: prüft den Eintrag ``log4perl.logger.<flag>`` (Log.pm:475-488).
+_DEBUG_CATEGORY_RE = re.compile(r"^[A-Za-z][A-Za-z0-9._-]*$")
+
+
+def _client_string(token: str) -> str:
+    """Perl ``$request->string($token)`` für ``getStringQuery`` (Queries.pm:1988-2016).
+
+    Perl gibt den lokalisierten Text zurück, wenn das Token existiert, sonst
+    ``''`` (:2004-2012). Unsere i18n-Tabellen tragen nur die Keys, die dieser
+    Port selbst aussendet — ein Token, das nur Perl kennt, ergibt hier
+    deshalb ``''``, also dieselbe Antwort wie Perls unbekanntes Token.
+    """
+    from lyrion.i18n import get_string, resolve_language
+    return get_string(str(token).upper(), lang=resolve_language(), default="")
+
+
+def _debug_category_level(flag: str) -> str | None:
+    """Antwortwert für ``debug <flag> ?`` (Perl ``debugQuery``, Queries.pm:1517-1549).
+
+    Perl liefert den Level-Namen der Kategorie (:1538-1544); live
+    ``debug scan ?`` → ``{"_value":"ERROR"}``. ``None`` heißt „ungültiges
+    Flag" (:1526-1535 ``setStatusBadParams`` → Socket zu).
+
+    Unser Port führt keine log4perl-Kategorienliste (Perl Log.pm:879-960);
+    ein uns unbekanntes, aber syntaktisch gültiges Token beantworten wir
+    deshalb mit Perls Default für eine unkonfigurierte Kategorie, ``ERROR``
+    (Log.pm:868 ``|| 'ERROR'``), statt mit dem geschlossenen Socket.
+    """
+    token = str(flag or "").strip()
+    if not _DEBUG_CATEGORY_RE.match(token):
+        return None
+    name = f"lyrion.{token}"
+    if name in logging.Logger.manager.loggerDict:
+        return logging.getLevelName(logging.getLogger(name).getEffectiveLevel())
+    return "ERROR"
+
+
+def _fs_page(index: Any, quantity: Any, count: int) -> tuple[int, int] | None:
+    """Perl ``Slim::Control::Request::normalize`` (Request.pm:1805-1839).
+
+    ``None`` heißt „nicht valide" — Perl füllt dann nur ``count``
+    (Queries.pm:3165-3170).
+    """
+    def _num(value: Any) -> int | None:
+        try:
+            return int(str(value))
+        except (TypeError, ValueError):
+            return None
+
+    frm = _num(index)
+    num = _num(quantity)
+    if num is None and frm is not None:
+        num = count
+    if not num or not count:
+        return None
+    if frm is None:
+        frm = 0
+    if frm > count - 1:
+        return None
+    if frm < 0:
+        frm = 0
+    return frm, min(frm + num - 1, count - 1)
+
+
+def _read_directory(args: list) -> dict:
+    """``readdirectory <index> <quantity> [folder:<path>] [filter:<f>]``.
+
+    Perl ``readDirectoryQuery`` (Queries.pm:3093-3213), Dispatch
+    ``['readdirectory','_index','_quantity']`` (Request.pm:497). Antwort:
+    ``count`` plus ``fsitems_loop`` mit ``path``/``name``/``isfolder``
+    (:3201-3210), Ordner vor Dateien (:3183-3193). Live 2026-09-13:
+    ``readdirectory 0 5`` → ``{"count":0}`` (ohne ``folder`` liest Perl ein
+    leeres Verzeichnis), ``readdirectory 0 5 folder:/tmp`` →
+    ``{"count":118,"fsitems_loop":[{"isfolder":"1","name":…,"path":…},…]}``.
+    Perl serialisiert ``isfolder`` als ``"1"``/``"0"``; wir liefern die Zahl
+    (Squeezer ruft das Kommando nicht auf).
+    """
+    folder = ""
+    want = ""
+    for a in (list(args)[2:] if len(args) > 2 else []):
+        s = str(a)
+        if s.startswith("folder:"):
+            folder = s[7:]
+        elif s.startswith("filter:"):
+            want = s[7:]
+    if not folder:
+        # Perl: Slim::Utils::Misc::readDirectory(undef) → leere Liste.
+        return {"count": 0}
+
+    names: list[str] = []
+    is_dir: dict[str, bool] = {}
+    try:
+        with os.scandir(folder) as it:
+            for entry in it:
+                try:
+                    names.append(entry.name)
+                    is_dir[entry.name] = entry.is_dir()
+                except OSError:
+                    continue
+    except OSError:
+        return {"count": 0}
+
+    if want == "foldersonly":
+        names = [n for n in names if is_dir[n]]
+    elif want == "filesonly":
+        names = [n for n in names if not is_dir[n]]
+    elif want.startswith("filetype:"):
+        suffix = "." + want[len("filetype:"):].lower()
+        names = [n for n in names if is_dir[n] or n.lower().endswith(suffix)]
+    elif want and not want.startswith(("filename:", "filetype:")):
+        try:
+            pattern = re.compile(want, re.IGNORECASE)
+        except re.error:
+            pattern = None
+        if pattern is not None:
+            names = [n for n in names
+                     if pattern.search(os.path.join(folder, n))]
+
+    # Perl sortiert Ordner vor Dateien (Queries.pm:3183-3193); die
+    # Namenssortierung davor macht die Reihenfolge bestimmt.
+    names.sort()
+    ordered = ([n for n in names if is_dir[n]]
+               + [n for n in names if not is_dir[n]])
+    count = len(ordered)
+    page = _fs_page(args[0] if args else None,
+                    args[1] if len(args) > 1 else None, count)
+    if page is None:
+        return {"count": count}
+    start, end = page
+    loop = []
+    for name in ordered[start:end + 1]:
+        # Perl: catdir($folder, $item) bzw. $item ohne Ordner (:3194).
+        loop.append({
+            "path": os.path.join(folder, name),
+            "name": name,
+            "isfolder": 1 if is_dir[name] else 0,
+        })
+    return {"count": count, "fsitems_loop": loop}
+
+
+def _last_scan_epoch() -> int:
+    """Zeitpunkt des letzten Bibliotheks-Scans als Unix-Epoch.
+
+    Perl: ``Slim::Music::Import->lastScanTime()`` aus
+    ``metainformation.name='lastRescanTime'`` (Import.pm:290-300), von
+    ``serverstatusQuery`` als ``lastscan`` ausgegeben (Queries.pm:3731);
+    live ``{"lastscan":"1789309710"}``. Unser Schema hat keine
+    ``metainformation``-Tabelle — nächste Entsprechung ist
+    ``MAX(tracks.lastscanned)`` (UTC-Zeitstempel des zuletzt erfaßten
+    Titels, ``importer.py``). Controller lesen den Wert als Zahl
+    (Squeezer: ``Util.getLong(data, "lastscan")``, CometClient.java:355).
+    """
+    try:
+        rows = _db_query("SELECT MAX(lastscanned) AS t FROM tracks")
+    except Exception:  # noqa: BLE001 — kein Scan-Zeitstempel verfügbar
+        return 0
+    if not rows or not rows[0].get("t"):
+        return 0
+    try:
+        from datetime import datetime, timezone
+        stamp = str(rows[0]["t"]).split(".", 1)[0]
+        return int(datetime.fromisoformat(stamp)
+                   .replace(tzinfo=timezone.utc).timestamp())
+    except Exception:  # noqa: BLE001
+        return 0
 
 
 def _jive_params(args, names: list[str]) -> tuple[dict, dict]:
@@ -1728,11 +1909,21 @@ class JSONRPCAPI:
             return resp
 
     async def _displaystatus(self, pid: str | None, args: list[str]) -> dict:
-        """displaystatus [showBriefly:<text> <duration>] — now-playing popup.
+        """displaystatus — now-playing popup / display status.
 
-        'showBriefly:<text>' sets a popup (jive block) that expires after
-        <duration> seconds (default 5); a bare query returns the active
-        popup or {} when idle.
+        Perl ``displaystatusQuery`` (Queries.pm:1630-1757, Dispatch
+        ``[1,1,1]`` Request.pm:495). Ohne gespeicherte Anzeige beendet Perl
+        den Request ohne Result → ``{}``; live 2026-09-13
+        ``displaystatus 0 2`` (mit Client) → ``{"result":{}}`` und ohne
+        Client → Socket zu. Liegt eine Anzeige vor, antwortet Perl mit dem
+        ``type`` der notification (``$request->addResult('type', $type)``,
+        :1666) und einem ``display``-Record mit ``text``/``duration`` im
+        jive-Format (:1673-1687).
+
+        Squeezer liest genau das: ``Util.getRecord(data, "display")``
+        (CometClient.java:475-487) — der frühere Schlüssel ``jive`` wurde
+        deshalb nie gefunden. ``showBriefly:<text> [<dauer>]`` setzt das
+        Popup (Standarddauer 5 s).
         """
         now = time.time()
         if self._popup_expires and now > self._popup_expires:
@@ -1747,10 +1938,26 @@ class JSONRPCAPI:
                 if nxt.isdigit():
                     duration = int(nxt)
                 self._popup = {
-                    "jive": {"text": text, "type": "popup", "duration": duration}
+                    "jive": {"text": text, "type": "showbriefly",
+                             "duration": duration}
                 }
                 self._popup_expires = now + duration
-        return self._popup or {}
+        if not self._popup:
+            return {}
+        # ``_popup`` bleibt intern ``{"jive": {...}}`` (an anderen Stellen
+        # dieser Datei gesetzt, u. a. Preset-/Sync-Popups); nach außen wird
+        # daraus die Perl-Antwortform ``{type, display:{…}}``.
+        jive = dict(self._popup.get("jive") or {})
+        text: Any = jive.get("text", "")
+        if isinstance(text, (list, tuple)):
+            text = "\n".join(str(part) for part in text)
+        display: dict[str, Any] = {"text": str(text)}
+        duration = jive.get("duration")
+        if duration:
+            # Perl fügt duration nur bei gesetzter Dauer hinzu (:1685).
+            display["duration"] = int(duration)
+        return {"type": str(jive.get("type") or "showbriefly"),
+                "display": display}
 
 
     async def _slim_request(self, player_id: str, command: list[str]) -> Any:
@@ -1885,7 +2092,10 @@ class JSONRPCAPI:
                 "ip": local_ip,
                 "player count": len(players),
                 "other player count": 0,
-                "lastscan": 0,
+                # Perl Queries.pm:3731: Import->lastScanTime() (Prefs
+                # metainformation 'lastRescanTime'); live {"lastscan":"1789309710"}.
+                # Squeezer liest den Wert als Zahl (CometClient.java:355).
+                "lastscan": _last_scan_epoch(),
                 # SqueezeClient's ServerStatusResponse requires mediadirs
                 "mediadirs": [],
                 # P4-3: real library totals (were hardcoded 0)
@@ -1999,13 +2209,30 @@ class JSONRPCAPI:
                 "title": _jive_string("HOME"),
             }
 
-        # ── menustatus (Squeezer format: [?, items, directive, player]) ──
-        # Squeezer's parseMenuStatus: data[0] unused, data[1] = item
-        # array, data[2] = menu directive — items are only added when
-        # the directive is "add" (MenuStatusMessage.ADD)!
+        # ── menustatus ─────────────────────────────────────────────
+        # Perl-Dispatch ['menustatus','_data','_action'] zeigt auf einen
+        # Stub, der nur ``warn "menustatus query"`` macht (Jive.pm:150-152) —
+        # der Request endet ohne Result: live 2026-09-13 ``menustatus 0 2``
+        # UND ``menustatus`` → {"result":{}}. Echte Menüdaten erreichen
+        # Controller ausschließlich als menustatus-*Notification* über cometd
+        # (Jive.pm:1972 notifyFromArray ['menustatus',$items,'add',$id]).
         if cmd == "menustatus":
+            if args:
+                return {}
+            # Dokumentierte Abweichung: das argumentlose ["menustatus"] ist
+            # bei uns der Seed-Request der Cometd-Subscription
+            # /<cid>/slim/menustatus/<mac> (cometd.py:333-336), und Squeezer
+            # liest daraus data[1] als Item-Array (CometClient.java:492-505,
+            # parseMenuStatus). Die Query-Form mit Argumenten bleibt
+            # Perl-gleich.
             client = pm.get_player(pid) if (pm is not None and pid) else None
             return [None, self._home_menu(client), "add", pid or ""]
+
+        # displaystatus mit '?' am Ende — ['displaystatus'] ist in Slot 0
+        # registriert (Request.pm:495); endet die Anfrage auf '?', greift der
+        # leere Query-Slot → live Socket ohne Body (``displaystatus ?``).
+        if cmd == "displaystatus" and args and str(args[-1]) == "?":
+            return {}
 
         # ── Jive-Settings-/Menü-Queries (Slim/Control/Jive.pm) ─────
         # SqueezePlay/Controller rufen sie für ihre Einstellungsmenüs auf
@@ -2030,6 +2257,103 @@ class JSONRPCAPI:
                 await self._jive_end_of_track_sleep(pm, pid)
             else:  # jivesync
                 self._jive_sync_action(pm, pid, args)
+            return {}
+
+        # ── Controller-Kommandos in Perl-Form ──────────────────────
+        # Live-Proben (nur lesend) gegen Perl 9.1.1, 2026-09-13; die
+        # wörtlichen Antworten stehen in tests/test_controller_commands.py.
+        # Perl-Fundstellen je Kommando: Request.pm-Dispatch + Queries.pm-Handler.
+
+        # getstring <tokens,komma-getrennt>  (Queries.pm:1988-2016)
+        # Dispatch ['getstring','_tokens'] (Request.pm:500) ist KEINE
+        # '?'-Query — ein zusätzliches '?' ist nicht dispatchbar.
+        # Live: getstring PLAY,BROWSE,NOSUCH_TOKEN_XYZ →
+        #   {"BROWSE":"Durchsuchen","PLAY":"Wiedergabe","NOSUCH_TOKEN_XYZ":""}
+        if cmd == "getstring":
+            if len(args) != 1 or str(args[0]) in ("", "?"):
+                return {}
+            return {token: _client_string(token)
+                    for token in str(args[0]).split(",")}
+
+        # readdirectory <index> <quantity> [folder:<path>] [filter:<f>]
+        # Live: readdirectory 0 5 → {"count":0}
+        # Perl wählt den Dispatch-Eintrag über das LETZTE Token
+        # (Request.pm:1011-1024): endet die Anfrage auf '?', greift der
+        # Query-Slot — den gibt es für ['readdirectory','_index','_quantity']
+        # nicht (Request.pm:497), live schließt Perl dann den Socket
+        # (``readdirectory 0 ?``, ``readdirectory ?``).
+        if cmd == "readdirectory":
+            if args and str(args[-1]) == "?":
+                return {}
+            return _read_directory(list(args))
+
+        # works <index> <quantity>  (Queries.pm:5062-…, Request.pm:633)
+        # Live: ``works`` und ``works 0 5`` → {"count":0}; ``works ?`` →
+        # Socket zu. Unser Schema hat keine works-Tabelle; Perls SQL braucht
+        # tracks.work + works (Queries.pm:5097-5105), der Zähler bleibt 0 —
+        # die Form ist damit Perl-gleich.
+        if cmd == "works":
+            if args and str(args[-1]) == "?":
+                return {}
+            return {"count": 0}
+
+        # libraries [getid]  (Queries.pm:2074-2097, Request.pm:509-510)
+        # Live: libraries → {}; libraries getid → {"id":0};
+        #       libraries getid ohne Client → Socket zu (needClient=1).
+        if cmd == "libraries":
+            if (args and str(args[0]) == "getid" and pm is not None and pid
+                    and pm.get_player(pid) is not None):
+                return {"id": 0}
+            return {}
+
+        # lastscan …  — Perl hat dafür KEINEN Dispatch-Eintrag (Request.pm)
+        # und schließt den Socket ohne Body; live für ["lastscan","?"] und
+        # ["lastscan"]. Der Controller liest den Wert aus 'serverstatus'
+        # (Squeezer: CometClient.java:355).
+        if cmd == "lastscan":
+            return {}
+
+        # debug <flag> ?  (Queries.pm:1517-1549, Request.pm:489)
+        # Live: debug scan ? → {"_value":"ERROR"}; debug ? → Socket zu
+        # (_debugflag wäre hier '?' → bad params).
+        if cmd == "debug":
+            level = _debug_category_level(str(args[0]) if args else "")
+            return {} if level is None else {"_value": level}
+
+        # irenable ?  (Queries.pm:2058-2072, Request.pm:507)
+        # Live: {"_irenable":1} — Client-Zustand mit Default 1
+        # (Slim/Player/Client.pm:201).
+        if cmd == "irenable" and args and str(args[0]) == "?":
+            player = pm.get_player(pid) if (pm is not None and pid) else None
+            if player is None:
+                return {}
+            prefs = dict(getattr(player, "playerprefs", {}) or {})
+            return {"_irenable": int(prefs.get("irenable", 1) or 0)}
+
+        # linesperscreen ?  (Queries.pm:2100-2112, Request.pm:511)
+        # Live: {"_linesperscreen":0} für alle angebundenen Spieler.
+        if cmd == "linesperscreen" and args and str(args[0]) == "?":
+            player = pm.get_player(pid) if (pm is not None and pid) else None
+            if player is None:
+                return {}
+            return {"_linesperscreen": int(
+                getattr(player, "lines_per_screen", 0) or 0)}
+
+        # gototime ?  — Perl dispatcht 'gototime' auf timeQuery
+        # (Request.pm:669-670); der Ergebnisschlüssel ist '_time' aus
+        # songTime (Queries.pm:4786-4800). Live: {"_time":0}.
+        if cmd == "gototime" and args and str(args[0]) == "?":
+            player = pm.get_player(pid) if (pm is not None and pid) else None
+            if player is None:
+                return {}
+            return {"_time": int(getattr(player, "elapsed", 0) or 0)}
+
+        # artworkspec …  — nur ['artworkspec','add','_spec','_name'] ist
+        # dispatchbar (Request.pm:482); jede andere Form ist bad dispatch
+        # (Commands.pm:232-235) → Socket zu, live bestätigt. Ein gültiges
+        # 'add' endet ebenfalls nach setStatusDone ohne Result
+        # (Commands.pm:253-256) → leeres Dict.
+        if cmd == "artworkspec":
             return {}
 
         # ── Control commands (return {} — LMS convention) ──────────
@@ -2135,6 +2459,49 @@ class JSONRPCAPI:
         # loop_loop format: {"count": N, "loop_loop": [{id, name, url,
         # hasitems, ...}]}. items is DB-backed (FavoritesManager); the
         # other subcommands go through the CLI handler.
+
+        # favorites exists [<dB-id>|<url>]  (Perl cliExists,
+        # Slim/Plugin/Favorites/Plugin.pm:786-815, Dispatch :82
+        # ['favorites','exists','_id']). Eine numerische ID wird über die
+        # Track-Tabelle zur URL aufgelöst; eine unbekannte ID ist bad params
+        # → Socket zu. Live 2026-09-13: favorites exists → {"exists":0};
+        # favorites exists abc → {"exists":0}; favorites exists 1 → Socket zu
+        # (Track 1 existiert nicht in Perls Bibliothek).
+        if cmd == "favorites" and args and str(args[0]) == "exists":
+            # ``favorites exists ?`` endet auf '?' → Perl sucht den
+            # Query-Slot, den es für ['favorites','exists','_id'] nicht gibt
+            # (Plugin.pm:82) → live Socket ohne Body.
+            if str(args[-1]) == "?":
+                return {}
+            favourite = str(args[1]) if len(args) > 1 else ""
+            if favourite.isdigit():
+                try:
+                    rows = _db_query("SELECT url FROM tracks WHERE id = ?",
+                                     (int(favourite),))
+                except Exception:  # noqa: BLE001
+                    rows = []
+                if not rows:
+                    return {}
+                favourite = str(rows[0].get("url") or "")
+            # Perl sucht die URL in der flachen Favoritenliste
+            # (OpmlFavorites::findUrl:372-390) und liefert deren Index.
+            flat: list[dict] = []
+
+            def _collect(nodes) -> None:
+                for node in nodes or []:
+                    flat.append(node)
+                    _collect(node.get("children"))
+
+            try:
+                from lyrion.music.favorites import get_favorites_manager
+                _collect(await get_favorites_manager().list_tree())
+            except Exception:  # noqa: BLE001
+                pass
+            for i, item in enumerate(flat):
+                if str(item.get("url") or "") == favourite:
+                    return {"exists": 1, "index": i}
+            return {"exists": 0}
+
         if cmd == "favorites" and args and str(args[0]) == "items":
             return await self._json_favorites_items(pid, args[1:])
 

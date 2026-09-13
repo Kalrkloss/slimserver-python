@@ -448,7 +448,15 @@ async def cmd_serverstatus(
         totals["genres"] = int(r_gen[0]["n"]) if r_gen else 0
         # A scan that ran before adds 'lastscan' instead of the live progress.
         if not scanning:
-            r_scan = await _query_db("SELECT MAX(last_rescan) AS t FROM tracks")
+            # Perl: Import->lastScanTime() aus metainformation
+            # 'lastRescanTime' (Import.pm:290-300). Unser Schema hat keine
+            # metainformation-Tabelle; die Spalte 'last_rescan' existiert
+            # nicht (die Abfrage schlug bisher still fehl und die Zeile
+            # fehlte) — jüngster Erfassungs-Zeitstempel der Titel, als
+            # Unix-Epoch wie in Perl.
+            r_scan = await _query_db(
+                "SELECT strftime('%s', MAX(lastscanned)) AS t FROM tracks"
+            )
             lastscan = (
                 int(r_scan[0]["t"])
                 if r_scan and r_scan[0]["t"]
