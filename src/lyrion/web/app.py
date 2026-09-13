@@ -14,7 +14,13 @@ from typing import Callable, Optional
 import uvicorn
 
 from .api import JSONRPCAPI, WebAPIHandler
-from .cometd import LONG_POLL_TIMEOUT, CometdManager, _client_id_from_channel
+from .cometd import (
+    CometdManager,
+    _client_id_from_channel,
+    connect_ack,
+    connect_timeout,
+    has_invalid_client_advice,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +82,20 @@ async def _respond_401(send) -> None:
     await send({"type": "http.response.body", "body": b"Unauthorized"})
 
 
+async def _send_cometd_reply(send, replies: list[dict]) -> None:
+    """One complete JSON reply (Content-Length framing, no chunked body)."""
+    import json as _json
+
+    await send({
+        "type": "http.response.start",
+        "status": 200,
+        "headers": [(b"Content-Type", b"application/json"),
+                    (b"Cache-Control", b"no-cache")],
+    })
+    await send({"type": "http.response.body",
+                "body": _json.dumps(replies).encode("utf-8")})
+
+
 async def _handle_streaming_connect(
     cometd: CometdManager,
     cid: str,
@@ -94,20 +114,19 @@ async def _handle_streaming_connect(
     """
     import json as _json
 
-    connect_ack = {
-        "channel": "/meta/connect",
-        "successful": True,
-        "clientId": cid,
-        "id": msg.get("id", ""),
-        # Perl LONG_POLLING_TIMEOUT (Cometd.pm:48) = 60 s
-        "advice": {"reconnect": "retry", "interval": 0,
-                   "timeout": LONG_POLL_TIMEOUT},
-    }
+    # Perl Cometd.pm:271-280 stores this frame as ``first_event`` with
+    # id/channel/clientId/successful/timestamp and
+    # ``advice => { interval => $streaming ? RETRY_DELAY : 0 }``. Built by the
+    # shared helper so both transports (this one and cometd_stream.py) emit
+    # byte-identical acks — the ASGI path used to advertise
+    # ``advice.timeout: 60`` (60 ms!) and ``interval: 0`` for a streaming
+    # connect, while the native stream already carried 60000/5000.
+    ack = connect_ack(msg, cid)
     # Perl puts the (re)connect reply FIRST in the response (Cometd.pm:279-292,
     # "first_event"). We keep the shipped order — batch acks, then the connect
     # ack — because the Android/libcometd clients could not be exercised in
     # this suite; the deviation is documented, not silently changed (P3-4).
-    first = list(replies) + [connect_ack]
+    first = list(replies) + [ack]
     events = await cometd.wait_for_events(cid, timeout=0)
     first.extend(events)
 
@@ -199,12 +218,33 @@ async def _handle_cometd(cometd: CometdManager, path: str, receive, send) -> Non
     poll_owners: dict[str, object] = {}
 
     try:
+        # Perl Cometd.pm:228-244: a message whose clientId the manager does not
+        # know is answered with the re-handshake advice ALONE and the message
+        # loop is abandoned (``last``) BEFORE the /meta/(re)connect branch — so
+        # the reply carries no connect ack and no chunked stream is opened
+        # (``Transfer-Encoding: chunked`` is set at Cometd.pm:292, after the
+        # check). Appending a fabricated ``successful: true`` /meta/connect next
+        # to the advice told jive/libcometd it was still connected while the
+        # server had no record of it, so it never re-handshaked and never
+        # re-registered its subscriptions — and, on this path, the client also
+        # got the meaningless ``advice.timeout: 60`` (60 ms) frame. Mirrors
+        # cometd_stream.py:331-352.
+        if connect_msgs and has_invalid_client_advice(replies):
+            await _send_cometd_reply(send, replies)
+            return
+
         if connect_msgs:
             # /meta/connect: streaming clients (SqueezeClient, Material) need
             # the reply IMMEDIATELY (5s timeout) and then a held-open stream
             # that pushes events as chunks.
             for msg in connect_msgs:
                 cid = msg.get("clientId", "")
+                # Perl Cometd.pm:200-212: "No clientId found" — a message
+                # without a clientId is not processed at all (only the first
+                # clientId of a packet is used, :164-180). Never fabricate a
+                # connect ack for one: its clientId would be empty.
+                if not cid:
+                    continue
                 if msg.get("connectionType") == "streaming":
                     await _handle_streaming_connect(cometd, cid, msg, replies, send)
                     return
@@ -212,20 +252,20 @@ async def _handle_cometd(cometd: CometdManager, path: str, receive, send) -> Non
                 # it owns the client until a newer connect takes over (Perl
                 # registers the connection with the manager only in the
                 # /meta/(re)connect branch, Cometd.pm:286).
-                if cid:
-                    owner = object()
-                    cometd.register_connection(cid, owner)
-                    poll_owners[cid] = owner
-                # hold until events arrive or timeout
-                events = await cometd.wait_for_events(cid)
-                replies.append({
-                    "channel": "/meta/connect",
-                    "successful": True,
-                    "clientId": cid,
-                    "id": msg.get("id", ""),
-                    "advice": {"reconnect": "retry", "interval": 0,
-                               "timeout": LONG_POLL_TIMEOUT},
-                })
+                owner = object()
+                cometd.register_connection(cid, owner)
+                poll_owners[cid] = owner
+                # Hold until events arrive or the timeout expires. Perl lets
+                # the CLIENT pick the hold time (Cometd.pm:302-306,
+                # ``advice.timeout`` in ms; 0 = answer now) and answers
+                # immediately when events are already pending (:309-312, which
+                # wait_for_events does by returning the queue first).
+                events = await cometd.wait_for_events(
+                    cid, timeout=connect_timeout(msg))
+                # Perl Cometd.pm:271-280 (first_event): the same shared ack the
+                # native stream writes — interval 0 for long-polling,
+                # timeout 60000 ms, RFC1123 timestamp.
+                replies.append(connect_ack(msg, cid))
                 replies.extend(events)
                 # A completed poll restarts Perl's autokill window.
                 cometd.touch(cid)
@@ -247,14 +287,7 @@ async def _handle_cometd(cometd: CometdManager, path: str, receive, send) -> Non
                 events = await cometd.wait_for_events(cid, timeout=0)
                 replies.extend(events)
 
-        response = _json.dumps(replies).encode("utf-8")
-        await send({
-            "type": "http.response.start",
-            "status": 200,
-            "headers": [(b"Content-Type", b"application/json"),
-                        (b"Cache-Control", b"no-cache")],
-        })
-        await send({"type": "http.response.body", "body": response})
+        await _send_cometd_reply(send, replies)
     except Exception as exc:  # noqa: BLE001
         # The response could not be written — the client is gone from THIS
         # request. Only a connection that processed the client's /meta/connect

@@ -400,6 +400,51 @@ def connect_advice(connection_type: str = "") -> dict:
     }
 
 
+def connect_ack(msg: dict, client_id: str) -> dict:
+    """The single /meta/(re)connect ack (Perl Cometd.pm:271-280).
+
+    Perl stores it in ``first_event`` and every field is fixed there:
+    ``id``, ``channel``, ``clientId``, ``successful``, ``timestamp``
+    (``time2str(time())``, :276) and ``advice => { interval => $streaming ?
+    RETRY_DELAY : 0 }`` (:278). Both transports must emit exactly this
+    frame — it is the one and only answer to a /meta/connect
+    (``handle_messages`` deliberately never answers that channel).
+
+    ``advice.timeout`` is the documented Python superset of Perl's connect
+    advice (see ``connect_advice``); it must be the 60 s *milliseconds*
+    value, not 60, or a client reads it as a 60 ms server timeout.
+    """
+    return {
+        "channel": "/meta/connect",
+        "successful": True,
+        "clientId": client_id,
+        "id": msg.get("id", ""),
+        "timestamp": _http_timestamp(),
+        "advice": connect_advice(msg.get("connectionType", "")),
+    }
+
+
+def connect_timeout(msg: dict, default: float = LONG_POLL_TIMEOUT) -> float:
+    """Hold time in SECONDS for one long-polling /meta/connect.
+
+    Perl Cometd.pm:302-306: ``my $timeout = LONG_POLLING_TIMEOUT;`` and
+    "Client can override timeout" — a client that sends
+    ``advice.timeout`` (milliseconds, 0 = answer now) decides how long the
+    poll may be held.  A Bayeux client does exactly that when it wants its
+    pending requests flushed immediately (libcometd/jive send
+    ``advice: {timeout: 0}``); ignoring it held the reply for the full 60 s
+    while the client's own network timeout had long expired, so the app
+    reported "connection failed" although the server was listening.
+    """
+    advice = msg.get("advice") if isinstance(msg, dict) else None
+    if isinstance(advice, dict) and "timeout" in advice:
+        try:
+            return max(0.0, float(advice["timeout"]) / 1000.0)
+        except (TypeError, ValueError):
+            return default
+    return default
+
+
 def has_invalid_client_advice(replies: list) -> bool:
     """True when a reply is Perl's invalid-clientId / re-handshake advice.
 
