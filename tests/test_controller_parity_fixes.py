@@ -1,5 +1,5 @@
-"""Controller-Parität Runde 2 — fehlende JSON-Kommandos, Loop-Schlüssel,
-``status``-Felder und die zwei eigenen Harness-Fehler.
+"""Controller-Parität Runde 2 + 3 — fehlende JSON-Kommandos, Loop-Schlüssel,
+``status``-Felder, ``playlist <entity> ?``, ``can ?`` und ``pref``-Keys.
 
 Referenz ist Perl allein. Dispatch-Einträge in ``Slim/Control/Request.pm``,
 Handler in ``Slim/Control/Queries.pm``; die OPML-basierten Menü-Queries
@@ -32,6 +32,29 @@ Live gegengeprüft (nur lesend) gegen das Perl-LMS 9.1.1,
                         current_artist/current_url, aber mit ``can_seek``
                         (Remote-Stream mit bekannter Bitrate UND Dauer)
 
+Live-Probe 2026-09-13 (Runde 3, nur lesend, Perl 9.1.1, Player
+``00:00:00:00:00:00``, Queue = ein 1.FM-Stream) — wörtliche Antworten::
+
+    playlist repeat ?   -> {"_repeat":"0"}
+    playlist shuffle ?  -> {"_shuffle":"0"}
+    playlist tracks ?   -> {"_tracks":1}
+    playlist index ?    -> {"_index":"0"}
+    playlist modified ? -> {"_modified":1}
+    playlist name ?     -> {"_name":"1.FM - Ambient Psychill"}
+    playlist url ?      -> {"_url":null}
+    playlist duration ? -> {"_duration":"0"}
+    playlist artist ?   -> {"_artist":"Goabert"}
+    playlist title ?    -> {"_title":"pulchra somnium"}
+    playlist path ?     -> {"_path":"http://strm112.1.fm/ambientpsy_mobile_mp3"}
+    playlist remote ?   -> {"_remote":1}
+    playlist album ?    -> {}
+    playlist genre ?    -> {}
+    can ?               -> {"_can":0}
+    can play ?          -> {"_can":1}
+    pref ?              -> {"_p2":null}
+    pref audiodir ?     -> {"_p2":null}
+    playerpref ?        -> {"_p2":null}
+
 Perl-Fundstellen je Kommando:
 
 * ``player <entity> ?`` — ``playerXQuery`` ``Queries.pm:2514-2576``
@@ -58,6 +81,20 @@ Perl-Fundstellen je Kommando:
   ``Song.pm:849-870`` → ``Protocols/HTTP.pm:1150-1165`` (Bitrate UND Dauer)
   bzw. Formatklassen; ``count``/``offset`` nur im ``menuMode``
   (:4325-4332, :4401).
+* ``playlist <entity> ?`` — ``playlistXQuery`` ``Queries.pm:2708-2772``
+  (Dispatch ``Request.pm:548-591``): ``repeat``/``shuffle``
+  :2724-2725/:2727-2728, ``index``/``jump`` :2730-2731, ``name``
+  :2733-2734 + ``remote_title`` :2766-2767, ``url`` :2736-2738
+  (``Client.pm:1212-1228``), ``modified`` :2740-2741, ``tracks``
+  :2743-2744, ``path`` :2746-2748, ``remote`` :2750-2753,
+  ``title``/``duration``/``artist``/``album``/``genre`` :2755-2768 über
+  ``_songData`` (Tags ``dalgN``); der Index kommt aus ``_index`` bzw. dem
+  laufenden Titel (``Playlist.pm:62-73``).
+* ``can ?`` — ``canQuery`` ``Slim/Plugin/CLI/Plugin.pm:751-797``
+  (Dispatch ``Request.pm:400-401``): ``_can`` 0/1 als Zahl (:783, :791).
+* ``pref``/``playerpref`` — ``prefQuery`` ``Queries.pm:3009-3051``
+  (Dispatch ``Request.pm:544``/``:602``): Ergebnisschlüssel immer ``_p2``
+  (:3045-3048), unbekannte Pref = undef → JSON null.
 """
 
 from __future__ import annotations
@@ -609,3 +646,253 @@ def test_status_no_can_seek_without_a_playing_song(tmp_path, monkeypatch):
     """Stop → kein ``can_seek`` (Perl nur im ``playingSong()``-Zweig :4086)."""
     player = _status_player(tmp_path, monkeypatch, [11, 12], 0, mode="stop")
     assert "can_seek" not in _status(player, ["0", "100"])
+
+
+def test_status_plain_has_no_count_or_offset_even_with_a_queue(tmp_path,
+                                                               monkeypatch):
+    """Runde-3-Entscheid: ``count`` NUR im Menü-Pfad (Perl-Beleg).
+
+    Perl fügt ``count`` ausschließlich innerhalb ``if ($menuMode)`` hinzu
+    (``Queries.pm:4318-4320``: ``my $menuCount = $songCount?$songCount+2:0;
+    $request->addResult("count", $menuCount);``); ``offset`` ebenso
+    (:4433, nur ``if $menuMode``). Squeezers ``count``-Feld ohne
+    Default ist deshalb KEIN Grund, die Perl-Form zu verlassen — live
+    Perl 9.1.1: ``status`` → ``{…, "playlist_tracks":1, …}`` ohne
+    ``count``/``offset``.
+
+    Der Menü-Pfad behält beide Felder (siehe
+    ``test_status_count_and_offset_only_in_menu_mode``).
+    """
+    player = _status_player(tmp_path, monkeypatch, [11, 12], 0, mode="play",
+                            elapsed=10.0)
+    plain = _status(player, [])
+    assert "count" not in plain and "offset" not in plain
+    assert plain["playlist_tracks"] == 2
+
+
+# ----------------------------------------------------------------------
+# playlist <entity> ?   (playlistXQuery, Queries.pm:2708-2772)
+# ----------------------------------------------------------------------
+
+def _playlist_db(tmp_path, monkeypatch) -> str:
+    """Eigene Bibliotheks-DB mit Artist UND Album (für ``_songData``-Felder)."""
+    path = tmp_path / "lyrion.db"
+    if path.exists():
+        path.unlink()          # mehrere Player pro Test → DB neu aufsetzen
+    con = sqlite3.connect(path)
+    con.executescript(
+        """
+        CREATE TABLE tracks (id INTEGER PRIMARY KEY, title TEXT, url TEXT,
+            duration REAL, year INTEGER, tracknum INTEGER, bitrate INTEGER,
+            samplerate INTEGER, bitspersample INTEGER, genre TEXT, cover TEXT,
+            remote INTEGER, disc INTEGER, filesize INTEGER, comment TEXT,
+            lyrics TEXT, content_type TEXT);
+        CREATE TABLE contributors (id INTEGER PRIMARY KEY, name TEXT);
+        CREATE TABLE tracks_contributors (track INTEGER, contributor INTEGER,
+                                          role INTEGER);
+        CREATE TABLE albums (id INTEGER PRIMARY KEY, title TEXT, artwork TEXT);
+        CREATE TABLE tracks_albums (track INTEGER, album INTEGER);
+        INSERT INTO tracks (id, title, url, duration, genre, content_type,
+                            remote)
+        VALUES (11, 'First Song', 'file:///music/first.mp3', 180.0, 'Rock',
+                'mp3', 0),
+               (12, 'Second Song', 'file:///music/second.mp3', 245.5, 'Metal',
+                'mp3', 0);
+        INSERT INTO contributors (id, name) VALUES (7, 'Goabert');
+        INSERT INTO tracks_contributors (track, contributor, role)
+        VALUES (11, 7, 1), (12, 7, 1);
+        INSERT INTO albums (id, title) VALUES (5, 'First Album');
+        INSERT INTO tracks_albums (track, album) VALUES (11, 5);
+        """
+    )
+    con.commit()
+    con.close()
+    monkeypatch.setattr(api_mod, "_library_db_path", lambda: str(path))
+    return str(path)
+
+
+def _playlist_player(tmp_path, monkeypatch, playlist, position, **kw):
+    _playlist_db(tmp_path, monkeypatch)
+    p = PlayerState(mac=MAC, name="Taverne", ip="192.168.1.130", port=58044)
+    p.power = True
+    p.playlist = list(playlist)
+    p.playlist_position = position
+    p.playlist_total = len(p.playlist)
+    for key, value in kw.items():
+        setattr(p, key, value)
+    return p
+
+
+def _pl_req(player, command):
+    """``_slim_request`` gegen DIESEN Player (der Singleton-PlayerManager
+    wird auf ihn gesetzt, wie in ``_status``)."""
+    _pm(player)
+    return asyncio.run(JSONRPCAPI()._slim_request(player.mac, list(command)))
+
+
+@pytest.mark.parametrize("entity,expected", [
+    ("repeat", {"_repeat": 0}),
+    ("shuffle", {"_shuffle": 0}),
+    ("tracks", {"_tracks": 2}),
+    ("index", {"_index": 1}),
+    ("jump", {"_jump": 1}),
+])
+def test_playlist_entity_queue_state_queries(entity, expected, tmp_path,
+                                             monkeypatch):
+    """``repeat``/``shuffle``/``tracks``/``index``/``jump`` sind IMMER
+    vorhanden (Perl ``Playlist::repeat``/``shuffle`` :2724-2725/:2727-2728,
+    ``playingSongIndex`` :2730-2731, ``Playlist::count`` :2743-2744).
+
+    Live Perl 9.1.1 2026-09-13:: ``playlist repeat ?`` → ``{"_repeat":"0"}``,
+    ``playlist shuffle ?`` → ``{"_shuffle":"0"}``, ``playlist tracks ?`` →
+    ``{"_tracks":1}``, ``playlist index ?`` → ``{"_index":"0"}``. Der Harness
+    setzt numerische Strings mit Zahlen gleich, wir senden echte Zahlen.
+    """
+    player = _playlist_player(tmp_path, monkeypatch, [11, 12], 1,
+                              mode="play", elapsed=10.0)
+    assert _pl_req(player, ["playlist", entity, "?"]) == expected
+
+
+def test_playlist_entity_name_is_the_remote_stream_title(tmp_path, monkeypatch):
+    """``playlist name ?`` — Remote-Stream: ``remote_title`` (:2766-2767).
+
+    Live Perl: ``{"_name":"1.FM - Ambient Psychill"}`` (Stream-Titel, NICHT
+    der Tracktitel). Für einen LOKALEN Track setzt Perl kein ``name`` (Tag
+    ``N`` = ``remote_title`` greift nur bei Streams) → kein Result.
+    """
+    stream = "http://stream.example.org:8000/live.mp3"
+    player = _playlist_player(tmp_path, monkeypatch, [stream], 0, mode="play",
+                              elapsed=5.0, current_url=stream,
+                              current_title="1.FM - Ambient Psychill")
+    assert _pl_req(player, ["playlist", "name", "?"]) == {
+        "_name": "1.FM - Ambient Psychill"}
+
+    local = _playlist_player(tmp_path, monkeypatch, [11, 12], 0, mode="play",
+                             elapsed=5.0)
+    assert _pl_req(local, ["playlist", "name", "?"]) == {}
+
+
+def test_playlist_entity_url_is_null_without_a_saved_playlist(tmp_path,
+                                                              monkeypatch):
+    """``playlist url ?`` → ``$client->currentPlaylist()`` (:2736-2738).
+
+    ``currentPlaylist`` liefert nur ein gespeichertes Playlist-Objekt und
+    sonst undef (``Client.pm:1212-1228``) → live ``{"_url":null}``.
+    """
+    player = _playlist_player(tmp_path, monkeypatch, [11, 12], 0, mode="play")
+    assert _pl_req(player, ["playlist", "url", "?"]) == {"_url": None}
+
+
+def test_playlist_entity_modified_follows_queue_mutations(tmp_path,
+                                                          monkeypatch):
+    """``playlist modified ?`` → ``currentPlaylistModified`` (:2740-2741).
+
+    Perl setzt das Flag in den Queue-Kommandos auf 1 (``playlistXitemCommand``
+    ``Commands.pm:831``, ``playlistJumpCommand`` :1506) und auf 0 beim Laden
+    einer gespeicherten Playlist (:1162). Live Perl (Queue per add gebaut):
+    ``{"_modified":1}``. Ohne je veränderte Queue ist es undef → null.
+    """
+    player = _playlist_player(tmp_path, monkeypatch, [11], 0, mode="stop")
+    assert _pl_req(player, ["playlist", "modified", "?"]) == {"_modified": None}
+    _pl_req(player, ["playlist", "add", "12"])
+    assert _pl_req(player, ["playlist", "modified", "?"]) == {"_modified": 1}
+
+
+def test_playlist_entity_current_track_fields(tmp_path, monkeypatch):
+    """``title``/``duration``/``artist``/``album``/``genre`` kommen aus
+    ``_songData`` des Tracks am ``_index`` (:2755-2768).
+
+    Live Perl (Remote-Stream): ``{"_artist":"Goabert"}``,
+    ``{"_duration":"0"}``, ``{"_title":"pulchra somnium"}`` — und
+    ``playlist album ?`` → ``{}``, ``playlist genre ?`` → ``{}``, weil der
+    Stream keine Werte hat (ein fehlendes Feld ergibt KEINEN Schlüssel).
+    """
+    player = _playlist_player(tmp_path, monkeypatch, [11, 12], 0, mode="play",
+                              elapsed=10.0)
+    assert _pl_req(player, ["playlist", "title", "?"]) == {"_title": "First Song"}
+    assert _pl_req(player, ["playlist", "artist", "?"]) == {"_artist": "Goabert"}
+    assert _pl_req(player, ["playlist", "album", "?"]) == {"_album": "First Album"}
+    assert _pl_req(player, ["playlist", "genre", "?"]) == {"_genre": "Rock"}
+    assert _pl_req(player, ["playlist", "duration", "?"]) == {"_duration": 180.0}
+    # Ohne Dauer-Feld bleibt der Schlüssel trotzdem stehen (definiert, :2755).
+    assert _pl_req(player, ["playlist", "duration", "?"])["_duration"] == 180.0
+    # Track 12 hat kein Album → kein Result (:2755-2768).
+    assert _pl_req(player, ["playlist", "album", "1", "?"]) == {}
+
+
+def test_playlist_entity_index_argument_selects_the_track(tmp_path,
+                                                          monkeypatch):
+    """``playlist title <_index> ?`` (Dispatch ``Request.pm:588``).
+
+    Ohne ``_index`` arbeitet Perl auf dem laufenden Titel
+    (``Playlist.pm:72-73``).
+    """
+    player = _playlist_player(tmp_path, monkeypatch, [11, 12], 0, mode="play")
+    assert _pl_req(player, ["playlist", "title", "1", "?"]) == {
+        "_title": "Second Song"}
+
+
+def test_playlist_entity_path_and_remote(tmp_path, monkeypatch):
+    """``path`` → ``Playlist::url`` bzw. 0 (:2746-2748), ``remote`` nur bei
+    definierter URL (:2750-2753).
+
+    Live Perl (Stream): ``{"_path":"http://strm112.1.fm/ambientpsy_mobile_mp3"}``
+    und ``{"_remote":1}``.
+    """
+    stream = "http://stream.example.org:8000/live.mp3"
+    remote = _playlist_player(tmp_path, monkeypatch, [stream], 0, mode="play",
+                              elapsed=5.0, current_url=stream,
+                              current_title="Radio Eins")
+    assert _pl_req(remote, ["playlist", "path", "?"]) == {"_path": stream}
+    assert _pl_req(remote, ["playlist", "remote", "?"]) == {"_remote": 1}
+
+    local = _playlist_player(tmp_path, monkeypatch, [11], 0, mode="play")
+    assert _pl_req(local, ["playlist", "path", "?"]) == {
+        "_path": "file:///music/first.mp3"}
+    assert _pl_req(local, ["playlist", "remote", "?"]) == {"_remote": 0}
+
+    empty = _playlist_player(tmp_path, monkeypatch, [], 0, mode="stop")
+    assert _pl_req(empty, ["playlist", "path", "?"]) == {"_path": 0}
+    assert _pl_req(empty, ["playlist", "remote", "?"]) == {}
+    assert _pl_req(empty, ["playlist", "title", "?"]) == {}
+
+
+# ----------------------------------------------------------------------
+# can ?   (canQuery, Slim/Plugin/CLI/Plugin.pm:751-790)
+# ----------------------------------------------------------------------
+
+def test_can_query_is_a_number_and_zero_without_params():
+    """``can ?`` → ``{"_can":0}`` als ZAHL (Perl :783/:791).
+
+    Live Perl 9.1.1: ``can ?`` → ``{"_can":0}``, ``can play ?`` →
+    ``{"_can":1}`` (ein Dispatch-Eintrag existiert). Vorher antworteten wir
+    ``{"_can":""}`` (String) — der Harness meldete das als Typabweichung.
+    """
+    assert _req(["can", "?"]) == {"_can": 0}
+    assert _req(["can", "play", "?"]) == {"_can": 1}
+    assert _req(["can", "gibtsnicht", "?"]) == {"_can": 0}
+
+
+# ----------------------------------------------------------------------
+# pref / playerpref ohne Namespace   (prefQuery, Queries.pm:3009-3044)
+# ----------------------------------------------------------------------
+
+def test_pref_query_uses_the_p2_key():
+    """``pref <name> ?`` → IMMER ``_p2`` (:3045-3048).
+
+    Live Perl 9.1.1: ``pref ?`` → ``{"_p2":null}``,
+    ``pref audiodir ?`` → ``{"_p2":null}`` (unbekannte Pref = undef → null).
+    Vorher antworteten wir mit dem Pref-Namen als Schlüssel
+    (``{"audiodir":""}``) — eine erfundene Form.
+    """
+    assert _req(["pref", "?"]) == {"_p2": None}
+    assert _req(["pref", "audiodir", "?"]) == {"_p2": None}
+
+
+def test_playerpref_without_a_name_is_p2_null():
+    """``playerpref ?`` (ohne Pref-Namen) → ``{"_p2":null}`` (live Perl).
+
+    ``playerpref <pref> ?`` bleibt unverändert (``tests/test_playerpref.py``).
+    """
+    assert _req(["playerpref", "?"]) == {"_p2": None}
+    assert _req(["playerpref", "replayGainMode", "?"]) == {"_p2": "0"}

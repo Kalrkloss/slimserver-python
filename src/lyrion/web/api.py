@@ -673,6 +673,67 @@ _ROLE_NAMES = {
     1: "ARTIST",
 }
 
+#: Entitäten von ``playlist <entity> ?`` mit ``_index`` in der Perl-Dispatch-
+#: Form (``Request.pm:551``, ``:553``, ``:559``, ``:560``, ``:575``, ``:581``,
+#: ``:588``): sie arbeiten auf dem Track an diesem Index, ohne Index auf dem
+#: laufenden Titel (``Playlist.pm:62-73``:
+#: ``$index = Slim::Player::Source::playingSongIndex($client)`` :72-73).
+_PLAYLIST_INDEX_ENTITIES = frozenset({
+    "album", "artist", "duration", "genre", "path", "remote", "title",
+})
+
+#: Alle ``playlist <entity> ?``-Entities (``playlistXQuery``,
+#: ``Queries.pm:2708-2772``).
+_PLAYLIST_QUERY_ENTITIES = _PLAYLIST_INDEX_ENTITIES | frozenset({
+    "name", "url", "modified", "tracks", "repeat", "shuffle", "index", "jump",
+})
+
+
+def _playlist_local_id(entry: object) -> int | None:
+    """DB-Track-Id eines Queue-Eintrags, sonst ``None`` (Remote-URL).
+
+    Dieselbe Regel wie in ``_json_player_status``: eine Zahl oder ein reiner
+    Ziffern-String ist ein lokaler Track (der CLI-/Plugin-Pfad liefert
+    ``"51994"``), alles andere eine Stream-URL.
+    """
+    if isinstance(entry, bool):
+        return None
+    if isinstance(entry, int):
+        return entry
+    text = str(entry)
+    return int(text) if text.isdigit() else None
+
+
+def _can_dispatch(tokens: list) -> bool:
+    """Perl ``canQuery``: gibt es einen Dispatch-Eintrag für diese Tokens?
+
+    Perl baut aus den ``_p1``…``_p5``-Parametern (leere und ``?`` werden
+    vorher entfernt, ``Slim/Plugin/CLI/Plugin.pm:764-778``) einen
+    ``Slim::Control::Request`` und antwortet ``_can`` 1, wenn eine Funktion
+    gefunden wurde (:791); login/shutdown/exit sind immer erreichbar (:783).
+    Ein leeres Token-Array ist nie dispatchbar — live gegen Perl 9.1.1:
+    ``can ?`` → ``{"_can":0}``.
+    """
+    words = [str(t) for t in tokens if str(t) not in ("", "?")]
+    if not words:
+        return False
+    name = words[0].lower()
+    if name in _KNOWN_JSON_COMMANDS:
+        return True
+    try:
+        from lyrion.control.cli import get_registered_commands
+        return name in get_registered_commands()
+    except Exception:  # noqa: BLE001
+        return False
+
+
+#: Kommandos, die nur der JSON-RPC-Pfad beantwortet (nicht in der
+#: CLI-Registry) — für ``can <cmd> ?``.
+_KNOWN_JSON_COMMANDS = frozenset({
+    "jsonrpc", "displaystatus", "menustatus", "artworkspec", "apps", "radios",
+    "radiosearch", "browse", "browsedb", "folderinfo", "folders", "readdirectory",
+})
+
 
 def _jive_string(key: str) -> str:
     """Perl ``$client->string($key)`` (Slim/Utils/Strings.pm:525-536).
@@ -2510,6 +2571,41 @@ class JSONRPCAPI:
         # (Commands.pm:253-256) → leeres Dict.
         if cmd == "artworkspec":
             return {}
+
+        # playlist <entity> ?  — playlistXQuery (Queries.pm:2708-2772,
+        # Dispatch Request.pm:548-591). Squeezer/SqueezeCtrl lesen hier die
+        # Repeat-/Shuffle-/Queue-Länge (`playlist repeat ?`, `playlist shuffle ?`,
+        # `playlist tracks ?`); ohne diesen Zweig fiel die Form in den
+        # Control-Pfad und antwortete leer.
+        if (cmd == "playlist" and len(args) >= 2
+                and str(args[-1]) == "?"
+                and str(args[0]).lower() in _PLAYLIST_QUERY_ENTITIES):
+            return await self._json_playlist_entity(pm, pid, [str(a) for a in args])
+
+        # can <cmd> ?  — canQuery (Slim/Plugin/CLI/Plugin.pm:751-790,
+        # Dispatch Request.pm:400-401). `_can` ist ein 0/1-INT (:783, :791);
+        # live Perl 9.1.1: `can ?` → {"_can":0}.
+        if cmd == "can" and args and str(args[-1]) == "?":
+            return {"_can": 1 if _can_dispatch(list(args[:-1])) else 0}
+
+        # pref <name> ? / pref ? / playerpref ?  — prefQuery
+        # (Queries.pm:3009-3051, Dispatch Request.pm:602). Der Ergebnisschlüssel
+        # ist IMMER `_p2` (:3045-3048) und der Wert die Pref; eine unbekannte
+        # Pref ist undef → JSON null (live Perl 9.1.1: `pref ?` und
+        # `pref audiodir ?` → {"_p2":null}). Die namensraumlose Form ist keine
+        # sinnvolle Abfrage (Report 'Methode & Grenzen'), die KEY-Form war aber
+        # bei uns erfunden (`{"audiodir":""}`).
+        if cmd in ("pref", "playerpref") and args and str(args[-1]) == "?":
+            name = str(args[0])
+            if name == "?":
+                # `pref ?`/`playerpref ?`: der gesuchte Name ist '?' selbst →
+                # in Perl undef (Queries.pm:3045-3048).
+                return {"_p2": None}
+            if cmd == "pref":
+                from lyrion.config import get_config
+                return {"_p2": get_config().get(name, None)}
+            # `playerpref <pref> ?` selbst wird weiter unten beantwortet
+            # (_PLAYERPREF_DEFAULTS, Tests in tests/test_playerpref.py).
 
         # ── Control commands (return {} — LMS convention) ──────────
         # ── CLI query commands: <cmd> ? → {"_<cmd>": value} ──────
@@ -4612,6 +4708,116 @@ class JSONRPCAPI:
             loop.append(item)
         return {"count": len(loop), "playlist_tracks_loop": loop}
 
+    async def _json_playlist_entity(self, pm, pid: str | None, args: list[str]) -> dict:
+        """``playlist <entity> ?`` — Perl ``playlistXQuery``.
+
+        Perl ``Slim/Control/Queries.pm:2708-2772`` (Dispatch
+        ``Request.pm:548-591``); jede Form antwortet mit dem nackten Schlüssel
+        ``_<entity>``. Presence-Regeln wie Perl — **ein Feld ohne Wert erzeugt
+        keinen Schlüssel**, und der aktuelle Titel kommt aus
+        ``Slim::Player::Playlist::track($client, $index)`` mit ``$index``
+        undef → ``Source::playingSongIndex`` (``Playlist.pm:62-73``):
+
+        * ``repeat``/``shuffle`` → ``Playlist::repeat``/``shuffle``
+          (:2724-2725/:2727-2728) — immer vorhanden (Wert 0/1/2).
+        * ``index``/``jump`` → ``playingSongIndex`` (:2730-2731).
+        * ``tracks`` → ``Playlist::count`` (:2743-2744).
+        * ``modified`` → ``currentPlaylistModified`` (:2740-2741) — undef,
+          solange die Queue nie verändert wurde (JSON null).
+        * ``url`` → ``$client->currentPlaylist()`` (:2736-2738); ohne
+          gespeicherte Playlist undef → null (live Perl: ``{"_url":null}``).
+        * ``path`` → ``Playlist::url`` bzw. 0 (:2746-2748).
+        * ``remote`` → nur bei definierter URL (:2750-2753).
+        * ``name`` → Titel der gespeicherten Playlist (:2733-2734) bzw.
+          ``remote_title`` des Streams (:2766-2767); bei einem lokalen Track
+          gibt Perl KEIN Result.
+        * ``title``/``duration``/``artist``/``album``/``genre`` → das
+          ``_songData``-Feld des Tracks (:2755-2768, Tags ``dalgN``).
+        """
+        player = pm.get_player(pid) if (pm is not None and pid) else None
+        if player is None:
+            return {}
+        entity = str(args[0]).lower()
+        playlist = list(getattr(player, "playlist", []) or [])
+
+        if entity == "repeat":
+            return {"_repeat": int(getattr(player, "repeat", 0) or 0)}
+        if entity == "shuffle":
+            return {"_shuffle": int(getattr(player, "shuffle", 0) or 0)}
+        if entity in ("index", "jump"):
+            return {f"_{entity}": int(getattr(player, "playlist_position", 0) or 0)}
+        if entity == "tracks":
+            return {"_tracks": len(playlist)}
+        if entity == "modified":
+            flag = getattr(player, "playlist_modified", None)
+            return {"_modified": None if flag is None else int(flag)}
+        if entity == "url":
+            # Ohne gespeicherte Playlist ist currentPlaylist() undef → null.
+            url = getattr(player, "current_playlist_url", None)
+            return {"_url": str(url) if url else None}
+
+        # _index nur bei den Dispatch-Formen mit `_index` (Request.pm:551-588);
+        # ohne Index ist es der laufende Titel (Playlist.pm:72-73).
+        index: int | None = None
+        if (entity in _PLAYLIST_INDEX_ENTITIES and len(args) >= 3
+                and re.fullmatch(r"-?\d+", str(args[1]))):
+            index = int(str(args[1]))
+        if index is None:
+            index = int(getattr(player, "playlist_position", 0) or 0)
+        entry = playlist[index] if 0 <= index < len(playlist) else None
+        url_str = "" if entry is None else str(entry)
+
+        if entity == "path":
+            # Perl: url($client, $index) || 0 (:2746-2748) — ohne Eintrag 0.
+            if entry is None:
+                return {"_path": 0}
+            tid = _playlist_local_id(entry)
+            if tid is None:
+                return {"_path": url_str or 0}
+            rows = await self._load_tracks([tid])
+            return {"_path": str((rows.get(tid) or {}).get("url") or 0)}
+        if entity == "remote":
+            # Perl nur bei definierter URL (:2750-2753).
+            if entry is None:
+                return {}
+            return {"_remote": 1 if _is_remote_url(url_str) else 0}
+
+        # title/duration/artist/album/genre/name — _songData des Tracks.
+        if entry is None:
+            return {}
+        tid = _playlist_local_id(entry)
+        info: dict = {}
+        is_remote = tid is None
+        if tid is not None:
+            info = dict((await self._load_tracks([tid])).get(tid) or {})
+        else:
+            # Remote-Stream: Titel des laufenden Items wie in
+            # _json_player_status (current_title = ICY/Stationstitel, sonst
+            # der Host) — Perls ``$remoteMeta->{title} || $track->title``.
+            title = str(getattr(player, "current_title", "") or "")
+            if not title:
+                try:
+                    from urllib.parse import urlparse
+                    title = (urlparse(url_str).hostname or url_str).replace("www.", "")
+                except Exception:  # noqa: BLE001
+                    title = url_str
+            info = {"title": title, "url": url_str, "duration": 0}
+            if index == int(getattr(player, "playlist_position", 0) or 0):
+                info["artist"] = str(getattr(player, "current_artist", "") or "")
+
+        if entity == "duration":
+            # Auch 0 ist definiert → der Schlüssel bleibt (:2763-2764).
+            return {"_duration": float(info.get("duration", 0) or 0)}
+        if entity == "name":
+            # Tag 'N' → remote_title; nur ein Stream hat einen Namen
+            # (:2766-2767). Ein lokaler Track liefert kein Result.
+            value = info.get("title") if is_remote else None
+        else:
+            value = info.get(entity)
+        if value in (None, ""):
+            return {}
+        return {f"_{entity}": value}
+
     async def _json_playlist_mutation(self, sub: str, toks: list) -> dict:
         """new/rename/delete on saved playlists (Perl Commands.pm)."""
         parts: dict[str, str] = {}
@@ -4995,6 +5201,16 @@ class JSONRPCAPI:
         elif cmd == "playlist":
             sub = args[0] if args else ""
             rest = args[1:] if len(args) > 1 else []
+            # Queue-verändernde Subs setzen bei Perl das Modified-Flag
+            # (``$client->currentPlaylistModified(1)`` in playlistXitemCommand/
+            # playlistJumpCommand, Commands.pm:831/:912/:1058/:1506); die
+            # Query ``playlist modified ?`` antwortet damit (Queries.pm:2740-2741).
+            # Ein aus einer gespeicherten Playlist geladener Queue setzt 0
+            # (Commands.pm:1162) — deshalb nur add/insert/play/delete/move.
+            if sub in ("add", "insert", "play", "delete", "move", "zap"):
+                _pl = pm.get_player(pid)
+                if _pl is not None:
+                    setattr(_pl, "playlist_modified", 1)
             if sub == "add" and rest:
                 # Accept a DB track id, a 'track_id:<n>' tag (controllers),
                 # a plain URL, or album/artist/year/genre filters (SqueezePlay
