@@ -60,6 +60,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -111,21 +112,27 @@ class _Favs:
         return [dict(x) for x in self.TREE.get(parent_id, [])]
 
     async def resolve_path(self, path):
-        """Mirror of FavoritesManager.resolve_path ('0' = virtual root).
+        """Mirror of FavoritesManager.resolve_path.
 
-        Walks the hierarchical id ('0.0', '0.0.1') index by index through
-        the sorted child lists and returns the DB id of the last element.
+        Walks the id ('<sid>.0', '<sid>.0.1', legacy '0.0') index by index
+        through the sorted child lists and returns the DB id of the last
+        element.  The leading crumb is Perl's browse-session handle
+        (``getSID``, XMLBrowser.pm:1739-1741) — our old root ``0`` is still
+        accepted.
         """
+        from lyrion.music.favorites import _is_session_root
+
+        crumbs = [c for c in str(path).split(".") if c]
+        if crumbs and (_is_session_root(crumbs[0]) or crumbs[0] == "0"):
+            crumbs = crumbs[1:]
+        if not crumbs:
+            return None
         try:
-            parts = [int(p) for p in str(path).split(".") if p]
+            parts = [int(p) for p in crumbs]
         except ValueError:
             return None
-        if not parts or parts[0] != 0:
-            return None
-        if len(parts) < 2:
-            return None
         parent: int | None = None
-        for idx in parts[1:]:
+        for idx in parts:
             items = await self.list_items(parent)
             if idx < 0 or idx >= len(items):
                 return None
@@ -169,10 +176,11 @@ def _perl_sid(name: str) -> str:
     """Perl's item_id prefix — a per-request ``createUUID`` session id.
 
     ``XMLBrowser.pm:341-353`` (``getSID``/``createUUID``): every fresh
-    ``favorites items`` request gets a new 8-hex prefix, so the ids inside
-    a fixture are meaningless across requests.  Ours is the stable virtual
-    root ``0`` (``FavoritesManager.resolve_path``), which clients echo
-    back the same way.
+    ``favorites items`` request gets a new 8-hex prefix
+    (``Slim/Utils/Misc.pm:1557-1560``), so the ids inside a fixture are
+    meaningless across requests.  We now hand out a handle of exactly that
+    shape too (``lyrion.web.api._new_fav_sid``) — the value differs per
+    request, the *form* must not.
     """
     for it in _perl_result(name)["item_loop"]:
         go = (it.get("actions") or {}).get("go")
@@ -181,6 +189,19 @@ def _perl_sid(name: str) -> str:
         if it.get("params"):
             return it["params"]["item_id"].split(".")[0]
     raise AssertionError(f"{name}: no item_id found")
+
+
+def _ours_sid(res: dict) -> str:
+    """The 8-hex session handle of OUR answer ('<sid>.<index>')."""
+    for it in res["item_loop"]:
+        go = (it.get("actions") or {}).get("go")
+        item_id = (go["params"]["item_id"] if go
+                   else (it.get("params") or {}).get("item_id") or it.get("id"))
+        return str(item_id).split(".")[0]
+    raise AssertionError("no item_id found")
+
+
+SID_RE = re.compile(r"^[a-f0-9]{8}$")
 
 
 def _folder_item(res: dict, idx: int = 0) -> dict:
@@ -263,12 +284,15 @@ def test_folder_item_key_set_matches_perl(favs):
 def test_folder_item_go_action_navigates_with_item_id(favs):
     perl_id = _perl_sid(USE_CM_FIXTURE)
     perl = _folder_item(_perl_result(USE_CM_FIXTURE))["actions"]["go"]
-    ours = _folder_item(_items(MENU_ARGS))["actions"]["go"]
+    res = _items(MENU_ARGS)
+    ours = _folder_item(res)["actions"]["go"]
     assert ours["cmd"] == perl["cmd"] == ["favorites", "items"]
     assert set(ours["params"]) == set(perl["params"]) == {"menu", "item_id"}
     assert ours["params"]["menu"] == perl["params"]["menu"] == "favorites"
-    # ours: '0.0' — Perl: '<sid>.0'; same position, stable root vs. UUID
-    assert ours["params"]["item_id"] == "0.0"
+    # both sides answer with '<sid>.0' (one browse-session handle per answer)
+    ours_id = _ours_sid(res)
+    assert SID_RE.match(ours_id), ours_id
+    assert ours["params"]["item_id"] == f"{ours_id}.0"
     assert perl["params"]["item_id"] == f"{perl_id}.0"
     assert _folder_item(_items(MENU_ARGS))["addAction"] == "go"
     assert "player" not in ours, "Perl's base go has no player key"
@@ -278,6 +302,7 @@ def test_folder_tap_opens_the_subfolder(favs):
     """The folder item_id must resolve to the folder's children."""
     res = _items(MENU_ARGS)
     fid = _folder_item(res)["actions"]["go"]["params"]["item_id"]
+    assert fid == f"{_ours_sid(res)}.0"
     sub = _items(["items", 0, 200, "menu:favorites",
                   "useContextMenu:1", f"item_id:{fid}"])
     assert [it["text"] for it in sub["item_loop"]] == [
@@ -307,13 +332,17 @@ def test_audio_item_is_touch_to_play(favs):
 
 def test_audio_item_params_match_perl(favs):
     """XMLBrowser.pm:1139-1147/1259-1263 — item_id + touchToPlay + isContextMenu."""
-    ours = _audio_item(_items(MENU_ARGS))
+    res = _items(MENU_ARGS)
+    ours = _audio_item(res)
     perl = _audio_item(_perl_result(USE_CM_FIXTURE))
     assert set(ours["params"]) == set(perl["params"]) == {
         "item_id", "touchToPlay", "touchToPlaySingle", "isContextMenu"}
     assert ours["params"]["touchToPlaySingle"] == 1
     assert ours["params"]["isContextMenu"] == 1
-    assert ours["params"]["item_id"] == ours["params"]["touchToPlay"] == "0.1"
+    ours_id = _ours_sid(res)
+    assert SID_RE.match(ours_id), ours_id
+    assert ours["params"]["item_id"] == ours["params"]["touchToPlay"]
+    assert ours["params"]["item_id"] == f"{ours_id}.1"
     assert perl["params"]["item_id"] == perl["params"]["touchToPlay"]
 
 
@@ -435,14 +464,17 @@ def test_subfolder_playcontrol_echoes_item_id(favs):
 
 def test_tap_yields_the_perl_play_command(favs):
     """Rebuild _performJSONAction (SlimBrowserApplet.lua:704-767) by hand."""
-    item = _audio_item(_items(MENU_ARGS))
-    action = _items(MENU_ARGS)["base"]["actions"]["play"]
+    res = _items(MENU_ARGS)
+    item = _audio_item(res)
+    action = res["base"]["actions"]["play"]
     params = dict(action["params"])
     params.update(item[action["itemsParams"]])
     tokens = [f"{k}:{v}" for k, v in params.items()]
     request = list(action["cmd"]) + ["0", "200"] + tokens + ["useContextMenu:1"]
     assert request[:3] == ["favorites", "playlist", "play"]
-    assert "item_id:0.1" in request and "touchToPlay:0.1" in request
+    ours_id = _ours_sid(res)
+    assert f"item_id:{ours_id}.1" in request
+    assert f"touchToPlay:{ours_id}.1" in request
     assert "menu:favorites" in request and "useContextMenu:1" in request
     # the server must be able to answer it (Perl: cliBrowse, Plugin.pm:747)
     assert request[3:5] == ["0", "200"]

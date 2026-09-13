@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any, Optional
@@ -30,6 +31,18 @@ _OPML_CANDIDATES = (
 )
 _opml_lock = asyncio.Lock()
 _opml_import_done = False
+
+#: Perl's browse-session handle: ``getSID`` accepts any token *starting* with
+#: 8 hex digits (``Slim/Control/XMLBrowser.pm:1739-1741``), created by
+#: ``createUUID`` as ``substr(sha1_hex(time . $$ . hostname), 0, 8)``
+#: (``Slim/Utils/Misc.pm:1557-1560``).
+_SESSION_SID_RE = re.compile(r"^[a-f0-9]{8}$", re.IGNORECASE)
+
+
+def _is_session_root(token: object) -> bool:
+    """``XMLBrowser::getSID`` — the browse-session prefix of an item id."""
+    return bool(_SESSION_SID_RE.match(str(token or "")))
+
 
 
 def _opml_path() -> Path | None:
@@ -104,21 +117,36 @@ class FavoritesManager:
             return [self._fav_to_dict(f, include_children=True) for f in result.scalars().all()]
 
     async def resolve_path(self, path: str) -> Optional[int]:
-        """Resolve an LMS hierarchical id ('0.3.1') to a DB favorite id.
+        """Resolve an LMS item id ('<sid>.3.1' / legacy '0.3.1') to a DB id.
 
-        '0' is the virtual root; each following number is the index into
-        the sorted item list of the parent (same ordering as list_items:
-        folders first, then streams, both alphabetical). Returns None if
-        the path does not exist.
+        Perl's ``XMLBrowser`` roots every item id in the browse session's
+        handle: ``my @crumbIndex = $sid ? ($sid) : ()`` plus one entry per
+        drill-down (``Slim/Control/XMLBrowser.pm:341-353``/``:387-394``), so
+        an id reads ``<8-hex-sid>.<index>[.<index>…]`` (``:1022``/``:1142``).
+        On the way back ``_cliQuery_done`` splits on '.' and shifts the handle
+        off when ``getSID`` recognises it (``:331-336``, ``:1739-1741``).
+        ``'0'`` is our pre-session root and stays accepted so ids from older
+        responses keep resolving.
+
+        Each following number is the index into the sorted item list of its
+        parent (same ordering as list_items: folders first, then streams,
+        both alphabetical). Returns None if the path does not exist.
         """
+        crumbs = [c for c in str(path).split(".") if c]
+        # Perl `getSID($index[0])` (XMLBrowser.pm:336/1739-1741): the leading
+        # crumb of a session id is the 8-hex browse handle, never an index.
+        if crumbs and _is_session_root(crumbs[0]):
+            crumbs = crumbs[1:]
+        elif crumbs and crumbs[0] == "0":
+            crumbs = crumbs[1:]
+        if not crumbs:
+            return None
         try:
-            parts = [int(p) for p in str(path).split(".") if p]
+            parts = [int(p) for p in crumbs]
         except ValueError:
             return None
-        if not parts or parts[0] != 0:
-            return None
         parent: Optional[int] = None
-        for idx in parts[1:]:
+        for idx in parts:
             items = await self.list_items(parent)
             if idx < 0 or idx >= len(items):
                 return None

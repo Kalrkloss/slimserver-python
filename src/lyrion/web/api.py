@@ -115,6 +115,77 @@ def _library_db_path() -> str:
 
 _LIBRARY_DB = "/root/.lyrion/Lyrion/Prefs/lyrion.db"
 
+#: Perl's browse-session handle: ``XMLBrowser::getSID`` accepts any token
+#: starting with 8 hex digits (``Slim/Control/XMLBrowser.pm:1739-1741``) and
+#: ``getSID``/``createUUID`` builds it as a *short digest*
+#: (``substr(sha1_hex(time . $$ . hostname), 0, 8)``,
+#: ``Slim/Utils/Misc.pm:1557-1560``).  It is the ROOT handle of one browse
+#: session: ``@crumbIndex = $sid ? ($sid) : ()`` (``XMLBrowser.pm:353``) and
+#: every item id becomes ``<sid>.<index>[.<index>…]`` (``:1022``/``:1142``).
+#: A client that taps the item echoes that id back; ``cliQuery`` then finds
+#: the cached feed for the sid (``:225-229``) and strips it before walking
+#: the index path (``:334-336``).  That is the shape the favorites ids must
+#: have — our old synthetic root ``0`` is not a sid and every Perl client
+#: (and every Perl answer) uses the session token instead.
+_FAV_SID_RE = re.compile(r"^[a-f0-9]{8}$", re.IGNORECASE)
+
+
+def _new_fav_sid() -> str:
+    """A fresh browse-session handle (Perl ``createUUID``, Misc.pm:1557-1560)."""
+    import secrets
+
+    return secrets.token_hex(4)
+
+
+def _is_fav_sid(token: str) -> bool:
+    """``XMLBrowser::getSID`` — a root handle is 8 hex chars (``:1739-1741``)."""
+    return bool(_FAV_SID_RE.match(str(token or "")))
+
+
+def _status_state_fingerprint(cmd: str, pid: str | None) -> tuple | None:
+    """State snapshot of the inputs a cached ``status`` answer was built from.
+
+    The 1 s poll cache (``_status_cache``) exists against flood clients, but
+    it must NEVER mask a state change: Perl re-runs every subscribed request
+    after each command (``@notificationQueue``/``notify``,
+    ``Slim/Control/Request.pm:1872-1876``/``:2005-2100``) and that push has to
+    carry the new ``mode``/``time``.  A paused player's pushed status used to
+    be served from a <1 s old pre-pause entry (``mode: play``), which left
+    Squeezer's play/pause icon and its local 1 s progress ticker running
+    (``BaseClient.parseStatus`` → ``updatePlayStatus(…, "mode")``,
+    ``CometClient.postSongTimeChanged``).  Returns ``None`` when the state
+    cannot be sampled — then the response is neither cached nor served.
+    """
+    try:
+        from lyrion.player.manager import PlayerManager
+
+        pm = PlayerManager()
+        if cmd == "status":
+            player = pm.get_player(pid) if pid else None
+            if player is None:
+                players = pm.get_all_players()
+                player = players[0] if players else None
+            if player is None:
+                return ()
+            return (
+                str(player.mode),
+                bool(player.power),
+                round(float(getattr(player, "elapsed", 0) or 0), 3),
+                round(float(getattr(player, "duration", 0) or 0), 3),
+                int(getattr(player, "seq_no", 0) or 0),
+                int(getattr(player, "volume", 0) or 0),
+                int(getattr(player, "shuffle", 0) or 0),
+                int(getattr(player, "repeat", 0) or 0),
+                str(getattr(player, "current_title", "") or ""),
+            )
+        return tuple(sorted(
+            (str(p.mac), str(p.mode), bool(p.power),
+             bool(getattr(p, "connected", False)), str(getattr(p, "name", "")),
+             int(getattr(p, "seq_no", 0) or 0))
+            for p in pm.get_all_players()))
+    except Exception:  # noqa: BLE001
+        return None
+
 
 def _db_query(sql: str, params: tuple = ()) -> list[dict]:
     """Run a read-only query against the library DB (synchronous)."""
@@ -1460,7 +1531,10 @@ class JSONRPCAPI:
         self._methods: dict[str, Callable] = {}
         # Short-TTL cache for status/serverstatus/players polls
         # (misbehaving clients can flood the server otherwise).
-        self._status_cache: dict[tuple, tuple[float, Any]] = {}
+        # key -> (timestamp, state fingerprint, answer); the fingerprint
+        # (see _status_state_fingerprint) keeps a state change from being
+        # masked by the 1 s window.
+        self._status_cache: dict[tuple, tuple[float, tuple | None, Any]] = {}
         # P4-4: active display popup (showBriefly) + expiry timestamp
         self._popup: Optional[dict] = None
         self._popup_expires: float = 0.0
@@ -1832,10 +1906,31 @@ class JSONRPCAPI:
             logging.getLogger("lyrion.web.api").warning("_playlist_prev failed: %s", e)
             return False
 
+    async def _fav_position_path(self, fm: Any, db_id: int) -> str:
+        """Session-prefixed position path of a root favourite (Perl's id).
+
+        A caller that addresses the parent by its DB id (Web UI:
+        ``['favorites','items','<parent_id>']``) gets an id of the same shape
+        as every other one: ``<sid>.<index>`` where ``index`` is the item's
+        position in the sorted root list — the path ``resolve_path`` walks.
+        """
+        sid = _new_fav_sid()
+        try:
+            items = await fm.list_items(None)
+        except Exception:  # noqa: BLE001
+            return sid
+        for i, it in enumerate(items):
+            try:
+                if int(it.get("id")) == int(db_id):
+                    return f"{sid}.{i}"
+            except (TypeError, ValueError):
+                continue
+        return sid
+
     async def _fav_items_loop(self, fm: Any, parent: Optional[int],
                               parent_path: str, feed_mode: bool,
                               menu_mode: bool = False) -> list[dict]:
-        """Build the favorites loop with LMS hierarchical ids.
+        """Build the favorites loop with Perl's session item ids.
 
         Two shapes, mirroring Perl's ``XMLBrowser::_cliQuery_done``:
 
@@ -1849,7 +1944,8 @@ class JSONRPCAPI:
           ``image``/``isaudio``/``hasitems``, ``XMLBrowser.pm:1378-1410``)
           other controllers (SqueezeTray, Squeezer, SPA) read.
 
-        id = display-position path from the virtual root ('0.0', '0.3.1');
+        id = Perl's ``<8-hex browse-session id>.<position>[.<position>…]``
+        (``XMLBrowser.pm:353/1022/1142``, root handle ``getSID`` :1739-1741);
         dbid carries the internal DB id; feed_mode embeds children in
         'items' arrays.
         """
@@ -1887,17 +1983,24 @@ class JSONRPCAPI:
                     item["id_hierarchical"] = hier
                     item["dbid"] = str(it["id"])
                 if is_folder:
-                    # Folder: go opens the folder's items (hierarchical id).
+                    # Folder: go opens the folder's items (session id).
                     item["actions"] = {
                         "go": {"player": 0, "cmd": ["favorites", "items"],
                                "params": {"item_id": hier}},
                     }
                 else:
-                    # Stream: play/do plays the favorite.
+                    # Stream: play/do plays the favorite.  Perl's only
+                    # favorites play route is ['favorites','playlist',
+                    # '_method'] (Favorites/Plugin.pm:81) — a plain
+                    # ['playlist','play'] cannot resolve a favourites id
+                    # (the playlist command knows track_id/album_id filters,
+                    # Commands.pm:1313-1323), i.e. the tap stayed ineffective.
                     item["actions"] = {
-                        "play": {"player": 0, "cmd": ["playlist", "play"],
+                        "play": {"player": 0,
+                                 "cmd": ["favorites", "playlist", "play"],
                                  "params": {"item_id": hier}},
-                        "do": {"player": 0, "cmd": ["playlist", "play"],
+                        "do": {"player": 0,
+                               "cmd": ["favorites", "playlist", "play"],
                                "params": {"item_id": hier}},
                     }
             if feed_mode and is_folder:
@@ -1921,14 +2024,22 @@ class JSONRPCAPI:
         * no ``menu:`` token ⇒ the classic ``loop_loop`` shape other
           controllers read (unchanged).
 
-        ``item_id:`` accepts the hierarchical id ('0.3.1') and a bare DB
-        id; a bare numeric first argument (Web UI) is a folder id.
+        ``item_id:`` accepts Perl's session form ('<8-hex-sid>.3.1'), our
+        legacy virtual root ('0.3.1') and a bare DB id; a bare numeric first
+        argument (Web UI) is a folder id.
         """
         try:
             from lyrion.music.favorites import get_favorites_manager
             fm = get_favorites_manager()
             parent = None
-            parent_path = "0"
+            # Perl's XMLBrowser roots every item id in a fresh browse-session
+            # handle: `my @crumbIndex = $sid ? ($sid) : ()` + `push
+            # @crumbIndex, $i` → `<sid>.<index>[.<index>…]`
+            # (XMLBrowser.pm:341-353/387-394, id at :1022/:1142).  The client
+            # echoes it back as item_id: and the server strips the handle
+            # before walking the index path (:334-336).  Our former root was
+            # the synthetic "0" — no Perl client ever sees that form.
+            parent_path = _new_fav_sid()
             menu_mode = any(str(a) == "menu" or str(a).startswith("menu:")
                             for a in rest)
             feed_mode = any(str(a).startswith("feedMode:")
@@ -1939,23 +2050,28 @@ class JSONRPCAPI:
             if feed_mode:
                 menu_mode = False
             # item_id:<n> (SqueezeTray folder children) — highest priority;
-            # accepts the LMS hierarchical id ('0.3.1') and the DB id.
+            # accepts Perl's '<sid>.<path>', the legacy '0.<path>' and the
+            # bare DB id (Perl finds the feed through the sid, XMLBrowser.pm:225).
             for a in rest:
                 if str(a).startswith("item_id:"):
                     val = str(a)[8:]
                     if "." in val:
                         parent = await fm.resolve_path(val)
-                        parent_path = val if parent is not None else "0"
+                        if parent is not None:
+                            # keep the client's own handle → stable child ids
+                            parent_path = val
+                        else:
+                            parent_path = _new_fav_sid()
                     elif val.isdigit():
                         parent = int(val)
-                        parent_path = f"0.{val}"
+                        parent_path = await self._fav_position_path(fm, parent)
                     break
             if parent is None and len(rest) == 1 and str(rest[0]).isdigit():
                 # Web UI: ['favorites','items','<parent_id>'] — a bare
                 # number is the folder id (SqueezeTray sends multiple
                 # args: start/count/want_url — never a bare parent).
                 parent = int(str(rest[0]))
-                parent_path = f"0.{rest[0]}"
+                parent_path = await self._fav_position_path(fm, parent)
             loop = await self._fav_items_loop(fm, parent, parent_path,
                                               feed_mode, menu_mode)
             if menu_mode:
@@ -2064,8 +2180,10 @@ class JSONRPCAPI:
             cache_key = (str(pid), str(cmd), json.dumps(args, sort_keys=True))
             cached = self._status_cache.get(cache_key)
             now = time.time()
-            if cached and now - cached[0] < 1.0:
-                return cached[1]
+            fingerprint = _status_state_fingerprint(cmd, pid)
+            if (cached and fingerprint is not None and now - cached[0] < 1.0
+                    and cached[1] == fingerprint):
+                return cached[2]
             self._cache_hit = False
 
         try:
@@ -2130,7 +2248,9 @@ class JSONRPCAPI:
                 loop.append(entry)
             result = {"count": len(players), "players_loop": loop}
             if cacheable:
-                self._status_cache[cache_key] = (time.time(), result)
+                _fp = _status_state_fingerprint(cmd, pid)
+                if _fp is not None:
+                    self._status_cache[cache_key] = (time.time(), _fp, result)
             return result
 
         # ── serverstatus ───────────────────────────────────────────
@@ -2261,14 +2381,18 @@ class JSONRPCAPI:
                 ss_loop.append(entry)
             result["players_loop"] = ss_loop
             if cacheable:
-                self._status_cache[cache_key] = (time.time(), result)
+                _fp = _status_state_fingerprint(cmd, pid)
+                if _fp is not None:
+                    self._status_cache[cache_key] = (time.time(), _fp, result)
             return result
 
         # ── status (player) ────────────────────────────────────────
         if cmd == "status":
             result = await self._json_player_status(pm, pid, args)
             if cacheable:
-                self._status_cache[cache_key] = (time.time(), result)
+                _fp = _status_state_fingerprint(cmd, pid)
+                if _fp is not None:
+                    self._status_cache[cache_key] = (time.time(), _fp, result)
             return result
 
         # ── menu (home menu for Jive/Material/OpenSqueeze apps) ────

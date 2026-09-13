@@ -49,8 +49,23 @@ Documented deviations from Perl
   attribute, our ``favorites`` table has no icon column.
 * ``base.actions.playControl.cmd`` is the literal ``["favorites","items"]``
   from the fixtures instead of being recomputed from the request tokens.
-* ``defeatDestructiveTouchToPlay`` (``base.go = base.playControl`` for
-  pre-7.6 clients, ``XMLBrowser.pm:1430``) is not implemented.
+* ``defeatDestructiveTouchToPlay`` (``XMLBrowser.pm:1260-1271`` /
+  ``:1430``) is not implemented: with that player pref set, Perl answers an
+  otherwise touch-to-play row with ``goAction: "playControl"`` +
+  ``playControlParams: {xmlbrowserPlayControl: <index>}`` so the tap opens
+  the context menu instead of starting playback (live Perl LMS
+  192.168.1.90: both root stations carry exactly that pair).  We always
+  serve the ``goAction: "play"`` branch (``:1259-1267``).
+
+Item ids
+--------
+The ``item_id``/``touchToPlay`` values are Perl's session ids:
+``<8-hex browse-session handle>.<index>[.<index>…]`` — the handle is
+``XMLBrowser::createUUID`` (``Slim/Utils/Misc.pm:1557-1560``), recognised
+by ``getSID`` (``Slim/Control/XMLBrowser.pm:1739-1741``), prefixed to the
+crumb path at ``:353`` and emitted with the item at ``:1022``/``:1142``.
+The server that hands out such an id must accept it back
+(``lyrion.music.favorites.FavoritesManager.resolve_path``).
 """
 
 from __future__ import annotations
