@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -249,6 +250,148 @@ def _playctl_index(value: str) -> int:
     if num == float("-inf"):
         return -_PLAYCTL_INF
     return int(num)  # int use truncates toward zero, like Perl
+
+
+#: Perl's server/player default for ``defeatDestructiveTouchToPlay``
+#: (``Slim/Utils/Prefs.pm:272``: ``'defeatDestructiveTouchToPlay' => 4``).
+_DEFEAT_DEFAULT = 4
+
+#: url → Perl-style negative remote-track id, and its reverse index.
+_REMOTE_TRACK_IDS: dict[str, int] = {}
+_REMOTE_TRACK_URLS: dict[int, str] = {}
+
+#: Perl's cover-less remote fallback (``_addJiveSong``, Queries.pm:5628-5630
+#: — ``/html/images/radio.png`` through the skin alias).  Our HTTP layer only
+#: serves the skin-qualified file (curl 2026-09-13: skin-relative → 404,
+#: ``/html/EN/html/images/radio.png`` → 200 ``image/png``), and it is the same
+#: image file Perl points at.
+RADIO_PLACEHOLDER_ICON = "/html/EN/html/images/radio.png"
+
+#: Our own stand-in for the current cover-less stream item's ``artwork_url``
+#: (non-menu ``playlist_loop`` shape, api.py `_json_player_status`).  It is
+#: NOT artwork: Perl's precedence (``_addJiveSong``, Queries.pm:5618-5630)
+#: must not mistake it for a real ``artwork_url``, otherwise the radio
+#: placeholder never applies to the Menu-Status item.
+_REMOTE_ART_PLACEHOLDER = "/html/images/favorites.png"
+
+
+def _remote_track_id(url: object) -> int:
+    """Perl's ``id`` for a remote track (``Slim/Schema/RemoteTrack.pm:317``).
+
+    ``RemoteTrack->new`` initialises the read-only accessor with
+    ``$self->init_accessor(_url => $url, id => -int($self), …)`` — ``int``
+    of the stringified object yields its address, so the ``id`` is a
+    **negative integer that is stable for the object's lifetime** and maps
+    back to the URL through ``%idIndex`` (``:412``, ``fetchById``
+    ``:439-451``).  Live Perl 192.168.1.90 answers a stream item with exactly
+    that shape (read-only ``status - 1 tags:ABdejJKlrStTuxy``):
+    ``"id": "-94115161401160"``.
+
+    We hand out the same *shape* — a negative integer of the same magnitude
+    (12 hex digits, Perl's pointers are ≈1e14) — derived from the URL, so it
+    is deterministic per process and resolvable back with
+    :func:`_remote_url_for_id`.  Clients parse the field as a number; the URL
+    string we used to send crashes them (Squeeze Client on a player-preview
+    zoom).
+    """
+    key = str(url)
+    tid = _REMOTE_TRACK_IDS.get(key)
+    if tid is None:
+        tid = -int(hashlib.sha1(key.encode("utf-8", "replace"))
+                   .hexdigest()[:12], 16)
+        _REMOTE_TRACK_IDS[key] = tid
+        _REMOTE_TRACK_URLS[tid] = key
+    return tid
+
+
+def _remote_url_for_id(track_id: object) -> str | None:
+    """``RemoteTrack->fetchById`` (``Slim/Schema/RemoteTrack.pm:439-451``).
+
+    The server accepts its own remote-track id back and resolves it to the
+    URL (Perl keeps ``%idIndex`` in memory and a 30-day disk cache,
+    ``:413``).
+    """
+    try:
+        return _REMOTE_TRACK_URLS.get(int(str(track_id)))
+    except (TypeError, ValueError):
+        return None
+
+
+#: Playlist container extensions — Perl asks ``$song->isPlaylist()``
+#: (``Slim/Player/Song.pm``), i.e. whether the playing URL is a playlist file
+#: rather than a plain stream.
+_PLAYLIST_EXT_RE = re.compile(r"\.(?:m3u8?|pls|asx|b4s|wpl)(?:$|[?#])",
+                              re.IGNORECASE)
+
+
+def _defeat_destructive_touch_to_play(rest: list, player=None) -> bool:
+    """Perl ``_defeatDestructiveTouchToPlay`` (``XMLBrowser.pm:1951-1983``).
+
+    Decides whether a *tap* on a touch-to-play row must NOT start playback
+    blindly, but open the play-control context menu instead
+    (``goAction: "playControl"`` + ``playControlParams``).  Order of
+    resolution, verbatim from Perl:
+
+    1. the request param ``defeatDestructiveTouchToPlay:<n>``
+       (``:1964``) — controllers send it to force a branch;
+    2. the *client's* stored pref (``:1965``);
+    3. the server pref (``:1966``) with Perl's default ``4``
+       (``Slim/Utils/Prefs.pm:272``).
+
+    Values (``:1968-1973``): ``0`` never, ``1`` always, ``2`` playlist length
+    > 1, ``3`` playing and length > 1, ``4`` playing and the current item is
+    not a radio stream.  ``$pref != 0`` with **no** client at all returns 1
+    (``:1976``) — which is why a plain controller/CLI request gets the
+    play-control branch from Perl.
+
+    The Perl ``< 7.6``-SqueezePlay exception (``:1955-1962``, UA sniffing)
+    is not ported: the app version is not part of the request.
+    """
+    pref: Any = None
+    for a in rest or []:
+        s = str(a)
+        if s.startswith("defeatDestructiveTouchToPlay:"):
+            pref = s[len("defeatDestructiveTouchToPlay:"):]
+            break
+    if pref is None and player is not None:
+        pref = (getattr(player, "playerprefs", None) or {}).get(
+            "defeatDestructiveTouchToPlay")
+    if pref is None:
+        pref = _DEFEAT_DEFAULT
+    try:
+        # Perl numifies the param: a non-numeric string becomes 0.
+        num = int(str(pref).strip() or 0)
+    except ValueError:
+        num = 0
+    if not num:
+        return False                     # :1975 `return 0 if !$pref`
+    if num == 1:
+        return True                      # :1976 `$pref == 1`
+    if player is None:
+        # Documented divergence: Perl's second clause (:1976
+        # ``|| !$client``) defeats the tap for *any* pref as soon as the
+        # request has no client at all.  Our port cannot separate "no client"
+        # from "player the server does not know" (both arrive as an
+        # unresolvable ``pid``), and every existing favourites parity fixture
+        # drives the API without an installed ``PlayerState`` — Perl's rule
+        # would flip those to the play-control branch.  An unresolvable
+        # player therefore keeps the non-defeated branch; a request that
+        # *does* want the play-control menu can ask for it explicitly with
+        # ``defeatDestructiveTouchToPlay:1`` (:1964).
+        return False
+    if num == 4:
+        # :1977 `$client->isPlaying() && $client->playingSong()->duration()
+        #        && !$client->playingSong()->isPlaylist()`
+        url = str(getattr(player, "current_url", "") or "")
+        return bool(getattr(player, "mode", "") == "play"
+                    and float(getattr(player, "duration", 0) or 0) > 0
+                    and not _PLAYLIST_EXT_RE.search(url))
+    length = int(getattr(player, "playlist_total", 0) or 0)
+    if length < 2:
+        return False                     # :1979
+    if num == 3 and getattr(player, "mode", "") != "play":
+        return False                     # :1980
+    return True
 
 
 def _genres_table_populated(db=None) -> bool:
@@ -1927,9 +2070,32 @@ class JSONRPCAPI:
                 continue
         return sid
 
+    @staticmethod
+    def _fav_item_id(loop: list[dict], index: int) -> Optional[str]:
+        """The browse-session id of the favourites row at ``index``.
+
+        Menu-shape rows carry it as ``params.item_id`` (stations,
+        ``XMLBrowser.pm:1142``) or ``actions.go.params.item_id`` (folders,
+        ``:1243``); ``xmlbrowserPlayControl`` addresses the row by its
+        position (``:808``), so the context-menu answer needs the id of that
+        row back.
+        """
+        if index < 0 or index >= len(loop):
+            return None
+        item = loop[index]
+        params = item.get("params")
+        if isinstance(params, dict) and params.get("item_id") is not None:
+            return str(params["item_id"])
+        go = (item.get("actions") or {}).get("go") or {}
+        go_params = go.get("params")
+        if isinstance(go_params, dict) and go_params.get("item_id") is not None:
+            return str(go_params["item_id"])
+        return None
+
     async def _fav_items_loop(self, fm: Any, parent: Optional[int],
                               parent_path: str, feed_mode: bool,
-                              menu_mode: bool = False) -> list[dict]:
+                              menu_mode: bool = False,
+                              use_play_control: bool = False) -> list[dict]:
         """Build the favorites loop with Perl's session item ids.
 
         Two shapes, mirroring Perl's ``XMLBrowser::_cliQuery_done``:
@@ -1963,8 +2129,9 @@ class JSONRPCAPI:
                 if is_folder:
                     item = favorites_menu.folder_item(it["title"], hier)
                 else:
-                    item = favorites_menu.audio_item(it["title"], hier,
-                                                     url=it["url"] or "")
+                    item = favorites_menu.audio_item(
+                        it["title"], hier, url=it["url"] or "",
+                        use_play_control=use_play_control, index=i)
             else:
                 # LMS reference format (lyrion.org): hierarchical id
                 # '<root>.<position>' (the apps re-send it as item_id:),
@@ -2005,7 +2172,8 @@ class JSONRPCAPI:
                     }
             if feed_mode and is_folder:
                 item["items"] = await self._fav_items_loop(
-                    fm, int(it["id"]), hier, feed_mode, menu_mode)
+                    fm, int(it["id"]), hier, feed_mode, menu_mode,
+                    use_play_control)
             loop.append(item)
         return loop
 
@@ -2031,6 +2199,20 @@ class JSONRPCAPI:
         try:
             from lyrion.music.favorites import get_favorites_manager
             fm = get_favorites_manager()
+            # XMLBrowser.pm:802 — the destructive-tap defeat decides whether a
+            # station row is a touch-to-play row (goAction "play") or the
+            # play-control row (goAction "playControl", the shape whose tap
+            # opens Play/Add/Play-next).  Perl resolves it per request
+            # (:1951-1983); our player object carries the playing state it
+            # looks at.
+            player = None
+            if pid:
+                try:
+                    from lyrion.player.manager import PlayerManager
+                    player = PlayerManager().get_player(pid)
+                except Exception:  # noqa: BLE001
+                    player = None
+            use_play_control = _defeat_destructive_touch_to_play(rest, player)
             parent = None
             # Perl's XMLBrowser roots every item id in a fresh browse-session
             # handle: `my @crumbIndex = $sid ? ($sid) : ()` + `push
@@ -2073,9 +2255,26 @@ class JSONRPCAPI:
                 parent = int(str(rest[0]))
                 parent_path = await self._fav_position_path(fm, parent)
             loop = await self._fav_items_loop(fm, parent, parent_path,
-                                              feed_mode, menu_mode)
+                                              feed_mode, menu_mode,
+                                              use_play_control)
             if menu_mode:
                 from lyrion.web import favorites_menu
+                # XMLBrowser.pm:805-830 — the tap on a touch-to-play row
+                # arrives as `xmlbrowserPlayControl:<itemIndex>` (the token is
+                # numified at :808); Perl answers with the play-control menu
+                # for exactly that row (`_playlistControlContextMenu`,
+                # :1811-1844), not with the list again.
+                play_ctl = next((str(a) for a in rest if str(a).startswith(
+                    "xmlbrowserPlayControl:")), None)
+                if play_ctl is not None:
+                    idx = _playctl_index(play_ctl[len("xmlbrowserPlayControl:"):])
+                    fav_id = self._fav_item_id(loop, idx)
+                    if fav_id is None:
+                        # Out of range: Perl emits only window/offset/count
+                        # (:813-830) — count 0, no item_loop.
+                        return {"window": dict(favorites_menu.WINDOW_TEXT_LIST),
+                                "offset": 0, "count": 0}
+                    return favorites_menu.play_control_context_menu(fav_id)
                 # Perl echoes the request's tagged params into the
                 # playControl base action (XMLBrowser.pm:978).  The two
                 # leading positionals are the named slots of
@@ -2092,7 +2291,8 @@ class JSONRPCAPI:
                         k, _, v = s.partition(":")
                         tagged[k] = v
                 return favorites_menu.render_favorites_menu(
-                    loop, playcontrol_params=tagged)
+                    loop, playcontrol_params=tagged,
+                    use_play_control=use_play_control)
             resp = self._browse_response(loop)
             # LMS reference: 'title' on the response level.
             resp["title"] = _jive_string("FAVORITES")
@@ -4186,8 +4386,17 @@ class JSONRPCAPI:
                 except Exception:
                     pass
                 info = {"remote": 1}
-            item: dict = {"id": tid_local if tid_local is not None else tid,
-                          "playlist index": i}
+            item: dict = {
+                # Perl `_addSong` → `$returnHash{'id'} = $track->id`
+                # (Queries.pm:5971/_songData:5880): a DB integer for a local
+                # track, and for a REMOTE track the negative RemoteTrack id
+                # (RemoteTrack.pm:317).  Never the URL string — a client that
+                # parses the field as a number (Squeeze Client crashed on the
+                # player-preview zoom) cannot read it.
+                "id": (tid_local if tid_local is not None
+                       else _remote_track_id(tid)),
+                "playlist index": i,
+            }
             # title/trackType are always present (Orange Squeeze does
             # firstItem.get("trackType").asText() — a missing field is a
             # NULL NPE crash).
@@ -4261,7 +4470,7 @@ class JSONRPCAPI:
             # 'icon-id', else the radio placeholder for a cover-less remote
             # item. SqueezePlay reads both (Player.lua:282).
             _art = item.get("artwork_url") or info.get("artwork_url") or ""
-            if _art:
+            if _art and _art != _REMOTE_ART_PLACEHOLDER:
                 item["icon"] = _art
             elif info.get("cover"):
                 # Jive builds '/music/' .. iconId .. '/cover' .. size from
@@ -4270,7 +4479,15 @@ class JSONRPCAPI:
                 item["icon-id"] = str(info["cover"])
                 item["icon"] = f"music/{info['cover']}/cover"
             elif tid_local is None:
-                item["icon-id"] = "/html/images/favorites.png"
+                # "send radio placeholder art for remote tracks with no art"
+                # — Perl's fallback (Queries.pm:5628-5630).  Perl names the
+                # skin-relative ``/html/images/radio.png``; our HTTP layer
+                # only serves the skin-qualified file, so we emit the path
+                # that really answers (curl 2026-09-13: ``/html/images/
+                # radio.png`` → 404, ``/html/EN/html/images/radio.png`` →
+                # 200 image/png; Squeezer prefixes the origin either way,
+                # ``Util.getAbsoluteUrl`` Util.java:239-245).
+                item["icon-id"] = RADIO_PLACEHOLDER_ICON
             loop.append(item)
 
         # A negative/absent position must never index the list (-1 would hit
@@ -4629,7 +4846,17 @@ class JSONRPCAPI:
             # artwork/now-playing sink (seen live as a missing cover and
             # `RequestHttp.lua:71 Response sink` error). Perl omits the key
             # in that case.
-            if item_loop:
+            # Perl builds ``item_loop`` ONLY in menuMode: `my $loop =
+            # $menuMode ? 'item_loop' : 'playlist_loop'` (Queries.pm:4353),
+            # and the menu loop is added through _addJiveSong (:4411/:4416).
+            # A plain `status - 1 tags:…` therefore carries playlist_loop and
+            # NOT item_loop — live Perl 192.168.1.90 answered 25 keys with no
+            # item_loop (and no title) where we sent 26.  Only the MENU status
+            # has it, and that is the frame the clients read it from
+            # (SqueezePlay's _whatsPlaying, Player.lua:272-273; Squeezer's
+            # parsePlayerStatus, CometClient.java:419-426; the playerstatus
+            # subscription is always `status - 1 menu:menu useContextMenu:1`).
+            if menu_mode and item_loop:
                 result["item_loop"] = item_loop
         result |= sync_fields
         if remote_meta:

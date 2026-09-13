@@ -106,14 +106,17 @@ def _play_action() -> dict[str, Any]:
 
 def base_actions(*, playcontrol_params: dict[str, Any],
                  with_presets: bool = True,
-                 all_touch_to_play: bool = False) -> dict[str, dict]:
+                 all_touch_to_play: bool = False,
+                 use_play_control: bool = False) -> dict[str, dict]:
     """The ``base.actions`` table of a favourites menu response.
 
     ``playcontrol_params`` is the request's tagged-param copy
     (``XMLBrowser.pm:978`` ``$request->getParamsCopy()``);
     ``with_presets`` mirrors ``_jivePresetBase`` being called only when at
     least one item ships ``presetParams``; ``all_touch_to_play`` mirrors
-    ``$allTouchToPlay`` (``:1429-1431``).
+    ``$allTouchToPlay`` (``:1429-1431``); ``use_play_control`` mirrors
+    ``_defeatDestructiveTouchToPlay`` (``:1951-1983``) for the ``go``
+    remapping below.
     """
     params = dict(_BASE_PARAMS)
     actions: dict[str, dict[str, Any]] = {
@@ -142,9 +145,13 @@ def base_actions(*, playcontrol_params: dict[str, Any],
             }
     if all_touch_to_play:
         # XMLBrowser.pm:1430 — every row is touch-to-play, so the whole list
-        # becomes one big "play" surface.
-        actions["go"] = actions["play"]
+        # becomes one big "play" surface.  With the destructive tap defeated
+        # Perl maps ``go`` onto ``playControl`` instead of ``play``
+        # (``$defeatDestructiveTouchToPlay ? playControl : play``).
+        actions["go"] = (actions["playControl"] if use_play_control
+                         else actions["play"])
     return actions
+
 
 
 def folder_item(text: str, item_id: str,
@@ -169,26 +176,48 @@ def folder_item(text: str, item_id: str,
 
 def audio_item(text: str, item_id: str, *, url: str,
                icon_id: str = FAVORITES_ICON,
-               favorites_type: str = "audio") -> dict[str, Any]:
-    """A touch-to-play station row (XMLBrowser.pm:1131-1147, 1259-1267).
+               favorites_type: str = "audio",
+               use_play_control: bool = False,
+               index: int | None = None) -> dict[str, Any]:
+    """A station row (XMLBrowser.pm:1131-1147, 1259-1272).
 
-    No ``actions`` — the play command comes from ``base.actions.play``,
-    completed with this item's ``params`` (``itemsParams: "params"``).
+    No ``actions`` — the tap resolves through the response ``base``: Squeezer
+    reads ``goAction`` as a *name* into ``base.actions`` and only uses a base
+    action when the item carries a map under that action's ``itemsParams``
+    (``JiveItem.java:269-275`` + ``extractAction`` ``:585-596``), and the
+    response-level ``base`` is injected into every item before parsing
+    (``CometClient.java:555-566``).
+
+    Two branches, exactly like Perl's ``_defeatDestructiveTouchToPlay``
+    (``XMLBrowser.pm:1951-1983``) decides between them:
+
+    * ``use_play_control=False`` → ``goAction: "play"`` + ``style:
+      "itemplay"`` + ``touchToPlay``/``touchToPlaySingle``
+      (``XMLBrowser.pm:1259-1267``).  Squeezer then takes
+      ``JiveItemView.java:181-182`` (``base.actions.play.nextWindow ==
+      "nowPlaying"``) and sends ``favorites playlist play …`` directly.
+    * ``use_play_control=True`` → ``goAction: "playControl"`` + the item's
+      ``playControlParams`` (``XMLBrowser.pm:1268-1272``).  ``base.actions.
+      playControl`` has no ``nextWindow`` and ``window.isContextMenu=1``, so
+      Squeezer runs ``JiveItemViewLogic.execGoAction`` →
+      ``goAction.isContextMenu()`` → ``ContextMenu.show``
+      (``JiveItemViewLogic.java:67-73``) and the tap opens the
+      Play/Add/Play-next menu instead of starting playback blind.  Perl's
+      live answer for the controllers is that branch
+      (``{"goAction": "playControl", "playControlParams":
+      {"xmlbrowserPlayControl": "<index>"}, …}``); the follow-up request
+      ``favorites items … xmlbrowserPlayControl:<index>`` is answered by
+      :func:`play_control_context_menu`.
     """
     item_id = str(item_id)
     icon = icon_id or FAVORITES_ICON
-    return {
+    params: dict[str, Any] = {"item_id": item_id, "isContextMenu": 1}
+    item: dict[str, Any] = {
         "text": text,
         "type": "audio",
-        "style": "itemplay",
-        "goAction": "play",
+        "goAction": "playControl" if use_play_control else "play",
         "icon-id": icon,
-        "params": {
-            "item_id": item_id,
-            "touchToPlay": item_id,
-            "touchToPlaySingle": 1,
-            "isContextMenu": 1,
-        },
+        "params": params,
         # _favoritesParams(): what the ``set-preset-*`` base actions send.
         "presetParams": {
             "favorites_url": url,
@@ -196,6 +225,73 @@ def audio_item(text: str, item_id: str, *, url: str,
             "favorites_type": favorites_type,
             "icon": icon,
         },
+    }
+    if use_play_control:
+        # XMLBrowser.pm:1270-1271 — the defeated branch carries neither
+        # ``style`` nor the touchToPlay pair.
+        item["playControlParams"] = {
+            "xmlbrowserPlayControl": str(index if index is not None else 0),
+        }
+    else:
+        item["style"] = "itemplay"
+        # XMLBrowser.pm:1261-1262 (`number` for playall-less items).
+        params["touchToPlay"] = item_id
+        params["touchToPlaySingle"] = 1
+    return item
+
+
+def play_control_context_menu(item_id: str) -> dict[str, Any]:
+    """Perl's answer to a tap on a touch-to-play favourites row (menu).
+
+    Live Perl 192.168.1.90, ``favorites items useContextMenu:1
+    menu:favorites xmlbrowserPlayControl:6`` (README-wide read-only probe,
+    2026-09-13) — ``XMLBrowser.pm:805-830`` reaching
+    ``_playlistControlContextMenu`` for the favourites feed: ``count`` 3,
+    ``offset`` 0, ``windowStyle`` ``text_list``, **no** ``base`` and three
+    rows, each carrying its whole command in its own ``actions.go``::
+
+        {"text": "Am Ende hinzufügen", "style": "item_add",
+         "actions": {"go": {"player": 0, "cmd": ["favorites","playlist","add"],
+                            "params": {"item_id": "<id>", "menu": 1},
+                            "nextWindow": "parentNoRefresh"}}}
+        {"text": "Als nächstes wiedergeben", "style": "itemNoAction",
+         "actions": {"go": {… "cmd": ["favorites","playlist","insert"], …}}}
+        {"text": "Wiedergabe", "style": "item_play",
+         "actions": {"go": {… "cmd": ["favorites","playlist","play"],
+                            "params": {"item_id": "<id>", "menu": 1},
+                            "nextWindow": "nowPlaying"}}}
+
+    That shape is what makes the defeated branch usable in clients without a
+    ``base``: every row resolves its own ``actions.go``
+    (``JiveItem.java:271-275``) and the play row's ``nextWindow ==
+    'nowPlaying'`` routes it through ``JiveItemView.java:181-182`` →
+    ``SqueezeService.action`` → ``favorites playlist play item_id:<id>``.
+    The texts are the German ones Perl answered with (server locale); a
+    locale-aware port must feed them through the string table.
+    """
+    item_id = str(item_id)
+
+    def entry(cmd: str, style: str, text: str, next_window: str,
+              player: int | None = 0) -> dict[str, Any]:
+        go: dict[str, Any] = {
+            "cmd": [MENU, "playlist", cmd],
+            "params": {"item_id": item_id, "menu": 1},
+            "nextWindow": next_window,
+        }
+        if player is not None:
+            go["player"] = player
+        return {"text": text, "style": style, "actions": {"go": go}}
+
+    return {
+        "window": dict(WINDOW_TEXT_LIST),
+        "offset": 0,
+        "count": 3,
+        "item_loop": [
+            entry("add", "item_add", "Am Ende hinzufügen", "parentNoRefresh"),
+            entry("insert", "itemNoAction", "Als nächstes wiedergeben",
+                  "parentNoRefresh"),
+            entry("play", "item_play", "Wiedergabe", "nowPlaying"),
+        ],
     }
 
 
@@ -208,14 +304,21 @@ def _window_for(items: list[dict]) -> dict[str, Any]:
 
 def render_favorites_menu(items: list[dict], *,
                           title: str = "Favorites",
-                          playcontrol_params: dict[str, Any] | None = None
+                          playcontrol_params: dict[str, Any] | None = None,
+                          use_play_control: bool = False
                           ) -> dict[str, Any]:
     """Assemble a menu-mode favourites response from Perl-shaped ``items``.
 
     ``items`` must already come from :func:`folder_item` /
-    :func:`audio_item` (the caller owns the tree walk).
+    :func:`audio_item` (the caller owns the tree walk).  ``use_play_control``
+    is the resolved ``_defeatDestructiveTouchToPlay`` value
+    (``XMLBrowser.pm:1951-1983``); it selects the row branch
+    (:func:`audio_item`) and Perl's ``base.go`` remapping
+    (``:1430``).
     """
-    all_touch_to_play = all(it.get("goAction") == "play" for it in items)
+    touch_rows = [it for it in items
+                  if it.get("goAction") in ("play", "playControl")]
+    all_touch_to_play = bool(items) and len(touch_rows) == len(items)
     with_presets = any("presetParams" in it for it in items)
     return {
         "window": _window_for(items),
@@ -228,6 +331,7 @@ def render_favorites_menu(items: list[dict], *,
                 playcontrol_params=dict(playcontrol_params or {}),
                 with_presets=with_presets,
                 all_touch_to_play=all_touch_to_play,
+                use_play_control=use_play_control,
             ),
         },
     }
@@ -241,5 +345,6 @@ __all__ = [
     "audio_item",
     "base_actions",
     "folder_item",
+    "play_control_context_menu",
     "render_favorites_menu",
 ]
