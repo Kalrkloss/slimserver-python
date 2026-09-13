@@ -34,6 +34,7 @@ import struct
 from collections.abc import Coroutine
 from dataclasses import dataclass, field
 from typing import Any, Callable
+import uuid as _uuid
 
 try:
     import uvloop
@@ -47,7 +48,27 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-DISCOVERY_PORT = 3483  # slimproto UDP port for player beacons
+DISCOVERY_PORT = 3483
+DEFAULT_HTTP_PORT = 9000      # Perls Standard-httpport (JSON-TLV unten)
+
+
+def server_uuid() -> str:
+    """Stabile Server-UUID fürs Discovery-Datagramm.
+
+    Perl liest/erzeugt sie im Pref-Store (``server_uuid``); unser Store wird
+    hier nur gelesen, weil der Schreibpfad asynchron ist und im Request-Kontext
+    lebt. Fehlt der Wert, wird eine aus dem Hostnamen abgeleitete UUID benutzt:
+    sie bleibt über Neustarts stabil, ist aber nicht mit Perls Wert identisch.
+    """
+    try:
+        from lyrion.config import get_prefs
+        val = str(get_prefs().get("server_uuid") or "")
+        if val:
+            return val
+    except Exception:
+        pass
+    import socket as _sock  # lokal, das Modul aliast socket weiter unten
+    return str(_uuid.uuid5(_uuid.NAMESPACE_DNS, "lyrion-" + _sock.gethostname()))
 SSDP_PORT = 1900
 SSDP_MULTICAST = "239.255.255.250"
 
@@ -336,9 +357,17 @@ class DiscoveryService:
             # /html/...), so the native server answers non-Cometd GETs with
             # a 302 redirect to the real web port — that keeps cover art
             # working without moving the Cometd endpoint.
-            http_port = int(get_config().get("cometd_stream_port") or 9080)
+            # Der ``JSON``-TLV ist Perls HTTP-Port (live Perl: "JSON\x049000"
+            # gegen "JSON\x049080" bei uns). Apps, die den angekündigten Port
+            # für JSON-RPC nutzen (Squeeze Client), liefen auf 9080 ins Leere
+            # ("sieht den Server, kann aber nicht verbinden"), weil der native
+            # Server dort nur GETs per 302 umleitet und POST /jsonrpc.js nicht
+            # bedient.
+            http_port = int(get_config().get("httpport")
+                            or get_config().get("web_port")
+                            or DEFAULT_HTTP_PORT)
         except Exception:
-            http_port = 9080
+            http_port = DEFAULT_HTTP_PORT
 
         hostname = _socket.gethostname()[:16]
         values = {
@@ -346,7 +375,10 @@ class DiscoveryService:
             b"IPAD": local_ip.encode(),
             b"JSON": str(http_port).encode(),
             b"VERS": __version__.encode("ascii", errors="replace"),
-            b"UUID": b"lyrion-server-0001",
+            # Echte, stabile Server-UUID. Perl liefert live
+            # "UUID 809f80c3-23b4-4ff2-a203-f628777ef819"; der Platzhalter
+            # "lyrion-server-0001" konnte Client-Caches verwirren.
+            b"UUID": server_uuid().encode(),
         }
         # parse TLV blocks: T(4) L(1) V(L)
         body = data[1:]
