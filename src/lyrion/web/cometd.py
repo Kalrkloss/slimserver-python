@@ -36,6 +36,7 @@ import json
 import logging
 import time
 from dataclasses import dataclass, field
+from email.utils import formatdate
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -43,6 +44,20 @@ logger = logging.getLogger(__name__)
 LONG_POLL_TIMEOUT = 60  # Perl Cometd.pm:48 LONG_POLLING_TIMEOUT => 60000 ms
 # ("server will wait up to 60s for events to send", then answers the
 # /meta/connect so the client polls again). Was an invented 25 s.
+
+# The same value in milliseconds. Bayeux ``advice`` interval/timeout are
+# milliseconds; Perl hands its own ms constant straight through
+# (Cometd.pm:251 ``timeout => LONG_POLLING_TIMEOUT`` = 60000).
+LONG_POLL_TIMEOUT_MS = LONG_POLL_TIMEOUT * 1000
+
+# Perl Cometd.pm:47 ``use constant LONG_POLLING_INTERVAL => 0;`` — a
+# long-polling client may re-poll immediately.
+LONG_POLLING_INTERVAL = 0
+
+# Perl Cometd.pm:45 ``use constant RETRY_DELAY => 5000;`` (ms). Used as the
+# advice interval of a *streaming* /meta/connect (Cometd.pm:277-279
+# ``interval => $streaming ? RETRY_DELAY : 0``).
+RETRY_DELAY_MS = 5000
 
 # Perl Slim::Web::Cometd LONG_POLLING_AUTOKILL (Cometd.pm:49, 693): after a
 # long-polling response is sent, a timer is armed for this many seconds and
@@ -349,6 +364,101 @@ def _set_manager(mgr: "CometdManager") -> None:
 def get_manager() -> Optional["CometdManager"]:
     """Return the active CometdManager (created at startup), or None."""
     return _manager
+
+
+def _http_timestamp() -> str:
+    """Perl's ``timestamp => time2str(time())`` (HTTP::Date, RFC 1123, GMT).
+
+    Perl stamps /meta/handshake (Cometd.pm:260), /meta/(re)connect
+    (Cometd.pm:276), /meta/disconnect (Cometd.pm:338) and the
+    invalid-clientId advice (Cometd.pm:235) with it; the Bayeux clients echo
+    it into their logs. ``email.utils.formatdate(usegmt=True)`` produces the
+    byte-identical string (verified against Perl 5.38 / HTTP::Date).
+    """
+    return formatdate(time.time(), usegmt=True)
+
+
+def connect_advice(connection_type: str = "") -> dict:
+    """Advice for a /meta/(re)connect reply (Perl Cometd.pm:277-279).
+
+    Perl: ``advice => { interval => $streaming ? RETRY_DELAY : 0 }`` where
+    ``RETRY_DELAY`` is 5000 (Cometd.pm:45). Bayeux advice values are
+    milliseconds, so a streaming connect advertises the 5000 ms retry delay
+    and a long-polling connect advertises 0 (re-poll immediately,
+    Cometd.pm:47). ``timeout`` is the 60 s hold time in milliseconds — the
+    same number Perl puts into the handshake advice (Cometd.pm:251); it used
+    to go out as ``60``, i.e. 60 ms.
+
+    ``reconnect => 'retry'`` is kept from the previous Python form: Perl's
+    connect advice carries only ``interval``, this is a documented superset.
+    """
+    streaming = connection_type == "streaming"
+    return {
+        "reconnect": "retry",
+        "interval": RETRY_DELAY_MS if streaming else LONG_POLLING_INTERVAL,
+        "timeout": LONG_POLL_TIMEOUT_MS,
+    }
+
+
+def has_invalid_client_advice(replies: list) -> bool:
+    """True when a reply is Perl's invalid-clientId / re-handshake advice.
+
+    Perl answers a message whose clientId the manager does not know with
+    ``advice => { reconnect => 'handshake', interval => 0 }`` and ``last``s
+    out of the message loop (Cometd.pm:228-244), so the /meta/connect branch
+    is never reached and the response carries NO connect ack. Both transports
+    use this to recognise that case instead of fabricating a successful
+    connect ack next to it.
+    """
+    for reply in replies:
+        if not isinstance(reply, dict):
+            continue
+        advice = reply.get("advice")
+        if isinstance(advice, dict) and advice.get("reconnect") == "handshake":
+            return True
+    return False
+
+
+def _subscriptions(message: dict, data: dict) -> list[str]:
+    """The channel(s) a subscribe message registers.
+
+    Perl (Cometd.pm:350-355): "a channel name or a channel pattern or an
+    array of channel names and channel patterns", wrapping a scalar into an
+    array. Material sends ``data.response``, Jive/SqueezeClient send
+    ``data.subscription``, SqueezeCtrl sends ``subscription`` as a TOP-LEVEL
+    field of /meta/subscribe — all three are still accepted. A list value is
+    why this returns a list: indexing ``subscriptions[sub]`` with one crashed
+    the whole batch with ``unhashable type: 'list'``.
+    """
+    raw = (data.get("subscription") or data.get("response")
+           or message.get("subscription") or "")
+    if isinstance(raw, str):
+        raw = [raw] if raw else []
+    if not isinstance(raw, list):
+        return []
+    return [s for s in raw if isinstance(s, str) and s]
+
+
+def _merged_subscription(existing, data) -> dict:
+    """Store ``data`` for a channel without dropping an earlier request.
+
+    Perl's /meta/subscribe is a pure channel registration
+    (``Manager::add_channels``, Cometd.pm:357) and never touches the request
+    a client registered through /slim/subscribe — the two live in different
+    places (channel buckets vs. the Request subsystem). Blindly replacing the
+    stored payload with a request-less one would silently downgrade every
+    later push to the jive default and lose the client's
+    pagination/``subscribe:N``.
+    """
+    if not isinstance(existing, dict) or not isinstance(data, dict):
+        return data if isinstance(data, dict) else {}
+    if _stored_request(existing) and not _stored_request(data):
+        merged = dict(data)
+        merged["request"] = existing["request"]
+        if existing.get("response") and not merged.get("response"):
+            merged["response"] = existing["response"]
+        return merged
+    return data
 
 
 class CometdManager:
@@ -901,8 +1011,10 @@ class CometdManager:
                 reply.update({
                     "successful": False,
                     "clientId": None,
+                    "timestamp": _http_timestamp(),
                     "error": "invalid clientId",
-                    "advice": {"reconnect": "handshake", "interval": 0},
+                    "advice": {"reconnect": "handshake",
+                               "interval": LONG_POLLING_INTERVAL},
                 })
                 replies.append(reply)
                 continue
@@ -914,7 +1026,13 @@ class CometdManager:
                     "version": "1.0",
                     "clientId": client.client_id,
                     "supportedConnectionTypes": ["long-polling", "streaming"],
-                    "advice": {"reconnect": "retry", "interval": 0},
+                    "timestamp": _http_timestamp(),
+                    # Perl Cometd.pm:248-252: the handshake advice carries
+                    # reconnect/interval AND the 60 s hold time in ms. The
+                    # timeout was missing here.
+                    "advice": {"reconnect": "retry",
+                               "interval": LONG_POLLING_INTERVAL,
+                               "timeout": LONG_POLL_TIMEOUT_MS},
                 })
                 logger.info("Cometd handshake -> client %s", client.client_id)
 
@@ -924,9 +1042,9 @@ class CometdManager:
                     data = {}
                 # Material sends data.response, Jive/SqueezeClient send
                 # data.subscription, SqueezeCtrl sends 'subscription' as
-                # a TOP-LEVEL field of /meta/subscribe — accept all.
-                subscription = (data.get("subscription") or data.get("response")
-                                or msg.get("subscription") or "")
+                # a TOP-LEVEL field of /meta/subscribe — accept all, and an
+                # ARRAY of channels/patterns too (Perl Cometd.pm:350-355).
+                subscriptions = _subscriptions(msg, data)
                 if channel == "/slim/subscribe":
                     # Perl Slim/Web/Cometd.pm:479-492: a /slim/subscribe is a
                     # request+subscribe and needs BOTH data.request and
@@ -948,56 +1066,90 @@ class CometdManager:
                 # it from the response channel (/<clientId>/...). A namespace
                 # root like /slim/... is never a clientId (review P3-2).
                 if not cid:
-                    cid = _client_id_from_channel(subscription)
+                    cid = _client_id_from_channel(
+                        subscriptions[0] if subscriptions else "")
                 client = self.get_or_create(cid) if cid else None
-                if client is not None and subscription:
-                    # Store the subscription together with its request. On a
-                    # /slim/subscribe (jive Comet.lua:286-296) that request is
-                    # the query to re-execute on every change; on a pure
-                    # /meta/subscribe channel registration there is none.
-                    client.subscriptions[subscription] = data
-                    logger.info("Cometd %s subscribed %s", cid, subscription)
-                    # Push the initial result of the subscription request.
-                    # Without a client request fall back to the jive form so
-                    # the seed payload already carries title/playlist
-                    # (a bare `playerstatus - 1` does not — LIVE-01).
-                    request = _stored_request(data)
-                    if request is None:
-                        request = _default_request(subscription)
-                    if request:
-                        result = await self._dispatch(request)
-                        self.push(cid, {
-                            "channel": subscription,
-                            "data": result,
-                            # SqueezeClient's Message class requires id: Int
-                            # — a missing id breaks the whole array parse.
-                            "id": msg.get("id", ""),
-                        })
-                if client is not None:
-                    reply.update({"successful": True, "error": None})
-                else:
+                if client is None:
                     # No clientId and no derivable id in the response channel:
                     # never mint a client (review P3-2) — ack the failure.
                     reply.update({"successful": False,
                                   "error": "clientId not found"})
-                # libcometd (SqueezeClient) requires the subscription
-                # field in the ack — otherwise 'Subscription response
-                # missing'.
-                if subscription:
-                    reply["subscription"] = subscription
+                    replies.append(reply)
+                    continue
+                # Perl Cometd.pm:359-367 pushes one /meta/subscribe ack per
+                # subscription; /slim/subscribe answers once (Cometd.pm:454).
+                acks = list(subscriptions) if channel == "/meta/subscribe" \
+                    else (subscriptions[:1] or [""])
+                for sub in acks:
+                    if sub:
+                        stored = _merged_subscription(
+                            client.subscriptions.get(sub), data)
+                        client.subscriptions[sub] = stored
+                        logger.info("Cometd %s subscribed %s", cid, sub)
+                        # Push the initial result of the subscription request.
+                        # Without a client request fall back to the jive form
+                        # so the seed payload already carries title/playlist
+                        # (a bare `playerstatus - 1` does not — LIVE-01).
+                        seed = _stored_request(stored)
+                        if seed is None:
+                            seed = _default_request(sub)
+                        if seed:
+                            result = await self._dispatch(seed)
+                            self.push(cid, {
+                                "channel": sub,
+                                "data": result,
+                                # SqueezeClient's Message class requires id:
+                                # Int — a missing id breaks the array parse.
+                                "id": msg.get("id", ""),
+                            })
+                    ack = dict(reply)
+                    ack["successful"] = True
+                    ack["error"] = None
+                    # Perl puts clientId into every subscribe ack
+                    # (Cometd.pm:363 / :456); libcometd (SqueezeClient)
+                    # requires the subscription field — else 'Subscription
+                    # response missing'.
+                    ack["clientId"] = cid
+                    if sub:
+                        ack["subscription"] = sub
+                    replies.append(ack)
+                if not subscriptions:
+                    reply.update({"successful": True, "error": None,
+                                  "clientId": cid})
+                    replies.append(reply)
+                continue
 
             elif channel in ("/meta/unsubscribe", "/slim/unsubscribe"):
                 client = self.get(cid)
                 self.touch(cid)
                 data = msg.get("data", {})
-                # Accept data.unsubscribe, data.subscription, or the TOP-LEVEL
-                # 'subscription' field (libcometd/Android send it top-level,
-                # like /meta/subscribe).
-                subscription = (data.get("unsubscribe") or data.get("subscription")
-                                or msg.get("subscription") or "")
-                if client is not None and subscription:
-                    client.subscriptions.pop(subscription, None)
-                reply.update({"successful": client is not None})
+                if not isinstance(data, dict):
+                    data = {}
+                # Accept data.unsubscribe (Perl's field, Cometd.pm:504 /
+                # :371), data.subscription, or the TOP-LEVEL 'subscription'
+                # field (libcometd/Android send it top-level, like
+                # /meta/subscribe). A channel ARRAY is accepted too
+                # (Perl Cometd.pm:371-376).
+                raw_unsub = data.get("unsubscribe")
+                if isinstance(raw_unsub, str) and raw_unsub:
+                    subscriptions = [raw_unsub]
+                elif isinstance(raw_unsub, list):
+                    subscriptions = [s for s in raw_unsub
+                                     if isinstance(s, str) and s]
+                else:
+                    subscriptions = _subscriptions(msg, data)
+                if client is not None:
+                    for sub in subscriptions:
+                        client.subscriptions.pop(sub, None)
+                # Perl Cometd.pm:382-387 / :519-525: every unsubscribe ack
+                # carries clientId and the subscription; /slim/unsubscribe
+                # echoes data back.
+                reply.update({"successful": client is not None,
+                              "clientId": cid or None})
+                if subscriptions:
+                    reply["subscription"] = subscriptions[0]
+                if channel == "/slim/unsubscribe":
+                    reply["data"] = data
 
             elif channel == "/slim/request":
                 data = msg.get("data", {})
@@ -1016,16 +1168,24 @@ class CometdManager:
                         "data": result,
                         "id": msg.get("id", ""),
                     })
-                    reply.update({"successful": True})
+                    # Perl Cometd.pm:575-580: the /slim/request ack carries
+                    # clientId (a missing one breaks libcometd's correlation).
+                    reply.update({"successful": True, "clientId": cid})
                 else:
-                    reply.update({"successful": False})
+                    reply.update({"successful": False, "clientId": None})
 
             elif channel == "/meta/disconnect":
                 # Remove the client so its subscriptions/events are freed.
                 self.remove(cid)
+                # Perl Cometd.pm:333-339: the ack is stamped with a timestamp
+                # and Perl sets ``Connection: close``. The transports close
+                # the socket themselves.
                 reply.update({
                     "successful": True,
-                    "advice": {"reconnect": "none", "interval": 0},
+                    "clientId": cid or None,
+                    "timestamp": _http_timestamp(),
+                    "advice": {"reconnect": "none",
+                               "interval": LONG_POLLING_INTERVAL},
                 })
                 logger.info("Cometd disconnect -> client %s", cid)
 

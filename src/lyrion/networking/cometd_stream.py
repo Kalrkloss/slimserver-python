@@ -21,7 +21,13 @@ import asyncio
 import json
 import logging
 
-from lyrion.web.cometd import LONG_POLL_TIMEOUT, _client_id_from_channel
+from lyrion.web.cometd import (
+    LONG_POLL_TIMEOUT,
+    _client_id_from_channel,
+    _http_timestamp,
+    connect_advice,
+    has_invalid_client_advice,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -322,6 +328,28 @@ async def _handle_connection(manager, reader: asyncio.StreamReader,
                 if connect_msgs:
                     msg = connect_msgs[0]
                     cid = msg.get("clientId", "")
+                    if has_invalid_client_advice(replies):
+                        # Perl Cometd.pm:225-244: a message whose clientId the
+                        # manager no longer knows is answered with the
+                        # re-handshake advice ALONE and the message loop is
+                        # abandoned (``last``) *before* the /meta/(re)connect
+                        # branch — so the response carries no connect ack and
+                        # no chunked stream is opened (``Transfer-Encoding:
+                        # chunked`` is set at Cometd.pm:292, after the check).
+                        # Appending a fabricated ``successful: true``
+                        # /meta/connect told jive it was still connected while
+                        # the server had no record of it, so it never
+                        # re-handshaked and never re-registered its
+                        # subscriptions (frozen Now-Playing after a restart /
+                        # the LONG_POLLING_AUTOKILL reaper dropped it).
+                        payload = json.dumps(replies).encode("utf-8")
+                        writer.write(b"HTTP/1.1 200 OK\r\n"
+                                     b"Content-Type: application/json\r\n"
+                                     b"Cache-Control: no-cache\r\n"
+                                     + f"Content-Length: {len(payload)}\r\n\r\n".encode()
+                                     + payload)
+                        await writer.drain()
+                        break
                     # This connection processed the client's /meta/connect: it
                     # now OWNS the client and is the only connection allowed to
                     # drop it (Perl register_connection on (re)connect). A
@@ -337,10 +365,11 @@ async def _handle_connection(manager, reader: asyncio.StreamReader,
                     connect_ack = {
                         "channel": "/meta/connect", "successful": True,
                         "clientId": cid, "id": msg.get("id", ""),
-                        # Perl LONG_POLLING_TIMEOUT (Cometd.pm:48) advertised
-                        # to the client as the connect hold time, in seconds.
-                        "advice": {"reconnect": "retry", "interval": 0,
-                                   "timeout": LONG_POLL_TIMEOUT},
+                        # Perl Cometd.pm:274-280: the ack is stamped and its
+                        # advice carries RETRY_DELAY (5000 ms) for a streaming
+                        # connect, 0 for long-polling (Cometd.pm:45, :278).
+                        "timestamp": _http_timestamp(),
+                        "advice": connect_advice(msg.get("connectionType", "")),
                     }
                     # handle_messages() deliberately does NOT answer
                     # /meta/connect, so this is the one and only connect ack.
@@ -405,6 +434,16 @@ async def _handle_connection(manager, reader: asyncio.StreamReader,
                                     # ack is the only one; result events flow
                                     # via push_task (exactly once).
                                     nc = nconnect[0]
+                                    if has_invalid_client_advice(nreplies):
+                                        # Perl Cometd.pm:228-244 again: the
+                                        # re-handshake advice goes out alone —
+                                        # no connect ack, and the stream ends
+                                        # so the client must handshake anew.
+                                        nbad = json.dumps(nreplies).encode("utf-8")
+                                        writer.write(f"{len(nbad):x}\r\n".encode()
+                                                     + nbad + b"\r\n")
+                                        await writer.drain()
+                                        break
                                     new_cid = nc.get("clientId", stream_cid)
                                     if new_cid and new_cid != stream_cid:
                                         manager.connection_closed(stream_cid)
@@ -421,7 +460,10 @@ async def _handle_connection(manager, reader: asyncio.StreamReader,
                                         "channel": "/meta/connect",
                                         "successful": True,
                                         "clientId": nc.get("clientId", ""),
-                                        "id": nc.get("id", "")}]
+                                        "id": nc.get("id", ""),
+                                        "timestamp": _http_timestamp(),
+                                        "advice": connect_advice(
+                                            nc.get("connectionType", ""))}]
                                     nchunk = json.dumps(payload).encode("utf-8")
                                     writer.write(f"{len(nchunk):x}\r\n".encode()
                                                  + nchunk + b"\r\n")

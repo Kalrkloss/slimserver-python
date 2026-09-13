@@ -1109,3 +1109,55 @@ def test_p0_asgi_non_connect_post_abort_keeps_client(caplog):
     assert client is not None, (
         "a non-connect POST abort must not drop the client "
         f"(log: {caplog.text})")
+
+
+# ---------------------------------------------------------------------------
+# R1 controller hardening — advice units and the invalid-clientId connect.
+#
+# Perl Cometd.pm:277-279 gives a /meta/(re)connect the advice
+# ``{ interval => $streaming ? RETRY_DELAY : 0 }`` (RETRY_DELAY = 5000,
+# Cometd.pm:45) and carries no ``timeout``/``reconnect`` there. Python keeps
+# ``reconnect`` and the 60 s hold time as a documented superset; the timeout
+# is emitted in MILLISECONDS (60000), matching the handshake advice
+# (Cometd.pm:251) — it used to go out as ``60``, i.e. 60 ms.
+# ---------------------------------------------------------------------------
+
+
+def test_connect_advice_is_a_documented_superset_of_perl():
+    from lyrion.web.cometd import (
+        LONG_POLLING_INTERVAL,
+        LONG_POLL_TIMEOUT_MS,
+        RETRY_DELAY_MS,
+        connect_advice,
+    )
+
+    streaming = connect_advice("streaming")
+    assert streaming["interval"] == RETRY_DELAY_MS == 5000
+    assert connect_advice("long-polling")["interval"] == LONG_POLLING_INTERVAL
+    assert streaming["timeout"] == LONG_POLL_TIMEOUT_MS == 60000
+    # superset fields (Perl's connect advice has interval only)
+    assert streaming["reconnect"] == "retry"
+
+
+def test_connect_with_unknown_clientid_is_not_acked_as_success():
+    """Perl Cometd.pm:228-244 answers the re-handshake advice alone.
+
+    handle_messages() reports the invalid clientId; the transport must not
+    append a fabricated ``successful: true`` /meta/connect next to it (the
+    client would believe it is still connected and never re-register its
+    subscriptions).
+    """
+    from lyrion.web.cometd import has_invalid_client_advice
+
+    async def run():
+        mgr = CometdManager(_StubRPC())
+        replies = await mgr.handle_messages([{
+            "channel": "/meta/connect", "clientId": "deadbeef", "id": 4,
+            "connectionType": "streaming"}])
+        return replies
+
+    replies = _run(run())
+    assert has_invalid_client_advice(replies), replies
+    assert not any(r.get("channel") == "/meta/connect"
+                   and r.get("successful") for r in replies), replies
+
