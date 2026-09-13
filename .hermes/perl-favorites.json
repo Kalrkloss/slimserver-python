@@ -1,0 +1,232 @@
+[
+ {
+  "text": "Chill",
+  "type": null,
+  "url": null,
+  "ptype": null,
+  "icon": "html/images/favorites.png",
+  "children": [
+   {
+    "text": "Hirschmilch Chillout",
+    "type": "audio",
+    "url": "http://hirschmilch.de:7000/chillout.mp3",
+    "ptype": "audio",
+    "icon": "/imageproxy/http%3A%2F%2Fcdn-radiotime-logos.tunein.com%2Fs111987q.png/image.png",
+    "children": []
+   },
+   {
+    "text": "Absolut relax (Easy Listening)",
+    "type": "audio",
+    "url": " https://absolut-relax.live-sm.absolutradio.de/absolut-relax/stream/mp3",
+    "ptype": "audio",
+    "icon": "/imageproxy/http%3A%2F%2Fcdn-radiotime-logos.tunein.com%2Fs158432q.png/image.png",
+    "children": []
+   },
+   {
+    "text": "Hirschmilch Electronic",
+    "type": "audio",
+    "url": "http://hirschmilch.de:7000/electronic.mp3",
+    "ptype": "audio",
+    "icon": "html/images/favorites.png",
+    "children": []
+   },
+   {
+    "text": "SUNSHINE LIVE",
+    "type": "audio",
+    "url": "http://stream.sunshine-live.de/live/mp3-192",
+    "ptype": "audio",
+    "icon": "/plugins/TuneIn/html/images/podcasts.png",
+    "children": []
+   },
+   {
+    "text": "SUNSHINE LIVE - Chillout",
+    "type": "audio",
+    "url": "http://stream.sunshine-live.de/sp8/mp3-192",
+    "ptype": "audio",
+    "icon": "/plugins/TuneIn/html/images/podcasts.png",
+    "children": []
+   },
+   {
+    "text": "1.FM - Ambient Psychill",
+    "type": "audio",
+    "url": "http://strm112.1.fm/ambientpsy_mobile_mp3",
+    "ptype": "audio",
+    "icon": "html/images/favorites.png",
+    "children": []
+   }
+  ]
+ },
+ {
+  "text": "Nachrichten",
+  "type": null,
+  "url": null,
+  "ptype": null,
+  "icon": "html/images/favorites.png",
+  "children": [
+   {
+    "text": "Deutschlandfunk",
+    "type": "audio",
+    "url": "https://st01.sslstream.dlf.de/dlf/01/128/mp3/stream.mp3",
+    "ptype": "audio",
+    "icon": "html/images/favorites.png",
+    "children": []
+   },
+   {
+    "text": "WDR 5",
+    "type": "audio",
+    "url": "https://wdr-wdr5-live.icecastssl.wdr.de/wdr/wdr5/live/mp3/128/stream.mp3",
+    "ptype": "audio",
+    "icon": "html/images/favorites.png",
+    "children": []
+   },
+   {
+    "text": "SWR Aktuell",
+    "type": "audio",
+    "url": "https://liveradio.swr.de/sw282p3/swraktuell/",
+    "ptype": "audio",
+    "icon": "html/images/favorites.png",
+    "children": []
+   },
+   {
+    "text": "SWR 1",
+    "type": "audio",
+    "url": "https://liveradio.swr.de/sw282p3/swr1rp/",
+    "ptype": "audio",
+    "icon": "html/images/favorites.png",
+    "children": []
+   },
+   {
+    "text": "SWR 2",
+    "type": "audio",
+    "url": "https://liveradio.swr.de/sw282p3/swr2/",
+    "ptype": "audio",
+    "icon": "html/images/favorites.png",
+    "children": []
+   },
+   {
+    "text": "hr-iNFO",
+    "type": "audio",
+    "url": "https://dispatcher.rndfnk.com/hr/hrinfo/live/high",
+    "ptype": "audio",
+    "icon": "/plugins/TuneIn/html/images/podcasts.png",
+    "children": []
+   }
+  ]
+ },
+ {
+  "text": "Lokal",
+  "type": null,
+  "url": null,
+  "ptype": null,
+  "icon": "html/images/favorites.png",
+  "children": [
+   {
+    "text": "SWR 3",
+    "type": "audio",
+    "url": "https://liveradio.swr.de/sw282p3/swr3/",
+    "ptype": "audio",
+    "icon": "html/images/favorites.png",
+    "children": []
+   },
+   {
+    "text": "Antenne Koblenz",
+    "type": "audio",
+    "url": "https://stream.radiogroup.de/antenne-koblenz/mp3-192/",
+    "ptype": "audio",
+    "icon": "html/images/favorites.png",
+    "children": []
+   },
+   {
+    "text": "BigFM",
+    "type": "audio",
+    "url": "http://streams.bigfm.de/bigfm-rlp-128-aac",
+    "ptype": "audio",
+    "icon": "html/images/favorites.png",
+    "children": []
+   },
+   {
+    "text": "hr 3",
+    "type": "audio",
+    "url": "https://dispatcher.rndfnk.com/hr/hr3/rheinmain/high",
+    "ptype": "audio",
+    "icon": "/imageproxy/http%3A%2F%2Fcdn-profiles.tunein.com%2Fs57109%2Fimages%2Flogoq.png/image.png",
+    "children": []
+   }
+  ]
+ },
+ {
+  "text": "Dub",
+  "type": null,
+  "url": null,
+  "ptype": null,
+  "icon": "html/images/favorites.png",
+  "children": [
+   {
+    "text": "Leer",
+    "type": "text",
+    "url": null,
+    "ptype": "text",
+    "icon": null,
+    "children": []
+   }
+  ]
+ },
+ {
+  "text": "Trance",
+  "type": null,
+  "url": null,
+  "ptype": null,
+  "icon": "html/images/favorites.png",
+  "children": [
+   {
+    "text": "Hirschmilch Progressive",
+    "type": "audio",
+    "url": "http://hirschmilch.de:7000/progressive.mp3",
+    "ptype": "audio",
+    "icon": "html/images/favorites.png",
+    "children": []
+   },
+   {
+    "text": "Hirschmilch Psytrance",
+    "type": "audio",
+    "url": "http://hirschmilch.de:7000/psytrance.mp3",
+    "ptype": "audio",
+    "icon": "html/images/favorites.png",
+    "children": []
+   }
+  ]
+ },
+ {
+  "text": "Rock",
+  "type": null,
+  "url": null,
+  "ptype": null,
+  "icon": "html/images/favorites.png",
+  "children": [
+   {
+    "text": "Rockland Radio",
+    "type": "audio",
+    "url": "https://streams.rockland.de/koblenz/mp3-192/direkt/",
+    "ptype": "audio",
+    "icon": "html/images/favorites.png",
+    "children": []
+   }
+  ]
+ },
+ {
+  "text": "1Mix Radio EDM Stream",
+  "type": "audio",
+  "url": "http://opml.radiotime.com/Tune.ashx?id=s355203&formats=aac,ogg,mp3,wmpro,wma,wmvoice&partnerId=16&serial=d2a2c9ee371ad11f177e3da58647d5d1",
+  "ptype": "audio",
+  "icon": "/imageproxy/http%3A%2F%2Fcdn-profiles.tunein.com%2Fs355203%2Fimages%2Flogoq.jpg%3Ft%3D1/image.jpg",
+  "children": []
+ },
+ {
+  "text": "1Mix Radio EDM Stream",
+  "type": "audio",
+  "url": "http://opml.radiotime.com/Tune.ashx?id=s355203&formats=aac,ogg,mp3,wmpro,wma,wmvoice&partnerId=15&serial=89d36ef4510ad7d85b912b3d0fee8bad",
+  "ptype": "audio",
+  "icon": "http://cdn-profiles.tunein.com/s355203/images/logoq.jpg?t=1",
+  "children": []
+ }
+]
