@@ -1404,10 +1404,22 @@ class CometdManager:
                     # Perl Cometd.pm:584-589: a long-polling transport carries
                     # the result in THIS response, everything else goes through
                     # $manager->deliver_events (:589, Manager.pm:247-263).
+                    #
+                    # The result event is Perl's ``handleRequest`` return
+                    # (Cometd.pm:920-928): ``channel`` = the response channel,
+                    # ``id`` = the request id (``$params->{id} || 0``, :769 —
+                    # never a fabricated empty string: libcometd/Squeeze Client's
+                    # ``Message.id: Int`` is mandatory and an empty string breaks
+                    # its array parse), ``data`` = the results, and
+                    # ``ext.priority`` = the caller's ``data.priority`` or ''
+                    # (:772/:926-928). ``successful`` is deliberately absent —
+                    # Perl only stamps it on the /slim/request ACK (:576), and
+                    # libcometd's Message defaults it to true.
                     self.deliver_result(cid, {
                         "channel": response_channel,
+                        "id": msg.get("id") or 0,
                         "data": result,
-                        "id": msg.get("id", ""),
+                        "ext": {"priority": data.get("priority") or ""},
                     }, replies)
                     continue
                 reply.update({"successful": False, "clientId": None})

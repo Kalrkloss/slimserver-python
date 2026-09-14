@@ -5103,10 +5103,46 @@ class JSONRPCAPI:
         from lyrion.web import menus
 
         def _go(cmd: list[str], params: dict | None = None) -> dict:
+            """A home-menu node's navigation action — ``go`` ONLY.
+
+            Perl never mirrors a navigation action into ``do``: the live home
+            menu (``menu 0 100 direct:1`` against 192.168.1.90) carries
+
+            * ``favorites``  -> ``{"actions": {"go": {"cmd": ["favorites", "items"],
+              "params": {"menu": "favorites"}}}}``  (no ``player``, no ``do``)
+            * ``radios``     -> ``{"actions": {"go": {"cmd": ["radios"], "params":
+              {"menu": "radio"}}}}``
+            * ``myMusic*``/``settingsInformation``/``globalSearch`` -> ``go`` only
+
+            — and ``do`` appears on exactly three entries whose ``do`` is NOT a
+            navigation: ``settingsRepeat``/``settingsShuffle`` (``do.choices``)
+            and ``settingsPlayerNameChange`` (``do.params.playername ==
+            "__INPUT__"``).
+
+            The mirrored ``do`` made both Android controllers execute the row as
+            an *action* instead of opening it, because ``do`` wins over ``go``:
+
+            * Squeeze Client (maniac103/squeezeclient, GPL-3, read-only clone
+              ``/tmp/squeezeclient-src``) —
+              ``ui/itemlist/JiveHomeListItemFragment.kt:109-132`` tests
+              ``item.doAction != null -> connectionHelper.executeAction(...)``
+              BEFORE ``item.goAction != null -> listener.onGoAction(...)`` and
+              before ``listener.onNodeSelected(item.id)``; ``executeAction``
+              (``cometd/ConnectionHelper.kt:280-281``) publishes an
+              ``ExecuteActionRequest`` and *discards* the answer, so the row
+              never opens a list;
+            * Squeezer — same rule, ``model/JiveItem.java:268-270`` ("``do``
+              wins over ``go``/``goAction``"), the rule our own port of the tap
+              path uses (``tests/test_squeezer_favorites_tap.py:jive_go_action``).
+
+            Live symptom it caused: tapping "Favoriten"/"Radio" in either app
+            sent ``["favorites","items","menu:favorites","useContextMenu:1"]``
+            and showed nothing — no list ever opened.
+            """
             go: dict = {"player": 0, "cmd": cmd}
             if params:
                 go["params"] = params
-            return {"go": go, "do": go}
+            return {"go": go}
 
         items: list[dict] = [
             # My Music node — SqueezePlay expands it into the myMusic

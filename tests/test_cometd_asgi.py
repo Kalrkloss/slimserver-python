@@ -92,6 +92,7 @@ from lyrion.web.cometd import (
     RETRY_DELAY_MS,
     STREAMING_HOLD_WINDOW,
     CometdManager,
+    _channel_matches,
     connect_timeout,
 )
 
@@ -1413,3 +1414,173 @@ def test_live_post_behind_an_open_stream_is_served():
     assert awaited < 10.0, f"the queued POST waited {awaited:.1f}s"
     # ... and the client survived the end of that stream (Perl's grace)
     assert client is not None
+
+
+# ---------------------------------------------------------------------------
+# The app sequence (Squeeze Client / maniac103/squeezeclient, GPL-3)
+# ---------------------------------------------------------------------------
+# ``cometd/CometdClient.kt`` drives this order:
+#   1. ``handshake()``                                    (:143-160)
+#   2. ``startListening()``: ONE POST with ``/meta/connect`` +
+#      ``/meta/subscribe`` of ``/<clientId>/**``            (:162-210) — that
+#      glob is the ONLY server-side subscription the app holds;
+#   3. ``publishOneShotRequest()`` (``ConnectionHelper.kt:412-435``): the
+#      response channel is ``/<clientId>/slim/request/<nextRequestId>``
+#      (``Channels.oneShotRequestResponse``, :346-347) and
+#      ``CometdClient.subscribe`` only FILTERS the event flow client-side
+#      (``ChannelId.matches``, :321-335) — it never sends /meta/subscribe;
+#   4. the answer must arrive on the stream, as ``Message`` (:295-315):
+#      ``channel``, ``clientId``, ``id: Int`` (mandatory!), ``successful``
+#      (default true), ``error``, ``data`` — ``data`` is what the request
+#      awaits (``.mapNotNull { it.data }.first()``, :424).
+# The event Perl sends there is ``handleRequest``'s return (Cometd.pm:920-928):
+# ``{channel, id, data, ext: {priority}}`` with ``id = $params->{id} || 0``
+# (:769) and ``priority = $params->{priority} || ''`` (:772). Measured live
+# against 192.168.1.90:9000 (read-only ``favorites items``) — word-for-word
+# ``{"id": "171", "channel": "/<cid>/slim/request/1", "data": {...},
+#   "ext": {"priority": ""}}``.
+
+APP_GLOB_ONLY = "**"          # what startListening subscribes
+APP_REQUEST_CHANNEL = "/*"    # what Squeezer's cometd helper adds
+
+
+def test_app_sequence_favorites_answer_reaches_a_glob_subscriber():
+    """handshake→subscribe /**→connect(streaming)→request → payload on stream.
+
+    Also pins the glob resolution the app depends on: its only server-side
+    subscription is ``/<cid>/**`` (``/<cid>/slim/request/*`` for Squeezer), so
+    the answer on ``/<cid>/slim/request/171`` must match BOTH patterns
+    (Perl Manager::add_channels rewrites them to ``^/<cid>/`` resp.
+    ``^/<cid>/slim/request/[^/]+``).
+    """
+    async def run():
+        mgr, rec = _manager()
+        cid, _hs = await _handshake_async(mgr)
+        await _post_async(mgr, [
+            {"channel": "/meta/subscribe", "clientId": cid, "id": 2,
+             "subscription": f"/{cid}/{APP_GLOB_ONLY}"},
+            {"channel": "/meta/subscribe", "clientId": cid, "id": 3,
+             "subscription": f"/{cid}/slim/request{APP_REQUEST_CHANNEL}"}])
+        client = mgr.get(cid)
+        assert client is not None
+        assert set(client.subscriptions) == {
+            f"/{cid}/{APP_GLOB_ONLY}", f"/{cid}/slim/request{APP_REQUEST_CHANNEL}"}
+
+        stream = _HeldTransport([{"channel": "/meta/connect", "clientId": cid,
+                                  "id": 4, "connectionType": "streaming"}])
+        task = asyncio.create_task(_handle_cometd(mgr, "/cometd",
+                                                 stream.receive, stream.send))
+        await asyncio.wait_for(stream.first_chunk.wait(), timeout=5)
+
+        response_channel = f"/{cid}/slim/request/171"
+        tr = await _post_async(mgr, [{
+            "channel": "/slim/request", "clientId": cid, "id": 171,
+            "data": {"request": [PLAYER, ["favorites", "items",
+                                          "menu:favorites",
+                                          "useContextMenu:1"]],
+                     "response": response_channel}}])
+        framed = await _wait_for_chunk_channel(stream, response_channel)
+        task.cancel()
+        return cid, rec, tr.json(), framed
+
+    cid, rec, reply, framed = asyncio.run(run())
+    # the POST itself only answers the /slim/request ACK (Perl :576)
+    assert [m["channel"] for m in reply] == ["/slim/request"], reply
+    assert reply[0]["successful"] is True
+    assert reply[0]["id"] == 171
+    assert rec.calls == [[PLAYER, ["favorites", "items", "menu:favorites",
+                                  "useContextMenu:1"]]]
+    # the answer rides the OPEN connection, on the channel the app named
+    assert framed is not None, "the favourites answer never reached the stream"
+    assert framed["channel"] == f"/{cid}/slim/request/171"
+    # Perl's field set for that event (Cometd.pm:920-928) — and nothing else
+    assert set(framed) == {"channel", "id", "data", "ext"}
+    assert framed["id"] == 171               # echoed, so the app can match it
+    assert framed["ext"] == {"priority": ""}  # $params->{priority} || ''
+    assert "item_loop" in framed["data"]
+    # the app's own filter accepts it on every pattern it holds
+    for pattern in (f"/{cid}/{APP_GLOB_ONLY}",
+                    f"/{cid}/slim/request{APP_REQUEST_CHANNEL}"):
+        assert _channel_matches(pattern, framed["channel"]), pattern
+
+
+def test_app_sequence_request_without_id_still_gets_perls_zero():
+    """Perl Cometd.pm:769 ``$params->{id} || 0`` — always a number.
+
+    Squeeze Client's ``Message.id: Int`` is mandatory and a JSON *string*
+    (or a missing field) breaks its whole chunk parse
+    (``readFromEventStream``, ``CometdClient.kt:227-273``), so the fallback
+    must be the integer 0, never ``""``.
+    """
+    async def run():
+        mgr, _rec = _manager()
+        cid, _hs = await _handshake_async(mgr)
+        await _post_async(mgr, [{"channel": "/meta/subscribe", "clientId": cid,
+                                 "id": 2, "subscription": f"/{cid}/**"}])
+        stream = _HeldTransport([{"channel": "/meta/connect", "clientId": cid,
+                                  "id": 3, "connectionType": "streaming"}])
+        task = asyncio.create_task(_handle_cometd(mgr, "/cometd",
+                                                 stream.receive, stream.send))
+        await asyncio.wait_for(stream.first_chunk.wait(), timeout=5)
+        channel = f"/{cid}/slim/request/1"
+        await _post_async(mgr, [{
+            "channel": "/slim/request", "clientId": cid,
+            "data": {"request": [PLAYER, ["favorites", "items"]],
+                     "response": channel}}])
+        framed = await _wait_for_chunk_channel(stream, channel)
+        task.cancel()
+        return framed
+
+    framed = asyncio.run(run())
+    assert framed is not None
+    assert framed["id"] == 0
+    assert isinstance(framed["id"], int)
+
+
+def test_response_event_carries_the_requested_priority():
+    """Cometd.pm:772/:926-928 — ``data.priority`` lands in ``ext.priority``."""
+    async def run():
+        mgr, _rec = _manager()
+        cid, _hs = await _handshake_async(mgr)
+        await _post_async(mgr, [{"channel": "/meta/subscribe", "clientId": cid,
+                                 "id": 2, "subscription": f"/{cid}/**"}])
+        stream = _HeldTransport([{"channel": "/meta/connect", "clientId": cid,
+                                  "id": 3, "connectionType": "streaming"}])
+        task = asyncio.create_task(_handle_cometd(mgr, "/cometd",
+                                                 stream.receive, stream.send))
+        await asyncio.wait_for(stream.first_chunk.wait(), timeout=5)
+        channel = f"/{cid}/slim/request/9"
+        await _post_async(mgr, [{
+            "channel": "/slim/request", "clientId": cid, "id": 9,
+            "data": {"request": [PLAYER, ["favorites", "items"]],
+                     "priority": "high", "response": channel}}])
+        framed = await _wait_for_chunk_channel(stream, channel)
+        task.cancel()
+        return framed
+
+    framed = asyncio.run(run())
+    assert framed is not None
+    assert framed["ext"] == {"priority": "high"}
+
+
+def test_long_polling_app_request_result_carries_the_same_event_shape():
+    """The long-polling transport must frame the SAME event (Perl :584-589).
+
+    Perl pushes ``$result`` — the ``handleRequest`` return — into the POST's
+    own event list, so both transports see ``{channel, id, data, ext}``.
+    """
+    mgr, _rec = _manager()
+    cid, _hs = _asgi_handshake(mgr)
+    _post(mgr, [{"channel": "/meta/subscribe", "clientId": cid, "id": 2,
+                 "subscription": f"/{cid}/**"}])
+    _post(mgr, [{"channel": "/meta/connect", "clientId": cid, "id": 3,
+                 "connectionType": "long-polling", "advice": {"timeout": 0}}])
+    channel = f"/{cid}/slim/request/12"
+    tr = _post(mgr, [{"channel": "/slim/request", "clientId": cid, "id": 12,
+                      "data": {"request": [PLAYER, ["favorites", "items"]],
+                               "response": channel}}])
+    payload = tr.json()
+    assert [m["channel"] for m in payload] == ["/slim/request", channel], payload
+    result = payload[1]
+    assert set(result) == {"channel", "id", "data", "ext"}
+    assert result["id"] == 12 and result["ext"] == {"priority": ""}

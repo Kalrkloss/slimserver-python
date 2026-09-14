@@ -66,6 +66,7 @@ from typing import Any
 
 import pytest
 
+from lyrion.player.state import PlayerState
 from lyrion.web.api import JSONRPCAPI
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
@@ -504,3 +505,142 @@ def test_any_menu_value_yields_the_perl_menu_shape(favs, menu):
     assert set(res["base"]["actions"]) == \
         set(_perl_result(USE_CM_FIXTURE)["base"]["actions"])
     assert "actions" in _folder_item(res)
+
+
+# ── 8. the HOME-MENU entry: navigating must not be shadowed by ``do`` ─────
+#
+# Symptom (user, both Android apps): tapping "Favoriten" opened nothing at
+# all — no list appeared.  The home menu handed the app a node with BOTH
+# ``actions.go`` and ``actions.do`` (the same command mirrored), and in both
+# controllers ``do`` wins over ``go``:
+#
+# * Squeeze Client (maniac103/squeezeclient, GPL-3, read-only clone
+#   ``/tmp/squeezeclient-src``) — ``ui/itemlist/JiveHomeListItemFragment.kt``
+#   ``onItemSelected`` (:109-132) tests in this order: ``input`` -> ``choices``
+#   -> **``doAction`` -> ``goAction``** -> ``onNodeSelected(item.id)``.
+#   ``cometd/ConnectionHelper.kt:280-281`` runs a ``do`` through
+#   ``executeAction`` -> ``ExecuteActionRequest`` and DISCARDS the answer, so
+#   the tap fired ``["favorites","items","menu:favorites"]`` and the UI stayed
+#   where it was.
+# * Squeezer — the same rule, ``model/JiveItem.java:268-270`` (``do`` wins
+#   over ``go``/``goAction``); it is the rule our port of the tap path uses
+#   (``tests/test_squeezer_favorites_tap.py:jive_go_action``).
+#
+# Perl's live home menu (``menu 0 100 direct:1`` against 192.168.1.90) never
+# does that: ``favorites``/``radios``/``myMusic*`` carry ``go`` and **no**
+# ``do``; ``do`` exists on exactly three settings entries whose ``do`` is not
+# a navigation (``settingsRepeat``/``settingsShuffle`` with ``do.choices``,
+# ``settingsPlayerNameChange`` with ``do.params.playername`` = __INPUT__).
+# Verbatim live answer for the favourites entry:
+#
+#   {"actions": {"go": {"cmd": ["favorites", "items"],
+#                       "params": {"menu": "favorites"}}},
+#    "id": "favorites", "node": "home", "text": "Favoriten", "weight": 100}
+
+PERL_HOME_FAVORITES_GO = {"cmd": ["favorites", "items"],
+                          "params": {"menu": "favorites"}}
+
+
+def _home_node(node_id: str) -> dict:
+    return next(i for i in JSONRPCAPI()._home_menu() if i["id"] == node_id)
+
+
+def app_tap(record: dict) -> tuple[str, dict]:
+    """Which effect a tap has — Squeeze Client's resolution order.
+
+    Ported from ``combineItemAndBaseActions`` (``cometd/response/
+    SlimBrowseListResponse.kt:144-230``) plus ``JiveHomeListItemFragment.kt``
+    ``onItemSelected`` (:109-132): the first of input/choices/``do``/``go``/
+    node that exists wins.  Note :195 — a ``do`` object that carries
+    ``choices`` is NOT turned into ``doAction`` (it becomes the choices sheet).
+    ``executeAction`` (``do``) is the branch that shows nothing.
+    """
+    actions = record.get("actions") or {}
+    do_obj = actions.get("do")
+    do_action = do_obj if isinstance(do_obj, dict) and "choices" not in do_obj \
+        else None
+    choice_actions = [c for c in (do_obj or {}).get("choices", [])
+                      if isinstance(c, dict)]
+    choice_strings = record.get("choiceStrings")
+    selected = record.get("selectedIndex")
+    choices = bool(choice_actions) and choice_strings is not None \
+        and selected is not None and len(choice_actions) == len(choice_strings)
+    if record.get("input") is not None:
+        return "input", {}
+    if choices:
+        return "choices", {}
+    if do_action is not None:
+        return "do", do_action
+    if actions.get("go") is not None:
+        return "go", actions["go"]
+    return "node", {}
+
+
+def squeezer_effect(record: dict) -> tuple[str, dict]:
+    """Squeezer's rule (``JiveItem.java:268-270``), as in the tap test.
+
+    ``goAction`` is resolved as a name: ``actions.do`` first, else
+    ``actions.<goAction|go>``; a ``do`` therefore STEALS the tap from a
+    navigation ``go``.
+    """
+    actions = record.get("actions") or {}
+    if actions.get("do") is not None:
+        return "do", actions["do"]
+    name = record.get("goAction", "go")
+    if actions.get(name) is not None:
+        return "go", actions[name]
+    return "node", {}
+
+
+def test_home_menu_favorites_node_is_go_only_like_perl():
+    """The node must match Perl verbatim — a mirrored ``do`` kills the tap."""
+    item = _home_node("favorites")
+    # Perl's live node keys: id/node/text/weight/actions — nothing else.
+    assert set(item) == {"id", "node", "text", "weight", "actions"}
+    assert item["id"] == "favorites" and item["node"] == "home"
+    assert item["weight"] == 100
+    assert list(item["actions"]) == ["go"]        # NO mirrored "do"
+    go = item["actions"]["go"]
+    # Documented deviation: Perl's live ``go`` here has no ``player`` key
+    # (``{"cmd": [...], "params": {...}}``); ours carries the (client-ignored,
+    # ``JiveAction`` has no such field) player index like every other node.
+    assert {k: v for k, v in go.items() if k != "player"} == \
+        PERL_HOME_FAVORITES_GO
+    result = item["text"].lower()
+    assert result.startswith("fav")             # "Favoriten" / "Favorites"
+    # both controllers must navigate (open the favourites list) on a tap
+    assert app_tap(item)[0] == "go"
+    assert squeezer_effect(item)[0] == "go"
+
+
+def test_home_menu_radio_node_is_go_only_like_perl():
+    """Perl live: ``radios`` = go/cmd radios/params menu:radio — no ``do``."""
+    item = _home_node("radios")
+    assert list(item["actions"]) == ["go"]
+    assert app_tap(item)[0] == squeezer_effect(item)[0] == "go"
+    assert app_tap(item)[1]["cmd"] == ["radios"]
+    assert app_tap(item)[1]["params"] == {"menu": "radio"}
+
+
+def test_home_menu_do_stays_on_the_settings_entries():
+    """Negative control: dropping every ``do`` would break Perl's settings.
+
+    Perl sends ``do`` (and no ``go``) for the repeat/shuffle choice rows and
+    the player-name input row — those are actions, not navigations.
+    """
+    player = PlayerState(mac="1c:87:2c:47:fc:34", name="Taverne",
+                         ip="192.168.1.130", port=43856)
+    items = JSONRPCAPI()._home_menu(player)
+    with_do = {i["id"] for i in items if "do" in (i.get("actions") or {})}
+    # Perl's ``do`` rows: settingsRepeat/settingsShuffle (``do.choices``) and
+    # settingsPlayerNameChange (``do.params.playername`` = __INPUT__, not
+    # ported).  ``playerpower`` is OUR extra row (Perl's home menu has no such
+    # item) — its ``do`` is a genuine action, so the tap is meant to run it.
+    assert with_do == {"settingsRepeat", "settingsShuffle",
+                       "playerpower"}, with_do
+    repeat = next(i for i in items if i["id"] == "settingsRepeat")
+    assert "go" not in repeat["actions"]
+    assert app_tap(repeat)[0] == "choices"          # choices win, as in Perl
+    assert squeezer_effect(repeat)[0] == "do"
+    assert repeat["actions"]["do"]["choices"][0]["cmd"] == \
+        ["playlist", "repeat", "0"]
