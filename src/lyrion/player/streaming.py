@@ -1191,6 +1191,30 @@ def controller_for(mac: str) -> Optional[StreamingController]:
     return _controllers.get(_normalize(mac))
 
 
+def reported_playmode(mac: str) -> Optional[str]:
+    """Perl ``Slim::Player::Source::playmode($client)`` — the status ``mode``.
+
+    ``Queries.pm:4081`` reports ``mode`` as
+    ``Slim::Player::Source::playmode($client)``; called without a new mode
+    that is ``_returnPlayMode`` (``Slim/Player/Source.pm:55-64``)::
+
+        return 'stop' if !$_[1]->power();
+        my $returnedmode = $controller->isStopped ? 'stop'
+                            : $controller->isPaused ? 'pause' : 'play';
+
+    with ``isStopped`` = ``playingState == STOPPED && streamingState == IDLE``
+    (``StreamingController.pm:1681-1683``). A stream that is only
+    BUFFERING/STREAMING — the state ``_Stream`` sets together with the strm
+    frame (:1350-1352) — therefore already reads ``play``; the player's STMs
+    is not needed (:1676-1695).
+
+    ``None`` when no controller is registered for ``mac`` yet (the caller then
+    keeps its own value).
+    """
+    ctl = controller_for(mac)
+    return ctl.reported_mode() if ctl is not None else None
+
+
 def reset(mac: Optional[str] = None) -> None:
     """Drop the controller for ``mac`` (or all) — for tests and disconnects."""
     if mac is None:

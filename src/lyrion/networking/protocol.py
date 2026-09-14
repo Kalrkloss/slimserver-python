@@ -113,7 +113,7 @@ import struct
 from collections.abc import Coroutine, Sequence
 from dataclasses import dataclass, field
 from enum import IntFlag
-from typing import Any, Callable, Literal
+from typing import Any, Callable, Literal, Optional, cast
 from urllib.parse import urlparse
 import time
 
@@ -171,6 +171,72 @@ def _streaming_mode(mac: str, event: str, fallback: PlayerMode, **params) -> Pla
     except Exception as exc:  # noqa: BLE001
         logger.debug("streaming event %s for %s failed: %s", event, mac, exc)
     return fallback
+
+
+def _reported_playmode(mac: str) -> Optional[str]:
+    """The status ``mode`` Perl derives from its controller state.
+
+    Perl has no separate ``mode`` field: the status query adds
+    ``Slim::Player::Source::playmode($client)`` (``Slim/Control/Queries.pm:4081``)
+    and that is ``_returnPlayMode`` (``Slim/Player/Source.pm:55-64``)::
+
+        return 'stop' if !$_[1]->power();
+        my $returnedmode = $controller->isStopped ? 'stop'
+                            : $controller->isPaused ? 'pause' : 'play';
+
+    ``isStopped`` is ``playingState == STOPPED && streamingState == IDLE``
+    (``StreamingController.pm:1681-1683``), so a stream that is only
+    BUFFERING/STREAMING — the state ``_Stream`` sets with the strm frame
+    (:1350-1352) — already reports ``play``; no player event is needed.
+    ``None`` = no controller for this player (the caller keeps its value).
+    """
+    try:
+        from lyrion.player import streaming
+        return streaming.reported_playmode(mac)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("reported playmode for %s failed: %s", mac, exc)
+        return None
+
+
+def _after_strm_sent(mac: str, song: Any = None) -> None:
+    """Perl's bookkeeping after a ``strm 's'`` frame went out.
+
+    Three Perl rules, all of them identical for a /stream.mp3 file stream and
+    a direct radio stream (``stream_s`` builds both, ``Squeezebox.pm:546-770``):
+
+    * ``$client->streamStartTimestamp(undef)`` on EVERY strm frame
+      (``Squeezebox.pm:567``; the client sets it again with its STMc,
+      ``Squeezebox2.pm:141-142``). Until then ``statHandler`` ignores every
+      stat code but STMc (:143-145) — which is why the player's own STMf here
+      is a start ack, not a lost stream (``Squeezebox2.pm:174-176`` has no
+      STMf branch at all).
+    * the controller already moved to BUFFERING + STREAMING with the frame
+      (``_Stream``, ``StreamingController.pm:1350-1352``; ``note_strm_sent``).
+    * the status ``mode`` follows that state (``Source::playmode``,
+      ``Source.pm:55-64``) — ``play`` from the first frame on, NOT only once
+      the player reports STMs (a client that never sends one would otherwise
+      stay ``stop`` while its audio runs).
+    """
+    try:
+        from lyrion.player.manager import PlayerManager
+        player = PlayerManager().get_player(mac)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("strm tail: player lookup failed for %s: %s", mac, exc)
+        player = None
+    if player is not None:
+        # Squeezebox.pm:567 — the start handshake is re-armed per frame.
+        player.strm_sent_at = time.time()
+        if song is not None:
+            player.strm_sent_track = song
+    try:
+        from lyrion.player import streaming
+        streaming.note_strm_sent(mac, song)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("streaming note_strm_sent failed for %s: %s", mac, exc)
+    mode = _reported_playmode(mac)
+    if player is not None and mode in ("stop", "play", "pause"):
+        player.mode = cast(PlayerMode, mode)
+
 
 # Player buffer threshold, in KB of audio the player buffers before it
 # starts decoding — carried in the strm frame. Perl values:
@@ -2462,30 +2528,22 @@ class SlimProtoClient:
         try:
             writer.write(frame)
             await writer.drain()
-            # Remember what we actually streamed (the idempotency guard
-            # above must not re-send for the SAME track while it plays) and
-            # WHEN — the player's start handshake (STMf/STMc/STMs) follows
-            # within milliseconds and must not be mistaken for "stream lost".
+            # A new stream replaces whatever ran before: the old track is no
+            # longer the one the player runs.
             try:
                 from lyrion.player.manager import PlayerManager
                 _p = PlayerManager().get_player(mac)
-                if _p is not None:
-                    _p.strm_sent_track = track_id
-                    _p.strm_sent_at = time.time()
-                    if _p.playing_track_id != track_id:
-                        # A new stream replaces whatever ran before: the old
-                        # track is no longer the one the player runs.
-                        _p.playing_track_id = None
+                if _p is not None and _p.playing_track_id != track_id:
+                    _p.playing_track_id = None
             except Exception:  # noqa: BLE001
                 pass
-            # PROT-14: our strm frame is out, so Perl's `_Stream` tail applies —
-            # nextTrack cleared, playing BUFFERING, streaming STREAMING
-            # (StreamingController.pm:1350-1352).
-            try:
-                from lyrion.player import streaming
-                streaming.note_strm_sent(mac, track_id)
-            except Exception as exc:  # noqa: BLE001
-                logger.debug("streaming note_strm_sent failed for %s: %s", mac, exc)
+            # PROT-14: our strm frame is out, so Perl's tail applies — the
+            # stream-start handshake is re-armed (Squeezebox.pm:567), the
+            # controller moves to BUFFERING/STREAMING (StreamingController.pm:
+            # 1350-1352), the idempotency guard records the track we ACTUALLY
+            # streamed, and the status mode follows the controller
+            # (Source.pm:55-64 → Queries.pm:4081).
+            _after_strm_sent(mac, track_id)
             logger.info("Sent strm to %s: track=%d codec=%s", mac, track_id, codec)
             return True
         except (ConnectionError, OSError, RuntimeError) as exc:
@@ -2760,6 +2818,17 @@ class SlimProtoClient:
             logger.warning("Failed to send direct strm to %s: %s", mac, exc)
             return False
 
+        # Perl's `stream_s` tail applies to a DIRECT stream exactly like to a
+        # /stream.mp3 file stream: Squeezebox.pm:567 clears the start handshake
+        # on the frame, the controller already sits in BUFFERING+STREAMING
+        # (StreamingController.pm:1350-1352) and the status mode is derived from
+        # it (Source.pm:55-64). Without this the controller stayed STOPPED-IDLE,
+        # so the status reported `mode:stop` for the whole start and the
+        # player's own STMf start ack dropped it back to stop — even while the
+        # stream was running (Squeezebox2.pm:174-176: no STMf branch, it is a
+        # plain playerStatusHeartbeat).
+        _after_strm_sent(mac)
+
         # Wait for the player's RESP (source headers) and send 'cont' with
         # the metaint so the player can strip Icecast metadata itself.
         asyncio.create_task(self._send_cont_after_resp(mac, url))
@@ -2795,6 +2864,8 @@ class SlimProtoClient:
             writer.write(frame)
             await writer.drain()
             logger.info("Sent proxy strm to %s (remote: %s)", mac, url[:60])
+            # Perl's stream_s tail, see _send_direct_stream / Squeezebox.pm:567.
+            _after_strm_sent(mac)
             # No 'cont' frame — matches real LMS behaviour.
             return True
         except (ConnectionError, OSError, RuntimeError) as exc:
@@ -3982,9 +4053,19 @@ class SlimProtoClient:
                         # no audio, mode=stop, old title on screen. An STMf
                         # inside the handshake window therefore keeps both the
                         # guard and the mode.
+                        #
+                        # The marker is ``strm_sent_at`` alone (set by
+                        # ``_after_strm_sent`` on EVERY strm frame, file and
+                        # direct radio alike — Perl clears the start handshake
+                        # per frame, Squeezebox.pm:567). Requiring a track id
+                        # here meant a radio stream — which has none — never
+                        # armed the handshake: its own STMf was read as "stream
+                        # lost" and the status dropped to `mode:stop` while the
+                        # stream ran (LIVE 2026-09-14 18:59:41, SqueezePlay:
+                        # `Sent DIRECT strm` → STMf → `Stopped ... _Invalid` →
+                        # `mode: stop`, only STMs 10 s later flipped it).
                         _handshake_ack = bool(
-                            player.strm_sent_track is not None
-                            and player.strm_sent_at
+                            player.strm_sent_at
                             and (time.time() - player.strm_sent_at)
                             <= self.STRM_START_HANDSHAKE_WINDOW_S
                         )
@@ -4005,9 +4086,13 @@ class SlimProtoClient:
                             # (StreamingController.pm:2223-2248).
                             _streaming_note(mac_str, "Stopped")
                             # Mark stop only if the server didn't already
-                            # (natural end vs. user stop / pause-stop).
+                            # (natural end vs. user stop / pause-stop); the
+                            # value itself follows the controller
+                            # (Source.pm:55-64 → Queries.pm:4081).
                             if player.mode not in ("pause",):
-                                player.mode = "stop"
+                                player.mode = cast(
+                                    PlayerMode,
+                                    _reported_playmode(mac_str) or "stop")
                                 player.pause_requested = False
                             else:
                                 player.pause_requested = False  # pause-ack

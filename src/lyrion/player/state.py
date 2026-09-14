@@ -61,6 +61,11 @@ class PlayerState:
     # "stream lost": it must keep the guard and must not report a stop
     # (live: `Sent strm track=9900` → STMf → mode=stop, frozen elapsed,
     # 99.8 % full output buffer = the wedge).
+    # Set on EVERY strm frame — the /stream.mp3 file stream AND the direct
+    # radio stream (`_after_strm_sent`, Perl clears its own start handshake
+    # per frame: ``$client->streamStartTimestamp(undef)``,
+    # Squeezebox.pm:567). A radio stream has no track id, so this timestamp
+    # is the ONLY marker that arms the handshake for it.
     strm_sent_at: float = 0.0
     # Track id the player DEMONSTRABLY plays: set by ``STMs`` (track started,
     # Squeezebox2.pm:162-163) or by an ``STMt`` whose ``elapsed`` advanced —
