@@ -46,7 +46,7 @@ class ImportConfig:
     deletes.
     """
 
-    source_path: Path = Path("/mnt/media/Musik")
+    source_path: Path | None = None
     batch_size: int = 100
     overwrite_existing: bool = False
     mode: str = "full"
@@ -145,6 +145,13 @@ class MusicImporter:
         self.config = config or ImportConfig()
         self.stats = ImportStats()
         self._progress_callbacks: list[Callable[[ImportStats], Any]] = []
+        # No source path configured: fall back to the configured music folder
+        # (Perl picks the OS music folder as the default media dir,
+        # ``Slim/Utils/Prefs.pm:687-712`` → ``OSDetect::dirsFor('music')``).
+        if self.config.source_path is None:
+            from lyrion.media.music_dir import resolve_music_dir
+
+            self.config.source_path = resolve_music_dir()
 
     def add_progress_callback(self, cb: Callable[[ImportStats], Any]) -> None:
         self._progress_callbacks.append(cb)
@@ -162,8 +169,19 @@ class MusicImporter:
 
         from lyrion.media.scan_state import SCAN_STATE
 
-        if not self.config.source_path.is_dir():
-            logger.error("Music directory does not exist: %s", self.config.source_path)
+        source = self.config.source_path
+        if source is None or not source.is_dir():
+            # Distinguish "folder is gone" from "the share is not mounted"
+            # (gvfs/FUSE) — different operator action, same silent library.
+            from lyrion.platform import paths as platform_paths
+
+            if source is None:
+                logger.error(
+                    "No music folder configured — set 'mediadirs' (Perl "
+                    "defaultMediaDirs, Slim/Utils/Prefs.pm:687-712)")
+            else:
+                code, message = platform_paths.explain_missing_path(source)
+                logger.error("Music directory unusable (%s): %s", code, message)
             self.stats.end_time = datetime.now()
             SCAN_STATE.finish()
             return self.stats

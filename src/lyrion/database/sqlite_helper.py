@@ -47,6 +47,25 @@ _init_lock = threading.Lock()
 DEFAULT_DB_PATH: Path | None = None
 
 
+def _default_db_path() -> Path:
+    """Where the library DB lives when no path was configured.
+
+    The platform layer decides the data root (Windows ``%ProgramData%\\Lyrion``,
+    macOS ``~/Library/Application Support/Squeezebox``, Linux/Unix
+    ``~/.lyrion/Lyrion``), so this is no longer a hardcoded Linux home path.
+    An existing library from an earlier version always wins — losing an 80k
+    track library to a directory change would be the worst possible outcome
+    (Perl migrates the same way: ``Slim/Utils/OS/Unix.pm:115-127``
+    ``migratePrefsFolder``).
+    """
+    from lyrion.platform import paths as platform_paths
+
+    legacy = Path.home() / ".lyrion" / "Lyrion" / "Prefs" / "lyrion.db"
+    if legacy.is_file():
+        return legacy
+    return platform_paths.port_dir("prefs") / "lyrion.db"
+
+
 # ---------------------------------------------------------------------------
 # Initialization
 # ---------------------------------------------------------------------------
@@ -68,8 +87,7 @@ async def init_db(
     if _db_engine is not None:
         return _db_engine
 
-    db_path = Path(db_path) if db_path else (
-        Path.home() / ".lyrion" / "Lyrion" / "Prefs" / "lyrion.db")
+    db_path = Path(db_path) if db_path else _default_db_path()
     db_path.parent.mkdir(parents=True, exist_ok=True)
     DEFAULT_DB_PATH = db_path
 

@@ -123,11 +123,17 @@ async def _run_server(
     log.info("=" * 60)
     log.info("Pyrion Music Server v%s (build %s)", __version__, __build_date__)
     log.info("Python %s", sys.version)
-    log.info("Server data directory: %s", cfg.serverdata_dir)
+    log.info("Server data directory: %s (from %s)",
+             cfg.serverdata_dir, cfg.serverdata_source)
     log.info("Prefs directory: %s", cfg.prefs_dir)
     log.info("Log directory: %s", cfg.log_dir)
     log.info("Cache directory: %s", cfg.cache_dir)
     log.info("=" * 60)
+
+    # Warn when a configured music folder is missing, unmounted, unreadable or
+    # empty — the "mount gone → metadata yes, sound no" case.  Read-only, no
+    # system change (lyrion.platform.paths).
+    _warn_about_media_dirs(cfg, log)
 
     # Initialize database
     await init_db(cfg.db_path)
@@ -415,15 +421,29 @@ async def _broadcast_server_presence(log: logging.Logger, slimproto_port: int, h
 
 
 # -----------------------------------------------------------------------------
-# Daemonization (Unix only)
-# ---------------------------------------------------------------------------
+# Daemonization (POSIX only — Windows uses a service, like Perl)
+# -----------------------------------------------------------------------------
 
 def _daemonize() -> bool:
-    """Daemonize the process (Unix only). Returns True if we are the daemon."""
-    if os.name != "posix":
-        return True  # Not supported, continue normally
+    """Daemonize the process. Returns True if we are the daemon.
 
-    # Double-fork daemonization
+    POSIX only: the double fork needs ``os.fork``/``os.setsid``.  Windows has
+    neither, and Perl does not daemonize there either — it runs under the
+    Windows Service Manager instead (``Slim/Utils/OS/Win64.pm:55-89``
+    ``runService``, ``:122-125`` restart via the service manager).  On Windows
+    the flag is therefore a logged no-op and the server keeps running in the
+    foreground, which is what a service wrapper expects.
+    """
+    if os.name != "posix":
+        _bootstrap_log(
+            "--daemon is not supported on this platform; staying in the "
+            "foreground (Windows services are installed by the installer, "
+            "like Perl's Slim::Utils::OS::Win64::runService)",
+            level=logging.WARNING,
+        )
+        return True
+
+    # Double-fork daemonization.
     try:
         pid = os.fork()
         if pid > 0:
@@ -433,7 +453,8 @@ def _daemonize() -> bool:
         sys.stderr.write(f"First fork failed: {e}\n")
         sys.exit(1)
 
-    # First child: detach from process group
+    # First child: detach from process group.  '/'-chdir is a POSIX convention;
+    # the pid file (written later) is absolute, so it still lands correctly.
     os.chdir("/")
     os.setsid()
     os.umask(0o022)
@@ -447,14 +468,78 @@ def _daemonize() -> bool:
         sys.stderr.write(f"Second fork failed: {e}\n")
         sys.exit(1)
 
-    # Redirect standard file descriptors
-    devnull = os.open("/dev/null", os.O_RDWR)
+    # Redirect standard file descriptors to the platform's null device
+    # (os.devnull is 'nul' on Windows, '/dev/null' elsewhere).
+    devnull = os.open(os.devnull, os.O_RDWR)
     os.dup2(devnull, 0)  # stdin
     os.dup2(devnull, 1)  # stdout
     os.dup2(devnull, 2)  # stderr
     os.close(devnull)
 
     return True  # We are the daemon
+
+
+# -----------------------------------------------------------------------------
+# Start-up check of the configured music folders
+# -----------------------------------------------------------------------------
+
+def _configured_media_dirs(cfg: object) -> list[str]:
+    """The music folders the server is configured to use, de-duplicated.
+
+    Mirrors Perl's preference shape: ``mediadirs`` is the current array
+    preference (``Slim/Utils/Prefs.pm:102,163``), ``audiodir`` the legacy one
+    it migrates from (``Prefs.pm:687-698``) and ``musicdir`` the per-client/old
+    CLI name the port kept.
+    """
+    dirs: list[str] = []
+    from lyrion.platform import paths as _platform_paths
+
+    for name in ("mediadirs", "audiodir", "musicdir"):
+        try:
+            value = cfg.get(name, "")  # type: ignore[attr-defined]
+        except Exception:  # pragma: no cover - defensive
+            continue
+        if isinstance(value, (list, tuple, set)):
+            candidates = [str(v) for v in value]
+        elif value:
+            # The store serialises list preferences comma separated
+            # (web/settings.py mirrors Server/Basic.pm:88-121); a .conf file
+            # hands back the raw line.  Both go through the shared splitter so
+            # a gvfs mount id (…,share=…) is not torn apart.
+            candidates = _platform_paths.split_path_list(value)
+        else:
+            candidates = []
+        for candidate in candidates:
+            text = candidate.strip()
+            if text and text not in dirs:
+                dirs.append(text)
+    return dirs
+
+
+def _warn_about_media_dirs(cfg: object, log: logging.Logger) -> list[tuple[str, str, str]]:
+    """Warn at start-up when a configured music folder is unusable.
+
+    Perl only skips a *missing default* folder silently
+    (``Slim/Utils/Prefs.pm:700-710``); the port additionally reports it,
+    because with network mounts "metadata but no sound" is otherwise
+    indistinguishable from "never scanned".  Distinguishes a missing file from
+    a missing mount (``lyrion.platform.paths.explain_missing_path``) and never
+    changes the system.
+    """
+    from lyrion.platform import paths as _paths
+
+    dirs = _configured_media_dirs(cfg)
+    problems = _paths.warn_about_media_dirs(dirs, log=log)
+    if problems:
+        log.warning(
+            "Music folder check: %d of %d configured folder(s) are not usable "
+            "(see the warnings above) — the library will be incomplete until "
+            "they are back", len(problems), len(dirs),
+        )
+    else:
+        log.info("Music folder check: %d configured folder(s) are usable: %s",
+                 len(dirs), dirs)
+    return problems
 
 
 # ---------------------------------------------------------------------------
@@ -586,10 +671,19 @@ Examples:
         _pid_file = Path(args.pidfile)
         _write_pidfile(_pid_file)
 
-    # Set up signal handlers
+    # Set up signal handlers.  SIGHUP does not exist on Windows (Python only
+    # defines it there from 3.13 onward, and only for consoles), so it is
+    # installed only when the platform has it — Perl does the same thing: its
+    # Windows code never touches POSIX signals (Slim/Utils/OS/Win32.pm:331
+    # ``dontSetUserAndGroup``, :715-765 restart via the Service Manager).
     signal.signal(signal.SIGTERM, _signal_handler)
     signal.signal(signal.SIGINT, _signal_handler)
-    signal.signal(signal.SIGHUP, _signal_handler)
+    _sighup = getattr(signal, "SIGHUP", None)
+    if _sighup is not None:
+        try:
+            signal.signal(_sighup, _signal_handler)
+        except (OSError, ValueError, AttributeError):  # pragma: no cover
+            pass
 
     # Bootstrap: paths, environment, event loop
     try:

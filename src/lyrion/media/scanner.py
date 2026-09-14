@@ -159,7 +159,7 @@ def _fix_tag_encoding(value: str) -> str:
 @dataclass
 class ScanConfig:
     """Configuration for scanning music folders."""
-    base_path: Path = Path("/mnt/media2/Musik")
+    base_path: Path | None = None
     extensions: frozenset[str] = SUPPORTED_EXTENSIONS
     skip_patterns: list[re.Pattern[str]] = field(default_factory=list)
     recursive: bool = True
@@ -168,8 +168,23 @@ class ScanConfig:
     generate_artwork: bool = True
 
     def __post_init__(self) -> None:
-        if not self.base_path.exists():
-            logger.warning("Scan base path does not exist: %s", self.base_path)
+        if self.base_path is None:
+            # No hardcoded Linux path: the folder comes from the preference
+            # chain (media/music_dir.py → Perl's defaultMediaDirs,
+            # ``Slim/Utils/Prefs.pm:687-712`` → ``OSDetect::dirsFor('music')``).
+            from lyrion.media.music_dir import resolve_music_dir
+
+            self.base_path = resolve_music_dir()
+            if self.base_path is not None:
+                logger.info("Configured to scan: %s", self.base_path)
+            return
+        from lyrion.platform import paths as platform_paths
+
+        code, message = platform_paths.explain_missing_path(self.base_path)
+        if code != platform_paths.OK:
+            # Catches the gvfs case too: "mount gone" is not the same as
+            # "folder deleted" and must not look like a successful empty scan.
+            logger.warning("Scan base path unusable (%s): %s", code, message)
             return
         logger.info("Configured to scan: %s", self.base_path)
 
@@ -280,6 +295,17 @@ class MediaScanner:
         """
         logger.info("Starting scan of: %s", self.config.base_path)
         self.stats.start_time = datetime.now()
+
+        if self.config.base_path is None:
+            # Nothing to walk: no 'mediadirs'/'musicdir'/'audiodir' set and no
+            # OS music folder found (Perl defaultMediaDirs,
+            # ``Slim/Utils/Prefs.pm:687-712``).  Refuse instead of walking a
+            # hardcoded Linux path that may exist on the build machine only.
+            logger.error(
+                "No music folder to scan — set 'mediadirs' or 'musicdir' "
+                "(Perl: defaultMediaDirs, Slim/Utils/Prefs.pm:687-712)")
+            self.stats.errors.append("no music folder configured")
+            return [], self.stats
 
         scan_results: list[ScanResult] = []
 

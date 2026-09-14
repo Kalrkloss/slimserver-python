@@ -111,16 +111,18 @@ def as_path_list(value: Any) -> list[str]:
     (``Prefs.pm:383-403``); our store serialises them comma separated
     (``web/settings.py`` ``_save_server_basic``).  Both shapes are accepted.
 
-    NOTE: a path containing a literal comma cannot be represented in the
-    comma-separated form — a known limitation of our store, not of this code.
+    The splitting happens in :func:`lyrion.platform.paths.split_path_list`,
+    which keeps the comma inside a gvfs mount id
+    (``smb-share:server=host,share=name``) — otherwise a mounted SMB share would
+    silently vanish from folder browsing.
+
+    NOTE: a path containing a literal comma *followed by* ``key=`` still cannot
+    be represented in the comma-separated form — a known limitation of our
+    store, not of this code.
     """
-    if value is None:
-        return []
-    if isinstance(value, (list, tuple, set)):
-        raw: Iterable[Any] = value
-    else:
-        raw = str(value).split(",")
-    return [p for p in (str(p).strip() for p in raw) if p]
+    from lyrion.platform import paths as platform_paths
+
+    return platform_paths.split_path_list(value)
 
 
 def get_dir_pref(name: str) -> list[str]:
@@ -166,9 +168,14 @@ def _scanner_root_candidates() -> list[str]:
 
     # Read ScanConfig's dataclass default instead of instantiating it:
     # ``__post_init__`` logs a warning when the path is missing
-    # (scanner.py:170-174), which would spam the log on every browse request.
+    # (scanner.py:169-186), which would spam the log on every browse request.
     base_default = ScanConfig.__dataclass_fields__["base_path"].default
-    return [str(ImportConfig().source_path), str(base_default)]
+    # NOTE: the OS music folder is deliberately NOT added here — it is the
+    # *last* resort in :func:`library_roots` (Perl's defaultMediaDirs order,
+    # ``Slim/Utils/Prefs.pm:687-712``).  On this host ``~/Music`` exists but is
+    # an empty decoy while the library lives on a gvfs/SMB mount; listing it as
+    # a "configured" root would hide the real library from ``musicfolder``.
+    return [str(ImportConfig().source_path or ""), str(base_default or "")]
 
 
 def scanner_configured_roots() -> list[str]:
@@ -274,11 +281,25 @@ def library_roots() -> list[str]:
     if scanned:
         return scanned
 
-    default_music = Path.home() / "Music"
-    if default_music.is_dir():
+    default_music = _platform_music_dir()
+    if default_music is not None and default_music.is_dir():
         return [str(default_music)]
 
     return []
+
+
+def _platform_music_dir() -> Path | None:
+    """The OS music folder — Perl ``OSDetect::dirsFor('music')``.
+
+    ``~/Music`` on macOS (``OSX.pm:183-199``), ``%USERPROFILE%\\Music``
+    (``CSIDL_MYMUSIC``) on Windows (``Win32.pm:189-197``); Perl has **no**
+    default on Unix/Linux (``Unix.pm:68-71``), where the historical ``~/Music``
+    is kept as the last resort.
+    """
+    from lyrion.platform import paths as platform_paths
+
+    music = platform_paths.default_music_dir()
+    return music if music is not None else Path.home() / "Music"
 
 
 def effective_media_dirs(media_type: str = "audio") -> list[str]:
@@ -319,27 +340,29 @@ def effective_media_dirs(media_type: str = "audio") -> list[str]:
 def file_url_from_path(path: str | os.PathLike[str]) -> str:
     """Perl ``fileURLFromPath`` — ``Slim/Utils/Misc.pm:292-331``.
 
-    ``URI::file`` escapes ``:``/``=``/``,``/space, so
+    Delegates to :func:`lyrion.platform.paths.file_url_from_path`: ``URI::file``
+    escapes ``:``/``=``/``,``/space, so
     ``/run/.../smb-share:server=x,share=y/Musik`` becomes
     ``file:///run/.../smb-share%3Aserver%3Dx%2Cshare%3Dy/Musik`` — exactly the
-    encoding our ``tracks.url`` values already use.
+    encoding our ``tracks.url`` values already use.  The platform module also
+    covers the Windows drive-letter (``file:///C:/…``) and UNC
+    (``file://server/share/…``) shapes that plain concatenation got wrong.
     """
-    text = str(path)
-    if text.startswith(_URL_SCHEMES):
-        return text
-    if not text.startswith("/"):
-        text = "/" + text
-    return "file://" + urllib.parse.quote(text, safe="/")
+    from lyrion.platform import paths as platform_paths
+
+    return platform_paths.file_url_from_path(path)
 
 
 def path_from_file_url(url: str | os.PathLike[str]) -> str:
-    """Perl ``pathFromFileURL`` — inverse of :func:`file_url_from_path`."""
-    text = str(url)
-    for scheme in ("file://", "tmp://"):
-        if text.startswith(scheme):
-            text = text[len(scheme):]
-            break
-    return urllib.parse.unquote(text)
+    """Perl ``pathFromFileURL`` — inverse of :func:`file_url_from_path`.
+
+    Delegates to :func:`lyrion.platform.paths.path_from_file_url`; that module
+    documents the gvfs/Windows/UNC cases and rejects ``..`` URLs like Perl
+    (``Slim/Utils/Misc.pm:271-274``) by returning an empty string.
+    """
+    from lyrion.platform import paths as platform_paths
+
+    return platform_paths.path_from_file_url(url)
 
 
 # ---------------------------------------------------------------------------
@@ -448,12 +471,33 @@ def resolve_folder_id(folder_id: Any) -> str | None:
         url = _track_url_by_id(int(token))
         if url is None:
             return None
-        return path_from_file_url(url)
+        return _real_case(path_from_file_url(url))
 
     if token.startswith(_URL_SCHEMES):
-        return path_from_file_url(token)
+        path = path_from_file_url(token)
+        # ``path_from_file_url`` returns '' for a URL Perl rejects
+        # (``Slim/Utils/Misc.pm:271-274``: no '..' in file URLs).
+        return _real_case(path) if path else None
 
     return token
+
+
+def _real_case(path: str) -> str:
+    """The path with the case the filesystem actually uses.
+
+    On Windows/macOS a client may hand back a differently-cased path for a
+    folder that exists; Perl resolves that with ``noCaseFilename``
+    (``Slim/Utils/OS.pm:388-390``) and ``Win32::GetLongPathName``
+    (``Slim/Utils/OS/Win32.pm:247-289``).  On a case-sensitive filesystem the
+    input is returned unchanged.
+    """
+    if not path:
+        return path
+    from lyrion.platform import paths as platform_paths
+
+    if not platform_paths.fs_is_case_insensitive():
+        return path
+    return str(platform_paths.resolve_existing_case(path))
 
 
 _RO_CONN: sqlite3.Connection | None = None
@@ -519,7 +563,15 @@ def _track_url_by_id(track_id: int) -> str | None:
 
 
 def _track_id_by_url(url: str) -> int | None:
-    """Numeric ``tracks.id`` for a file URL — Perl uses it as the folder id."""
+    """Numeric ``tracks.id`` for a file URL — Perl uses it as the folder id.
+
+    Exact match first.  On a case-insensitive filesystem (Windows, macOS) a
+    path that differs only in case still denotes the same object, so a
+    ``COLLATE NOCASE`` retry follows — Perl normalises the same way with
+    ``noCaseFilename`` = ``lc(Info::fileName)`` (``Slim/Utils/OS.pm:388-390``,
+    ``Slim/Utils/OS/Win32.pm:318-321``).  SQLite's ``NOCASE`` folds ASCII only,
+    which is the same limit as Perl's byte-wise ``lc`` on these names.
+    """
     con = _ro_connection()
     if con is None:
         return None
@@ -527,6 +579,14 @@ def _track_id_by_url(url: str) -> int | None:
         row = con.execute(
             "SELECT id FROM tracks WHERE url = ? LIMIT 1", (url,)
         ).fetchone()
+        if row is None or row[0] is None:
+            from lyrion.platform import paths as platform_paths
+
+            if platform_paths.fs_is_case_insensitive():
+                row = con.execute(
+                    "SELECT id FROM tracks WHERE url = ? COLLATE NOCASE LIMIT 1",
+                    (url,),
+                ).fetchone()
     except sqlite3.Error:
         return None
     return int(row[0]) if row and row[0] is not None else None

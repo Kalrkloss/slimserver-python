@@ -90,6 +90,21 @@ def write_conf(path: Path, data: ConfigFile) -> None:
 # Preference store (SQLite-backed)
 # ---------------------------------------------------------------------------
 
+def _legacy_or_default_prefs_db() -> Path:
+    """Where the singleton :class:`PreferenceStore` opens its DB before init.
+
+    Order: the legacy per-user file (``~/.lyrion/prefs.db`` — the location every
+    version before the platform layer used) when it exists, else the file inside
+    the OS-specific data root.  Never creates anything.
+    """
+    from lyrion.platform import paths as _paths
+
+    legacy = Path.home() / ".lyrion" / "prefs.db"
+    if legacy.is_file():
+        return legacy
+    return _paths.port_dir("prefs") / "prefs.db"
+
+
 _PREF_DB_SCHEMA = """
 CREATE TABLE IF NOT EXISTS prefmeta (
     name TEXT PRIMARY KEY,
@@ -128,7 +143,13 @@ class PreferenceStore:
         self,
         db_path: Path | str | None = None,
     ) -> None:
-        self._db_path: Path = Path(db_path) if db_path else Path.home() / ".lyrion" / "prefs.db"
+        # Until ``LyrionConfig.init()`` points the store at the resolved
+        # serverdata directory, the legacy per-user location is used.  An
+        # existing legacy file wins, so an upgrade keeps its preferences
+        # (Perl's ``migratePrefsFolder``, ``Slim/Utils/OS/Unix.pm:115-127``,
+        # does the same for prefs folders).
+        self._db_path: Path = (Path(db_path) if db_path
+                               else _legacy_or_default_prefs_db())
         self._db: aiosqlite.Connection | None = None
         self._cache: dict[str, str] = {}
         # prefmeta rows (name -> row) for synchronous type coercion.
@@ -354,6 +375,7 @@ class LyrionConfig:
         "_conf_path",
         "_conf",
         "_serverdata_dir",
+        "_serverdata_source",
         "_prefs_dir",
         "_log_dir",
         "_cache_dir",
@@ -367,6 +389,7 @@ class LyrionConfig:
         self._conf_path: Path | None = None
         self._conf: ConfigFile = ConfigFile()
         self._serverdata_dir: Path | None = None
+        self._serverdata_source: str = ""
         self._prefs_dir: Path | None = None
         self._log_dir: Path | None = None
         self._cache_dir: Path | None = None
@@ -384,43 +407,55 @@ class LyrionConfig:
     # ---- directory resolution ----
 
     def _resolve_serverdata_dir(self) -> Path:
-        """Determine the server data directory (where prefs/cache/log live)."""
+        """Determine the server data directory (where prefs/cache/log live).
+
+        Delegates to :func:`lyrion.platform.paths.resolve_serverdata_dir`, which
+        applies the Perl-shaped rules: ``--serverdata`` (Perl's ``--prefsdir``,
+        ``Slim/Utils/Prefs.pm:89-92``) → ``$LYRION_SERVERDATA`` → an existing
+        data directory of an earlier version (migration) → the OS default
+        (Windows ``%ProgramData%\\Lyrion``, macOS
+        ``~/Library/Application Support/Squeezebox`` — ``Slim/Utils/OS/Win32.pm:485-560``,
+        ``Slim/Utils/OS/OSX.pm:175`` — Linux/Unix ``~/.lyrion/Lyrion``).
+        """
         if self._serverdata_dir:
             return self._serverdata_dir
 
-        prefs = PreferenceStore.instance()
-        # CLI override
-        if getattr(self._cli_args, "serverdata", None):
-            return Path(self._cli_args.serverdata)
+        from lyrion.platform import paths as _paths
 
-        # Check environment
-        env_dir = os.environ.get("LYRION_SERVERDATA")
-        if env_dir:
-            return Path(env_dir)
-
-        # Platform defaults
-        system = os.name
-        if system == "nt":  # Windows
-            base = Path(os.environ.get("PROGRAMDATA", "C:/ProgramData"))
-        elif system == "posix" and hasattr(os, "uname") and os.uname().sysname == "Darwin":
-            base = Path.home() / "Library" / "Application Support"
-        else:
-            base = Path.home() / ".lyrion"
-
-        default_dir = base / "Lyrion"
-        self._serverdata_dir = default_dir
+        selected, source = _paths.resolve_serverdata_dir(
+            cli_value=getattr(self._cli_args, "serverdata", None),
+            environ=os.environ,
+        )
+        self._serverdata_source = source
+        self._serverdata_dir = selected
         self._serverdata_dir.mkdir(parents=True, exist_ok=True)
         return self._serverdata_dir
+
+    @property
+    def serverdata_source(self) -> str:
+        """Which rule chose :attr:`serverdata_dir` (``cli``/``env``/``migration``/``os-default``)."""
+        self._resolve_serverdata_dir()
+        return self._serverdata_source
 
     @property
     def serverdata_dir(self) -> Path:
         return self._resolve_serverdata_dir()
 
+    def _explicit_serverdata(self) -> str | None:
+        """The ``--serverdata`` / ``$LYRION_SERVERDATA`` root, when one was given."""
+        cli = getattr(self._cli_args, "serverdata", None)
+        if cli:
+            return str(cli)
+        return os.environ.get("LYRION_SERVERDATA") or None
+
     @property
     def prefs_dir(self) -> Path:
         if self._prefs_dir:
             return self._prefs_dir
-        self._prefs_dir = self.serverdata_dir / "Prefs"
+        from lyrion.platform import paths as _paths
+
+        self._prefs_dir = _paths.port_dir(
+            "prefs", serverdata=self._explicit_serverdata())
         self._prefs_dir.mkdir(parents=True, exist_ok=True)
         return self._prefs_dir
 
@@ -428,7 +463,10 @@ class LyrionConfig:
     def log_dir(self) -> Path:
         if self._log_dir:
             return self._log_dir
-        self._log_dir = self.serverdata_dir / "Logs"
+        from lyrion.platform import paths as _paths
+
+        self._log_dir = _paths.port_dir(
+            "log", serverdata=self._explicit_serverdata())
         self._log_dir.mkdir(parents=True, exist_ok=True)
         return self._log_dir
 
@@ -436,7 +474,10 @@ class LyrionConfig:
     def cache_dir(self) -> Path:
         if self._cache_dir:
             return self._cache_dir
-        self._cache_dir = self.serverdata_dir / "Cache"
+        from lyrion.platform import paths as _paths
+
+        self._cache_dir = _paths.port_dir(
+            "cache", serverdata=self._explicit_serverdata())
         self._cache_dir.mkdir(parents=True, exist_ok=True)
         return self._cache_dir
 
