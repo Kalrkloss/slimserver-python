@@ -13,6 +13,14 @@ import urllib.parse
 import zlib
 from typing import Any, Callable, Optional
 
+#: The CLI tags Perl's TuneIn importer registers as radio sub-feeds: one
+#: dynamic OPMLBased plugin per TuneIn directory item
+#: (``Slim/Plugin/InternetRadio/Plugin.pm:92-205`` with ``menu => 'radios'``)
+#: plus Perl's ``sounds`` app feed (``Slim/Plugin/Sounds``).  The single source
+#: of truth is :data:`lyrion.web.radiobrowser.RADIO_FEEDS`; that module has no
+#: import-time dependency on this file, so the import stays cycle-free.
+from lyrion.web.radiobrowser import RADIO_FEEDS as _RADIO_FEEDS
+
 logger = logging.getLogger(__name__)
 
 # Perl-Defaults der Client-Prefs, die die Jive-Settings-Seiten abfragen
@@ -2679,7 +2687,8 @@ class JSONRPCAPI:
     async def _fav_items_loop(self, fm: Any, parent: Optional[int],
                               parent_path: str, feed_mode: bool,
                               menu_mode: bool = False,
-                              use_play_control: bool = False) -> list[dict]:
+                              use_play_control: bool = False,
+                              menu: str = "favorites") -> list[dict]:
         """Build the favorites loop with Perl's session item ids.
 
         Two shapes, mirroring Perl's ``XMLBrowser::_cliQuery_done``:
@@ -2711,7 +2720,7 @@ class JSONRPCAPI:
             if menu_mode:
                 from lyrion.web import favorites_menu
                 if is_folder:
-                    item = favorites_menu.folder_item(it["title"], hier)
+                    item = favorites_menu.folder_item(it["title"], hier, menu=menu)
                 else:
                     item = favorites_menu.audio_item(
                         it["title"], hier, url=it["url"] or "",
@@ -2924,6 +2933,64 @@ class JSONRPCAPI:
             resp = self._browse_response([])
             resp["title"] = _jive_string("FAVORITES")
             return resp
+
+    async def _json_favorites_add(self, args: list) -> dict:
+        """``favorites add url:<url> title:<title> [type:<t> icon:<i>]``.
+
+        Perl ``cliAdd`` (``Slim/Plugin/Favorites/Plugin.pm:821-922``) reads
+        only the *tagged* params ``url``/``title``/``icon``/``item_id``/
+        ``type``/``hotkey`` (:831-837) and:
+
+        * rejects the request without ``title`` **and** ``url``
+          (``setStatusBadParams``, :872-877 → no result on the wire);
+        * stores ``type || 'audio'`` (:854) and ``icon || $favs->icon($url)``
+          (:855);
+        * inserts at ``item_id`` when given, otherwise appends at the end
+          (:880-893);
+        * answers ``count`` 1 (:859) after ``$favs->save`` (:895).
+
+        ``addlevel`` creates a *folder* (:861-870, title only).  Positional
+        fallbacks (``favorites add <url> <title> [<parent_id>]``) are additive —
+        Perl ignores them, our CLI documented them.
+        """
+        command = str(args[0])
+        tokens = [str(a) for a in args[1:]]
+        tagged: dict = {}
+        positional: list = []
+        for token in tokens:
+            if ":" in token and token.split(":", 1)[0] in (
+                    "url", "title", "type", "icon", "parser", "item_id",
+                    "parent", "hotkey"):
+                key, _, value = token.partition(":")
+                tagged[key] = value
+            else:
+                positional.append(token)
+        title = tagged.get("title") or (positional[0] if positional else "")
+        url = tagged.get("url") or (positional[1] if len(positional) > 1 else "")
+        if command == "addlevel":
+            if not title:
+                return {}                       # Perl: bad params (:872-877)
+            url = None
+        elif not (title and url):
+            return {}
+        try:
+            from lyrion.music.favorites import get_favorites_manager
+            fm = get_favorites_manager()
+            parent = None
+            target = tagged.get("item_id") or tagged.get("parent")
+            if target:
+                if str(target).isdigit():
+                    parent = int(str(target))
+                else:
+                    parent = await fm.resolve_path(str(target))
+            new_id = await fm.add(str(title), url, parent)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("favorites add failed: %s", exc)
+            return {}
+        if new_id is None:
+            return {}
+        logger.info("favorites add: %s (%s) -> %s", title, url, new_id)
+        return {"count": 1}                     # Favorites/Plugin.pm:859
 
     async def _displaystatus(self, pid: str | None, args: list[str]) -> dict:
         """displaystatus — now-playing popup / display status.
@@ -3760,6 +3827,17 @@ class JSONRPCAPI:
                     return {"exists": 1, "index": i}
             return {"exists": 0}
 
+        # favorites add  |  favorites addlevel   (Perl cliAdd)
+        # Dispatch ['favorites','add'] / ['favorites','addlevel']
+        # (Slim/Plugin/Favorites/Plugin.pm:76-77) → cliAdd (:821-922): the
+        # command needs ``url`` AND ``title`` (:847, bad params otherwise
+        # :872-877), stores ``type`` (default 'audio', :854) and the icon
+        # (:855), appends at the end when no item_id is given (:890-893) and
+        # answers ``count`` 1 (:859).  Our former path handed the CLI echo
+        # (a text list) back, which the JSON clients cannot read.
+        if cmd == "favorites" and args and str(args[0]) in ("add", "addlevel"):
+            return await self._json_favorites_add(args)
+
         if cmd == "favorites" and args and str(args[0]) == "items":
             return await self._json_favorites_items(pid, args[1:])
 
@@ -3794,6 +3872,27 @@ class JSONRPCAPI:
                     return {str(args[0]): prefs.get(str(args[0])) or ""}
             except Exception as e:  # noqa: BLE001
                 return {"error": str(e)}
+            return {}
+
+        # ── Radio sub-feeds (Perl's dynamic OPMLBased plugins) ─────────
+        # Perl's TuneIn importer creates one plugin per directory item and
+        # registers ``[<tag>,'items','_index','_quantity']`` and
+        # ``[<tag>,'playlist','_method']`` for each
+        # (``Slim/Plugin/OPMLBased.pm:117-125``); the item rows of the
+        # ``radios`` menu then send exactly these two request forms
+        # (``base.actions.go`` / ``base.actions.play``, :204-219 / :960-990).
+        # The tag list is the TuneIn ``MENUS`` table plus Perl's ``sounds``
+        # app feed (``Slim/Plugin/Sounds``) — see lyrion.web.radiobrowser.
+        # ``search items …`` must be checked *before* the library search:
+        # Perl resolves the literal token before the ``_index`` slot
+        # (``Request.pm:1007-1032``), so ``search items`` is the Radio search
+        # while ``search <start> <count> term:<x>`` stays the library query.
+        if cmd in _RADIO_FEEDS and args:
+            if str(args[0]) == "items":
+                return await self._json_radio_feed(cmd, args[1:], pid)
+            if str(args[0]) == "playlist":
+                return await self._json_radio_playlist(cmd, args[1:], pid)
+            # Perl registers nothing else for a radio tag → bad dispatch.
             return {}
 
         # ── search (LMS format: search <start> <count> term:<begriff>) ──
@@ -3843,9 +3942,13 @@ class JSONRPCAPI:
                 return await self._json_radios(cmd, args)
             return await self._json_browse(cmd, args)
 
-        # ── radiosearch (controller Radio search; LMS 'radiosearch') ──
+        # ── radiosearch (controller Radio search; an additive alias) ──
+        # Perl has no ``radiosearch`` dispatch (its radio search is the
+        # ``search items … menu:search search:<term>`` form above); this alias
+        # answers with that very envelope so Squeezer/OrangeSqueeze get
+        # touch-to-play rows instead of the former inert ones.
         if cmd == "radiosearch":
-            return await self._json_radiosearch(cmd, args)
+            return await self._json_radiosearch(cmd, args, pid)
 
         # ── browselibrary (SqueezePlay My-Music children; LMS 'browselibrary
         #    items <start> <count> mode:<albums|artists|genres|years|bmf|search>') ──
@@ -7059,66 +7162,384 @@ class JSONRPCAPI:
                              "track_id": r["id"]} for r in tracks],
         }
 
-    async def _radio_stations_loop(self) -> list[dict]:
-        """The Radio directory entries, in Perl's ``radioss_loop`` item shape.
+    # ── Radio directory (Perl's TuneIn OPML menu) ──────────────────────
+    # Perl reference (read-only checkout ``/tmp/lms91/slimserver-public-9.1``):
+    # ``Slim/Plugin/InternetRadio/Plugin.pm:42-59`` fetches the TuneIn
+    # directory index and ``:78-205`` creates one *dynamic* OPMLBased plugin
+    # per directory item (``tag => lc $subclass``, ``menu => 'radios'``,
+    # ``weight``, ``type``); ``Slim/Plugin/OPMLBased.pm:117-132`` registers
+    # ``[<tag>,'items','_index','_quantity']`` / ``[<tag>,'playlist','_method']``
+    # on ``Slim::Control::XMLBrowser::cliQuery`` plus the ``radios`` menu query;
+    # ``Slim/Plugin/InternetRadio/TuneIn.pm:33-81`` is the tag → {icon, weight}
+    # table, :151-164 the unshifted "My Presets" entry.
+    #
+    # Data source (user decision, approved deviation): radio-browser.info
+    # instead of TuneIn — see :mod:`lyrion.web.radiobrowser`.  The former
+    # handler answered ``radios`` with the favourites streams, which is why the
+    # controllers never reached the radio sub-menus.
 
-        Data sources: persisted stations (``remote_media``) first, else the
-        remote-URL favorites. Both awaits run under a short timeout: the
-        2026-09-13 live incident showed this handler stalling for >25 s when
-        the async DB session/favorites path is starved (a client flood kept
-        the loop busy); ``radios`` must never block the request forever.
-        Perl's item form comes from ``Slim/Plugin/OPMLBased.pm:252-258``
-        (``cmd``/``name``/``type``/``icon``/``weight``, weight default 1000
-        :34); our ``id``/``url``/``text``/``actions`` extras stay because the
-        Android controllers read them.
+    @staticmethod
+    def _radio_feed_tokens(rest: list) -> tuple[int, int, dict]:
+        """``(start, quantity, tagged)`` of a ``<feed> items`` request.
+
+        The two leading positionals are the named slots of
+        ``['<tag>','items','_index','_quantity']`` (``OPMLBased.pm:117-120``);
+        every ``key:value`` token is a tagged param Perl reads with
+        ``$request->getParam`` (``XMLBrowser.pm:303-310``: ``_index``,
+        ``_quantity``, ``search``, ``want_url``, ``item_id``, ``menu``,
+        ``xmlbrowserPlayControl``).
         """
-        def _perl_item(name: str, url: str, item_id: str) -> dict:
-            return {
-                # Perl-Form (OPMLBased.pm:252-258): cmd = Plugin-Tag
-                "cmd": url or item_id,
-                "name": name,
-                "type": "xmlbrowser",
-                "icon": "html/images/radio.png",
-                "weight": 1000,
-                # unsere Aliasse für Squeezer/SqueezeCtrl/SPA
-                "id": item_id,
-                "text": name,
-                "url": url,
-                "hasitems": 0,
-                "actions": {
-                    "play": {"player": 0, "cmd": ["playlist", "play"],
-                             "params": {"item_id": item_id}},
-                    "do": {"player": 0, "cmd": ["playlist", "play"],
-                           "params": {"item_id": item_id}},
-                },
-            }
+        nums = [str(a) for a in rest if str(a).lstrip("-").isdigit()]
+        start = int(nums[0]) if nums else 0
+        qty = int(nums[1]) if len(nums) > 1 else 0
+        tagged: dict = {}
+        for a in rest:
+            s = str(a)
+            if ":" in s:
+                key, _, value = s.partition(":")
+                tagged[key] = value
+        return start, qty, tagged
 
+    @staticmethod
+    def _radio_node(feed: str, search: str):
+        """The root node of a radio sub-feed (Perl's per-tag feed URL)."""
+        from lyrion.web import radiobrowser
+
+        if feed == "search":
+            # A search feed without a term has no data — Perl answers the
+            # "Leer" placeholder (measured live 2026-09-14,
+            # ``search items 0 6 menu:search`` → count 1, one itemNoAction row).
+            if not search:
+                return radiobrowser.RadioNode("empty", feed, "", "")
+            return radiobrowser.RadioNode("stations", feed, search, "")
+        if feed in ("podcast", "sounds"):
+            return radiobrowser.RadioNode(
+                "empty", feed, "", radiobrowser.FEED_TITLES.get(feed, ""))
+        if feed == "presets":
+            return radiobrowser.RadioNode("presets", feed)
+        return radiobrowser.RadioNode(
+            "index", feed, "", radiobrowser.FEED_TITLES.get(feed, ""))
+
+    async def _radio_play_control(self, rest: list, pid: str | None) -> bool:
+        """``_defeatDestructiveTouchToPlay`` for a radio sub-feed request.
+
+        ``XMLBrowser.pm:1951-1983`` — same resolution as the favourites feed
+        (:func:`_defeat_destructive_touch_to_play`): a request without a client
+        lands on the defeated branch, a named idle/playing client on the plain
+        ``play`` row.
+        """
+        player = None
+        if pid:
+            try:
+                from lyrion.player.manager import PlayerManager
+                player = PlayerManager().get_player(pid)
+            except Exception:  # noqa: BLE001
+                player = None
+        return _defeat_destructive_touch_to_play(
+            rest, player, client_named=player is not None)
+
+    async def _json_radios(self, cmd: str, args: list[str]) -> dict:
+        """``radios [<start> <count>] [menu:…]`` — Perl's Radio directory menu.
+
+        Perl registers ``['radios','_index','_quantity']`` on
+        ``OPMLBased::cliRadiosQuery`` (``Slim/Plugin/OPMLBased.pm:129-132``,
+        handler :181-280) and answers through ``dynamicAutoQuery``, whose loop
+        is ``$query . 's_loop'`` → ``radioss_loop`` with ``count`` last
+        (``Slim/Control/Queries.pm:5384``, :5443).  With a ``menu:`` token the
+        same handler emits the jive item form (``OPMLBased.pm:200-247``).
+
+        Live Perl 9.1.1 (192.168.1.90:9000, read-only 2026-09-14)::
+
+            radios 0 3     -> {"count":10,"radioss_loop":[{"cmd":"presets",
+                                "name":"Eigene Voreinstellungen",
+                                "type":"xmlbrowser",
+                                "icon":"/plugins/TuneIn/html/images/radiopresets.png",
+                                "weight":5}, …]}             (slice, count total)
+            radios 3 3     -> Sport, Nachrichten, Talksendungen
+            radios 0 3 menu:radio
+                           -> {"count":10,"item_loop":[{"text":…,"weight":5,
+                                "icon-id":…,"window":{"titleStyle":"album"},
+                                "actions":{"go":{"cmd":["presets","items"],
+                                "params":{"menu":"presets"}}}}, …],"offset":0}
+        """
+        from lyrion.web import menus as _menus
+        from lyrion.web import radiobrowser
+
+        start = (int(str(args[0]))
+                 if args and str(args[0]).lstrip("-").isdigit() else 0)
+        qty = (int(str(args[1]))
+               if len(args) > 1 and str(args[1]).lstrip("-").isdigit() else 0)
+        menu_mode = any(str(a) == "menu" or str(a).startswith("menu:")
+                        for a in args)
+        nodes = radiobrowser.root_level()
+        total = len(nodes)
+        if qty > 0:
+            page = nodes[start:start + qty] if start <= total - 1 else []
+        else:
+            page = nodes[start:]
+        if menu_mode:
+            # OPMLBased.pm:221-246 — the search entry's input block carries the
+            # translated help/softbutton strings (``$request->string(...)``).
+            texts = {
+                "help": _menus.menu_title("JIVE_SEARCHFOR_HELP"),
+                "softbutton1": _menus.menu_title("INSERT"),
+                "softbutton2": _menus.menu_title("DELETE"),
+            }
+            items = [
+                radiobrowser.root_menu_item(
+                    str(n["tag"]), str(n["text"]), int(n["weight"]),
+                    str(n["icon"]), search=str(n["type"]) == "search", **texts)
+                for n in page]
+            return {"count": total, "item_loop": items, "offset": start}
+        return {
+            "count": total,
+            "radioss_loop": [
+                radiobrowser.root_plain_item(
+                    str(n["tag"]), str(n["text"]), int(n["weight"]),
+                    str(n["icon"]), search=str(n["type"]) == "search")
+                for n in page],
+        }
+
+    async def _json_radio_feed(self, feed: str, rest: list,
+                               pid: str | None) -> dict:
+        """``<feed> items <start> <count> <params…>`` — one Radio sub-feed.
+
+        The feed tag is one of Perl's dynamically created OPMLBased plugins
+        (``InternetRadio/Plugin.pm:92-205``); its CLI dispatch is
+        ``[<tag>,'items','_index','_quantity']`` (``OPMLBased.pm:117-120``) and
+        the handler is ``Slim::Control::XMLBrowser::cliQuery`` (:111-114), which
+        renders through ``_cliQuery_done`` (``Slim/Control/XMLBrowser.pm``
+        :274-1450).  Live Perl 9.1.1, read-only 2026-09-14::
+
+            local items 0 6 menu:local
+              -> {"offset":0,"title":"Lokale Sender","base":{…},"item_loop":[
+                  {"addAction":"go","actions":{"go":{"cmd":["local","items"],
+                   "params":{"menu":"local","item_id":"<sid>.0"}}},"text":"Sender"},
+                  {"type":"link","addAction":"go",…,"text":"Alle Deutschland"}],
+                  "count":2,"window":{"windowStyle":"text_list"}}
+            local items 0 4 menu:local item_id:<sid>.0       (the station level)
+              -> {"offset":0,"title":"Sender","base":{…},"item_loop":[
+                  {"type":"audio","text":…,"presetParams":{"favorites_url":…,
+                   "favorites_title":…,"favorites_type":"audio","icon":…},
+                   "icon":"/imageproxy/…/image.png","style":"itemplay",
+                   "goAction":"play","params":{"item_id":"<sid>.0.0",
+                   "isContextMenu":1,"touchToPlay":"<sid>.0.0",
+                   "touchToPlaySingle":1}}],"count":194,
+                  "window":{"windowStyle":"icon_list"}}
+            local items …, item_id:<sid>.0.0                 (a station row)
+              -> the row's info menu (Titel/URL/Bitrate); with
+                 ``xmlBrowseInterimCM:1`` the play-control menu with
+                 "In Favoriten speichern" (``menus.interim_context_menu``)
+        """
+        from lyrion.web import favorites_menu, radiobrowser
+
+        start, qty, tagged = self._radio_feed_tokens(rest)
+        use_play_control = await self._radio_play_control(rest, pid)
+        search = str(tagged.get("search") or "")
+        if search in ("__TAGGEDINPUT__", "__INPUT__"):
+            # the placeholder the client substitutes (OPMLBased.pm:231)
+            search = ""
+
+        if feed == "presets":
+            return await self._radio_presets_menu(rest, tagged, start, qty,
+                                                  use_play_control)
+
+        item_id = str(tagged.get("item_id") or "")
+        node = None
+        station = None
+        if item_id:
+            root, indices, crumb_search = radiobrowser.parse_item_id(item_id)
+            if root is None or root.feed != feed:
+                root = self._radio_node(feed, search or crumb_search)
+            if root is not None:
+                node, station, _index = await radiobrowser.resolve(root, indices)
+        else:
+            node = self._radio_node(feed, search)
+
+        if station is not None:
+            return await self._radio_station_leaf(feed, station, item_id, rest)
+
+        if node is None:
+            # Unknown/expired browse session or an out-of-range path: Perl
+            # answers the feed's empty form (XMLBrowser.pm:837-846) instead of
+            # an error.
+            return favorites_menu.render_menu(
+                feed, [], playcontrol_params=tagged,
+                use_play_control=use_play_control, empty_placeholder=True)
+
+        level = await radiobrowser.level_for(
+            node, start=start, qty=qty, use_play_control=use_play_control)
+        return favorites_menu.render_menu(
+            feed, level.items, title=level.title, playcontrol_params=tagged,
+            use_play_control=use_play_control,
+            count=level.total if level.items else None,
+            offset=start, empty_placeholder=True)
+
+    async def _radio_station_leaf(self, feed: str, station, item_id: str,
+                                  rest: list) -> dict:
+        """The answer for a tapped station row (``XMLBrowser.pm:846-900``).
+
+        Perl descends to the leaf and renders *its* rows: the info rows of
+        ``@mapAttributes`` (``Titel:``/``URL:``/``Bitrate:`` — :243-268, live
+        2026-09-14 ``count`` 3, ``offset`` 0), and with ``xmlBrowseInterimCM:1``
+        the play-control menu of ``_playlistControlContextMenu`` (:1811-1900,
+        live ``count`` 7) whose favourites row offers "In Favoriten speichern" →
+        ``['jivefavorites','add']`` when the stream is not a favourite yet
+        (Perl's ``findUrl`` lookup, :1871-1884).  ``base``/``window`` are absent
+        — exactly like the live answers.
+        """
+        from lyrion.web import favorites_menu, menus
+
+        index = str(item_id).rsplit(".", 1)[-1]
+        if any(str(a).startswith("xmlbrowserPlayControl:") for a in rest):
+            # A tap on a defeated row: Perl answers the same play-control menu
+            # but with ``noFavorites => 1`` (XMLBrowser.pm:822-838), i.e. the
+            # three playlist rows only.
+            return favorites_menu.play_control_context_menu(item_id, menu=feed)
+        if any(str(a) == "xmlBrowseInterimCM:1" for a in rest):
+            return menus.interim_context_menu(
+                item_id, menu=feed, name=station.title, url=station.url,
+                icon=station.favicon, item_index=index,
+                in_favorites=await self._radio_in_favorites(station.url),
+                bitrate=station.bitrate)
+        return menus.leaf_info_menu(station.title, station.url,
+                                    bitrate=station.bitrate)
+
+    @staticmethod
+    async def _radio_in_favorites(url: str) -> bool:
+        """Perl ``findUrl`` (``XMLBrowser.pm:1871``) over the whole tree."""
+        if not url:
+            return False
         try:
-            from lyrion.music.radio import get_radio_manager
-            stations = await asyncio.wait_for(
-                get_radio_manager().list_stations(), timeout=2.0)
-            if stations:
-                return [_perl_item(s.name or "", s.url or "", str(s.id))
-                        for s in stations]
+            from lyrion.music.favorites import get_favorites_manager
+            flat: list = []
+
+            def _collect(nodes) -> None:
+                for node in nodes or []:
+                    flat.append(node)
+                    _collect(node.get("children"))
+
+            _collect(await get_favorites_manager().list_tree())
+            return any(str(n.get("url") or "") == url for n in flat)
         except Exception:  # noqa: BLE001
-            pass
-        # Fallback: favorites that point at a remote stream (a URL).
+            return False
+
+    async def _radio_presets_menu(self, rest: list, tagged: dict, start: int,
+                                  qty: int, use_play_control: bool) -> dict:
+        """Perl's ``Eigene Voreinstellungen`` node = our own saved stations.
+
+        Perl's ``presets`` feed is the TuneIn preset list of the user's account
+        (``TuneIn.pm:85`` ``PRESETS_URL``, unshifted as tag ``presets`` at
+        :156-164).  This port has no TuneIn account, so the user's own stations
+        — the favourites tree — are what the node shows, walked exactly like the
+        favourites feed (``_fav_items_loop``: folders become drill-down rows,
+        streams touch-to-play rows carrying ``presetParams``).  Every generated
+        command carries ``menu:presets`` so the client's taps stay inside this
+        feed (``OPMLBased.pm:210-213``).  Without a single favourite Perl's own
+        answer for an empty feed is kept ("Leer", ``XMLBrowser.pm:837-846`` —
+        measured live for ``presets``).
+        """
+        from lyrion.web import favorites_menu
+
+        fm = None
         try:
             from lyrion.music.favorites import get_favorites_manager
             fm = get_favorites_manager()
-            loop = await asyncio.wait_for(
-                self._fav_items_loop(fm, None, "0", False), timeout=2.0)
-            out = []
-            for it in loop:
-                url = it.get("url") or ""
-                if not str(url).startswith(("http://", "https://", "mms://", "rtp://")):
-                    continue
-                out.append(_perl_item(
-                    str(it.get("text") or it.get("name") or "Radio"),
-                    str(url), str(it.get("id", ""))))
-            return out
         except Exception:  # noqa: BLE001
-            return []
+            fm = None
+        parent = None
+        parent_path = _new_fav_sid()
+        item_id = str(tagged.get("item_id") or "")
+        if item_id and fm is not None and "." in item_id:
+            resolved = await fm.resolve_path(item_id)
+            if resolved is not None:
+                parent, parent_path = resolved, item_id
+        loop: list = []
+        if fm is not None:
+            loop = await self._fav_items_loop(fm, parent, parent_path, False,
+                                              True, use_play_control,
+                                              menu="presets")
+        return favorites_menu.render_menu(
+            "presets", loop, playcontrol_params=tagged,
+            use_play_control=use_play_control, offset=start,
+            empty_placeholder=True)
+
+    async def _json_radio_playlist(self, feed: str, rest: list,
+                                   pid: str | None) -> dict:
+        """``<feed> playlist <play|add|insert> <params…>`` — start a station.
+
+        Perl registers ``[<tag>,'playlist','_method']`` on the same
+        ``XMLBrowser::cliQuery`` (``OPMLBased.pm:122-125``); ``_cliQuery_done``
+        marks such a request ``$isPlaylistCmd`` (:291-293), walks the item path
+        and hands the row's URL to the player (:778-790; the ``play``/``playlist``
+        attribute branch at :389-405).  The controllers send the row's own
+        ``params`` (``base.actions.play`` has ``itemsParams => 'params'``), i.e.
+        ``['local','playlist','play','menu:local','item_id:<sid>.0.0']``.
+
+        Perl answers ``setStatusDone()`` without a result body (:1512) — an empty
+        map here.  ``add``/``insert`` land on the same play: Perl's insert path
+        only differs in *where* in the playlist the stream goes
+        (``Slim/Control/Commands.pm`` playlist handling), the stream URL is the
+        same.
+        """
+        from lyrion.web import radiobrowser
+
+        if not pid:
+            return {}
+        item_id = next((str(a)[8:] for a in rest
+                        if str(a).startswith("item_id:")), "")
+        if not item_id:
+            return {}
+        if feed == "presets":
+            # the preset rows are favourites (`_radio_presets_menu`)
+            from lyrion.music.favorites import get_favorites_manager
+            fm = get_favorites_manager()
+            fav_id = await fm.resolve_path(item_id)
+            if fav_id is None:
+                return {}
+            await fm.play(pid, fav_id)
+            return {}
+        root, indices, crumb_search = radiobrowser.parse_item_id(item_id)
+        if root is None or root.feed != feed:
+            root = self._radio_node(feed, crumb_search)
+        if root is None:
+            return {}
+        _node, station, _index = await radiobrowser.resolve(root, indices)
+        if station is None:
+            return {}
+        from lyrion.player.manager import PlayerManager
+
+        ok = await PlayerManager().play_url(pid, station.url, station.title)
+        logger.info("radio stream %s on %s: %s (%s)", feed, pid,
+                    station.title, "ok" if ok else "failed")
+        return {}
+
+    async def _json_radiosearch(self, cmd: str, args: list[str],
+                                pid: str | None = None) -> dict:
+        """``radiosearch <start> <count> term:<text>`` — the Radio search.
+
+        Perl has no ``radiosearch`` dispatch: its radio search is the
+        ``type = search`` entry of the Radio menu, tapped as
+        ``['search','items','_index','_quantity','menu:search',
+        'search:<term>']`` (``OPMLBased.pm:221-246``, live Perl 9.1.1 →
+        ``{"offset":0,"title":"Suchergebnisse: rock","base":{…},
+        "item_loop":[…],"count":66,"window":{"windowStyle":"home_menu"}}``).
+        Controllers (Squeezer/OrangeSqueeze) address the same list through this
+        additive alias, so it answers with that very envelope — including
+        ``base.actions.play`` (``nextWindow: nowPlaying``) and ``presetParams``
+        per row.  The former handler returned ``type: audio`` rows without a
+        ``base``, i.e. rows a controller could neither start nor save.
+        """
+        nums = [int(str(s)) for s in args if str(s).lstrip("-").isdigit()]
+        start = nums[0] if nums else 0
+        count = nums[1] if len(nums) > 1 else 20
+        term = next((str(a)[5:] for a in args if str(a).startswith("term:")), "")
+        if not term:
+            term = next((str(a)[7:] for a in args
+                         if str(a).startswith("search:")), "")
+        return await self._json_radio_feed(
+            "search", [str(start), str(count), "menu:search",
+                       f"search:{term}"], pid)
 
     async def _json_apps(self, args: list[str]) -> dict:
         """``apps [<index> <quantity>]`` — OPML-based app menus.
@@ -7200,78 +7621,6 @@ class JSONRPCAPI:
             except (TypeError, ValueError):
                 res["offset"] = 0
         return res
-
-    async def _json_radios(self, cmd: str, args: list[str]) -> dict:
-        """``radios [<start> <count>]`` — Perl ``radioss_loop``.
-
-        The controllers open the Radio directory from the home-menu 'Radio'
-        item (``actions.go`` = ``['browse','radios']`` or the bare ``radios``
-        query). Perl implements it through the OPML plugins: the dispatch is
-        ``['radios','_index','_quantity']`` (``Slim/Plugin/OPMLBased.pm:129-
-        132``), the handler chains ``cliRadiosQuery`` (:181-280) and
-        ``dynamicAutoQuery`` names the loop ``$query . 's_loop'`` with
-        ``count`` last (``Slim/Control/Queries.pm:5384``, :5443).
-
-        Live Perl 9.1.1, read-only 2026-09-13::
-
-            radios 0 10 -> {"count":10,"radioss_loop":[{"cmd":"presets",
-                           "type":"xmlbrowser","icon":"/plugins/TuneIn/…",
-                           "weight":5,"name":"Eigene Voreinstellungen"}, …]}
-        """
-        loop = await self._radio_stations_loop()
-        start = int(str(args[0])) if args and str(args[0]).isdigit() else 0
-        qty = int(str(args[1])) if len(args) > 1 and str(args[1]).isdigit() else 0
-        count = len(loop)
-        # Ohne Quantity liefern wir die volle Liste (Additiv-Abweichung: Perls
-        # dynamicAutoQuery antwortet dann ohne Result, aber das Jive-Home-
-        # Action 'radios menu:radio' bzw. bar 'radios' muss die Sender zeigen —
-        # vorher kam hier immer die volle Browse-Antwort).
-        if qty > 0:
-            page = loop[start:start + qty] if start <= count - 1 else []
-        else:
-            page = loop
-        # Additive aliases for our Jive/Material/SPA consumers.
-        return {"count": count, "radioss_loop": page,
-                "item_loop": page, "loop_loop": page, "offset": start}
-
-    async def _json_radiosearch(self, cmd: str, args: list[str]) -> dict:
-        """radiosearch <start> <count> term:<text> — search radio stations.
-
-        Uses the Radio Browser API when reachable; on any failure returns a
-        valid empty list so the controller shows 'no stations' instead of a
-        crash (the controller expects count + item_loop)."""
-        nums = [int(s) for s in args if str(s).isdigit()]
-        start = nums[0] if nums else 0
-        count = nums[1] if len(nums) > 1 else 20
-        term = next((str(a)[5:] for a in args if str(a).startswith("term:")), "")
-        if not term:
-            return self._browse_response([])
-        try:
-            from lyrion.music.radio import get_radio_manager
-            stations = await get_radio_manager().directory.search(
-                name=term, limit=count, offset=start)
-            items = []
-            for s in stations:
-                name = s.name or "Unknown"
-                items.append({
-                    "id": str(s.id) if s.id is not None else str(s.url),
-                    "name": name,
-                    "text": name,
-                    "url": s.url,
-                    "type": "audio",
-                    "hasitems": 0,
-                    "actions": {
-                        "play": {"player": 0, "cmd": ["playlist", "play"],
-                                 "params": {"item_id": str(s.id) if s.id is not None
-                                            else str(s.url)}},
-                        "do": {"player": 0, "cmd": ["playlist", "play"],
-                               "params": {"item_id": str(s.id) if s.id is not None
-                                          else str(s.url)}},
-                    },
-                })
-            return self._browse_response(items)
-        except Exception:  # noqa: BLE001
-            return self._browse_response([])
 
     async def _info_feed(self, cmd: str, pm, pid: str | None,
                          args: list) -> dict:
@@ -8141,13 +8490,24 @@ class JSONRPCAPI:
                 *params)
             return rows, total, "albums_loop", "albums"
         if mode == "artists":
+            # ``search:`` filters the contributor name (Perl's browse-library
+            # ``_artists``, ``Slim/Menu/BrowseLibrary.pm:1091-1137`` passes
+            # ``$search`` into the DB search; live Perl 9.1.1, read-only
+            # 2026-09-14: ``browselibrary items 0 5 mode:artists menu:1
+            # search:radio`` → count 11171 → **22**, while this port answered
+            # the unfiltered 10604 — the ``artists`` feed ignored ``search:``).
+            artist_where, artist_params = "", ()
+            if search:
+                artist_where = " WHERE c.name LIKE ?"
+                artist_params = (f"%{search}%",)
             rows = q("SELECT DISTINCT c.id, c.name FROM contributors c "
                      "JOIN tracks_contributors tc ON tc.contributor = c.id "
-                     "AND tc.role = 1 ORDER BY c.name LIMIT ? OFFSET ?",
-                     count, start)
+                     "AND tc.role = 1" + artist_where +
+                     " ORDER BY c.name LIMIT ? OFFSET ?",
+                     *(artist_params + (count, start)))
             total = total_of("SELECT COUNT(DISTINCT c.id) FROM contributors c "
                              "JOIN tracks_contributors tc ON tc.contributor = c.id "
-                             "AND tc.role = 1")
+                             "AND tc.role = 1" + artist_where, *artist_params)
             return rows, total, "artists_loop", "artists"
         if mode == "genres":
             # LIB-10: the importer now fills the genres table (id/name/
@@ -8158,22 +8518,37 @@ class JSONRPCAPI:
             # database that has not been rescanned since the genres table was
             # added (table empty): fall back to the old stable DISTINCT-text
             # index, which _genre_id_to_text and the drill filters understand.
+            #
+            # ``search:`` filters the genre name — Perl's ``_genres``
+            # (``Slim/Menu/BrowseLibrary.pm``, live 2026-09-14:
+            # ``browselibrary items 0 5 mode:genres menu:1 search:rock`` →
+            # count 762 → **91**; this port answered the unfiltered 713).
+            genre_where, genre_params = "", ()
+            if search:
+                genre_where = " WHERE name LIKE ?"
+                genre_params = (f"%{search}%",)
             rows, total = [], 0
             try:
-                rows = q("SELECT id, name AS genre FROM genres "
-                         "ORDER BY sortkey LIMIT ? OFFSET ?", count, start)
-                total = total_of("SELECT COUNT(*) FROM genres")
+                rows = q("SELECT id, name AS genre FROM genres" + genre_where +
+                         " ORDER BY sortkey LIMIT ? OFFSET ?",
+                         *(genre_params + (count, start)))
+                total = total_of("SELECT COUNT(*) FROM genres" + genre_where,
+                                 *genre_params)
             except Exception as exc:  # noqa: BLE001 — ältere DBs ohne Tabelle
                 logger.debug("genres table unavailable, falling back: %s", exc)
             if not rows and not total:
+                text_where, text_params = " WHERE genre != ''", ()
+                if search:
+                    text_where += " AND genre LIKE ?"
+                    text_params = (f"%{search}%",)
                 rows = q("SELECT genre, "
                          "ROW_NUMBER() OVER (ORDER BY genre COLLATE NOCASE) - 1 "
-                         "AS id FROM (SELECT DISTINCT genre FROM tracks "
-                         "WHERE genre != '') "
+                         "AS id FROM (SELECT DISTINCT genre FROM tracks"
+                         + text_where + ") "
                          "ORDER BY genre COLLATE NOCASE LIMIT ? OFFSET ?",
-                         count, start)
-                total = total_of("SELECT COUNT(DISTINCT genre) FROM tracks "
-                                 "WHERE genre != ''")
+                         *(text_params + (count, start)))
+                total = total_of("SELECT COUNT(DISTINCT genre) FROM tracks"
+                                 + text_where, *text_params)
             return rows, total, "genres_loop", "genres"
         if mode == "years":
             rows = q("SELECT DISTINCT year FROM tracks WHERE year > 0 "

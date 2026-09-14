@@ -362,55 +362,68 @@ def test_apps_is_count_plus_appss_loop():
 
 
 def test_radios_uses_the_radioss_loop_key():
-    """``radios`` → ``{"count":N,"radioss_loop":[…]}`` (Alias von OPMLBased).
+    """``radios 0 10`` → ``{"count":10,"radioss_loop":[…]}}`` (Perl's form).
 
-    Live Perl: ``radios 0 10`` → ``{"count":10,"radioss_loop":[{"cmd":…,
-    "type":"xmlbrowser","icon":…,"weight":…,"name":…}, …]}``.
+    Live Perl 9.1.1, read-only 2026-09-14: the plain query answers exactly the
+    two keys ``count`` and ``radioss_loop`` with TuneIn's directory items
+    ``{cmd,name,type,icon,weight}`` (``OPMLBased.pm:249-265``); the ``menu:``
+    form answers ``count``/``item_loop``/``offset`` (``:200-247``).  The
+    structure parity is covered in detail by ``tests/test_radio_structure.py``
+    against ``tests/fixtures/perl_radio_structure.json``.
     """
     res = _req(["radios", "0", "10"])
-    assert "count" in res and "radioss_loop" in res
-    # additive aliases our clients read
-    assert res["item_loop"] == res["radioss_loop"]
-    assert res["loop_loop"] == res["radioss_loop"]
+    assert set(res) == {"count", "radioss_loop"}, res
+    assert res["count"] == 10
+    assert [i["cmd"] for i in res["radioss_loop"]] == [
+        "presets", "local", "music", "sports", "news", "talk", "location",
+        "language", "podcast", "search"]
 
-
-def test_browse_radios_no_longer_errors():
-    """``browse radios`` lief in den Harness-Fehler (Transport) — es muss die
-    Perl-Radios-Form liefern, kein Exception-Pfad (``_radio_stations_loop``
-    läuft jetzt unter ``asyncio.wait_for``)."""
-    res = _req(["browse", "radios", "0", "10"])
-    assert "radioss_loop" in res
+    menu = _req(["radios", "0", "10", "menu:radio"])
+    assert set(menu) == {"count", "item_loop", "offset"}, menu
+    assert menu["count"] == 10
+    assert menu["item_loop"][0]["actions"]["go"]["cmd"] == ["presets", "items"]
 
 
 def test_radios_without_quantity_returns_the_full_list():
-    """Ohne Quantity bleibt die volle Liste (Client-Kompatibilität: die
-    Jive-Home-Action ruft ``radios``/``radios menu:radio`` ohne Index und
-    braucht die Sender; Perls ``dynamicAutoQuery`` antwortet dann ohne
-    Result — dokumentierte additive Abweichung)."""
+    """Without index/quantity the whole directory is answered.
+
+    Perl's ``dynamicAutoQuery`` needs both to render a result; the Jive home
+    action calls ``radios``/``radios menu:radio`` with neither and needs the
+    sub-nodes (the port answered the favourites streams here before).
+    """
     api = JSONRPCAPI()
-
-    async def _fake() -> list[dict]:
-        return [{"cmd": "a", "name": "A"}, {"cmd": "b", "name": "B"}]
-
-    api._radio_stations_loop = _fake  # type: ignore[method-assign]
     res = asyncio.run(api._json_radios("radios", ["menu:radio"]))
-    assert res["count"] == 2
-    assert len(res["radioss_loop"]) == 2
-    assert res["item_loop"] == res["radioss_loop"]
+    assert res["count"] == 10
+    assert len(res["item_loop"]) == 10
+    plain = asyncio.run(api._json_radios("radios", []))
+    assert len(plain["radioss_loop"]) == 10
 
 
 def test_radio_items_carry_the_perl_item_keys():
-    """OPMLBased-Itemform ``cmd``/``name``/``type``/``icon``/``weight``."""
+    """OPMLBased item forms — plain ``cmd/name/type/icon/weight`` and the
+    jive ``text/weight/icon-id/actions/window`` (live 2026-09-14)."""
     api = JSONRPCAPI()
+    plain = asyncio.run(api._json_radios("radios", ["0", "10"]))
+    first = plain["radioss_loop"][0]
+    assert set(first) == {"cmd", "name", "type", "icon", "weight"}, first
+    assert first["cmd"] == "presets" and first["weight"] == 5
+    assert first["name"] == "Eigene Voreinstellungen"
+    assert first["icon"] == "/plugins/TuneIn/html/images/radiopresets.png"
+    assert first["type"] == "xmlbrowser"
 
-    async def _fake() -> list[dict]:
-        return [{"cmd": "x", "name": "Station", "type": "xmlbrowser",
-                 "icon": "html/images/radio.png", "weight": 1000}]
+    menu = asyncio.run(api._json_radios("radios", ["9", "1", "menu:radio"]))
+    row = menu["item_loop"][0]
+    assert set(row) == {"text", "weight", "icon-id", "actions", "input",
+                        "window"}, row
+    assert row["window"] == {"titleStyle": "album"}
+    assert row["input"]["len"] == 3
 
-    api._radio_stations_loop = _fake  # type: ignore[method-assign]
-    res = asyncio.run(api._json_radios("radios", ["0", "10"]))
-    assert res["radioss_loop"][0]["cmd"] == "x"
-    assert res["radioss_loop"][0]["weight"] == 1000
+
+def test_browse_radios_no_longer_errors():
+    """``browse radios`` answers the Perl radio directory, no exception path."""
+    res = _req(["browse", "radios", "0", "10"])
+    assert "radioss_loop" in res
+    assert res["count"] == 10
 
 
 # ----------------------------------------------------------------------

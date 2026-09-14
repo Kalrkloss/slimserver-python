@@ -89,10 +89,22 @@ _TITLES: dict[str, tuple[str, int, str, int]] = {
     # ``XMLBrowser.pm:1811-1873`` / ``Favorites/Plugin.pm``).
     "TITLE": ("Titel", 12618, "Title", 12619),
     "URL": ("URL", 18121, "URL", 18122),
+    # Item-info row for a radio station (``@mapAttributes``
+    # ``XMLBrowser.pm:256-260``: ``sprintf('%s: %s%s', BITRATE, $value, KBPS)``).
+    # The live Perl LMS answers ``Bitrate: 192kb/s`` (read-only probe
+    # 2026-09-14, ``local items … item_id:<sid>.0.0``); the ``strings.txt``
+    # line numbers are not part of the read-only checkout, hence 0.
+    "BITRATE": ("Bitrate", 0, "Bitrate", 0),
+    "KBPS": ("kb/s", 0, "kb/s", 0),
     "ADD_TO_END": ("Am Ende hinzufügen", 24040, "Add to End", 24041),
     "PLAY_NEXT": ("Als nächstes wiedergeben", 11463, "Play Next", 11464),
     "JIVE_DELETE_FROM_FAVORITES": ("Favorit löschen", 23925,
                                    "Delete Favorite", 23926),
+    # ``XMLBrowser.pm:1879`` ``$token = 'JIVE_SAVE_TO_FAVORITES'`` — the
+    # favourites row of a station that is *not* a favourite yet (live Perl
+    # 2026-09-14, ``local items … xmlBrowseInterimCM:1``).
+    "JIVE_SAVE_TO_FAVORITES": ("In Favoriten speichern", 0,
+                               "Save to Favorites", 0),
     "PLAY": ("Wiedergabe", 11083, "Play", 11084),
     # mode:search menu (``XMLBrowser.pm:1213-1223`` input block) and the
     # EMPTY placeholder Perl shows for an empty feed (``:841-846``).
@@ -178,31 +190,43 @@ GO_MODE: dict[str, str] = {
 _INFO_TITLES: tuple[str, ...] = ("TITLE", "URL")
 
 
-def leaf_info_rows(name: str, url: str) -> list[dict]:
-    """Perl's info rows of a favourites **leaf** item (``XMLBrowser.pm:245-252``).
+def leaf_info_rows(name: str, url: str, bitrate: int = 0) -> list[dict]:
+    """Perl's info rows of a **leaf** item (``XMLBrowser.pm:243-268``).
 
     Two rows, in Perl's field order (``name`` before ``url`` in
     ``@mapAttributes``): ``TITLE: <name>`` then ``URL: <url>``; both carry
     ``style: itemNoAction`` + ``action: "none"`` (Perl's text-item marking,
     ``XMLBrowser.pm:1172-1175``) and no ``type``.
+
+    ``bitrate`` adds Perl's third row ``Bitrate: <n>kb/s`` (:256-260
+    ``sprintf('%s: %s%s', BITRATE, $value, KBPS)``) — the live Perl LMS
+    answers exactly three rows for a radio station
+    (``local items … item_id:<sid>.0.0``, read-only 2026-09-14).
     """
     rows = [{"text": f"{menu_title('TITLE')}: {name}",
              "style": "itemNoAction", "action": "none"}]
     if url:
         rows.append({"text": f"{menu_title('URL')}: {url}",
                      "style": "itemNoAction", "action": "none"})
+    if bitrate:
+        rows.append({"text": f"{menu_title('BITRATE')}: {int(bitrate)}"
+                             f"{menu_title('KBPS')}",
+                     "style": "itemNoAction", "action": "none"})
     return rows
 
 
-def leaf_info_menu(name: str, url: str) -> dict:
+def leaf_info_menu(name: str, url: str, bitrate: int = 0) -> dict:
     """The answer envelope of (1) above: offset/count/item_loop only."""
-    rows = leaf_info_rows(name, url)
+    rows = leaf_info_rows(name, url, bitrate)
     return {"offset": 0, "count": len(rows), "item_loop": rows}
 
 
-def interim_context_menu(item_id: str, *, name: str = "", url: str = "",
-                         icon: str = "", favorite_type: str = "audio",
-                         parser: Any = None, item_index: str = "") -> dict:
+def interim_context_menu(item_id: str, *, menu: str = "favorites",
+                         name: str = "", url: str = "", icon: str = "",
+                         favorite_type: str = "audio",
+                         parser: Any = None, item_index: str = "",
+                         in_favorites: bool | None = None,
+                         bitrate: int = 0) -> dict:
     """The answer of (2): the play-control menu of a tapped favourites row.
 
     Perl (``XMLBrowser.pm:854-859`` + ``_playlistControlContextMenu``
@@ -225,9 +249,30 @@ def interim_context_menu(item_id: str, *, name: str = "", url: str = "",
          {"text": "Titel: <name>", …}, {"text": "URL: <url>", …}]
 
     ``item_index`` is the numeric index Perl sends as ``params.item_id`` of
-    the delete row (its item id minus the browse-session handle).
+    the „Favorit löschen" row (its item id minus the browse-session handle);
+    the row itself is chosen by Perl's favourite lookup (``findUrl``,
+    ``XMLBrowser.pm:1870-1884``): a URL that is **not** a favourite yet gets
+    ``In Favoriten speichern`` → ``['jivefavorites','add']`` (:1875-1900) and
+    no ``item_id``, an existing one gets ``Favorit löschen`` →
+    ``['jivefavorites','delete']`` with ``item_id``.  ``in_favorites`` passes
+    that lookup's result; ``None`` keeps the favourites feed's own behaviour
+    (its rows *are* favourites).
+
+    ``menu`` is the feed's CLI tag: the three playlist-control rows carry
+    ``[menu,'playlist',add|insert|play]`` (live Perl answers the radio feeds'
+    rows with ``["local","playlist",…]``, the favourites feed's with
+    ``["favorites","playlist",…]``).
+
+    Live Perl 9.1.1, radio feed (read-only 2026-09-14,
+    ``local items 0 4 menu:local item_id:<sid>.0.0 isContextMenu:1
+    xmlBrowseInterimCM:1``) — ``count`` 7: the three playlist rows, then
+    ``{"text": "In Favoriten speichern", "style": "itemNoAction",
+    "actions": {"go": {"player": 0, "cmd": ["jivefavorites","add"],
+    "params": {"title": …, "url": …, "type": "audio", "parser": null,
+    "isContextMenu": 1, "icon": …}}}}``, then Titel/URL/Bitrate.
     """
     item_id = str(item_id)
+    already_favorite = True if in_favorites is None else bool(in_favorites)
 
     def control(cmd: str, style: str, text: str, next_window: str) -> dict:
         return {
@@ -235,21 +280,28 @@ def interim_context_menu(item_id: str, *, name: str = "", url: str = "",
             "style": style,
             "actions": {"go": {
                 "player": 0,
-                "cmd": ["favorites", "playlist", cmd],
+                "cmd": [menu, "playlist", cmd],
                 "params": {"item_id": item_id, "menu": 1},
                 "nextWindow": next_window,
             }},
         }
 
-    delete_params: dict = {
+    fav_params: dict = {
         "url": url,
         "type": favorite_type,
         "isContextMenu": 1,
         "icon": icon,
         "parser": parser,
         "title": name,
-        "item_id": str(item_index),
     }
+    if already_favorite:
+        # XMLBrowser.pm:1871-1884 — only a *known* favourite carries the index.
+        fav_token = "JIVE_DELETE_FROM_FAVORITES"
+        fav_action = "delete"
+        fav_params["item_id"] = str(item_index)
+    else:
+        fav_token = "JIVE_SAVE_TO_FAVORITES"
+        fav_action = "add"
     rows = [
         control("add", "item_add", menu_title("ADD_TO_END"),
                 "parentNoRefresh"),
@@ -257,13 +309,13 @@ def interim_context_menu(item_id: str, *, name: str = "", url: str = "",
                 "parentNoRefresh"),
         control("play", "item_play", menu_title("PLAY"), "nowPlaying"),
         {
-            "text": menu_title("JIVE_DELETE_FROM_FAVORITES"),
+            "text": menu_title(fav_token),
             "style": "itemNoAction",
-            "actions": {"go": {"params": delete_params, "player": 0,
-                               "cmd": ["jivefavorites", "delete"]}},
+            "actions": {"go": {"params": fav_params, "player": 0,
+                               "cmd": ["jivefavorites", fav_action]}},
         },
     ]
-    rows.extend(leaf_info_rows(name, url))
+    rows.extend(leaf_info_rows(name, url, bitrate))
     return {"offset": 0, "count": len(rows), "item_loop": rows}
 
 

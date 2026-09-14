@@ -1,0 +1,1932 @@
+{
+ "radios_plain": {
+  "params": [
+   "00:04:20:2b:88:c8",
+   [
+    "radios",
+    "0",
+    "3"
+   ]
+  ],
+  "result": {
+   "count": 10,
+   "radioss_loop": [
+    {
+     "type": "xmlbrowser",
+     "cmd": "presets",
+     "weight": 5,
+     "name": "Eigene Voreinstellungen",
+     "icon": "/plugins/TuneIn/html/images/radiopresets.png"
+    },
+    {
+     "type": "xmlbrowser",
+     "cmd": "local",
+     "name": "Lokales Radio",
+     "weight": 20,
+     "icon": "/plugins/TuneIn/html/images/radiolocal.png"
+    },
+    {
+     "type": "xmlbrowser",
+     "cmd": "music",
+     "icon": "/plugins/TuneIn/html/images/radiomusic.png",
+     "weight": 30,
+     "name": "Musik"
+    }
+   ]
+  }
+ },
+ "radios_menu": {
+  "params": [
+   "00:04:20:2b:88:c8",
+   [
+    "radios",
+    "0",
+    "3",
+    "menu:radio"
+   ]
+  ],
+  "result": {
+   "count": 10,
+   "item_loop": [
+    {
+     "actions": {
+      "go": {
+       "params": {
+        "menu": "presets"
+       },
+       "cmd": [
+        "presets",
+        "items"
+       ]
+      }
+     },
+     "window": {
+      "titleStyle": "album"
+     },
+     "icon-id": "/plugins/TuneIn/html/images/radiopresets.png",
+     "text": "Eigene Voreinstellungen",
+     "weight": 5
+    },
+    {
+     "text": "Lokales Radio",
+     "weight": 20,
+     "window": {
+      "titleStyle": "album"
+     },
+     "icon-id": "/plugins/TuneIn/html/images/radiolocal.png",
+     "actions": {
+      "go": {
+       "params": {
+        "menu": "local"
+       },
+       "cmd": [
+        "local",
+        "items"
+       ]
+      }
+     }
+    },
+    {
+     "icon-id": "/plugins/TuneIn/html/images/radiomusic.png",
+     "window": {
+      "titleStyle": "album"
+     },
+     "actions": {
+      "go": {
+       "cmd": [
+        "music",
+        "items"
+       ],
+       "params": {
+        "menu": "music"
+       }
+      }
+     },
+     "text": "Musik",
+     "weight": 30
+    }
+   ],
+   "offset": "0"
+  }
+ },
+ "radios_menu_search_item": {
+  "params": [
+   "00:04:20:2b:88:c8",
+   [
+    "radios",
+    "9",
+    "1",
+    "menu:radio"
+   ]
+  ],
+  "result": {
+   "count": 10,
+   "item_loop": [
+    {
+     "input": {
+      "softbutton2": "Löschen",
+      "len": 3,
+      "softbutton1": "Einfügen",
+      "help": {
+       "text": "Wählen Sie den gewünschten Buchstaben mit dem Rad und drücken Sie zum Bestätigen die mittlere Taste. Drücken Sie zum Starten der Suche die mittlere Taste erneut."
+      }
+     },
+     "weight": 110,
+     "window": {
+      "titleStyle": "album"
+     },
+     "text": "TuneIn durchsuchen",
+     "actions": {
+      "go": {
+       "params": {
+        "search": "__TAGGEDINPUT__",
+        "menu": "search"
+       },
+       "cmd": [
+        "search",
+        "items"
+       ]
+      }
+     },
+     "icon-id": "/plugins/TuneIn/html/images/radiosearch.png"
+    }
+   ],
+   "offset": "9"
+  }
+ },
+ "local_index": {
+  "params": [
+   "00:04:20:2b:88:c8",
+   [
+    "local",
+    "items",
+    "0",
+    "6",
+    "menu:local"
+   ]
+  ],
+  "result": {
+   "offset": 0,
+   "title": "Lokale Sender",
+   "base": {
+    "actions": {
+     "more": {
+      "cmd": [
+       "local",
+       "items"
+      ],
+      "player": 0,
+      "window": {
+       "isContextMenu": 1
+      },
+      "params": {
+       "menu": "local"
+      },
+      "itemsParams": "params"
+     },
+     "play": {
+      "itemsParams": "params",
+      "nextWindow": "nowPlaying",
+      "params": {
+       "menu": "local"
+      },
+      "player": 0,
+      "cmd": [
+       "local",
+       "playlist",
+       "play"
+      ]
+     },
+     "add-hold": {
+      "itemsParams": "params",
+      "params": {
+       "menu": "local"
+      },
+      "player": 0,
+      "cmd": [
+       "local",
+       "playlist",
+       "insert"
+      ]
+     },
+     "playControl": {
+      "itemsParams": "playControlParams",
+      "params": {
+       "_index": "0",
+       "_quantity": "6",
+       "menu": "local"
+      },
+      "window": {
+       "isContextMenu": 1
+      },
+      "player": 0,
+      "cmd": [
+       "local",
+       "items"
+      ]
+     },
+     "go": {
+      "itemsParams": "params",
+      "params": {
+       "menu": "local"
+      },
+      "cmd": [
+       "local",
+       "items"
+      ]
+     },
+     "add": {
+      "cmd": [
+       "local",
+       "playlist",
+       "add"
+      ],
+      "player": 0,
+      "params": {
+       "menu": "local"
+      },
+      "itemsParams": "params"
+     }
+    }
+   },
+   "item_loop": [
+    {
+     "text": "Sender",
+     "addAction": "go",
+     "actions": {
+      "go": {
+       "params": {
+        "item_id": "2558ac8d.0",
+        "menu": "local"
+       },
+       "cmd": [
+        "local",
+        "items"
+       ]
+      }
+     }
+    },
+    {
+     "text": "Alle Deutschland",
+     "type": "link",
+     "actions": {
+      "go": {
+       "params": {
+        "menu": "local",
+        "item_id": "2558ac8d.1"
+       },
+       "cmd": [
+        "local",
+        "items"
+       ]
+      }
+     },
+     "addAction": "go"
+    }
+   ],
+   "count": 2,
+   "window": {
+    "windowStyle": "text_list"
+   }
+  }
+ },
+ "local_stations": {
+  "params": [
+   "00:04:20:2b:88:c8",
+   [
+    "local",
+    "items",
+    "0",
+    "4",
+    "menu:local",
+    "item_id:2558ac8d.0"
+   ]
+  ],
+  "result": {
+   "offset": 0,
+   "title": "Sender",
+   "base": {
+    "actions": {
+     "set-preset-3": {
+      "player": 0,
+      "cmd": [
+       "jivefavorites",
+       "set_preset",
+       "key:3"
+      ],
+      "itemsParams": "presetParams"
+     },
+     "more": {
+      "itemsParams": "params",
+      "params": {
+       "menu": "local"
+      },
+      "window": {
+       "isContextMenu": 1
+      },
+      "player": 0,
+      "cmd": [
+       "local",
+       "items"
+      ]
+     },
+     "set-preset-7": {
+      "player": 0,
+      "cmd": [
+       "jivefavorites",
+       "set_preset",
+       "key:7"
+      ],
+      "itemsParams": "presetParams"
+     },
+     "set-preset-2": {
+      "cmd": [
+       "jivefavorites",
+       "set_preset",
+       "key:2"
+      ],
+      "player": 0,
+      "itemsParams": "presetParams"
+     },
+     "set-preset-1": {
+      "itemsParams": "presetParams",
+      "cmd": [
+       "jivefavorites",
+       "set_preset",
+       "key:1"
+      ],
+      "player": 0
+     },
+     "playControl": {
+      "itemsParams": "playControlParams",
+      "params": {
+       "_index": "0",
+       "_quantity": "4",
+       "menu": "local",
+       "item_id": "2558ac8d.0"
+      },
+      "window": {
+       "isContextMenu": 1
+      },
+      "player": 0,
+      "cmd": [
+       "local",
+       "items"
+      ]
+     },
+     "set-preset-5": {
+      "cmd": [
+       "jivefavorites",
+       "set_preset",
+       "key:5"
+      ],
+      "player": 0,
+      "itemsParams": "presetParams"
+     },
+     "set-preset-8": {
+      "itemsParams": "presetParams",
+      "player": 0,
+      "cmd": [
+       "jivefavorites",
+       "set_preset",
+       "key:8"
+      ]
+     },
+     "set-preset-6": {
+      "player": 0,
+      "cmd": [
+       "jivefavorites",
+       "set_preset",
+       "key:6"
+      ],
+      "itemsParams": "presetParams"
+     },
+     "set-preset-0": {
+      "cmd": [
+       "jivefavorites",
+       "set_preset",
+       "key:0"
+      ],
+      "player": 0,
+      "itemsParams": "presetParams"
+     },
+     "go": {
+      "nextWindow": "nowPlaying",
+      "params": {
+       "menu": "local"
+      },
+      "itemsParams": "params",
+      "cmd": [
+       "local",
+       "playlist",
+       "play"
+      ],
+      "player": 0
+     },
+     "add": {
+      "itemsParams": "params",
+      "params": {
+       "menu": "local"
+      },
+      "player": 0,
+      "cmd": [
+       "local",
+       "playlist",
+       "add"
+      ]
+     },
+     "add-hold": {
+      "itemsParams": "params",
+      "params": {
+       "menu": "local"
+      },
+      "player": 0,
+      "cmd": [
+       "local",
+       "playlist",
+       "insert"
+      ]
+     },
+     "play": {
+      "nextWindow": "nowPlaying",
+      "params": {
+       "menu": "local"
+      },
+      "itemsParams": "params",
+      "cmd": [
+       "local",
+       "playlist",
+       "play"
+      ],
+      "player": 0
+     },
+     "set-preset-9": {
+      "itemsParams": "presetParams",
+      "player": 0,
+      "cmd": [
+       "jivefavorites",
+       "set_preset",
+       "key:9"
+      ]
+     },
+     "set-preset-4": {
+      "cmd": [
+       "jivefavorites",
+       "set_preset",
+       "key:4"
+      ],
+      "player": 0,
+      "itemsParams": "presetParams"
+     }
+    }
+   },
+   "item_loop": [
+    {
+     "goAction": "play",
+     "text": "& Lagerfeuer. Von barba radio (Chill)\nBarbara Schönebergers Radio für´s BBQ mit Freunden",
+     "params": {
+      "touchToPlay": "2558ac8d.0.0",
+      "item_id": "2558ac8d.0.0",
+      "isContextMenu": 1,
+      "touchToPlaySingle": 1
+     },
+     "icon": "/imageproxy/http%3A%2F%2Fcdn-profiles.tunein.com%2Fs324809%2Fimages%2Flogoq.png/image.png",
+     "type": "audio",
+     "presetParams": {
+      "icon": "http://cdn-profiles.tunein.com/s324809/images/logoq.png",
+      "favorites_type": "audio",
+      "favorites_title": "& Lagerfeuer. Von barba radio (Chill)",
+      "favorites_url": "http://opml.radiotime.com/Tune.ashx?id=s324809&formats=aac,ogg,mp3,wmpro,wma,wmvoice&partnerId=15&serial=89d36ef4510ad7d85b912b3d0fee8bad"
+     },
+     "style": "itemplay"
+    },
+    {
+     "style": "itemplay",
+     "icon": "/imageproxy/http%3A%2F%2Fcdn-profiles.tunein.com%2Fs301789%2Fimages%2Flogoq.png/image.png",
+     "text": "100 % Roland Kaiser (Schlager)\n00% alle Hits! Hier erfahrt ihr alles über den Kaiser des deutsc",
+     "params": {
+      "touchToPlaySingle": 1,
+      "isContextMenu": 1,
+      "item_id": "2558ac8d.0.1",
+      "touchToPlay": "2558ac8d.0.1"
+     },
+     "goAction": "play",
+     "presetParams": {
+      "icon": "http://cdn-profiles.tunein.com/s301789/images/logoq.png",
+      "favorites_type": "audio",
+      "favorites_title": "100 % Roland Kaiser (Schlager)",
+      "favorites_url": "http://opml.radiotime.com/Tune.ashx?id=s301789&formats=aac,ogg,mp3,wmpro,wma,wmvoice&partnerId=15&serial=89d36ef4510ad7d85b912b3d0fee8bad"
+     },
+     "type": "audio"
+    },
+    {
+     "style": "itemplay",
+     "type": "audio",
+     "presetParams": {
+      "favorites_url": "http://opml.radiotime.com/Tune.ashx?id=s291105&formats=aac,ogg,mp3,wmpro,wma,wmvoice&partnerId=15&serial=89d36ef4510ad7d85b912b3d0fee8bad",
+      "favorites_type": "audio",
+      "favorites_title": "100% Andrea (Musik)",
+      "icon": "http://cdn-profiles.tunein.com/s291105/images/logoq.png?t=636289"
+     },
+     "goAction": "play",
+     "params": {
+      "item_id": "2558ac8d.0.2",
+      "touchToPlay": "2558ac8d.0.2",
+      "isContextMenu": 1,
+      "touchToPlaySingle": 1
+     },
+     "text": "100% Andrea (Musik)\nAndrea Berg - Simsalabim",
+     "icon": "/imageproxy/http%3A%2F%2Fcdn-profiles.tunein.com%2Fs291105%2Fimages%2Flogoq.png%3Ft%3D636289/image.png"
+    },
+    {
+     "goAction": "play",
+     "params": {
+      "touchToPlaySingle": 1,
+      "isContextMenu": 1,
+      "touchToPlay": "2558ac8d.0.3",
+      "item_id": "2558ac8d.0.3"
+     },
+     "text": "100% Danceschlager von Schlagerplanet Radio (Schlager)\n100% Danceschlager von Schlagerplanet Radio. Dein neues Radio für coolen modernen Schlagersound von",
+     "icon": "/imageproxy/http%3A%2F%2Fcdn-profiles.tunein.com%2Fs322872%2Fimages%2Flogoq.png%3Ft%3D1/image.png",
+     "type": "audio",
+     "presetParams": {
+      "icon": "http://cdn-profiles.tunein.com/s322872/images/logoq.png?t=1",
+      "favorites_type": "audio",
+      "favorites_title": "100% Danceschlager von Schlagerplanet Radio (Schlager)",
+      "favorites_url": "http://opml.radiotime.com/Tune.ashx?id=s322872&formats=aac,ogg,mp3,wmpro,wma,wmvoice&partnerId=15&serial=89d36ef4510ad7d85b912b3d0fee8bad"
+     },
+     "style": "itemplay"
+    }
+   ],
+   "count": 194,
+   "window": {
+    "windowStyle": "icon_list"
+   }
+  }
+ },
+ "local_station_leaf": {
+  "params": [
+   "00:04:20:2b:88:c8",
+   [
+    "local",
+    "items",
+    "0",
+    "4",
+    "menu:local",
+    "item_id:2558ac8d.0.0"
+   ]
+  ],
+  "result": {
+   "offset": 0,
+   "item_loop": [
+    {
+     "text": "Titel: & Lagerfeuer. Von barba radio (Chill)",
+     "style": "itemNoAction",
+     "action": "none"
+    },
+    {
+     "text": "URL: http://opml.radiotime.com/Tune.ashx?id=s324809&formats=aac,ogg,mp3,wmpro,wma,wmvoice&partnerId=15&serial=89d36ef4510ad7d85b912b3d0fee8bad",
+     "style": "itemNoAction",
+     "action": "none"
+    },
+    {
+     "text": "Bitrate: 192kb/s",
+     "style": "itemNoAction",
+     "action": "none"
+    }
+   ],
+   "count": 3
+  }
+ },
+ "local_station_interim_cm": {
+  "params": [
+   "00:04:20:2b:88:c8",
+   [
+    "local",
+    "items",
+    "0",
+    "4",
+    "menu:local",
+    "item_id:2558ac8d.0.0",
+    "isContextMenu:1",
+    "xmlBrowseInterimCM:1"
+   ]
+  ],
+  "result": {
+   "item_loop": [
+    {
+     "actions": {
+      "go": {
+       "nextWindow": "parentNoRefresh",
+       "params": {
+        "menu": 1,
+        "item_id": "2558ac8d.0.0"
+       },
+       "cmd": [
+        "local",
+        "playlist",
+        "add"
+       ],
+       "player": 0
+      }
+     },
+     "text": "Am Ende hinzufügen",
+     "style": "item_add"
+    },
+    {
+     "text": "Als nächstes wiedergeben",
+     "style": "itemNoAction",
+     "actions": {
+      "go": {
+       "cmd": [
+        "local",
+        "playlist",
+        "insert"
+       ],
+       "player": 0,
+       "nextWindow": "parentNoRefresh",
+       "params": {
+        "menu": 1,
+        "item_id": "2558ac8d.0.0"
+       }
+      }
+     }
+    },
+    {
+     "actions": {
+      "go": {
+       "params": {
+        "menu": 1,
+        "item_id": "2558ac8d.0.0"
+       },
+       "nextWindow": "nowPlaying",
+       "player": 0,
+       "cmd": [
+        "local",
+        "playlist",
+        "play"
+       ]
+      }
+     },
+     "style": "item_play",
+     "text": "Wiedergabe"
+    },
+    {
+     "actions": {
+      "go": {
+       "player": 0,
+       "cmd": [
+        "jivefavorites",
+        "add"
+       ],
+       "params": {
+        "parser": null,
+        "type": "audio",
+        "isContextMenu": 1,
+        "title": "& Lagerfeuer. Von barba radio (Chill)",
+        "url": "http://opml.radiotime.com/Tune.ashx?id=s324809&formats=aac,ogg,mp3,wmpro,wma,wmvoice&partnerId=15&serial=89d36ef4510ad7d85b912b3d0fee8bad",
+        "icon": "http://cdn-profiles.tunein.com/s324809/images/logoq.png"
+       }
+      }
+     },
+     "style": "itemNoAction",
+     "text": "In Favoriten speichern"
+    },
+    {
+     "text": "Titel: & Lagerfeuer. Von barba radio (Chill)",
+     "style": "itemNoAction",
+     "action": "none"
+    },
+    {
+     "text": "URL: http://opml.radiotime.com/Tune.ashx?id=s324809&formats=aac,ogg,mp3,wmpro,wma,wmvoice&partnerId=15&serial=89d36ef4510ad7d85b912b3d0fee8bad",
+     "style": "itemNoAction",
+     "action": "none"
+    },
+    {
+     "text": "Bitrate: 192kb/s",
+     "style": "itemNoAction",
+     "action": "none"
+    }
+   ],
+   "offset": 0,
+   "count": 7
+  }
+ },
+ "local_all_country": {
+  "params": [
+   "00:04:20:2b:88:c8",
+   [
+    "local",
+    "items",
+    "0",
+    "4",
+    "menu:local",
+    "item_id:2558ac8d.1"
+   ]
+  ],
+  "result": {
+   "offset": 0,
+   "title": "Deutschland",
+   "base": {
+    "actions": {
+     "add": {
+      "itemsParams": "params",
+      "params": {
+       "menu": "local"
+      },
+      "player": 0,
+      "cmd": [
+       "local",
+       "playlist",
+       "add"
+      ]
+     },
+     "go": {
+      "cmd": [
+       "local",
+       "items"
+      ],
+      "params": {
+       "menu": "local"
+      },
+      "itemsParams": "params"
+     },
+     "playControl": {
+      "cmd": [
+       "local",
+       "items"
+      ],
+      "player": 0,
+      "window": {
+       "isContextMenu": 1
+      },
+      "params": {
+       "_index": "0",
+       "_quantity": "4",
+       "menu": "local",
+       "item_id": "2558ac8d.1"
+      },
+      "itemsParams": "playControlParams"
+     },
+     "play": {
+      "cmd": [
+       "local",
+       "playlist",
+       "play"
+      ],
+      "player": 0,
+      "params": {
+       "menu": "local"
+      },
+      "nextWindow": "nowPlaying",
+      "itemsParams": "params"
+     },
+     "more": {
+      "window": {
+       "isContextMenu": 1
+      },
+      "player": 0,
+      "cmd": [
+       "local",
+       "items"
+      ],
+      "itemsParams": "params",
+      "params": {
+       "menu": "local"
+      }
+     },
+     "add-hold": {
+      "cmd": [
+       "local",
+       "playlist",
+       "insert"
+      ],
+      "player": 0,
+      "params": {
+       "menu": "local"
+      },
+      "itemsParams": "params"
+     }
+    }
+   },
+   "item_loop": [
+    {
+     "actions": {
+      "go": {
+       "params": {
+        "menu": "local",
+        "item_id": "2558ac8d.1.0"
+       },
+       "cmd": [
+        "local",
+        "items"
+       ]
+      }
+     },
+     "addAction": "go",
+     "text": "Alle Sender"
+    },
+    {
+     "text": "Aurich",
+     "addAction": "go",
+     "actions": {
+      "go": {
+       "params": {
+        "menu": "local",
+        "item_id": "2558ac8d.1.1"
+       },
+       "cmd": [
+        "local",
+        "items"
+       ]
+      }
+     },
+     "type": "link"
+    },
+    {
+     "text": "Bayreuth",
+     "type": "link",
+     "addAction": "go",
+     "actions": {
+      "go": {
+       "cmd": [
+        "local",
+        "items"
+       ],
+       "params": {
+        "menu": "local",
+        "item_id": "2558ac8d.1.2"
+       }
+      }
+     }
+    },
+    {
+     "type": "link",
+     "actions": {
+      "go": {
+       "cmd": [
+        "local",
+        "items"
+       ],
+       "params": {
+        "menu": "local",
+        "item_id": "2558ac8d.1.3"
+       }
+      }
+     },
+     "addAction": "go",
+     "text": "Berlin"
+    }
+   ],
+   "count": 41,
+   "window": {
+    "windowStyle": "text_list"
+   }
+  }
+ },
+ "music_index": {
+  "params": [
+   "00:04:20:2b:88:c8",
+   [
+    "music",
+    "items",
+    "0",
+    "3",
+    "menu:music"
+   ]
+  ],
+  "result": {
+   "offset": 0,
+   "title": "Musik",
+   "base": {
+    "actions": {
+     "add-hold": {
+      "params": {
+       "menu": "music"
+      },
+      "itemsParams": "params",
+      "cmd": [
+       "music",
+       "playlist",
+       "insert"
+      ],
+      "player": 0
+     },
+     "play": {
+      "cmd": [
+       "music",
+       "playlist",
+       "play"
+      ],
+      "player": 0,
+      "nextWindow": "nowPlaying",
+      "params": {
+       "menu": "music"
+      },
+      "itemsParams": "params"
+     },
+     "more": {
+      "window": {
+       "isContextMenu": 1
+      },
+      "player": 0,
+      "cmd": [
+       "music",
+       "items"
+      ],
+      "itemsParams": "params",
+      "params": {
+       "menu": "music"
+      }
+     },
+     "playControl": {
+      "itemsParams": "playControlParams",
+      "params": {
+       "_index": "0",
+       "_quantity": "3",
+       "menu": "music"
+      },
+      "window": {
+       "isContextMenu": 1
+      },
+      "player": 0,
+      "cmd": [
+       "music",
+       "items"
+      ]
+     },
+     "go": {
+      "itemsParams": "params",
+      "params": {
+       "menu": "music"
+      },
+      "cmd": [
+       "music",
+       "items"
+      ]
+     },
+     "add": {
+      "params": {
+       "menu": "music"
+      },
+      "itemsParams": "params",
+      "cmd": [
+       "music",
+       "playlist",
+       "add"
+      ],
+      "player": 0
+     }
+    }
+   },
+   "item_loop": [
+    {
+     "type": "link",
+     "actions": {
+      "go": {
+       "cmd": [
+        "music",
+        "items"
+       ],
+       "params": {
+        "menu": "music",
+        "item_id": "2fd91a4c.0"
+       }
+      }
+     },
+     "addAction": "go",
+     "text": "Country"
+    },
+    {
+     "type": "link",
+     "addAction": "go",
+     "actions": {
+      "go": {
+       "cmd": [
+        "music",
+        "items"
+       ],
+       "params": {
+        "menu": "music",
+        "item_id": "2fd91a4c.1"
+       }
+      }
+     },
+     "text": "Powerhitz"
+    },
+    {
+     "text": "Weltmusik",
+     "type": "link",
+     "actions": {
+      "go": {
+       "cmd": [
+        "music",
+        "items"
+       ],
+       "params": {
+        "item_id": "2fd91a4c.2",
+        "menu": "music"
+       }
+      }
+     },
+     "addAction": "go"
+    }
+   ],
+   "count": 25,
+   "window": {
+    "windowStyle": "text_list"
+   }
+  }
+ },
+ "location_index": {
+  "params": [
+   "00:04:20:2b:88:c8",
+   [
+    "location",
+    "items",
+    "0",
+    "3",
+    "menu:location"
+   ]
+  ],
+  "result": {
+   "offset": 0,
+   "title": "Orte",
+   "base": {
+    "actions": {
+     "go": {
+      "params": {
+       "menu": "location"
+      },
+      "itemsParams": "params",
+      "cmd": [
+       "location",
+       "items"
+      ]
+     },
+     "add": {
+      "itemsParams": "params",
+      "params": {
+       "menu": "location"
+      },
+      "player": 0,
+      "cmd": [
+       "location",
+       "playlist",
+       "add"
+      ]
+     },
+     "add-hold": {
+      "params": {
+       "menu": "location"
+      },
+      "itemsParams": "params",
+      "cmd": [
+       "location",
+       "playlist",
+       "insert"
+      ],
+      "player": 0
+     },
+     "play": {
+      "player": 0,
+      "cmd": [
+       "location",
+       "playlist",
+       "play"
+      ],
+      "itemsParams": "params",
+      "params": {
+       "menu": "location"
+      },
+      "nextWindow": "nowPlaying"
+     },
+     "more": {
+      "itemsParams": "params",
+      "params": {
+       "menu": "location"
+      },
+      "window": {
+       "isContextMenu": 1
+      },
+      "player": 0,
+      "cmd": [
+       "location",
+       "items"
+      ]
+     },
+     "playControl": {
+      "itemsParams": "playControlParams",
+      "params": {
+       "_index": "0",
+       "_quantity": "3",
+       "menu": "location"
+      },
+      "window": {
+       "isContextMenu": 1
+      },
+      "player": 0,
+      "cmd": [
+       "location",
+       "items"
+      ]
+     }
+    }
+   },
+   "item_loop": [
+    {
+     "type": "link",
+     "addAction": "go",
+     "actions": {
+      "go": {
+       "cmd": [
+        "location",
+        "items"
+       ],
+       "params": {
+        "item_id": "3582f52d.0",
+        "menu": "location"
+       }
+      }
+     },
+     "text": "Afrika"
+    },
+    {
+     "actions": {
+      "go": {
+       "cmd": [
+        "location",
+        "items"
+       ],
+       "params": {
+        "menu": "location",
+        "item_id": "3582f52d.1"
+       }
+      }
+     },
+     "addAction": "go",
+     "type": "link",
+     "text": "Asien"
+    },
+    {
+     "text": "Australien & Ozeanien",
+     "type": "link",
+     "addAction": "go",
+     "actions": {
+      "go": {
+       "cmd": [
+        "location",
+        "items"
+       ],
+       "params": {
+        "item_id": "3582f52d.2",
+        "menu": "location"
+       }
+      }
+     }
+    }
+   ],
+   "count": 7,
+   "window": {
+    "windowStyle": "text_list"
+   }
+  }
+ },
+ "language_index": {
+  "params": [
+   "00:04:20:2b:88:c8",
+   [
+    "language",
+    "items",
+    "0",
+    "3",
+    "menu:language"
+   ]
+  ],
+  "result": {
+   "offset": 0,
+   "title": "Sprachen",
+   "base": {
+    "actions": {
+     "playControl": {
+      "itemsParams": "playControlParams",
+      "params": {
+       "_index": "0",
+       "_quantity": "3",
+       "menu": "language"
+      },
+      "player": 0,
+      "cmd": [
+       "language",
+       "items"
+      ],
+      "window": {
+       "isContextMenu": 1
+      }
+     },
+     "more": {
+      "cmd": [
+       "language",
+       "items"
+      ],
+      "player": 0,
+      "window": {
+       "isContextMenu": 1
+      },
+      "params": {
+       "menu": "language"
+      },
+      "itemsParams": "params"
+     },
+     "play": {
+      "cmd": [
+       "language",
+       "playlist",
+       "play"
+      ],
+      "player": 0,
+      "params": {
+       "menu": "language"
+      },
+      "nextWindow": "nowPlaying",
+      "itemsParams": "params"
+     },
+     "add-hold": {
+      "params": {
+       "menu": "language"
+      },
+      "itemsParams": "params",
+      "cmd": [
+       "language",
+       "playlist",
+       "insert"
+      ],
+      "player": 0
+     },
+     "add": {
+      "params": {
+       "menu": "language"
+      },
+      "itemsParams": "params",
+      "cmd": [
+       "language",
+       "playlist",
+       "add"
+      ],
+      "player": 0
+     },
+     "go": {
+      "itemsParams": "params",
+      "params": {
+       "menu": "language"
+      },
+      "cmd": [
+       "language",
+       "items"
+      ]
+     }
+    }
+   },
+   "item_loop": [
+    {
+     "text": "Aboriginal",
+     "type": "link",
+     "addAction": "go",
+     "actions": {
+      "go": {
+       "cmd": [
+        "language",
+        "items"
+       ],
+       "params": {
+        "item_id": "1b772a8c.0",
+        "menu": "language"
+       }
+      }
+     }
+    },
+    {
+     "type": "link",
+     "actions": {
+      "go": {
+       "params": {
+        "menu": "language",
+        "item_id": "1b772a8c.1"
+       },
+       "cmd": [
+        "language",
+        "items"
+       ]
+      }
+     },
+     "addAction": "go",
+     "text": "Afrikaans"
+    },
+    {
+     "text": "Akan",
+     "type": "link",
+     "addAction": "go",
+     "actions": {
+      "go": {
+       "cmd": [
+        "language",
+        "items"
+       ],
+       "params": {
+        "item_id": "1b772a8c.2",
+        "menu": "language"
+       }
+      }
+     }
+    }
+   ],
+   "count": 93,
+   "window": {
+    "windowStyle": "text_list"
+   }
+  }
+ },
+ "presets_empty": {
+  "params": [
+   "00:04:20:2b:88:c8",
+   [
+    "presets",
+    "items",
+    "0",
+    "3",
+    "menu:presets"
+   ]
+  ],
+  "result": {
+   "offset": 0,
+   "base": {
+    "actions": {
+     "more": {
+      "itemsParams": "params",
+      "params": {
+       "menu": "presets"
+      },
+      "window": {
+       "isContextMenu": 1
+      },
+      "player": 0,
+      "cmd": [
+       "presets",
+       "items"
+      ]
+     },
+     "play": {
+      "player": 0,
+      "cmd": [
+       "presets",
+       "playlist",
+       "play"
+      ],
+      "itemsParams": "params",
+      "nextWindow": "nowPlaying",
+      "params": {
+       "menu": "presets"
+      }
+     },
+     "add-hold": {
+      "params": {
+       "menu": "presets"
+      },
+      "itemsParams": "params",
+      "cmd": [
+       "presets",
+       "playlist",
+       "insert"
+      ],
+      "player": 0
+     },
+     "playControl": {
+      "window": {
+       "isContextMenu": 1
+      },
+      "cmd": [
+       "presets",
+       "items"
+      ],
+      "player": 0,
+      "params": {
+       "_index": "0",
+       "_quantity": "3",
+       "menu": "presets"
+      },
+      "itemsParams": "playControlParams"
+     },
+     "go": {
+      "cmd": [
+       "presets",
+       "items"
+      ],
+      "params": {
+       "menu": "presets"
+      },
+      "itemsParams": "params"
+     },
+     "add": {
+      "params": {
+       "menu": "presets"
+      },
+      "itemsParams": "params",
+      "cmd": [
+       "presets",
+       "playlist",
+       "add"
+      ],
+      "player": 0
+     }
+    }
+   },
+   "item_loop": [
+    {
+     "action": "none",
+     "text": "Leer",
+     "style": "itemNoAction",
+     "type": "text"
+    }
+   ],
+   "count": 1,
+   "window": {
+    "windowStyle": "text_list"
+   }
+  }
+ },
+ "podcast_index": {
+  "params": [
+   "00:04:20:2b:88:c8",
+   [
+    "podcast",
+    "items",
+    "0",
+    "3",
+    "menu:podcast"
+   ]
+  ],
+  "result": {
+   "offset": 0,
+   "title": "Podcasts",
+   "base": {
+    "actions": {
+     "add-hold": {
+      "params": {
+       "menu": "podcast"
+      },
+      "itemsParams": "params",
+      "cmd": [
+       "podcast",
+       "playlist",
+       "insert"
+      ],
+      "player": 0
+     },
+     "more": {
+      "params": {
+       "menu": "podcast"
+      },
+      "itemsParams": "params",
+      "window": {
+       "isContextMenu": 1
+      },
+      "cmd": [
+       "podcast",
+       "items"
+      ],
+      "player": 0
+     },
+     "play": {
+      "params": {
+       "menu": "podcast"
+      },
+      "nextWindow": "nowPlaying",
+      "itemsParams": "params",
+      "cmd": [
+       "podcast",
+       "playlist",
+       "play"
+      ],
+      "player": 0
+     },
+     "playControl": {
+      "params": {
+       "_index": "0",
+       "_quantity": "3",
+       "menu": "podcast"
+      },
+      "itemsParams": "playControlParams",
+      "window": {
+       "isContextMenu": 1
+      },
+      "cmd": [
+       "podcast",
+       "items"
+      ],
+      "player": 0
+     },
+     "go": {
+      "itemsParams": "params",
+      "params": {
+       "menu": "podcast"
+      },
+      "cmd": [
+       "podcast",
+       "items"
+      ]
+     },
+     "add": {
+      "itemsParams": "params",
+      "params": {
+       "menu": "podcast"
+      },
+      "player": 0,
+      "cmd": [
+       "podcast",
+       "playlist",
+       "add"
+      ]
+     }
+    }
+   },
+   "item_loop": [
+    {
+     "addAction": "go",
+     "actions": {
+      "go": {
+       "params": {
+        "menu": "podcast",
+        "item_id": "14a6c8a2.0"
+       },
+       "cmd": [
+        "podcast",
+        "items"
+       ]
+      }
+     },
+     "text": "Musik"
+    },
+    {
+     "addAction": "go",
+     "actions": {
+      "go": {
+       "cmd": [
+        "podcast",
+        "items"
+       ],
+       "params": {
+        "menu": "podcast",
+        "item_id": "14a6c8a2.1"
+       }
+      }
+     },
+     "text": "Talk"
+    },
+    {
+     "actions": {
+      "go": {
+       "cmd": [
+        "podcast",
+        "items"
+       ],
+       "params": {
+        "menu": "podcast",
+        "item_id": "14a6c8a2.2"
+       }
+      }
+     },
+     "addAction": "go",
+     "text": "Sport"
+    }
+   ],
+   "count": 3,
+   "window": {
+    "windowStyle": "text_list"
+   }
+  }
+ },
+ "search_plain": {
+  "params": [
+   "00:04:20:2b:88:c8",
+   [
+    "search",
+    "items",
+    "0",
+    "6",
+    "menu:search"
+   ]
+  ],
+  "result": {
+   "offset": 0,
+   "base": {
+    "actions": {
+     "go": {
+      "params": {
+       "menu": "search"
+      },
+      "itemsParams": "params",
+      "cmd": [
+       "search",
+       "items"
+      ]
+     },
+     "add": {
+      "player": 0,
+      "cmd": [
+       "search",
+       "playlist",
+       "add"
+      ],
+      "itemsParams": "params",
+      "params": {
+       "menu": "search"
+      }
+     },
+     "add-hold": {
+      "params": {
+       "menu": "search"
+      },
+      "itemsParams": "params",
+      "cmd": [
+       "search",
+       "playlist",
+       "insert"
+      ],
+      "player": 0
+     },
+     "play": {
+      "itemsParams": "params",
+      "nextWindow": "nowPlaying",
+      "params": {
+       "menu": "search"
+      },
+      "player": 0,
+      "cmd": [
+       "search",
+       "playlist",
+       "play"
+      ]
+     },
+     "more": {
+      "player": 0,
+      "cmd": [
+       "search",
+       "items"
+      ],
+      "window": {
+       "isContextMenu": 1
+      },
+      "itemsParams": "params",
+      "params": {
+       "menu": "search"
+      }
+     },
+     "playControl": {
+      "window": {
+       "isContextMenu": 1
+      },
+      "cmd": [
+       "search",
+       "items"
+      ],
+      "player": 0,
+      "params": {
+       "_index": "0",
+       "_quantity": "6",
+       "menu": "search"
+      },
+      "itemsParams": "playControlParams"
+     }
+    }
+   },
+   "item_loop": [
+    {
+     "type": "text",
+     "style": "itemNoAction",
+     "text": "Leer",
+     "action": "none"
+    }
+   ],
+   "count": 1,
+   "window": {
+    "windowStyle": "text_list"
+   }
+  }
+ },
+ "search_rock": {
+  "params": [
+   "00:04:20:2b:88:c8",
+   [
+    "search",
+    "items",
+    "0",
+    "4",
+    "menu:search",
+    "search:rock"
+   ]
+  ],
+  "result": {
+   "offset": 0,
+   "title": "Suchergebnisse: rock",
+   "base": {
+    "actions": {
+     "playControl": {
+      "window": {
+       "isContextMenu": 1
+      },
+      "player": 0,
+      "cmd": [
+       "search",
+       "items"
+      ],
+      "itemsParams": "playControlParams",
+      "params": {
+       "_index": "0",
+       "_quantity": "4",
+       "menu": "search",
+       "search": "rock"
+      }
+     },
+     "add-hold": {
+      "itemsParams": "params",
+      "params": {
+       "menu": "search"
+      },
+      "player": 0,
+      "cmd": [
+       "search",
+       "playlist",
+       "insert"
+      ]
+     },
+     "play": {
+      "cmd": [
+       "search",
+       "playlist",
+       "play"
+      ],
+      "player": 0,
+      "nextWindow": "nowPlaying",
+      "params": {
+       "menu": "search"
+      },
+      "itemsParams": "params"
+     },
+     "more": {
+      "window": {
+       "isContextMenu": 1
+      },
+      "player": 0,
+      "cmd": [
+       "search",
+       "items"
+      ],
+      "itemsParams": "params",
+      "params": {
+       "menu": "search"
+      }
+     },
+     "add": {
+      "cmd": [
+       "search",
+       "playlist",
+       "add"
+      ],
+      "player": 0,
+      "params": {
+       "menu": "search"
+      },
+      "itemsParams": "params"
+     },
+     "go": {
+      "itemsParams": "params",
+      "params": {
+       "menu": "search"
+      },
+      "cmd": [
+       "search",
+       "items"
+      ]
+     }
+    }
+   },
+   "item_loop": [
+    {
+     "addAction": "go",
+     "actions": {
+      "go": {
+       "params": {
+        "item_id": "83f99031_rock.0",
+        "menu": "search"
+       },
+       "cmd": [
+        "search",
+        "items"
+       ]
+      }
+     },
+     "type": "link",
+     "text": "Künstler: ROCK"
+    },
+    {
+     "text": "Künstler: The Rock",
+     "type": "link",
+     "actions": {
+      "go": {
+       "cmd": [
+        "search",
+        "items"
+       ],
+       "params": {
+        "menu": "search",
+        "item_id": "83f99031_rock.1"
+       }
+      }
+     },
+     "addAction": "go"
+    },
+    {
+     "icon": "/imageproxy/http%3A%2F%2Fcdn-albums.tunein.com%2Fgn%2FDD4NCCJK5Wq.jpg/image.jpg",
+     "text": "Künstler: Bobby Rock",
+     "type": "link",
+     "addAction": "go",
+     "actions": {
+      "go": {
+       "cmd": [
+        "search",
+        "items"
+       ],
+       "params": {
+        "menu": "search",
+        "item_id": "83f99031_rock.2"
+       }
+      }
+     }
+    },
+    {
+     "icon": "/imageproxy/http%3A%2F%2Fcdn-albums.tunein.com%2Fgn%2F2G527TGQ0Jq.jpg/image.jpg",
+     "text": "Künstler: Rick Rock",
+     "type": "link",
+     "actions": {
+      "go": {
+       "params": {
+        "menu": "search",
+        "item_id": "83f99031_rock.3"
+       },
+       "cmd": [
+        "search",
+        "items"
+       ]
+      }
+     },
+     "addAction": "go"
+    }
+   ],
+   "count": 67,
+   "window": {
+    "windowStyle": "home_menu"
+   }
+  }
+ },
+ "artists_search": {
+  "params": [
+   "00:04:20:2b:88:c8",
+   [
+    "artists",
+    "0",
+    "5",
+    "search:radio"
+   ]
+  ],
+  "result": {
+   "artists_loop": [
+    {
+     "id": 20985,
+     "artist": "Radiohead",
+     "favorites_url": "db:contributor.name=Radiohead"
+    },
+    {
+     "id": 21902,
+     "artist": "The Radios",
+     "favorites_url": "db:contributor.name=The%20Radios"
+    },
+    {
+     "id": 24683,
+     "artist": "Radio Moscow",
+     "favorites_url": "db:contributor.name=Radio%20Moscow"
+    },
+    {
+     "id": 25650,
+     "artist": "Ultima Radio",
+     "favorites_url": "db:contributor.name=Ultima%20Radio"
+    },
+    {
+     "id": 19427,
+     "artist": "All India Radio",
+     "favorites_url": "db:contributor.name=All%20India%20Radio"
+    }
+   ],
+   "count": 21
+  }
+ }
+}

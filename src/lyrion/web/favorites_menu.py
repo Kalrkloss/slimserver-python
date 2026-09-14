@@ -91,11 +91,8 @@ WINDOW_TEXT_LIST: dict[str, Any] = {"windowStyle": "text_list"}
 #: ``window => {isContextMenu => 1}`` on Perl's ``more``/``playControl``.
 _IS_CONTEXT_MENU: dict[str, Any] = {"isContextMenu": 1}
 
-#: Default ``menu:`` params every base action carries.
-_BASE_PARAMS: dict[str, Any] = {"menu": MENU}
 
-
-def _play_action() -> dict[str, Any]:
+def _play_action(menu: str = MENU) -> dict[str, Any]:
     """``base.actions.play`` — the touch-to-play target.
 
     ``nextWindow: "nowPlaying"`` is the field SlimBrowserApplet.lua:2044
@@ -103,8 +100,8 @@ def _play_action() -> dict[str, Any]:
     """
     return {
         "player": 0,
-        "cmd": [MENU, "playlist", "play"],
-        "params": dict(_BASE_PARAMS),
+        "cmd": [menu, "playlist", "play"],
+        "params": {"menu": menu},
         "itemsParams": "params",
         "nextWindow": "nowPlaying",
     }
@@ -113,8 +110,9 @@ def _play_action() -> dict[str, Any]:
 def base_actions(*, playcontrol_params: dict[str, Any],
                  with_presets: bool = True,
                  all_touch_to_play: bool = False,
-                 use_play_control: bool = False) -> dict[str, dict]:
-    """The ``base.actions`` table of a favourites menu response.
+                 use_play_control: bool = False,
+                 menu: str = MENU) -> dict[str, dict]:
+    """The ``base.actions`` table of a feed menu response.
 
     ``playcontrol_params`` is the request's tagged-param copy
     (``XMLBrowser.pm:978`` ``$request->getParamsCopy()``);
@@ -123,21 +121,28 @@ def base_actions(*, playcontrol_params: dict[str, Any],
     ``$allTouchToPlay`` (``:1429-1431``); ``use_play_control`` mirrors
     ``_defeatDestructiveTouchToPlay`` (``:1951-1983``) for the ``go``
     remapping below.
+
+    ``menu`` is the feed's CLI tag: Perl builds every ``cmd`` from the query
+    name (``$query``, argument of ``cliQuery``) — ``favorites`` for the
+    favourites feed, ``local``/``music``/``search``/… for the Radio sub-feeds
+    (``Slim/Plugin/OPMLBased.pm:113``; live shapes, ``favorites_menu`` module
+    docstring plus the radio probes in
+    ``tests/fixtures/perl_radio_structure.json``).
     """
-    params = dict(_BASE_PARAMS)
+    params = {"menu": menu}
     actions: dict[str, dict[str, Any]] = {
         # NOTE: Perl's ``go`` action carries no ``player`` key.
-        "go": {"cmd": [MENU, "items"], "itemsParams": "params",
+        "go": {"cmd": [menu, "items"], "itemsParams": "params",
                "params": dict(params)},
-        "play": _play_action(),
-        "add": {"player": 0, "cmd": [MENU, "playlist", "add"],
+        "play": _play_action(menu),
+        "add": {"player": 0, "cmd": [menu, "playlist", "add"],
                 "params": dict(params), "itemsParams": "params"},
-        "add-hold": {"player": 0, "cmd": [MENU, "playlist", "insert"],
+        "add-hold": {"player": 0, "cmd": [menu, "playlist", "insert"],
                      "params": dict(params), "itemsParams": "params"},
-        "more": {"player": 0, "cmd": [MENU, "items"],
+        "more": {"player": 0, "cmd": [menu, "items"],
                  "window": dict(_IS_CONTEXT_MENU),
                  "itemsParams": "params", "params": dict(params)},
-        "playControl": {"player": 0, "cmd": [MENU, "items"],
+        "playControl": {"player": 0, "cmd": [menu, "items"],
                         "window": dict(_IS_CONTEXT_MENU),
                         "itemsParams": "playControlParams",
                         "params": dict(playcontrol_params)},
@@ -161,11 +166,13 @@ def base_actions(*, playcontrol_params: dict[str, Any],
 
 
 def folder_item(text: str, item_id: str,
-                icon_id: str = FAVORITES_ICON) -> dict[str, Any]:
-    """A favourites folder row (XMLBrowser.pm:1240-1255).
+                icon_id: str = FAVORITES_ICON,
+                menu: str = MENU) -> dict[str, Any]:
+    """A folder row (XMLBrowser.pm:1240-1255).
 
     Only ``actions.go`` + ``addAction: "go"`` — the tap drills into
-    ``favorites items item_id:<this id>``.
+    ``<menu> items item_id:<this id>``.  ``menu`` is the feed's CLI tag
+    (``favorites`` or the radio ``presets`` feed, see :func:`render_menu`).
     """
     return {
         "text": text,
@@ -173,8 +180,8 @@ def folder_item(text: str, item_id: str,
         "icon-id": icon_id,
         "actions": {
             "go": {
-                "cmd": [MENU, "items"],
-                "params": {"menu": MENU, "item_id": str(item_id)},
+                "cmd": [menu, "items"],
+                "params": {"menu": menu, "item_id": str(item_id)},
             },
         },
     }
@@ -246,7 +253,7 @@ def audio_item(text: str, item_id: str, *, url: str,
     return item
 
 
-def play_control_context_menu(item_id: str) -> dict[str, Any]:
+def play_control_context_menu(item_id: str, *, menu: str = MENU) -> dict[str, Any]:
     """Perl's answer to a tap on a touch-to-play favourites row (menu).
 
     Live Perl 192.168.1.90, ``favorites items useContextMenu:1
@@ -280,7 +287,7 @@ def play_control_context_menu(item_id: str) -> dict[str, Any]:
     def entry(cmd: str, style: str, text: str, next_window: str,
               player: int | None = 0) -> dict[str, Any]:
         go: dict[str, Any] = {
-            "cmd": [MENU, "playlist", cmd],
+            "cmd": [menu, "playlist", cmd],
             "params": {"item_id": item_id, "menu": 1},
             "nextWindow": next_window,
         }
@@ -308,6 +315,61 @@ def _window_for(items: list[dict]) -> dict[str, Any]:
     return dict(WINDOW_TEXT_LIST)
 
 
+def render_menu(menu: str, items: list[dict], *, title: str = "",
+                playcontrol_params: dict[str, Any] | None = None,
+                use_play_control: bool = False,
+                count: int | None = None, offset: int = 0,
+                empty_placeholder: bool = False) -> dict[str, Any]:
+    """The XMLBrowser menu envelope of *any* feed (``XMLBrowser.pm:1378-1445``).
+
+    Perl renders every ``menu:``-mode feed with the same envelope — the field
+    order and the four decisions below are taken verbatim:
+
+    * ``count`` last in the code and the loop named ``item_loop``
+      (``:1378-1379``);
+    * an *empty* feed gets the single ``Leer``/``EMPTY`` row and ``count`` 1
+      (``:837-846``, ``$menuMode && !$count && !$xmlBrowseInterimCM``) — only
+      for feeds that can be empty at all, hence the opt-in flag;
+    * ``with_presets`` ⇒ ``_jivePresetBase`` adds ``set-preset-0..9``
+      (``:1426-1427``, ``:1798-1808``);
+    * ``all_touch_to_play`` ⇒ ``base.go`` becomes ``base.play`` (or
+      ``base.playControl`` when the destructive tap is defeated, ``:1429-1431``);
+    * ``windowStyle`` from the items, else ``home_menu``/``text_list``
+      (``:1434-1441``).
+
+    ``menu`` is the feed's CLI tag (Perl's ``$query``): the ``cmd`` of every
+    base action and of every item row is built from it, so the same envelope
+    serves ``favorites`` and each Radio sub-feed
+    (``Slim/Plugin/OPMLBased.pm:113``).
+    """
+    if not items and empty_placeholder:
+        from lyrion.web import menus as _menus
+
+        items = [_menus.empty_placeholder_item()]
+    touch_rows = [it for it in items
+                  if it.get("goAction") in ("play", "playControl")]
+    all_touch_to_play = bool(items) and len(touch_rows) == len(items)
+    with_presets = any("presetParams" in it for it in items)
+    envelope: dict[str, Any] = {
+        "offset": offset,
+        "base": {
+            "actions": base_actions(
+                playcontrol_params=dict(playcontrol_params or {}),
+                with_presets=with_presets,
+                all_touch_to_play=all_touch_to_play,
+                use_play_control=use_play_control,
+                menu=menu,
+            ),
+        },
+        "item_loop": items,
+        "count": len(items) if count is None else count,
+        "window": _window_for(items),
+    }
+    if title:
+        envelope["title"] = title
+    return envelope
+
+
 def render_favorites_menu(items: list[dict], *,
                           title: str = "Favorites",
                           playcontrol_params: dict[str, Any] | None = None,
@@ -322,25 +384,9 @@ def render_favorites_menu(items: list[dict], *,
     (:func:`audio_item`) and Perl's ``base.go`` remapping
     (``:1430``).
     """
-    touch_rows = [it for it in items
-                  if it.get("goAction") in ("play", "playControl")]
-    all_touch_to_play = bool(items) and len(touch_rows) == len(items)
-    with_presets = any("presetParams" in it for it in items)
-    return {
-        "window": _window_for(items),
-        "offset": 0,
-        "count": len(items),
-        "item_loop": items,
-        "title": title,
-        "base": {
-            "actions": base_actions(
-                playcontrol_params=dict(playcontrol_params or {}),
-                with_presets=with_presets,
-                all_touch_to_play=all_touch_to_play,
-                use_play_control=use_play_control,
-            ),
-        },
-    }
+    return render_menu(MENU, items, title=title,
+                       playcontrol_params=playcontrol_params,
+                       use_play_control=use_play_control)
 
 
 __all__ = [
@@ -353,4 +399,5 @@ __all__ = [
     "folder_item",
     "play_control_context_menu",
     "render_favorites_menu",
+    "render_menu",
 ]
