@@ -331,6 +331,71 @@ def test_client_advice_timeout_zero_answers_the_poll_immediately():
     assert connect_timeout({}) == 60.0          # Perl's LONG_POLLING_TIMEOUT
 
 
+def test_asgi_streaming_connect_ack_leads_the_batch_like_perl():
+    """The ASGI transport orders a connect batch exactly like Perl's.
+
+    Perl stores the (re)connect reply in the response's ``first_event`` slot
+    (``Cometd.pm:269-271``, "We want the /meta/(re)connect response to always
+    be the first event sent in the response") and ``sendResponse`` unshifts
+    that slot in front of the batch it has already collected
+    (``Cometd.pm:642-650``).  Both transports must therefore lead with the
+    connect ack; this path used to append it AFTER the batch acks (review
+    P3-4, documented as a deviation).  A Bayeux client reads ``messages[0]``
+    as its connect answer.
+    """
+
+    async def run():
+        mgr, _rec = _manager()
+        cid, _hs = await _handshake_async(mgr)
+        tr = _Transport([
+            {"channel": "/meta/connect", "clientId": cid, "id": 2,
+             "connectionType": "streaming"},
+            {"channel": "/meta/subscribe", "clientId": cid, "id": 3,
+             "subscription": f"/{cid}/**"},
+        ])
+        task = asyncio.create_task(
+            _handle_cometd(mgr, "/cometd", tr.receive, tr.send))
+        try:
+            await asyncio.wait_for(tr.first_chunk.wait(), timeout=5)
+            reply = json.loads(tr.chunks[0])
+        finally:
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001, S110
+                pass
+        return reply
+
+    reply = asyncio.run(run())
+    channels = [m.get("channel") for m in reply]
+    assert channels[:2] == ["/meta/connect", "/meta/subscribe"], channels
+    assert reply[0]["successful"] is True
+    assert reply[0]["id"] == 2
+
+
+def test_asgi_long_poll_connect_ack_leads_the_batch_like_perl():
+    """Same ``first_event`` rule on the long-polling transport.
+
+    Perl's long-polling response is written by the ``sendResponse`` timer and
+    runs through the SAME unshift (``Cometd.pm:642-650``), so the connect ack
+    is ``messages[0]`` here too.
+    """
+    mgr, _rec = _manager()
+    cid, _hs = _asgi_handshake(mgr)
+    tr = _post(mgr, [
+        {"channel": "/meta/connect", "clientId": cid, "id": 2,
+         "connectionType": "long-polling", "advice": {"timeout": 0}},
+        {"channel": "/meta/subscribe", "clientId": cid, "id": 3,
+         "subscription": f"/{cid}/**"},
+    ])
+    reply = tr.json()
+    channels = [m.get("channel") for m in reply]
+    assert channels[0] == "/meta/connect", channels
+    assert reply[0]["successful"] is True
+    assert reply[0]["id"] == 2
+    assert "/meta/subscribe" in channels
+
+
 def test_streaming_connect_uses_retry_delay_interval():
     """Perl :45/:278: streaming advice interval = RETRY_DELAY (5000 ms).
 

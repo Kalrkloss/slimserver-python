@@ -167,11 +167,18 @@ async def _handle_streaming_connect(
     # ``advice.timeout: 60`` (60 ms!) and ``interval: 0`` for a streaming
     # connect, while the native stream already carried 60000/5000.
     ack = connect_ack(msg, cid)
-    # Perl puts the (re)connect reply FIRST in the response (Cometd.pm:279-292,
-    # "first_event"). We keep the shipped order — batch acks, then the connect
-    # ack — because the Android/libcometd clients could not be exercised in
-    # this suite; the deviation is documented, not silently changed (P3-4).
-    first = list(replies) + [ack]
+    # Perl puts the (re)connect reply FIRST in the response: it is stored in
+    # the response's ``first_event`` slot (Cometd.pm:269-271, "We want the
+    # /meta/(re)connect response to always be the first event sent in the
+    # response"), and ``sendResponse`` unshifts that slot in front of the
+    # already collected batch (Cometd.pm:642-650).  Both transports must
+    # therefore lead with the connect ack — the native frontend does
+    # (networking/cometd_stream.py, commit 2f0a19231) and the ASGI path used
+    # to append it AFTER the batch acks (review P3-4, "documented, not
+    # silently changed"): a Bayeux client that reads ``messages[0]`` as its
+    # connect answer saw a /meta/subscribe ack there instead.  Live Perl
+    # 9.1.1 answers ``[connect, /meta/subscribe]`` with connect first.
+    first = [ack] + list(replies)
     events = await cometd.wait_for_events(cid, timeout=0)
     first.extend(events)
 
@@ -393,8 +400,12 @@ async def _handle_cometd(cometd: CometdManager, path: str, receive, send) -> Non
                     cid, timeout=connect_timeout(msg))
                 # Perl Cometd.pm:271-280 (first_event): the same shared ack the
                 # native stream writes — interval 0 for long-polling,
-                # timeout 60000 ms, RFC1123 timestamp.
-                replies.append(connect_ack(msg, cid))
+                # timeout 60000 ms, RFC1123 timestamp.  It leads the response:
+                # ``sendResponse`` unshifts the first_event slot in front of
+                # the batch and the pending events (Cometd.pm:642-650), so the
+                # connect ack is messages[0] on this transport too — Perl
+                # answers ``[connect, /meta/subscribe]`` with connect first.
+                replies.insert(0, connect_ack(msg, cid))
                 replies.extend(events)
                 # A completed poll restarts Perl's autokill window.
                 cometd.touch(cid)
