@@ -94,21 +94,43 @@ def test_status_required_types(server_up):
     assert r.get("playlist repeat") in (0, 1, 2)
 
 
-def test_status_duration_present(server_up):
-    """A live stream must report a non-null duration. A missing (null)
-    duration makes SqueezePlay choke and the Now-Playing window never
-    opens; a 0 crashes SqueezeClient's seek slider. Regression: the
-    duration-null change."""
+def test_status_duration_follows_the_perl_truthy_length_rule(server_up):
+    """``duration`` exists only for a truthy song length (Perl rule).
+
+    ``Slim/Control/Queries.pm:4100-4102``::
+
+        if (my $dur = $song->duration()) {
+            $dur += 0;
+            $request->addResult('duration', $dur);
+        }
+
+    Live Perl 9.1.1 (read-only, 2026-09-14): a radio stream with no known
+    length answers ``status`` WITHOUT a ``duration`` key (its
+    ``remoteMeta``/``playlist_loop`` duration is the string "0"), a stream
+    with a known length answers ``"duration":7``.  A fabricated value (the
+    elapsed position, or a 1 s placeholder) is what killed SqueezeClient
+    (``IllegalStateException: Slider value(1006.49963) … valueTo(1006.497)``,
+    NowPlayingFragment.kt:440-479) and pinned SqueezePlay's progress bar.
+    """
     r = lms(TEST_PLAYER, ["status", "-", "1"])
     if r.get("mode") == "stop":
         pytest.skip("player stopped — play something to exercise the stream path")
     dur = r.get("duration")
-    assert dur is not None, "duration must be present (null breaks SqueezePlay window)"
+    if dur is None:
+        # no known length: Perl omits the key, so must we — and the
+        # item-level duration must say "unknown" (0/empty), never a value.
+        item = (r.get("playlist_loop") or [{}])[0]
+        meta = r.get("remoteMeta") or {}
+        known = {str(item.get("duration", "")), str(meta.get("duration", ""))}
+        known.discard("")
+        assert not (known - {"0", "0.0", "None"}), (
+            f"duration key missing although the item knows a length: {known}")
+        return
     try:
         durf = float(dur)
     except (TypeError, ValueError):
         pytest.fail(f"duration must be numeric, got {dur!r}")
-    assert durf > 0, "duration must be > 0 (0 crashes SqueezeClient seek slider)"
+    assert durf > 0, "a published duration must be > 0 (Perl's truthy test)"
 
 
 def test_status_item_loop_has_text_track_artist_album(server_up):
@@ -156,13 +178,18 @@ def test_status_time_and_duration_are_numeric(server_up):
     elapsed position (that pinned the bar at maximum and froze the time)."""
     r = lms(TEST_PLAYER, ["status", "-", "1", "menu:menu", "useContextMenu:1"])
     assert r.get("time") is not None and float(r["time"]) >= 0, f"bad time {r.get('time')!r}"
-    assert r.get("duration") is not None and float(r["duration"]) > 0, (
-        f"duration must be > 0, got {r.get('duration')!r}")
+    # Perl publishes `duration` only for a truthy $song->duration()
+    # (Queries.pm:4100-4102) — a stream without a known length has no key,
+    # but a published one is always > 0 and (for a local track) the DB length.
+    if r.get("duration") is not None:
+        assert float(r["duration"]) > 0, (
+            f"a published duration must be > 0, got {r.get('duration')!r}")
     loop = r.get("item_loop") or []
     if r.get("mode") == "play" and loop and loop[0].get("trackType") == "local":
         item_dur = float(loop[0].get("duration") or 0)
         # a known track length must NOT be replaced by the elapsed position
         if item_dur > 0:
+            assert r.get("duration") is not None, "a local track with a known length must publish duration"
             assert float(r["duration"]) == item_dur, (
                 f"local duration {r['duration']} must be the track length "
                 f"{item_dur}, not the elapsed position {r.get('time')}")

@@ -141,9 +141,14 @@ def test_pause_push_carries_mode_pause_and_frozen_time():
         "a pushed status that still says 'play' leaves the icon and the "
         "client-side timer running")
     assert pushed["time"] == pytest.approx(128.271)
-    # A remote stream without metadata reports the frozen position as its
-    # duration (api.py:4612-4622) — the value Squeezer puts on the bar.
-    assert pushed["duration"] == pytest.approx(128.271)
+    # The stream reports no length, so `duration` must be ABSENT — Perl adds
+    # the key only for a truthy $song->duration() (Queries.pm:4100-4102), and
+    # live Perl 9.1.1 answers exactly that for a metadata-less radio stream
+    # (read-only probe 2026-09-14).  The old port put the frozen position in
+    # it, which is what killed SqueezeClient's seek slider
+    # (Slider value … vs valueTo …).
+    assert "duration" not in pushed, (
+        f"no known stream length ⇒ no duration key, got {pushed['duration']!r}")
     assert pushed["power"] == 1
 
 

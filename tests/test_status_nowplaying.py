@@ -200,21 +200,63 @@ def test_paused_local_track_keeps_position(tmp_path, monkeypatch):
 
 
 # ----------------------------------------------------------------------
-# (b) stream: non-zero duration (existing rule) and a `time`
+# (b) stream: no `duration` key when the stream reports no length
 # ----------------------------------------------------------------------
-def test_stream_has_nonzero_duration_and_time(tmp_path, monkeypatch):
+def test_stream_without_duration_omits_the_duration_key(tmp_path, monkeypatch):
+    """Perl publishes `duration` only for a truthy length.
+
+    ``Slim/Control/Queries.pm:4100-4102``::
+
+        if (my $dur = $song->duration()) {
+            $dur += 0;
+            $request->addResult('duration', $dur);
+        }
+
+    Live Perl 9.1.1 (read-only, 2026-09-14, player ``00:04:20:2b:88:c8``,
+    stream "Dj Fada 2 - Life Breath (oct12)", ``remoteMeta.duration`` and
+    ``playlist_loop[0].duration`` = "0"): ``status - 1 tags:cdltoK`` carries
+    **no** ``duration`` key — while ``remoteMeta``/``playlist_loop`` still
+    report the stream duration as the string "0".  Synthesising one (elapsed
+    position / 1 s) made SqueezeClient's seek slider die with
+    ``java.lang.IllegalStateException: Slider value(1006.49963) … valueTo
+    (1006.497)`` (NowPlayingFragment.kt:440-479); with no known length the
+    client takes Perl's disabled-slider branch.
+    """
     monkeypatch.setattr(api_mod, "_library_db_path", lambda: _db(tmp_path))
     player = _player([STREAM_URL], 0, mode="play", elapsed=17.0,
                      current_title="Live Radio", current_url=STREAM_URL)
 
     r = _status(player)
 
-    assert r["duration"] is not None and r["duration"] > 0
+    assert "duration" not in r, f"a stream without a length must omit it: {r.get('duration')!r}"
     assert "time" in r and r["time"] == 17.0
     # streams get the analogous item params (Perl: id+0 == 0 for a URL)
     params = r["item_loop"][0]["params"]
     assert params["track_id"] == 0
     assert params["playlist_index"] == 0
+
+
+def test_perl_duration_rule_matches_queries_pm_4100(tmp_path, monkeypatch):
+    """``_perl_status_duration`` is Perl's ``if (my $dur = $song->duration())``.
+
+    ``Slim/Control/Queries.pm:4100-4102`` (live Perl 9.1.1, 2026-09-14):
+    alarm stream with 7 s → ``"duration":7``; radio stream with no known
+    length → the key is absent; a local track → the DB length (245.5 stays
+    fractional, an integral length is numified like ``$dur += 0``).
+    """
+    monkeypatch.setattr(api_mod, "_library_db_path", lambda: _db(tmp_path))
+    d = api_mod._perl_status_duration
+
+    assert d(7.0) == 7 and isinstance(d(7.0), int)     # live: "duration":7
+    assert d("7") == 7 and isinstance(d("7"), int)
+    assert d(245.5) == 245.5                          # DB LENGTH, fractional
+    assert d(0) is None and d(0.0) is None            # falsy → no key
+    assert d(None) is None and d("") is None
+    assert d("kaputt") is None
+
+    # the DB length of a real local track flows through unchanged
+    player = _player([12], 0, mode="play", elapsed=42.5)
+    assert _status(player)["duration"] == DUR[12]
 
 
 # ----------------------------------------------------------------------

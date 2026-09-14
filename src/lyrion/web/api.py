@@ -117,6 +117,43 @@ def _library_db_path() -> str:
 
 _LIBRARY_DB = "/root/.lyrion/Lyrion/Prefs/lyrion.db"
 
+
+def _perl_status_duration(value: Any):
+    """Perl's ``duration`` rule for ``status`` — ``Queries.pm:4100-4102``.
+
+    ``Slim/Control/Queries.pm``::
+
+        if (my $dur = $song->duration()) {
+            $dur += 0;
+            $request->addResult('duration', $dur);
+        }
+
+    The key exists only for a TRUTHY song length: the DB length (``LENGTH``
+    tag) of a local track, the parsed length of a remote stream — and it is
+    absent when that length is 0/undef.  ``$dur += 0`` numifies, so an
+    integral length is published as an integer.
+
+    Live Perl 9.1.1 (read-only, 2026-09-14, ``status - 1 tags:cdltoK``):
+    stream "Dj Fada 2 - Life Breath (oct12)" (no known length) → no
+    ``duration`` key at all; stream ``…/alarm.mp3`` (7 s) → ``"duration":7``;
+    a local track → its DB length.
+
+    Returns ``None`` when Perl would not publish the key.  NEVER synthesise a
+    value from the elapsed position or a placeholder: SqueezeClient derives its
+    seek slider's ``valueTo`` from ``duration`` and aborts with
+    ``java.lang.IllegalStateException: Slider value(1006.49963) … valueTo
+    (1006.497)`` (NowPlayingFragment.kt:440-479) when the position outgrows a
+    fabricated ``valueTo``; with no known length the clients use Perl's
+    disabled-slider branch.
+    """
+    try:
+        dur = float(value or 0)
+    except (TypeError, ValueError):
+        return None
+    if dur <= 0:
+        return None
+    return int(dur) if dur.is_integer() else dur
+
 #: Perl's browse-session handle: ``XMLBrowser::getSID`` accepts any token
 #: starting with 8 hex digits (``Slim/Control/XMLBrowser.pm:1739-1741``) and
 #: ``getSID``/``createUUID`` builds it as a *short digest*
@@ -5565,23 +5602,34 @@ class JSONRPCAPI:
         # (tags l/a) und wurden oben dorthin verschoben.
         if not tags or True:  # cheap: keep for local UI consumers
             result.setdefault("title", cur_info.get("title", ""))
-            # Duration: for a LOCAL track the real DB length (Perl
-            # `$song->duration()`, Queries.pm:4101) — never 0 and never the
-            # elapsed position (that pinned SqueezePlay's progress bar at
-            # maximum and froze the remaining-time display). For a live
-            # stream keep the non-zero rule: leaving it out (null) makes
-            # SqueezePlay's status processing choke and prevents the
-            # Now-Playing window from opening, while a 0 makes
-            # SqueezeClient's seek-slider crash (valueTo=0.1 vs growing
-            # position). Using the position keeps valueTo >= value for
-            # SqueezeClient while still giving SqueezePlay a duration.
-            dur = float(cur_info.get("duration", 0) or 0)
-            pos = float(elapsed or 0)
-            if dur <= 0 and cur_local is None and pos > 0:
-                dur = pos
-            if dur <= 0:
-                dur = 1.0
-            result["duration"] = dur
+            # Duration: Perl publishes the key ONLY when the current song
+            # reports a truthy length —
+            #   Slim/Control/Queries.pm:4100-4102
+            #       if (my $dur = $song->duration()) {
+            #           $dur += 0;
+            #           $request->addResult('duration', $dur);
+            #       }
+            # — i.e. the DB length (LENGTH tag) for a local track and the
+            # parsed length of a remote stream, and NOTHING AT ALL when that
+            # length is 0/undef.  Live Perl 9.1.1 (read-only, 2026-09-14):
+            #   * player 00:04:20:2b:88:c8, stream "Dj Fada 2 - Life Breath
+            #     (oct12)" (remoteMeta/playlist_loop duration "0") →
+            #     `status - 1 tags:cdltoK` has NO 'duration' key;
+            #   * player ca:c8:c7:26:6d:38, stream …/alarm.mp3 (length known,
+            #     7 s) → `"duration":7`.
+            # Never synthesise one from the elapsed position or a 1 s
+            # placeholder: SqueezeClient builds its seek slider from
+            # `duration` as valueTo and dies with
+            #   java.lang.IllegalStateException: Slider value(1006.49963) …
+            #   valueTo(1006.497)
+            # (NowPlayingFragment.kt:440-479) when the position runs away
+            # from a fabricated valueTo, and SqueezePlay's progress bar pins
+            # at maximum.  With no known length the clients take Perl's
+            # disabled-slider branch, which is exactly what the Perl server
+            # makes them do.
+            dur = _perl_status_duration(cur_info.get("duration"))
+            if dur is not None:
+                result["duration"] = dur
             # Never emit an EMPTY item_loop: Jive's `_whatsPlaying`
             # (share/jive/jive/slim/Player.lua:272-273) does
             # `if obj.item_loop then obj.item_loop[1].params ...` — with an
