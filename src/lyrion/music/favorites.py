@@ -87,31 +87,44 @@ class FavoritesManager:
     # ── queries ────────────────────────────────────────────────────────
 
     async def list_items(self, parent_id: Optional[int] = None) -> list[dict[str, Any]]:
-        """Return favorites under parent_id (None = root), folders first
-        (alphabetical), then streams (alphabetical)."""
+        """Return favorites under parent_id (None = root), in the OPML order.
+
+        Perl keeps the document order of the ``favorites.opml`` outlines: the
+        Favorites plugin loads the file with ``XML::Simple`` (``SuppressEmpty``
+        / ``forcearray => ['outline','body']``, ``Slim/Plugin/Favorites/Opml.pm:74-76``),
+        which preserves the outline arrays verbatim, and walks them as they
+        came for the Jive menu — Perl never re-sorts favourites by title or by
+        "folders first".  Live Perl 9.1.1 (2026-09-14, read-only
+        ``favorites items 0 100``): ``Chill, Nachrichten, Lokal, Dub, Trance,
+        Rock, <2 streams>`` — exactly the OPML/DB order, while this port
+        answered ``Chill, Dub, Lokal, Nachrichten, Rock, Trance, …``
+        (folders first, then title).
+
+        ``position`` is that document order; ``id`` breaks the tie for rows
+        an older import left at ``position = 0`` (they were inserted in
+        document order, so id order *is* the OPML order for them)."""
         await ensure_opml_imported()
         async with self._db_session() as session:
             stmt = (
                 select(Favorite)
                 .where(Favorite.parent_id == parent_id)
-                # Folders (url IS NULL) sort before streams; both groups
-                # alphabetically (case-insensitive).
-                .order_by(
-                    Favorite.url.is_not(None),
-                    func.lower(Favorite.title),
-                )
+                .order_by(Favorite.position, Favorite.id)
             )
             result = await session.execute(stmt)
             return [self._fav_to_dict(f) for f in result.scalars().all()]
 
     async def list_tree(self) -> list[dict[str, Any]]:
-        """Return the full tree (root items with nested children)."""
+        """Return the full tree (root items with nested children).
+
+        Same ordering as :meth:`list_items` (Perl's OPML document order); the
+        previous ``position, title`` sort disagreed with it inside one process.
+        """
         async with self._db_session() as session:
             stmt = (
                 select(Favorite)
                 .options(selectinload(Favorite.children))
                 .where(Favorite.parent_id.is_(None))
-                .order_by(Favorite.position, Favorite.title)
+                .order_by(Favorite.position, Favorite.id)
             )
             result = await session.execute(stmt)
             return [self._fav_to_dict(f, include_children=True) for f in result.scalars().all()]
@@ -175,8 +188,6 @@ class FavoritesManager:
     async def _next_position(
         self, session: Any, parent_id: Optional[int]
     ) -> int:
-        from sqlalchemy import func
-
         stmt = select(func.coalesce(func.max(Favorite.position), -1)).where(
             Favorite.parent_id == parent_id
         )
