@@ -124,6 +124,24 @@ def _spawn_server(tmp_path_factory):
         proc.wait()
 
 
+@pytest.fixture(autouse=True)
+def _isolate_streaming_controllers():
+    """Give every test the controller state of a fresh player.
+
+    Perl keeps a StreamingController per player and drops it with the player
+    (``Slim/Player/StreamingController.pm``); the port mirrors that per-player
+    state, but tests share one process, so a controller left behind by an
+    earlier test answers for the same MAC. Measured: ``test_strm_idempotency``
+    only fails when the file runs twice in a row (the later test saw the
+    earlier test's ``mode``). Reset on both sides of each test.
+    """
+    from lyrion.player import streaming
+
+    streaming.reset()
+    yield
+    streaming.reset()
+
+
 def pytest_configure(config):
     config.addinivalue_line(
         "markers",
