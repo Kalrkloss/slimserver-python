@@ -84,6 +84,32 @@ _TITLES: dict[str, tuple[str, int, str, int]] = {
     "PLAYLIST_SHORT": ("Liste", 608, "Playlist", 609),
     "JIVE_TURN_PLAYER_OFF": ("%s ausschalten", 22729, "Turn Off %s", 22730),
     "JIVE_TURN_PLAYER_ON": ("%s einschalten", 22712, "Turn On %s", 22713),
+    # Item-info rows (``XMLBrowser.pm:245-252`` ``@mapAttributes``) and the
+    # Favorites play-control menu texts (``_playlistControlContextMenu``
+    # ``XMLBrowser.pm:1811-1873`` / ``Favorites/Plugin.pm``).
+    "TITLE": ("Titel", 12618, "Title", 12619),
+    "URL": ("URL", 18121, "URL", 18122),
+    "ADD_TO_END": ("Am Ende hinzufügen", 24040, "Add to End", 24041),
+    "PLAY_NEXT": ("Als nächstes wiedergeben", 11463, "Play Next", 11464),
+    "JIVE_DELETE_FROM_FAVORITES": ("Favorit löschen", 23925,
+                                   "Delete Favorite", 23926),
+    "PLAY": ("Wiedergabe", 11083, "Play", 11084),
+    # mode:search menu (``XMLBrowser.pm:1213-1223`` input block) and the
+    # EMPTY placeholder Perl shows for an empty feed (``:841-846``).
+    "SEARCHING": ("Suchvorgang läuft ...", 17511, "Searching...", 17512),
+    "JIVE_SEARCHFOR_HELP": (
+        "Wählen Sie den gewünschten Buchstaben mit dem Rad und drücken Sie "
+        "zum Bestätigen die mittlere Taste. Drücken Sie zum Starten der "
+        "Suche die mittlere Taste erneut.", 24089,
+        "Use the scroll wheel to change letters, then press the center "
+        "button to select that letter. Press the center button again to "
+        "start your search.", 24090),
+    "INSERT": ("Einfügen", 24429, "Insert", 24430),
+    "DELETE": ("Löschen", 16735, "Delete", 16736),
+    "EMPTY": ("Leer", 526, "Empty", 527),
+    "PLAYLISTS": ("Wiedergabelisten", 752, "Playlists", 753),
+    "BROWSE_BY_WORK": ("Werke", 14797, "Works", 14798),
+    "BROWSE_BY_SONG": ("Titel", 14772, "Songs", 14773),
 }
 
 #: browselibrary mode → the feed's ``info`` command (``more`` action target).
@@ -109,6 +135,136 @@ GO_MODE: dict[str, str] = {
     "albums": "tracks", "artists": "albums", "genres": "albums",
     "years": "albums", "folder": "bmf", "tracks": "tracks",
 }
+
+
+# ── Favorites: leaf drill + interim context menu (XMLBrowser) ────────────
+#
+# Perl's Favorites feed is an OPML feed; a tap on a *leaf* (a station row)
+# never descends into children.  Two different answers come back, depending
+# on the tokens the controller sends (all measured live, read-only, Perl
+# 9.1.1 192.168.1.90:9000, ``favorites items`` with the ids Perl itself
+# handed out):
+#
+#  1. ``… menu:favorites item_id:<leaf> useContextMenu:1`` — the plain
+#     context drill.  Perl answers the item's *info rows*, built from
+#     ``@mapAttributes`` (``XMLBrowser.pm:245-252``: ``key => 'name', args =>
+#     ['TITLE']`` and ``key => 'url', args => ['URL']`` rendered as
+#     ``sprintf('%s: %s', string(TOKEN), $value)``) — exactly two rows
+#     ("Titel: <name>", "URL: <url>"), both ``style: itemNoAction`` +
+#     ``action: "none"``, and an envelope with **only** ``offset``,
+#     ``count`` and ``item_loop`` (no ``base``/``title``/``window``):
+#
+#         {"result": {"offset": 0, "count": 2, "item_loop": [
+#            {"text": "Titel: 1Mix Radio EDM Stream",
+#             "style": "itemNoAction", "action": "none"},
+#            {"text": "URL: http://opml.radiotime.com/Tune.ashx?id=…",
+#             "style": "itemNoAction", "action": "none"}]}}
+#
+#  2. ``… item_id:<leaf> isContextMenu:1 touchToPlay:<leaf>
+#     touchToPlaySingle:1 useContextMenu:1 xmlBrowseInterimCM:1`` — the tap
+#     on a touch-to-play row.  ``XMLBrowser.pm:854-859`` prepends
+#     ``_playlistControlContextMenu`` (``:1811-1873``) while the feed's own
+#     rows follow, which is Perl's six-row answer: add / insert / play
+#     (``favorites playlist <add|insert|play>``), the feed's delete row
+#     (``Slim/Plugin/Favorites/Plugin.pm`` ``jivefavorites delete``) and the
+#     two info rows — again with only ``offset``/``count``/``item_loop``.
+#
+# Before this port answered those two requests with the (empty) *child list*
+# of the leaf, so a controller that taps a favourite station got an empty
+# menu and never reached "Wiedergabe" ("Favoriten starten geht nicht").
+
+#: Perl's item-info string tokens (``XMLBrowser.pm:245-252``) with their
+#: strings.txt DE/EN columns — resolved through :func:`menu_title`.
+_INFO_TITLES: tuple[str, ...] = ("TITLE", "URL")
+
+
+def leaf_info_rows(name: str, url: str) -> list[dict]:
+    """Perl's info rows of a favourites **leaf** item (``XMLBrowser.pm:245-252``).
+
+    Two rows, in Perl's field order (``name`` before ``url`` in
+    ``@mapAttributes``): ``TITLE: <name>`` then ``URL: <url>``; both carry
+    ``style: itemNoAction`` + ``action: "none"`` (Perl's text-item marking,
+    ``XMLBrowser.pm:1172-1175``) and no ``type``.
+    """
+    rows = [{"text": f"{menu_title('TITLE')}: {name}",
+             "style": "itemNoAction", "action": "none"}]
+    if url:
+        rows.append({"text": f"{menu_title('URL')}: {url}",
+                     "style": "itemNoAction", "action": "none"})
+    return rows
+
+
+def leaf_info_menu(name: str, url: str) -> dict:
+    """The answer envelope of (1) above: offset/count/item_loop only."""
+    rows = leaf_info_rows(name, url)
+    return {"offset": 0, "count": len(rows), "item_loop": rows}
+
+
+def interim_context_menu(item_id: str, *, name: str = "", url: str = "",
+                         icon: str = "", favorite_type: str = "audio",
+                         parser: Any = None, item_index: str = "") -> dict:
+    """The answer of (2): the play-control menu of a tapped favourites row.
+
+    Perl (``XMLBrowser.pm:854-859`` + ``_playlistControlContextMenu``
+    ``:1811-1873`` + the Favorites feed's own rows) — live, read-only
+    ``favorites items 0 10000000 menu:favorites item_id:<leaf>
+    isContextMenu:1 touchToPlay:<leaf> touchToPlaySingle:1 useContextMenu:1
+    xmlBrowseInterimCM:1`` gave ``count`` 6 with exactly these rows:
+
+        [{"text": "Am Ende hinzufügen", "style": "item_add",
+          "actions": {"go": {"player": 0, "cmd": ["favorites","playlist","add"],
+                             "params": {"item_id": "<id>", "menu": 1},
+                             "nextWindow": "parentNoRefresh"}}},
+         {"text": "Als nächstes wiedergeben", "style": "itemNoAction",
+          "actions": {"go": {…"insert"…}}},
+         {"text": "Wiedergabe", "style": "item_play",
+          "actions": {"go": {…"play"…, "nextWindow": "nowPlaying"}}},
+         {"text": "Favorit löschen", "style": "itemNoAction",
+          "actions": {"go": {"player": 0, "cmd": ["jivefavorites","delete"],
+                             "params": {…url/title/type/icon/parser/item_id…}}}},
+         {"text": "Titel: <name>", …}, {"text": "URL: <url>", …}]
+
+    ``item_index`` is the numeric index Perl sends as ``params.item_id`` of
+    the delete row (its item id minus the browse-session handle).
+    """
+    item_id = str(item_id)
+
+    def control(cmd: str, style: str, text: str, next_window: str) -> dict:
+        return {
+            "text": text,
+            "style": style,
+            "actions": {"go": {
+                "player": 0,
+                "cmd": ["favorites", "playlist", cmd],
+                "params": {"item_id": item_id, "menu": 1},
+                "nextWindow": next_window,
+            }},
+        }
+
+    delete_params: dict = {
+        "url": url,
+        "type": favorite_type,
+        "isContextMenu": 1,
+        "icon": icon,
+        "parser": parser,
+        "title": name,
+        "item_id": str(item_index),
+    }
+    rows = [
+        control("add", "item_add", menu_title("ADD_TO_END"),
+                "parentNoRefresh"),
+        control("insert", "itemNoAction", menu_title("PLAY_NEXT"),
+                "parentNoRefresh"),
+        control("play", "item_play", menu_title("PLAY"), "nowPlaying"),
+        {
+            "text": menu_title("JIVE_DELETE_FROM_FAVORITES"),
+            "style": "itemNoAction",
+            "actions": {"go": {"params": delete_params, "player": 0,
+                               "cmd": ["jivefavorites", "delete"]}},
+        },
+    ]
+    rows.extend(leaf_info_rows(name, url))
+    return {"offset": 0, "count": len(rows), "item_loop": rows}
 
 
 def menu_title(token: str) -> str:
@@ -248,6 +404,54 @@ def base_actions(kind: str, filters: dict | None = None, start: int = 0,
     (``XMLBrowser.pm:1131-1135,1427``) — live: albums/artists/years/tracks
     have it, genres do not.
     """
+    if kind in ("search", "playlists"):
+        # Perl's modeless BrowseLibrary feeds (``_search`` / ``_playlists``)
+        # publish their base.actions from the feed's own common variables:
+        # ``params`` (used by go/play/add/add-hold/more) and
+        # ``playControlParams`` — *not* ``commonParams`` like the library
+        # modes.  Live Perl 9.1.1 (read-only 2026-09-14)
+        # ``browselibrary items 0 10 menu:1 mode:search`` /
+        # ``… mode:playlists`` gave exactly::
+        #
+        #   go     {cmd:["browselibrary","items"], itemsParams:"params",
+        #           params:{menu:"browselibrary", mode:<kind>}}   (no player)
+        #   play   {player:0, cmd:["browselibrary","playlist","play"],
+        #           itemsParams:"params", nextWindow:"nowPlaying",
+        #           params:{menu:"browselibrary", mode:<kind>}}
+        #   add    {player:0, cmd:["browselibrary","playlist","add"], …}
+        #   add-hold {player:0, cmd:["browselibrary","playlist","insert"], …}
+        #   more   {player:0, cmd:["browselibrary","items"], window:
+        #           {isContextMenu:1}, itemsParams:"params", params:{…}}
+        #   playControl {player:0, cmd:["browselibrary","items"],
+        #           window:{isContextMenu:1}, itemsParams:"playControlParams",
+        #           params:{_index:<start>, _quantity:<count>, menu:"1",
+        #                   mode:<kind>}}
+        #
+        # No ``set-preset-*`` (no row carries ``presetParams`` → Perl's
+        # ``$presetFavSet`` stays 0, ``XMLBrowser.pm:1131-1135,1427``).
+        feed_params = {"menu": "browselibrary", "mode": kind}
+        return {
+            "go": {"cmd": ["browselibrary", "items"], "itemsParams": "params",
+                   "params": dict(feed_params)},
+            "play": {"player": 0, "cmd": ["browselibrary", "playlist", "play"],
+                     "itemsParams": "params", "nextWindow": "nowPlaying",
+                     "params": dict(feed_params)},
+            "add": {"player": 0, "cmd": ["browselibrary", "playlist", "add"],
+                    "itemsParams": "params", "params": dict(feed_params)},
+            "add-hold": {"player": 0,
+                         "cmd": ["browselibrary", "playlist", "insert"],
+                         "itemsParams": "params", "params": dict(feed_params)},
+            "more": {"player": 0, "cmd": ["browselibrary", "items"],
+                     "window": {"isContextMenu": 1},
+                     "itemsParams": "params", "params": dict(feed_params)},
+            "playControl": {
+                "player": 0, "cmd": ["browselibrary", "items"],
+                "window": {"isContextMenu": 1},
+                "itemsParams": "playControlParams",
+                "params": {"_index": str(start), "_quantity": str(count),
+                           "menu": "1", "mode": kind},
+            },
+        }
     go_mode = GO_MODE.get(kind, "albums")
     go_params: dict = {"mode": go_mode, "menu": 1}
     if kind == "artists":
@@ -552,3 +756,161 @@ def year_info_menu(year: Any, index: int = 0, quantity: int = 20) -> dict:
     return {"title": y, "offset": 0, "count": len(item_loop),
             "window": {"windowStyle": "text_list"},
             "item_loop": item_loop, "base": base}
+
+
+# ── mode:search — the library search menu (BrowseLibrary _search) ────────
+#
+# Perl ``Slim/Menu/BrowseLibrary.pm`` registers the node
+# ``{name => 'SEARCH', params => {mode => 'search'}, feed => \&_search}``
+# (:1030-1036) and ``_search`` (:978-1004) answers the OPML
+# ``{name => cstring('SEARCH'), icon => 'html/images/search.png',
+# items => searchItems($client)}``.  ``searchItems`` (:1031-1070) is the
+# five-row list below — one search per browsable entity, each
+# ``{type => 'search', name => cstring(<token>),
+# icon => 'html/images/search.png', url => $browseLibraryModeMap{<mode>},
+# cachesearch => <TOKEN>}``.
+#
+# Live Perl 9.1.1 (192.168.1.90, read-only 2026-09-14):
+#
+#   ``browselibrary items 0 10 menu:1 mode:search`` →
+#     result keys ``base, count, item_loop, offset, title, window``,
+#     ``window.windowStyle`` ``home_menu`` (every row carries ``icon-id``),
+#     ``title`` "Suchen", 5 rows with keys ``actions, icon-id, input, text,
+#     type``; the ``go`` params are
+#     ``{menu: "browselibrary", mode: "search", item_id: "<i>",
+#       search: "__TAGGEDINPUT__", cachesearch: "ARTISTS"|…}`` and the
+#     ``input`` block is ``{len: 1, processingPopup: {text: <SEARCHING>},
+#     softbutton1: <INSERT>, softbutton2: <DELETE>, title: <row text>,
+#     help: {text: <JIVE_SEARCHFOR_HELP>}}`` (``XMLBrowser.pm:1213-1223``).
+#
+#   ``browselibrary items 0 10 mode:search`` (no ``menu:``) →
+#     ``{title: "Suchen", count: 5, loop_loop: [{id: "0", name: "Interpreten",
+#       type: "search", image: "html/images/search.png", isaudio: 0,
+#       hasitems: 1}, …]}`` — the flat shape of ``XMLBrowser.pm:1378-1406``
+#     (``id``/``name``/``type``/``image``/``isaudio``/``hasitems``).
+SEARCH_ENTRIES: tuple[tuple[str, str, str], ...] = (
+    # (name token, cachesearch token, browselibrary mode)
+    ("BROWSE_BY_ARTIST", "ARTISTS", "artists"),
+    ("BROWSE_BY_ALBUM", "ALBUMS", "albums"),
+    ("BROWSE_BY_WORK", "WORKS", "works"),
+    ("BROWSE_BY_SONG", "SONGS", "tracks"),
+    ("PLAYLISTS", "PLAYLISTS", "playlists"),
+)
+
+SEARCH_ICON = "html/images/search.png"
+
+
+def _search_input(title: str) -> dict:
+    """The ``input`` block of a search row (``XMLBrowser.pm:1213-1223``)."""
+    return {
+        "len": 1,
+        "processingPopup": {"text": menu_title("SEARCHING")},
+        "softbutton1": menu_title("INSERT"),
+        "softbutton2": menu_title("DELETE"),
+        "title": title,
+        "help": {"text": menu_title("JIVE_SEARCHFOR_HELP")},
+    }
+
+
+def search_menu_items() -> list[dict]:
+    """The five ``mode:search`` rows in Perl's order (``:1031-1070``)."""
+    items: list[dict] = []
+    for index, (token, cachesearch, _mode) in enumerate(SEARCH_ENTRIES):
+        title = menu_title(token)
+        items.append({
+            "text": title,
+            "type": "search",
+            "icon-id": SEARCH_ICON,
+            "input": _search_input(title),
+            "actions": {"go": {
+                "cmd": ["browselibrary", "items"],
+                "params": {
+                    "menu": "browselibrary",
+                    "mode": "search",
+                    "item_id": str(index),
+                    "search": "__TAGGEDINPUT__",
+                    "cachesearch": cachesearch,
+                },
+            }},
+        })
+    return items
+
+
+def search_menu_flat_items() -> list[dict]:
+    """The ``loop_loop`` form of the same five rows (``:1378-1406``)."""
+    return [{"id": str(i), "name": item["text"], "type": "search",
+             "image": SEARCH_ICON, "isaudio": 0, "hasitems": 1}
+            for i, item in enumerate(search_menu_items())]
+
+
+# ── mode:playlists — the saved-playlists feed (BrowseLibrary _playlists) ──
+#
+# Perl ``_playlists`` (``Slim/Menu/BrowseLibrary.pm:2154-2222``) runs the
+# ``playlists`` *query* (``tags:sux``) and maps each row to
+# ``{name = $row->{playlist}, type => 'playlist', playlist => \&_playlistTracks,
+# url => …, itemActions => {info|items|play|add|insert…}}`` (:2172-2217);
+# a ``file:`` row becomes a ``link`` row.  The feed's callback returns
+# ``{items => $items, sorted => 1}`` — **no** ``name``, which is why Perl's
+# answer carries no ``title`` (unlike ``mode:search``).
+#
+# Live Perl 9.1.1 (read-only 2026-09-14, its playlist store is empty):
+#   ``browselibrary items 0 10 mode:playlists`` →
+#     ``{loop_loop: [{id: "abfb23c4.0", type: "text", title: "Leer",
+#                     isaudio: 0, hasitems: 0}], count: 1}``
+#   ``browselibrary items 0 10 menu:1 mode:playlists`` →
+#     ``{offset: 0, count: 1, base: {actions: … mode:"playlists" …},
+#       item_loop: [{action: "none", style: "itemNoAction", text: "Leer",
+#                    type: "text"}], window: {windowStyle: "text_list"}}``
+# Both are XMLBrowser's empty-feed placeholder (``:841-846`` "Bug 7024,
+# display an 'Empty' item instead of returning an empty list" — DE "Leer").
+PLAYLIST_TRACKS_MODE = "playlistTracks"
+
+
+def saved_playlist_menu_items(rows: list[dict]) -> list[dict]:
+    """The jive-menu rows of the saved-playlists feed (``:2172-2217``).
+
+    ``rows`` are ``{"id": <playlist id>, "name": <playlist name>}``.
+    Perl's feed gives every row ``type => 'playlist'`` with the drill
+    command ``browselibrary items mode:playlistTracks playlist_id:<id>``
+    (``:2192-2199``) and the ``playlistcontrol`` play/add/insert actions
+    (``:2203-2216``).
+    """
+    items: list[dict] = []
+    for row in rows:
+        pid = str(row.get("id"))
+        name = str(row.get("name") or "")
+        # Perl's ``_playlists`` sets NO ``icon``/``image`` on a playlist row
+        # (:2172-2217 — only name/type/playlist/url/itemActions), so the
+        # answered window is ``text_list`` (no row carries an image,
+        # ``XMLBrowser.pm:1434-1441``).  An invented icon flipped ours to
+        # ``home_menu``.
+        items.append({
+            "text": name,
+            "type": "playlist",
+            "actions": {
+                "go": {
+                    "cmd": ["browselibrary", "items"],
+                    "params": {"mode": PLAYLIST_TRACKS_MODE,
+                               "playlist_id": pid, "menu": "browselibrary"},
+                },
+                "play": {"player": 0, "cmd": ["playlistcontrol"],
+                         "params": {"cmd": "load", "playlist_id": pid}},
+                "add": {"player": 0, "cmd": ["playlistcontrol"],
+                        "params": {"cmd": "add", "playlist_id": pid}},
+                "add-hold": {"player": 0, "cmd": ["playlistcontrol"],
+                             "params": {"cmd": "insert", "playlist_id": pid}},
+            },
+        })
+    return items
+
+
+def empty_placeholder_item() -> dict:
+    """Perl's EMPTY placeholder (``XMLBrowser.pm:841-846``)."""
+    return {"action": "none", "style": "itemNoAction",
+            "text": menu_title("EMPTY"), "type": "text"}
+
+
+def empty_placeholder_flat_item(item_id: str) -> dict:
+    """The same placeholder in the flat ``loop_loop`` shape (``:1378-1406``)."""
+    return {"id": str(item_id), "type": "text", "title": menu_title("EMPTY"),
+            "isaudio": 0, "hasitems": 0}

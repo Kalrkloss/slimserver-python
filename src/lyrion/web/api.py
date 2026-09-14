@@ -434,15 +434,19 @@ def _defeat_destructive_touch_to_play(rest: list, player=None,
 
     Documented deviations (measured, not assumed):
 
-    * **a named but unknown client** (``player is None`` while the request
-      carries a ``pid``) keeps the non-defeated branch, while Perl would not
-      even answer such a request.  Perl resolves ``$request->client`` from the
-      socket (live probe with an unregistered MAC: the connection is closed
-      without a result), so "no client" and "client we do not know" are two
-      different things there.  The favourites parity fixtures drive the API
-      with a ``pid`` but without an installed ``PlayerState``, and a request
-      can always force the branch with ``defeatDestructiveTouchToPlay:1``
-      (:1964).
+    * **a named but unknown client** resolves to "no client", exactly like
+      Perl's ``$request->client``: ``PlayerManager().get_player(mac)`` only
+      returns a player for a *connected* client, and Perl's
+      ``Request->new`` clears ``_clientid`` (status 103, not dispatchable)
+      for a mac it does not know.  Both therefore land on the ``!$client``
+      branch at :1976.  Live 2026-09-14: Perl answers the favourites list of
+      an unattributed request with ``goAction: "playControl"`` +
+      ``playControlParams {xmlbrowserPlayControl: "<index>"}`` and no
+      ``style``/``touchToPlay`` — the shape that makes a controller open the
+      Play/Add/Play-next menu, which this port used to answer with the blind
+      ``play`` row (the "Favoriten lassen sich nicht starten" symptom).
+      A request can still force either branch with
+      ``defeatDestructiveTouchToPlay:0|1`` (:1964).
 
     What this does **not** do: force the play-control branch for a *known*
     client.  Perl answers a client-attributed favourites request with the
@@ -2795,7 +2799,7 @@ class JSONRPCAPI:
                 except Exception:  # noqa: BLE001
                     player = None
             use_play_control = _defeat_destructive_touch_to_play(
-                rest, player, client_named=bool(pid))
+                rest, player, client_named=player is not None)
             parent = None
             # Perl's XMLBrowser roots every item id in a fresh browse-session
             # handle: `my @crumbIndex = $sid ? ($sid) : ()` + `push
@@ -2837,6 +2841,38 @@ class JSONRPCAPI:
                 # args: start/count/want_url — never a bare parent).
                 parent = int(str(rest[0]))
                 parent_path = await self._fav_position_path(fm, parent)
+            # ── A tap on a *leaf* (a station row) never descends ──────────
+            # Perl's Favorites feed is an OPML feed: the tapped item has no
+            # children, so ``XMLBrowser`` answers the item itself —
+            #   * ``xmlBrowseInterimCM:1`` (the tap on a touch-to-play row,
+            #     ``XMLBrowser.pm:854-859``) → the play-control menu plus the
+            #     feed's own rows (add/insert/play, delete, Titel/URL), and
+            #   * a plain ``useContextMenu:1`` drill → the two info rows of
+            #     ``@mapAttributes`` (:245-252).
+            # This port answered the (empty) child list of the leaf instead:
+            # the on-screen menu stayed empty and the controller never got a
+            # playable row ("Favoriten starten geht nicht", live client log
+            # 2026-09-14 16:48 with ``item_id:<sid>.0.0 isContextMenu:1
+            # touchToPlay:… xmlBrowseInterimCM:1``).
+            if menu_mode and parent is not None:
+                from lyrion.web import favorites_menu as _fav_menu
+                from lyrion.web import menus as _menus
+                try:
+                    leaf = await fm.get(parent)
+                except Exception:  # noqa: BLE001 — no get()/row vanished
+                    leaf = None
+                if leaf is not None and leaf.get("type") == "stream":
+                    name = str(leaf.get("title") or "")
+                    url = str(leaf.get("url") or "")
+                    path = parent_path or str(parent)
+                    index = path.rsplit(".", 1)[-1]
+                    if any(str(a) == "xmlBrowseInterimCM:1" for a in rest):
+                        return _menus.interim_context_menu(
+                            path, name=name, url=url,
+                            icon=_fav_menu.FAVORITES_ICON,
+                            favorite_type="audio",
+                            item_index=index if index.isdigit() else "")
+                    return _menus.leaf_info_menu(name, url)
             loop = await self._fav_items_loop(fm, parent, parent_path,
                                               feed_mode, menu_mode,
                                               use_play_control)
@@ -7347,7 +7383,8 @@ class JSONRPCAPI:
         filters: dict = {}
         for a in args:
             s = str(a)
-            for key in ("album_id", "artist_id", "genre_id", "year"):
+            for key in ("album_id", "artist_id", "genre_id", "year",
+                        "playlist_id"):
                 if s.startswith(f"{key}:") and s[len(key) + 1:].strip():
                     filters[key] = s[len(key) + 1:].strip()
         # Play-Control context menu (MENU-02): a SqueezePlay tap on a row
@@ -7363,6 +7400,90 @@ class JSONRPCAPI:
                          if str(a).startswith("xmlbrowserPlayControl:")),
                         None)
         is_menu = any(str(a) == "menu:1" for a in args)
+        # ── mode:search / mode:playlists — Perl's own feeds ──────────────
+        # Both are *modeless* BrowseLibrary feeds whose item set does not
+        # depend on the library rows: ``_search`` answers the five-row search
+        # menu (``Slim/Menu/BrowseLibrary.pm:1031-1070``), ``_playlists`` the
+        # saved-playlist list (:2154-2222).  The port answered ``mode:search``
+        # with a title LIKE-search (0 rows without ``search:``) and fell back
+        # to the ALBUM list for ``mode:playlists`` — live Perl 9.1.1
+        # (read-only 2026-09-14) returns 5 ``type: search`` rows and, for an
+        # empty playlist store, XMLBrowser's single "Leer"/``Empty``
+        # placeholder row (``XMLBrowser.pm:841-846``).
+        if mode in ("search", "playlists"):
+            from lyrion.web import menus as _menus
+
+            if mode == "search":
+                # A *search* itself: Perl's row URLs are the target feeds
+                # (``BrowseLibrary.pm:1036-1064`` ``url => $browseLibraryModeMap
+                # {'artists'|'albums'|'works'|'tracks'|'playlists'}``).  The
+                # client merges ``item_id`` (= the row index) and
+                # ``search:<text>`` from the row's ``go`` params, and
+                # XMLBrowser walks THAT feed with the query
+                # (``XMLBrowser.pm:389-398``/``:497-498``).  Without this
+                # routing the port would answer the search *menu* again.
+                _item = next((str(a)[8:] for a in args
+                              if str(a).startswith("item_id:")), "")
+                _query = search.strip()
+                if _item.isdigit() and _query and \
+                        _query != "__TAGGEDINPUT__" and \
+                        int(_item) < len(_menus.SEARCH_ENTRIES):
+                    mode = _menus.SEARCH_ENTRIES[int(_item)][2]
+                    search = _query
+                else:
+                    if is_menu:
+                        items = _menus.search_menu_items()
+                        return {
+                            "offset": start,
+                            "title": _menus.menu_title("SEARCH"),
+                            "count": len(items),
+                            "window": _menus.window_style_for_items(items),
+                            "item_loop": items,
+                            "base": {"actions": self._browselibrary_menu_actions(
+                                "search", filters, start, count, False)},
+                        }
+                    items = _menus.search_menu_flat_items()
+                    return {"title": _menus.menu_title("SEARCH"),
+                            "count": len(items), "loop_loop": items}
+
+            if mode == "playlists":
+                playlists = self._saved_playlists()
+                if is_menu:
+                    items = _menus.saved_playlist_menu_items(playlists)
+                    if not items:
+                        items = [_menus.empty_placeholder_item()]
+                    return {
+                        "offset": start,
+                        "count": len(items),
+                        "window": _menus.window_style_for_items(items),
+                        "item_loop": items,
+                        "base": {"actions": self._browselibrary_menu_actions(
+                            "playlists", filters, start, count, False)},
+                    }
+                if not playlists:
+                    return {"count": 1,
+                            "loop_loop": [_menus.empty_placeholder_flat_item(
+                                f"{_new_fav_sid()}.0")]}
+                loop = []
+                for row in playlists:
+                    pid = str(row["id"])
+                    name = row["name"]
+                    loop.append({
+                        "id": pid, "name": name, "text": name,
+                        "title": name, "type": "playlist",
+                        "isaudio": 1, "hasitems": 1,
+                        "actions": {
+                            "go": {"player": 0,
+                                   "cmd": ["browselibrary", "items"],
+                                   "params": {
+                                       "mode": _menus.PLAYLIST_TRACKS_MODE,
+                                       "playlist_id": pid}},
+                            "play": {"player": 0, "cmd": ["playlistcontrol"],
+                                     "params": {"cmd": "load",
+                                                "playlist_id": pid}},
+                        },
+                    })
+                return {"count": len(loop), "loop_loop": loop}
         # A browse must ANSWER (see _LIBRARY_QUERY_TIMEOUT): the fetch is
         # bounded, a starved/timed-out library read degrades to the
         # Perl-shaped empty answer (BrowseLibrary: count 0 + empty loop)
@@ -7466,6 +7587,28 @@ class JSONRPCAPI:
                 go_params = {"track_id": r["id"]}
                 play_params = {"track_id": r["id"]}
                 icon = "html/images/search.png"
+            elif kind == "tracks":
+                # Song list (album/artist/year drill, and the ``mode:search``
+                # row ``item_id:3``): one row per track.  Perl's flat
+                # renderer (``XMLBrowser.pm:1378-1406``) writes id/name/type/
+                # image/isaudio/hasitems, ``hasAudio`` (:1743-1751) is true
+                # for a ``type: audio`` item and ``hasitems`` stays 0 for an
+                # audio row with no ``items`` array — the same fields our
+                # MENU shape uses for a track.  Without this branch the port's
+                # flat ``mode:tracks`` answer skipped every row (empty list).
+                ident, name = str(r["id"]), r["title"] or ""
+                item = {
+                    "id": ident, "name": name, "text": name, "title": name,
+                    "type": "audio", "isaudio": 1, "hasitems": 0,
+                    "actions": {
+                        "go": {"player": 0, "cmd": ["songinfo"],
+                               "params": {"track_id": r["id"]}},
+                        "play": {"player": 0, "cmd": ["playlist", "play"],
+                                 "params": {"track_id": r["id"]}},
+                    },
+                }
+                loop.append(item)
+                continue
             elif kind == "folder":
                 ident, name = str(r["id"]), r["name"]
                 go = ["browselibrary", "items"]
@@ -7747,6 +7890,33 @@ class JSONRPCAPI:
         return out
 
     @staticmethod
+    def _saved_playlists() -> list[dict]:
+        """The saved playlists of this library (Perl's ``playlists`` query).
+
+        Perl's ``playlistsQuery`` (``Slim/Control/Queries.pm``, dispatch
+        ``['playlists','_index','_quantity']`` Request.pm:576) lists every
+        row of the ``playlists`` table; the BrowseLibrary ``_playlists`` feed
+        (``Slim/Menu/BrowseLibrary.pm:2154-2222``) turns each row into an
+        item.  The port's library DB carries the same table
+        (``playlists.id`` / ``playlist`` / ``name`` / ``pl_type`` /
+        ``disabled``); a disabled playlist (Perl: ``disabled``) is left out.
+
+        Live Perl 9.1.1 (read-only 2026-09-14) has an **empty** playlist
+        store and therefore answers XMLBrowser's ``Empty`` placeholder row
+        (``:841-846``) — its "Leer" row is a property of that server's data,
+        not of the feed.
+        """
+        try:
+            rows = _db_query(
+                "SELECT id, COALESCE(NULLIF(name, ''), playlist) AS name "
+                "FROM playlists WHERE COALESCE(disabled, 0) = 0 "
+                "ORDER BY name COLLATE NOCASE")
+        except Exception as exc:  # noqa: BLE001 — no playlists table/db
+            logger.debug("playlists read failed: %s", exc)
+            return []
+        return [{"id": r["id"], "name": r["name"] or ""} for r in rows]
+
+    @staticmethod
     def _browselibrary_menu_actions(kind: str, filters: dict | None = None,
                                     start: int = 0,
                                     count: int = 1,
@@ -7870,6 +8040,7 @@ class JSONRPCAPI:
         f_album = filters.get("album_id")
         f_genre = filters.get("genre_id")
         f_year = filters.get("year")
+        f_playlist = filters.get("playlist_id")
 
         def q(sql, *p):
             return _db_query(sql, p)
@@ -7878,6 +8049,24 @@ class JSONRPCAPI:
             rows = _db_query(sql, p)
             # _db_query returns list[dict]; grab the first row's first value.
             return list(rows[0].values())[0] if rows else 0
+
+        if mode in ("playlistTracks", "playlisttracks"):
+            # Perl ``_playlistTracks`` (''Slim/Menu/BrowseLibrary.pm:2226-2261``)
+            # runs the ``playlists tracks`` query with
+            # ``playlist_id:<id>`` and lists the songs of that saved
+            # playlist.  The port stores them in ``playlist_items``
+            # (playlist/track/position), so the drill is a join — without
+            # this branch the row's ``go`` target fell back to the album
+            # list (the old ``mode:playlists`` symptom).
+            if not f_playlist:
+                return [], 0, "tracks_loop", "tracks"
+            rows = q("SELECT t.id, t.title, t.year FROM tracks t "
+                     "JOIN playlist_items pi ON pi.track = t.id "
+                     "WHERE pi.playlist = ? ORDER BY pi.position "
+                     "LIMIT ? OFFSET ?", f_playlist, count, start)
+            total = total_of("SELECT COUNT(*) FROM playlist_items "
+                             "WHERE playlist = ?", f_playlist)
+            return rows, total, "tracks_loop", "tracks"
 
         if mode == "tracks" or mode in ("songs", "titles"):
             # Album/artist/year drill → the track list (Perl mode:tracks).

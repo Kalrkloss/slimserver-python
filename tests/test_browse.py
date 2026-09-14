@@ -6,6 +6,7 @@ read ``r["id"]``.
 """
 
 import asyncio
+import json
 import sqlite3
 
 from lyrion.web import api as api_mod
@@ -31,28 +32,98 @@ def _db(tmp_path):
     return str(db)
 
 
-def test_browselibrary_search_returns_matching_tracks(tmp_path, monkeypatch):
+def _search_menu(tmp_path, monkeypatch, args):
+    monkeypatch.setattr(api_mod, "_library_db_path",
+                        lambda: str(tmp_path / "lyrion.db"))
+
+    async def run():
+        return await JSONRPCAPI()._json_browselibrary("browselibrary", args)
+
+    return asyncio.run(run())
+
+
+def test_browselibrary_search_answers_perls_search_menu(tmp_path, monkeypatch):
+    """``mode:search`` is the search MENU, not a title query.
+
+    Perl ``_search``/``searchItems`` (``Slim/Menu/BrowseLibrary.pm:978-1070``)
+    answers five ``type: search`` rows (Artists/Albums/Works/Songs/Playlists)
+    with ``icon => 'html/images/search.png'``; live Perl 9.1.1 (read-only
+    2026-09-14) returns exactly those five with ``title`` "Suchen" and
+    ``window.windowStyle`` ``home_menu``.  The port used to run a title LIKE
+    query here, which returned 0 rows without a ``search:`` token.
+    """
+    res = _search_menu(tmp_path, monkeypatch,
+                       ["items", "0", "10", "mode:search"])
+    loop = res.get("loop_loop") or []
+    assert [i["name"] for i in loop] == ["Artists", "Albums", "Works", "Songs",
+                                         "Playlists"], loop
+    assert all(i["type"] == "search" and i["hasitems"] == 1 for i in loop)
+    assert [i["image"] for i in loop] == ["html/images/search.png"] * 5
+    assert res.get("title")
+
+    menu = _search_menu(tmp_path, monkeypatch,
+                        ["items", "0", "10", "menu:1", "mode:search"])
+    rows = menu["item_loop"]
+    assert [r["type"] for r in rows] == ["search"] * 5
+    assert menu["window"] == {"windowStyle": "home_menu"}
+    # the tap's request params (Perl ``XMLBrowser.pm:1192-1205``)
+    assert rows[3]["actions"]["go"]["params"]["search"] == "__TAGGEDINPUT__"
+    assert rows[3]["actions"]["go"]["params"]["cachesearch"] == "SONGS"
+    assert rows[3]["input"]["len"] == 1
+    assert set(rows[3]["input"]) == {"len", "processingPopup", "softbutton1",
+                                     "softbutton2", "title", "help"}
+
+
+def test_browselibrary_search_drills_into_the_target_feed(tmp_path, monkeypatch):
+    """A search sends ``item_id:<row>`` + ``search:<text>`` (``:1036-1064``).
+
+    Perl's search rows point at the *feeds*
+    (``url => $browseLibraryModeMap{'tracks'}`` etc.); XMLBrowser walks that
+    feed with the query, so ``item_id:3`` (Songs) + ``search:Sunset`` lists
+    matching tracks.
+    """
     db = tmp_path / "lyrion.db"
     con = sqlite3.connect(db)
     con.executescript(
         """
-        CREATE TABLE tracks (id INTEGER PRIMARY KEY, title TEXT);
+        CREATE TABLE tracks (id INTEGER PRIMARY KEY, title TEXT, year INTEGER);
         INSERT INTO tracks (id, title) VALUES (1, 'Sunset Orion'), (2, 'Other Song');
         """
     )
     con.commit()
     con.close()
-    monkeypatch.setattr(api_mod, "_library_db_path", lambda: str(db))
-
-    async def run():
-        api = JSONRPCAPI()
-        return await api._json_browselibrary(
-            "browselibrary", ["items", "0", "10", "mode:search", "search:Sunset"])
-
-    result = asyncio.run(run())
-    loop = result.get("loop_loop") or []
+    res = _search_menu(tmp_path, monkeypatch,
+                       ["items", "0", "10", "mode:search", "item_id:3",
+                        "search:Sunset"])
+    loop = res.get("loop_loop") or []
     assert len(loop) == 1, f"search must return only matches, got {loop}"
     assert loop[0]["name"] == "Sunset Orion"
+
+
+def test_browselibrary_playlists_feed_is_not_the_album_list(tmp_path, monkeypatch):
+    """``mode:playlists`` is the saved-playlists feed (``:2154-2222``).
+
+    With no saved playlist the live Perl answer is XMLBrowser's single EMPTY
+    placeholder row (``:841-846``: ``{"id": "<sid>.0", "type": "text",
+    "title": "Leer", "isaudio": 0, "hasitems": 0}``, ``count`` 1) — before
+    this fix the port fell through to the ALBUM list.
+    """
+    con = sqlite3.connect(tmp_path / "lyrion.db")
+    con.executescript("CREATE TABLE tracks (id INTEGER PRIMARY KEY, title TEXT);")
+    con.commit()
+    con.close()
+    res = _search_menu(tmp_path, monkeypatch,
+                       ["items", "0", "10", "mode:playlists"])
+    loop = res.get("loop_loop") or []
+    assert len(loop) == 1 and loop[0]["type"] == "text", loop
+    assert loop[0]["isaudio"] == 0 and loop[0]["hasitems"] == 0
+    assert "album_id" not in json.dumps(res)
+
+    menu = _search_menu(tmp_path, monkeypatch,
+                        ["items", "0", "10", "menu:1", "mode:playlists"])
+    assert menu["window"] == {"windowStyle": "text_list"}
+    assert menu["item_loop"][0]["type"] == "text"
+    assert menu["item_loop"][0]["style"] == "itemNoAction"
 
 
 def test_browselibrary_genres_returns_items(tmp_path, monkeypatch):
@@ -96,14 +167,19 @@ def test_albums_artist_id_filters(tmp_path, monkeypatch):
 
 
 def test_browselibrary_search_nomatch_returns_empty(tmp_path, monkeypatch):
-    """A search that matches nothing must NOT fall back to listing all albums."""
+    """A search that matches nothing must NOT fall back to listing all albums.
+
+    The search runs in the row's target feed (``item_id:3`` = Songs,
+    ``BrowseLibrary.pm:1057``); a query that matches no track answers 0 rows.
+    """
     db_path = _lib_db(tmp_path)
     monkeypatch.setattr(api_mod, "_library_db_path", lambda: db_path)
 
     async def run():
         api = JSONRPCAPI()
         return await api._json_browselibrary(
-            "browselibrary", ["items", "0", "10", "mode:search", "search:NoMatch"])
+            "browselibrary", ["items", "0", "10", "mode:search", "item_id:3",
+                              "search:NoMatch"])
 
     result = asyncio.run(run())
     assert result.get("count", 0) == 0

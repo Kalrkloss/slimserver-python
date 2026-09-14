@@ -355,6 +355,11 @@ def test_stream_row_has_no_item_actions_and_resolves_play_from_base(favs):
     ``base.actions.play``, and that base action is only usable because the
     row carries a ``params`` map (its ``itemsParams`` target).
     """
+    # The touch-to-play branch needs a client Perl can *resolve* and that is
+    # not playing (``XMLBrowser.pm:1976`` ``return 1 if $pref == 1 ||
+    # !$client``, ``:1977`` ``$client->isPlaying()``): an unknown/absent
+    # client is defeated.
+    _install_player("stop", duration=0)
     res = _items(MENU_ARGS)
     base = res["base"]
     row = _stream_row()
@@ -375,6 +380,7 @@ def test_stream_row_tap_sends_favorites_playlist_play(favs):
     ``base.actions.play.cmd`` plus the row's ``params`` (``itemsParams``);
     ``JiveItem.java:632`` appends ``useContextMenu:1``.
     """
+    _install_player("stop", duration=0)
     base = _items(MENU_ARGS)["base"]
     row = _stream_row()
     sent = jive_sends(row, base)
@@ -580,21 +586,25 @@ def test_squeezer_app_request_without_positionals_gets_the_same_row(favs):
         "params", {}).get("item_id", "").endswith(".0")
 
 
-def test_default_request_keeps_the_touch_to_play_shape_for_an_unknown_client(
-        favs):
-    """A pid we cannot resolve keeps Perl's ``play`` row (divergence, :1976).
+def test_unknown_client_gets_perls_defeated_playcontrol_row(favs):
+    """An unresolvable pid *is* "no client" for Perl (``:1976`` ``!$client``).
 
-    Both favourites parity suites (``test_favorites_menu``,
-    ``test_squeezer_pause_favorites``) drive the API with a pid but without an
-    installed ``PlayerState``; Perl would drop such a request outright (live
-    probe with an unregistered MAC closes the connection), so the port keeps
-    the historical touch-to-play branch there instead of guessing.
+    ``PlayerManager.get_player(mac)`` only answers for a connected player, and
+    Perl's ``Request->new`` clears ``_clientid`` (status 103) for a mac it does
+    not know — both land on ``return 1 if $pref == 1 || !$client``.  Live Perl
+    9.1.1 (read-only 2026-09-14, unattributed favourites request) answers
+    ``{"goAction": "playControl", "playControlParams":
+    {"xmlbrowserPlayControl": "6"}, "params": {"item_id": …, "isContextMenu": 1},
+    "type": "audio"}`` — no ``style``, no ``touchToPlay``.  This port used to
+    keep the blind ``play`` row here, so a controller opened no play-control
+    menu and the favourite never started.
     """
-    assert _defeat_destructive_touch_to_play([], None, client_named=True) is False
+    assert _defeat_destructive_touch_to_play([], None, client_named=None) is True
     row = _stream_row()                       # PLAYER pid, no installed player
-    assert row["goAction"] == "play"
-    assert row["style"] == "itemplay"
-    assert row["params"]["touchToPlay"] == row["params"]["item_id"]
+    assert row["goAction"] == "playControl"
+    assert row["playControlParams"]["xmlbrowserPlayControl"] == "1"
+    assert "style" not in row
+    assert "touchToPlay" not in row["params"]
 
 
 def test_playing_player_gets_the_play_control_row(favs):
@@ -644,6 +654,7 @@ def test_folder_and_stream_rows_differ_in_exactly_the_tap_fields(favs):
     a ``type``/``goAction``/``style`` triple, and only the folder row carries
     ``addAction``/``actions``.
     """
+    _install_player("stop", duration=0)
     res = _items(MENU_ARGS)
     folder, stream = res["item_loop"][0], res["item_loop"][1]
     assert set(folder) - set(stream) == {"addAction", "actions"}
