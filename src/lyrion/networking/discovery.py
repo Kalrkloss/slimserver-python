@@ -358,19 +358,22 @@ class DiscoveryService:
             # /html/...), so the native server answers non-Cometd GETs with
             # a 302 redirect to the real web port — that keeps cover art
             # working without moving the Cometd endpoint.
-            # Angekündigt wird der NATIVE Cometd-Port (9080), nicht Perls
-            # Webport 9000. Grund (gemessen 2026-09-13): SqueezePlay baut aus
-            # dieser Adresse seinen kompletten Bayeux-Verkehr und nutzt dabei
-            # den *Streaming*-Transport — der läuft auf dem nativen Port
-            # nachweislich, auf dem HTTP/ASGI-Pfad (9000) noch nicht belastbar
-            # ("SqueezePlay kann nicht verbinden", sobald 9000 angekündigt war).
-            # Der native Server proxyt POST /jsonrpc.js an 9000 weiter
-            # (cometd_stream.py:202-230) und beantwortet sonst GETs mit 302,
-            # daher funktionieren dort auch JSON-RPC-Clients wie Squeeze Client.
-            # Abweichung von Perl (dort JSON=9000), bewusst und hier begründet;
-            # sobald der ASGI-Streaming-Pfad belastbar ist, kann das zurück.
-            http_port = int(get_config().get("cometd_stream_port")
-                            or DEFAULT_NATIVE_PORT)
+            # Perl kündigt seinen HTTP-/Webport an (live: "JSON\x049000").
+            # Zuvor stand hier der native Cometd-Port (9080), weil der
+            # HTTP/ASGI-Pfad Streaming-Verbindungen monopolistisch hielt:
+            # uvicorn/h11 puffern gepipelinede Requests bis zum Response-Ende,
+            # der POST hinter dem Stream blieb unbedient und libcometd riss
+            # nach seinem 10-s-maxNetworkDelay ab (libcometd.js:1268,
+            # :380-389). Seit Cometd-Fix 63056abd7 endet der Stream nach
+            # RETRY_DELAY (5 s) Stille, die Verbindung wird vor dem
+            # terminierenden []-Chunk freigegeben und es gilt Perls 10-s-Grace
+            # (Slim/Web/Cometd.pm:1010-1014) — damit ist 9000 für
+            # SqueezePlay (streaming) und Squeeze Client (JSON-RPC) tragfähig.
+            # Der native Server proxyt GET/POST an 9000 weiter
+            # (cometd_stream.py:202-230, :270-283), bleibt also unberührt.
+            http_port = int(get_config().get("httpport")
+                            or get_config().get("web_port")
+                            or DEFAULT_HTTP_PORT)
         except Exception:
             http_port = DEFAULT_HTTP_PORT
 
