@@ -35,7 +35,6 @@ from lyrion.web.cometd import (
     LONG_POLLING_INTERVAL,
     LONG_POLL_TIMEOUT_MS,
     RETRY_DELAY_MS,
-    STREAMING_HOLD_WINDOW,
     CometdManager,
     _channel_matches,
     _default_request,
@@ -800,15 +799,20 @@ def test_grace_expiry_reaps_a_client_that_never_reconnected():
     assert mgr.get(cid) is None
 
 
-def test_streaming_connect_advice_and_window_come_from_perl_retry_delay():
+def test_streaming_connect_advice_and_grace_come_from_perl_retry_delay():
     """Both numbers are Perl's RETRY_DELAY (Cometd.pm:45), never invented.
 
     The streaming ack advertises ``interval => RETRY_DELAY`` (Cometd.pm:278)
-    and the ASGI hold window is that same interval, so a client whose stream
-    ends is already told to come back after it. The disconnect grace is Perl's
-    ``RETRY_DELAY * 2`` (Cometd.pm:1010-1014).
+    so a client whose stream ends (only the network can end it — Perl arms no
+    hold timer for the streaming branch, Cometd.pm:288-297) is told when to
+    come back. The disconnect grace is Perl's ``RETRY_DELAY * 2``
+    (Cometd.pm:1010-1014). There is NO Python-side streaming hold window any
+    more: it used to close the ASGI response after exactly this interval,
+    which Perl never does.
     """
-    assert STREAMING_HOLD_WINDOW == RETRY_DELAY_MS / 1000.0 == 5.0
+    import lyrion.web.cometd as cometd_mod
+
+    assert not hasattr(cometd_mod, "STREAMING_HOLD_WINDOW")
     assert DISCONNECT_GRACE == (RETRY_DELAY_MS / 1000.0) * 2 == 10.0
     assert connect_advice("streaming")["interval"] == RETRY_DELAY_MS
     assert connect_advice("long-polling")["interval"] == LONG_POLLING_INTERVAL

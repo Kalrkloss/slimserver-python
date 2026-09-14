@@ -24,7 +24,6 @@ import json
 from lyrion.networking.cometd_stream import start_cometd_server
 from lyrion.web.cometd import (
     LONG_POLLING_AUTOKILL,
-    MAX_QUEUED_EVENTS,
     CometdManager,
     _channel_matches,
 )
@@ -505,20 +504,31 @@ def test_cidless_exact_plus_glob_playerstatus_delivers_once():
     assert events[0]["channel"] == f"/slim/playerstatus/{player}"
 
 
-def test_queue_is_bounded_and_drops_oldest():
-    """A stalled/dead client must not grow its queue without bound."""
+def test_queue_has_no_cap_like_perl_and_dead_clients_are_reaped_instead():
+    """Perl's ``queue_events`` (Manager.pm:181-189) never drops an event.
+
+    Perl keeps every event for the client and drops the *client* when it stops
+    polling (LONG_POLLING_AUTOKILL -> disconnectClient, Cometd.pm:49/:693).
+    There used to be a Python-side cap of 256 events that silently threw the
+    oldest ones away — a client got less than Perl would have delivered.
+    """
     async def run():
         mgr = CometdManager(_StubRPC())
         hs = await mgr.handle_messages([{"channel": "/meta/handshake", "id": 1}])
         cid = hs[0]["clientId"]
-        for i in range(MAX_QUEUED_EVENTS + 37):
+        n = 512
+        for i in range(n):
             mgr.push(cid, {"channel": "/x", "data": {"n": i}, "id": i})
-        return await mgr.wait_for_events(cid, timeout=0)
+        queued = await mgr.wait_for_events(cid, timeout=0)
+        # a client that never comes back is not kept forever either: Perl's
+        # autokill drops it (and with it its queue) after 180 s.
+        reaped = mgr.kill_idle_clients(timeout=0.0)
+        return queued, reaped, mgr.get(cid)
 
-    events = _run(run())
-    assert len(events) == MAX_QUEUED_EVENTS, len(events)
-    assert events[-1]["data"]["n"] == MAX_QUEUED_EVENTS + 36  # newest kept
-    assert events[0]["data"]["n"] == 37                       # oldest dropped
+    queued, reaped, client = _run(run())
+    assert len(queued) == 512, f"events were dropped: {len(queued)}"
+    assert [e["data"]["n"] for e in queued] == list(range(512))
+    assert reaped and client is None, "an idle client was not reaped"
 
 
 def test_abrupt_close_keeps_the_client_until_the_grace_expires():

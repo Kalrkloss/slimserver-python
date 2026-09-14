@@ -90,7 +90,6 @@ from lyrion.web.cometd import (
     LONG_POLL_TIMEOUT_MS,
     LONG_POLLING_INTERVAL,
     RETRY_DELAY_MS,
-    STREAMING_HOLD_WINDOW,
     CometdManager,
     _channel_matches,
     connect_timeout,
@@ -1254,165 +1253,211 @@ def test_live_long_polling_request_result_rides_in_the_post_response():
 
 
 # ---------------------------------------------------------------------------
-# Streaming hold window + Perl's disconnect grace (the 10 s app teardown)
+# The streaming /meta/connect is held open indefinitely (Perl semantics)
 # ---------------------------------------------------------------------------
 
-def test_streaming_hold_window_closes_the_response_and_arms_the_grace():
-    """After STREAMING_HOLD_WINDOW of silence the stream ends — client kept.
+def test_streaming_connect_is_held_open_past_the_retired_hold_window():
+    """No Python timer ends a silent stream; Perl has none either.
 
-    Perl holds a streaming response for as long as the socket lives
-    (Cometd.pm:288-297 arms no timer for that branch; live probe: 20 s of
-    silence on a bare connect). uvicorn cannot: it queues HTTP pipelined
-    requests until the response completes (h11_impl.py:191-197, :278), so a
-    POST the client sent behind the stream was never served — the app's own
-    deadline for a non-connect message is libcometd's ``maxNetworkDelay``
-    = 10000 ms (libcometd.js:1268, :380-389 adds advice.timeout only for
-    ``metaConnect``), which is the 10 s after which the app re-handshaked.
-
-    The window's value is Perl's RETRY_DELAY (Cometd.pm:45), the interval the
-    connect ack advertises for re-connecting (Cometd.pm:277-279). The client
-    itself is NOT dropped when the window closes: Perl's webCloseHandler arms
-    ``disconnectClient`` for RETRY_DELAY * 2 (Cometd.pm:1010-1014) instead.
+    Perl's streaming branch arms NO timer (Cometd.pm:288-297 only sets
+    ``Transfer-Encoding: chunked`` and the transport marker; the only timer
+    there is the one :283 KILLS) and a live probe against LMS 9.1.1 showed a
+    bare connect staying open and silent for > 20 s. The ASGI handler used to
+    close the response after ``STREAMING_HOLD_WINDOW`` = RETRY_DELAY (5 s) of
+    silence; that hack is gone, so nothing may put ``more_body: False`` on the
+    wire while the peer is still connected — however long the silence lasts.
     """
     async def run():
-        import lyrion.web.app as app_mod
-
         mgr, _rec = _manager()
         cid, _hs = await _handshake_async(mgr)
-        old = app_mod.STREAMING_HOLD_WINDOW
-        app_mod.STREAMING_HOLD_WINDOW = 0.1        # keep the test short
-        try:
-            tr = _HeldTransport([{"channel": "/meta/connect", "clientId": cid,
-                                  "id": 2, "connectionType": "streaming"}])
-            task = asyncio.create_task(
-                _handle_cometd(mgr, "/cometd", tr.receive, tr.send))
-            for _ in range(200):
-                if not tr.streaming:
-                    break
-                await asyncio.sleep(0.02)
-            client = mgr.get(cid)
-            await asyncio.wait_for(task, timeout=5)
-        finally:
-            app_mod.STREAMING_HOLD_WINDOW = old
-        return tr, client
+        # A transport whose ``receive`` never reports http.disconnect
+        # (``_HeldTransport``): the peer is there, it just says nothing.
+        tr = _HeldTransport([{"channel": "/meta/connect", "clientId": cid,
+                              "id": 2, "connectionType": "streaming"}])
+        task = asyncio.create_task(
+            _handle_cometd(mgr, "/cometd", tr.receive, tr.send))
+        for _ in range(200):
+            if not tr.streaming:
+                break
+            await asyncio.sleep(0.02)
+        # Wait past the retired window (RETRY_DELAY = 5 s) — plus a margin.
+        await asyncio.sleep(RETRY_DELAY_MS / 1000.0 + 1.0)
+        open_now = tr.streaming
+        bodies = [e for e in tr.sent if e.get("type") == "http.response.body"]
+        # and the stream still carries events afterwards
+        mgr.push(cid, {"channel": f"/{cid}/slim/x", "id": 0, "data": {"n": 1}})
+        framed = await _wait_for_chunk_channel(tr, f"/{cid}/slim/x")
+        client = mgr.get(cid)
+        open_end = tr.streaming
+        bodies_end = [e for e in tr.sent
+                      if e.get("type") == "http.response.body"]
+        conns = client.connections if client is not None else 0
+        task.cancel()
+        return open_now, bodies, framed, open_end, bodies_end, conns
 
-    tr, client = asyncio.run(run())
-    bodies = [e for e in tr.sent if e.get("type") == "http.response.body"]
-    assert bodies[0]["more_body"] is True               # ack first, held open
-    assert bodies[-1]["more_body"] is False, "the window did not close it"
-    assert json.loads(bodies[-1]["body"]) == []         # Perl's empty batch
-    assert not tr.streaming
-    assert client is not None, "the client was dropped while its grace ran"
-    assert client.connections == 0
-    assert client.disconnect_at is not None             # Perl's 10 s timer
-    assert STREAMING_HOLD_WINDOW == RETRY_DELAY_MS / 1000.0 == 5.0
-    assert DISCONNECT_GRACE == 10.0
+    open_now, bodies, framed, open_end, bodies_end, conns = asyncio.run(run())
+    assert open_now, "the stream was closed while its peer was still connected"
+    assert len(bodies) == 1, f"a timer wrote extra bodies: {bodies}"
+    assert bodies[0]["more_body"] is True           # ack first, held open
+    assert open_end, "the held stream was terminated by a timer"
+    assert all(b["more_body"] is True for b in bodies_end), (
+        f"a timer terminated the held stream: {bodies_end}")
+    assert json.loads(bodies_end[0]["body"])          # ack, never an empty batch
+    assert json.loads(bodies_end[-1]["body"])[0]["data"] == {"n": 1}
+    assert framed is not None, "the held stream stopped accepting events"
+    assert conns > 0, "the client lost its open connection"
+    assert DISCONNECT_GRACE == 10.0                   # Perl's disconnectClient
 
 
-def test_streaming_hold_window_is_restarted_by_every_pushed_event():
-    """A stream that keeps delivering events is not closed by the window."""
+def test_streaming_events_are_pushed_for_as_long_as_the_peer_stays():
+    """A long-open stream keeps delivering every pushed event, in order."""
     async def run():
-        import lyrion.web.app as app_mod
-
         mgr, _rec = _manager()
         cid, _hs = await _handshake_async(mgr)
-        old = app_mod.STREAMING_HOLD_WINDOW
-        app_mod.STREAMING_HOLD_WINDOW = 0.3
-        try:
-            tr = _HeldTransport([{"channel": "/meta/connect", "clientId": cid,
-                                  "id": 2, "connectionType": "streaming"}])
-            task = asyncio.create_task(
-                _handle_cometd(mgr, "/cometd", tr.receive, tr.send))
+        tr = _HeldTransport([{"channel": "/meta/connect", "clientId": cid,
+                              "id": 2, "connectionType": "streaming"}])
+        task = asyncio.create_task(
+            _handle_cometd(mgr, "/cometd", tr.receive, tr.send))
 
-            async def feed():
-                for n in range(6):
-                    await asyncio.sleep(0.15)
-                    mgr.push(cid, {"channel": f"/{cid}/slim/x", "id": 0,
-                                   "data": {"n": n}})
+        async def feed():
+            for n in range(6):
+                await asyncio.sleep(0.15)
+                mgr.push(cid, {"channel": f"/{cid}/slim/x", "id": 0,
+                               "data": {"n": n}})
 
-            pusher = asyncio.create_task(feed())
-            await asyncio.sleep(0.8)                   # > 1 event, > 2 windows
-            open_after_events = tr.streaming
-            await pusher
-            for _ in range(200):
-                if not tr.streaming:
-                    break
-                await asyncio.sleep(0.02)
-            await asyncio.wait_for(task, timeout=5)
-        finally:
-            app_mod.STREAMING_HOLD_WINDOW = old
-        return tr, open_after_events
+        pusher = asyncio.create_task(feed())
+        await asyncio.sleep(0.8)                   # well past one event
+        open_after_events = tr.streaming
+        await pusher
+        await asyncio.sleep(0.3)
+        still_open = tr.streaming
+        task.cancel()
+        return tr, open_after_events, still_open
 
-    tr, open_after_events = asyncio.run(run())
-    assert open_after_events, (
-        "an event-carrying stream was closed after one idle window")
+    tr, open_after_events, still_open = asyncio.run(run())
+    assert open_after_events and still_open, (
+        "an event-carrying stream was closed by a timer")
     pushed = [m for chunk in tr.chunks for m in json.loads(chunk)
               if isinstance(m, dict) and str(m.get("channel", "")).startswith("/")]
-    assert any(str(m.get("channel", "")).endswith("/slim/x") for m in pushed)
+    ns = [m["data"]["n"] for m in pushed
+          if str(m.get("channel", "")).endswith("/slim/x")]
+    assert ns == list(range(6)), ns
 
 
-def test_live_post_behind_an_open_stream_is_served():
-    """The app's real pattern: connect AND its next POST on one socket.
+def test_live_asgi_stream_is_not_ended_by_a_timer():
+    """Live uvicorn: the streaming response stays open past RETRY_DELAY.
 
-    Perl answers the queued POST while the stream is still open (measured
-    live against LMS 9.1.1: 0.8 s — its HTTP layer keeps reading the socket,
-    Slim/Web/HTTP.pm:277, and writes each response on its own,
-    addHTTPResponse HTTP.pm:1895-1960). uvicorn defers pipelined requests
-    until the response completes, so without the hold window this POST stayed
-    unanswered until the client gave up — the reported
-    "favourites never open" symptom.
+    The retired hack closed it after 5 s of silence. Perl never closes it
+    (Cometd.pm:288-297 arms nothing there; the live 9.1.1 probe held a bare
+    connect open and silent for > 20 s), so the response must still be open
+    after the old window has passed. Then the socket is closed, which is
+    exactly Perl's webCloseHandler case: the client is NOT dropped, it only
+    gets ``disconnectClient`` armed for RETRY_DELAY * 2 (Cometd.pm:1010-1014).
     """
-    async def run():
-        import lyrion.web.app as app_mod
+    HOLD_S = RETRY_DELAY_MS / 1000.0 + 1.0        # past the retired window
 
+    async def run():
         rpc = _LiveRPC()
         mgr = CometdManager(rpc)
-        old = app_mod.STREAMING_HOLD_WINDOW
-        app_mod.STREAMING_HOLD_WINDOW = 0.3
-        try:
-            async with _live_server(mgr) as port:
-                cid = await _live_handshake(port)
-                client = await _Client.open(port)
-                # both POSTs back to back on ONE socket, like the Android apps
-                await client.post([{"channel": "/meta/connect", "clientId": cid,
-                                    "id": 2, "connectionType": "streaming"}])
-                await client.post([{
-                    "channel": "/slim/request", "clientId": cid, "id": 3,
-                    "data": {"request": [PLAYER, ["favorites", "items", "0", "100"]],
-                             "response": f"/{cid}/slim/request/7"}}])
-                started = time.monotonic()
-                await client.read_headers()
-                ack = json.loads(await client.read_chunk())
-                while await client.read_chunk(timeout=5.0):
-                    pass
-                await client.reader.readexactly(2)     # chunked-body terminator
-                awaited = time.monotonic() - started
-                _status, headers = await client.read_headers(timeout=5.0)
-                if headers.get("transfer-encoding", "").lower() == "chunked":
-                    parts = []
-                    while True:
-                        part = await client.read_chunk(timeout=5.0)
-                        if not part:
-                            break
-                        parts.append(part)
-                    payload = b"".join(parts)
-                else:
-                    payload = await client.reader.readexactly(
-                        int(headers["content-length"]))
-                client.close()
-                return cid, ack, json.loads(payload), awaited, mgr.get(cid), headers
-        finally:
-            app_mod.STREAMING_HOLD_WINDOW = old
+        async with _live_server(mgr) as port:
+            cid = await _live_handshake(port)
+            client = await _Client.open(port)
+            await client.post([{"channel": "/meta/connect", "clientId": cid,
+                                "id": 2, "connectionType": "streaming"}])
+            _status, headers = await client.read_headers()
+            ack = json.loads(await client.read_chunk())
+            started = time.monotonic()
+            # Nothing pushed, nothing sent — just silence, like Perl.
+            ended = False
+            while time.monotonic() - started < HOLD_S:
+                try:
+                    chunk = await client.read_chunk(timeout=HOLD_S)
+                except asyncio.TimeoutError:
+                    break
+                if chunk == b"":                 # the 0-chunk = body ended
+                    ended = True
+                    break
+            held = time.monotonic() - started
+            client.close()
+            for _ in range(100):                 # let http.disconnect land
+                await asyncio.sleep(0.02)
+            return cid, headers, ack, held, ended, mgr.get(cid)
 
-    cid, ack, reply, awaited, client, headers = asyncio.run(run())
-    print(f"\n[len] queued POST behind the open stream served after "
-          f"{awaited:.2f}s, headers={headers}")
-    assert ack[0]["channel"] == "/meta/connect" and ack[0]["successful"] is True
-    channels = [m.get("channel") for m in reply]
-    assert f"/{cid}/slim/request/7" in channels, reply
-    # inside the client's own deadline for a non-connect message (10 s)
-    assert awaited < 10.0, f"the queued POST waited {awaited:.1f}s"
-    # ... and the client survived the end of that stream (Perl's grace)
+    cid, headers, ack, held, ended, client = asyncio.run(run())
+    print(f"\n[hold] silent ASGI stream open for {held:.2f}s, ended={ended}")
+    assert headers.get("transfer-encoding", "").lower() == "chunked", headers
+    assert ack[0]["channel"] == "/meta/connect"
+    assert not ended, f"a timer ended the stream after {held:.2f}s of silence"
+    assert held >= RETRY_DELAY_MS / 1000.0, (
+        f"the stream was only observed for {held:.2f}s")
+    # a closed socket is Perl's webCloseHandler: client kept, grace armed
+    assert client is not None, "the client was dropped instead of given a grace"
+    assert client.connections == 0
+
+
+def test_live_post_behind_an_open_stream_is_served_by_the_frontend():
+    """The public port's job: a POST pipelined behind an open stream is served.
+
+    This is Perl HTTP.pm:2065-2072 ("We also support pipelined cometd requets,
+    even though this is against the HTTP RFC"): the socket stays in the read
+    set while the streaming response is open (HTTP.pm:277) and every response
+    is written on its own (addHTTPResponse HTTP.pm:1895-1960 via Cometd.pm:734).
+    uvicorn cannot do that (h11_impl.py:191-197 defers pipelined requests until
+    the current response completes), which is why the ASGI stream used to be
+    cut short — and no longer is: the PUBLIC port is the native frontend
+    (networking/cometd_stream.py, commit 54a201363), which reads the pipelined
+    request itself, exactly like Perl. Measured live against 192.168.1.90:9000
+    Perl answers in 0.8 s while the stream stays open.
+    """
+    from lyrion.networking.cometd_stream import start_cometd_server
+
+    async def run():
+        rpc = _LiveRPC()
+        mgr = CometdManager(rpc)
+        # No non-Bayeux request is made, so the relay target is never used.
+        server = await start_cometd_server(mgr, "127.0.0.1", 0, 1)
+        try:
+            port = server.sockets[0].getsockname()[1]
+            cid = await _live_handshake(port)
+            client = await _Client.open(port)
+            # streaming connect ...
+            await client.post([{"channel": "/meta/connect", "clientId": cid,
+                                "id": 2, "connectionType": "streaming"}])
+            await client.read_headers()
+            await client.read_chunk()          # the connect ack
+            # ... and the next POST pipelined onto the SAME socket
+            await client.post([{
+                "channel": "/slim/request", "clientId": cid, "id": 3,
+                "data": {"request": [PLAYER, ["favorites", "items",
+                                             "menu:favorites"]],
+                         "response": f"/{cid}/slim/request/7"}}])
+            started = time.monotonic()
+            frames = []
+            while time.monotonic() - started < 5.0:
+                try:
+                    frame = json.loads(await client.read_chunk(timeout=5.0))
+                except asyncio.TimeoutError:
+                    break
+                frames.extend(frame)
+                if any(str(m.get("channel", "")).endswith("/slim/request/7")
+                       for m in frames):
+                    break
+            waited = time.monotonic() - started
+            still_open = client.writer.is_closing() is False
+            client.close()
+            return cid, frames, waited, still_open, mgr.get(cid), rpc.calls
+        finally:
+            server.close()
+            await server.wait_closed()
+
+    cid, frames, waited, still_open, client, calls = asyncio.run(run())
+    print(f"\n[frontend] pipelined POST behind the open stream answered after "
+          f"{waited:.2f}s")
+    channels = [m.get("channel") for m in frames]
+    assert f"/{cid}/slim/request/7" in channels, frames
+    assert any(c[:2] == ["favorites", "items"] for c in calls), calls
+    assert waited < 10.0, f"the queued POST waited {waited:.1f}s"
+    assert still_open, "the answer cost the open stream its life"
     assert client is not None
 
 

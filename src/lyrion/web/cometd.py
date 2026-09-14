@@ -67,37 +67,30 @@ RETRY_DELAY_MS = 5000
 # /meta/disconnect. Python implements it as an idle sweep instead of a timer.
 LONG_POLLING_AUTOKILL = 180.0
 
-# Hold window of an ASGI streaming /meta/connect. Perl holds a streaming
+# Hold window of an ASGI streaming /meta/connect: NONE. Perl holds a streaming
 # response open for as long as the socket lives — it has no timer for that
 # branch at all (Cometd.pm:288-297 only sets ``Transfer-Encoding: chunked``
-# and marks the transport; only the long-polling branch arms a timer,
-# Cometd.pm:302-325). Live probe against LMS 9.1.1: a bare streaming connect
-# stays open and SILENT for at least 20 s (no heartbeat, no empty chunk —
-# Perl sends nothing) and its queued events are written the moment they exist
-# (Manager::deliver_events, Manager.pm:247-263 -> sendResponse Cometd.pm:661).
+# and marks the transport; the sole timer there is the one :283 kills, and
+# only the long-polling branch arms one, Cometd.pm:302-325). Live probe
+# against LMS 9.1.1: a bare streaming connect stays open and SILENT for at
+# least 20 s (no heartbeat, no empty chunk — Perl sends nothing) and its
+# queued events are written the moment they exist (Manager::deliver_events,
+# Manager.pm:247-263 -> sendResponse Cometd.pm:661).
 #
-# The ASGI transport cannot copy that: uvicorn queues HTTP pipelined requests
-# until the CURRENT response completes (h11: h11_impl.py:191-197 pauses the
-# read flow on ``h11.PAUSED`` and on_response_complete starts the queued cycle,
-# :278; httptools: httptools_impl.py:291-297 "Pipelined HTTP requests need to
-# be queued up"). Perl instead keeps reading the socket while the stream is
-# open (processHTTP stays in the read set, Slim/Web/HTTP.pm:277) and writes
-# every response independently (addHTTPResponse, HTTP.pm:1895-1960, called
-# from Cometd.pm:734): measured live, a POST sent right behind a streaming
-# connect is answered in 0.8 s while the stream stays open, while the same
-# POST on this ASGI path is not answered for as long as the stream is held.
-#
-# So the ASGI stream is closed after this much *silence* (every pushed event
-# restarts the window, a busy stream therefore stays open) to give the client's
-# queued POSTs their turn. The value is Perl's RETRY_DELAY (Cometd.pm:45) —
-# the interval Perl's own streaming connect ack tells the client to wait
-# before re-connecting (Cometd.pm:277-279), so the client is prepared for a
-# stream end. It must stay below the client's network deadline for a
-# NON-connect message: libcometd allows exactly ``maxNetworkDelay`` = 10000 ms
-# there (html/material/html/lib/libcometd.js:1268, and :380-389 adds
-# ``advice.timeout`` only for ``metaConnect``) — that 10 s is the deadline the
-# app hit before re-handshaking.
-STREAMING_HOLD_WINDOW = RETRY_DELAY_MS / 1000.0  # 5.0 s
+# Python used to close the ASGI stream after RETRY_DELAY (5 s) of silence
+# because uvicorn queues HTTP pipelined requests until the CURRENT response
+# completes (h11: h11_impl.py:191-197 pauses the read flow on ``h11.PAUSED``
+# and on_response_complete starts the queued cycle, :278; httptools:
+# httptools_impl.py:291-297 "Pipelined HTTP requests need to be queued up"),
+# so a POST the client had pipelined behind the stream was never answered.
+# That hack is gone: since the one-port rework (commit 54a201363) the PUBLIC
+# port is served by the native frontend, which reads pipelined requests
+# itself (Slim/Web/HTTP.pm:277 keeps the socket in the read set, Cometd.pm:734
+# -> addHTTPResponse HTTP.pm:1895-1960 writes each response on its own) and
+# relays every request on its OWN upstream connection
+# (networking/cometd_stream.py). The ASGI stream is reached only through that
+# internal relay, so the uvicorn limitation cannot reach a client — the
+# streaming response is now held open exactly like Perl's.
 
 # Grace period for a streaming client whose connection is gone. Perl does NOT
 # drop the client when its connection is lost: webCloseHandler unregisters the
@@ -110,11 +103,14 @@ STREAMING_HOLD_WINDOW = RETRY_DELAY_MS / 1000.0  # 5.0 s
 # a client that was simply between two connections.
 DISCONNECT_GRACE = (RETRY_DELAY_MS / 1000.0) * 2  # 10.0 s
 
-# Upper bound for one client's pending-event queue. Perl has no explicit cap
-# (it relies on LONG_POLLING_AUTOKILL / webCloseHandler to drop dead clients);
-# this is a Python-side safety net so a stalled or half-dead client cannot grow
-# the queue forever. Oldest events are dropped first.
-MAX_QUEUED_EVENTS = 256
+# NOTE: there is deliberately NO cap on a client's pending-event queue. Perl
+# has none: Manager::queue_events (Slim/Web/Cometd/Manager.pm:181-189) appends
+# every event and lets the client's own poll/connect fetch them; a client that
+# never comes back is dropped by LONG_POLLING_AUTOKILL -> disconnectClient
+# (180 s, Cometd.pm:49/:693) instead of having its events silently thrown
+# away. Python follows that: ``kill_idle_clients`` reaps a client with no open
+# transport after LONG_POLLING_AUTOKILL, so the queue cannot grow forever
+# either — and the client never loses an event Perl would have delivered.
 
 
 @dataclass
@@ -631,7 +627,15 @@ class CometdManager:
         return self._clients.get(client_id)
 
     def remove(self, client_id: str) -> None:
-        self._clients.pop(client_id, None)
+        # Wake whoever is waiting on this client (a held streaming
+        # /meta/connect blocks in ``wait_for_events(timeout=None)``) so it can
+        # notice that the client is gone and end its response. Perl sees the
+        # same fact from the socket/closing connection rather than from a
+        # wake-up, but the observable behaviour is the same: no event, the
+        # connection ends.
+        client = self._clients.pop(client_id, None)
+        if client is not None:
+            client.notify.set()
 
     def touch(self, client_id: str) -> None:
         """Mark client activity (Perl kills the autokill timer on connect)."""
@@ -970,11 +974,6 @@ class CometdManager:
         if client is None:
             return
         client.events.append(event)
-        if len(client.events) > MAX_QUEUED_EVENTS:
-            # Drop the oldest — a stalled/dead client must not grow the
-            # queue without bound (Perl drops the whole client via
-            # LONG_POLLING_AUTOKILL; this cap is the cheap safety net).
-            del client.events[:len(client.events) - MAX_QUEUED_EVENTS]
         client.notify.set()
 
     async def notify_server_status(self) -> None:
