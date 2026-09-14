@@ -5821,13 +5821,39 @@ class JSONRPCAPI:
                         )
         elif cmd == "play":
             player = pm.get_player(pid)
-            if player is not None:
-                await pm.power_on_for_playback(player)
-                player.mode = "play"
-                pm.set_mode(pid, "play")
-                await self._play_playlist_item(pm, player, player.playlist_position or 0)
-            else:
+            if player is None:
                 send("play")
+            else:
+                # Perl playcontrolCommand (Slim/Control/Commands.pm:697-781):
+                #   * 'play' while PAUSED becomes 'resume'
+                #     (``$wantmode = 'resume' if ($curmode eq 'pause' &&
+                #     $wantmode eq 'play')``, :743) → ``Source::playmode``'s
+                #     resume branch (Slim/Player/Source.pm:83-85,
+                #     ``$controller->resume``) → ``strm 'u'``
+                #     (Squeezebox2.pm:1104-1110): the paused output continues,
+                #     the file is NOT streamed again and the position is kept.
+                #   * 'play' from stop/loading goes through
+                #     ``['playlist', 'jump', playingSongIndex]`` (:758-763);
+                #     playlistJumpCommand powers the player on (:942-944) and
+                #     starts the item at that index (``controller()->play``,
+                #     :1020). ``playingSongIndex`` is never negative — a
+                #     negative stored index must not swallow the command.
+                #   * 'play' while already playing is a NO-OP: the whole
+                #     action sits behind ``if ($curmode ne $wantmode)`` (:756).
+                curmode = player.mode or "stop"
+                if curmode == "pause":
+                    await pm.pause_player(pid, False)          # Perl 'resume'
+                elif curmode != "play":
+                    await pm.power_on_for_playback(player)
+                    idx = int(player.playlist_position or 0)
+                    if idx < 0:
+                        # Perl's playingSongIndex (Source.pm:229-233:
+                        # ``return $song ? $song->index() : 0``) never
+                        # returns a negative index; a stale -1 (e.g. after a
+                        # failed strm send) must restart at the first item
+                        # instead of silently doing nothing.
+                        idx = 0
+                    await self._play_playlist_item(pm, player, idx)
         elif cmd == "stop":
             player = pm.get_player(pid)
             if player is not None:
@@ -5930,7 +5956,11 @@ class JSONRPCAPI:
                             if tid.isdigit():
                                 player.playlist.append(int(tid))
                         elif low.startswith("url:"):
-                            pending = low.split(":", 1)[1]
+                            # The VALUE must come from the original token: a
+                            # lowercased URL is a different URL (paths are
+                            # case-sensitive). Perl keeps the item verbatim
+                            # (playlistXitemCommand, Commands.pm:1354-1359).
+                            pending = str(item).split(":", 1)[1]
                         elif low.startswith("title:"):
                             title = str(item).split(":", 1)[1]
                             # Append the pending bare URL (it was held waiting
@@ -6044,8 +6074,17 @@ class JSONRPCAPI:
                         except Exception:
                             pass
                     elif "://" in str(rest[0]) if rest else False:
-                        # Bare stream URL
-                        await pm.play_url(pid, str(rest[0]), "")
+                        # Stream URL. The Jive action tags it ('url:http://…',
+                        # see the same token in _set_stream_title below); the
+                        # tag is transport metadata, the URL is the value.
+                        # Perl uses the positional item VERBATIM as the URL —
+                        # only whitespace is stripped, nothing is lowercased
+                        # or prefixed (playlistXitemCommand, Commands.pm:1354-
+                        # 1359: ``my $url = blessed($item) ? $item->url : $item``).
+                        _url = str(rest[0])
+                        if _url[:4].lower() == "url:":
+                            _url = _url[4:]
+                        await pm.play_url(pid, _url, "")
                         return
                     elif rest and str(rest[0]).isdigit():
                         idx = int(rest[0])
@@ -6213,11 +6252,21 @@ class JSONRPCAPI:
 
         Handles 'playlist play track_id:<n>' where the controllers send a
         bare tagged id (no playlist yet) — LMS play-by-track-id semantics.
+
+        Perl resolves a COMMA separated id list the way playlistcontrol
+        ``cmd:load`` does: the ids are split (``split(/,/, $track_id_list)``,
+        Commands.pm:2027-2035), the queue is replaced
+        (``Slim::Player::Playlist::stopAndClear``, Commands.pm:1941/:1694-1696,
+        followed by ``addTracks``, :1752-1753) and playback starts with the
+        FIRST loaded item (``playlist jump`` with an undefined index,
+        playlistXtracksCommand :1796 → ``controller()->play(0)``, :1020).
+        The sent order is kept (``%track_ids_order``, :2030-2049).
         """
-        if not tid.isdigit():
+        ids = [int(t) for t in str(tid).split(",") if str(t).strip().isdigit()]
+        if not ids:
             return
-        player.playlist = [int(tid)]
-        player.playlist_total = 1
+        player.playlist = ids
+        player.playlist_total = len(ids)
         player.playlist_position = 0
         player.last_activity = time.time()
 
