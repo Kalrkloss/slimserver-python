@@ -199,8 +199,17 @@ async def _run_server(
         await discovery.start()
         log.info("DiscoveryService started on port %d", slimproto_port)
 
-        # Periodic server announcement broadcast so remote apps find us
-        asyncio.create_task(_broadcast_server_presence(log, slimproto_port, http_port))
+        # Periodic server announcement broadcast so remote apps find us.
+        # The JSON beacon must name the SAME port the discovery TLV
+        # announces: the native cometd port (9080). It serves Bayeux
+        # directly (SqueezePlay pipelines POSTs on one socket, which
+        # uvicorn/h11 cannot, h11_impl.py:191-197) and proxies /jsonrpc.js
+        # to the web app (networking/cometd_stream.py:202-230). Two beacons
+        # naming different ports send apps to a front-end that is not the
+        # intended one — measured 2026-09-14: the TLV said 9080 while this
+        # beacon said 9000, so JSON-beacon apps landed on uvicorn.
+        asyncio.create_task(_broadcast_server_presence(
+            log, slimproto_port, int(cfg.get("cometd_stream_port", 9080))))
     except Exception as exc:
         log.warning("Could not start discovery service: %s", exc)
 
