@@ -460,6 +460,7 @@ def test_country_and_language_leaves_use_their_endpoints(monkeypatch):
 
 def test_local_uses_the_locale_country(monkeypatch):
     """``local`` → ``bycountrycodeexact(<Land des Servers>)``."""
+    monkeypatch.setattr(radiobrowser, "_stored_country", lambda: None)  # nie gesetzt
     monkeypatch.setenv("LC_ALL", "de_DE.UTF-8")
     monkeypatch.delenv("LANG", raising=False)
     seen: list[str] = []

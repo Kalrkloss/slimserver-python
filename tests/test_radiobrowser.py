@@ -19,8 +19,9 @@ from __future__ import annotations
 import asyncio
 import json
 import urllib.request
-from typing import Any
+from typing import Any, Optional
 
+import aiosqlite
 import pytest
 
 from lyrion.web import radiobrowser
@@ -370,6 +371,7 @@ def test_search_level_title_uses_the_query():
 
 
 def test_local_country_from_locale_and_pref(monkeypatch):
+    monkeypatch.setattr(radiobrowser, "_stored_country", lambda: None)
     monkeypatch.setenv("LC_ALL", "de_DE.UTF-8")
     monkeypatch.delenv("LANG", raising=False)
     monkeypatch.delenv("LC_MESSAGES", raising=False)
@@ -377,4 +379,215 @@ def test_local_country_from_locale_and_pref(monkeypatch):
     monkeypatch.setenv("LC_ALL", "en_US.UTF-8")
     assert radiobrowser.local_country() == "US"
     monkeypatch.delenv("LC_ALL", raising=False)
+    # No locale at all: the timezone answers (see the country tests below);
+    # with an unknown zone the shipped fallback is left.
+    monkeypatch.setenv("TZ", "Mars/Olympus")
     assert radiobrowser.local_country() == radiobrowser.DEFAULT_COUNTRY
+
+
+# ── the country of the ``local`` node: pref + first-start derivation ───────
+#
+# Perl precedent for a *derived* pref default: ``Slim/Utils/Prefs.pm:161``
+# (``'language' => \&defaultLanguage``) → ``:676-678`` →
+# ``Slim/Utils/OS.pm:399-414`` (``POSIX::setlocale(LC_CTYPE)``, up-cased, codeset
+# and territory stripped).  Perl has no country pref at all (its ``local`` node
+# is TuneIn's IP-geolocated one, ``TuneIn.pm:38-40``).
+
+@pytest.fixture(autouse=True)
+def _no_stored_country_pref():
+    """Kein ``radiobrowser_country`` aus einem anderen Testmodul.
+
+    Der ``PreferenceStore`` ist ein Singleton; ``tests/test_web_settings.py``
+    schreibt dieselbe Pref. ``get`` liest den Cache, deshalb genügt dessen
+    Leeren — die Ableitung ist damit wieder der „nie gesetzt"-Fall.
+    """
+    from lyrion.config import get_prefs
+
+    get_prefs()._cache.pop(radiobrowser.COUNTRY_PREF, None)
+    yield
+
+
+def _no_locale(monkeypatch) -> None:
+    for var in radiobrowser._LOCALE_VARS:
+        monkeypatch.delenv(var, raising=False)
+
+
+@pytest.mark.parametrize("locale,expected", [
+    ("de_DE.UTF-8", "DE"),
+    ("en_US.UTF-8", "US"),
+    ("en-US", "US"),
+    ("de_DE.ISO-8859-1@euro", "DE"),
+    ("fr_FR", "FR"),
+    ("C", ""),            # POSIX: no territory — Perl answers 'EN' (OS.pm:411)
+    ("POSIX", ""),
+    ("en", ""),           # language without a territory
+    ("", ""),
+])
+def test_region_of_locale_is_the_territory(locale, expected):
+    assert radiobrowser._region_of_locale(locale) == expected
+
+
+def test_derived_country_takes_the_locale_before_the_timezone(monkeypatch):
+    monkeypatch.setenv("LC_ALL", "de_DE.UTF-8")
+    monkeypatch.setenv("TZ", "America/New_York")
+    assert radiobrowser.derived_country() == "DE"
+
+    # ``LC_ALL`` decides — LANG is not consulted (POSIX precedence, the order
+    # ``POSIX::setlocale`` resolves in, OS.pm:399-404): with LC_ALL=C the
+    # timezone answers even though LANG names a territory.
+    monkeypatch.setenv("LC_ALL", "C")
+    monkeypatch.setenv("LANG", "fr_FR.UTF-8")
+    monkeypatch.setattr(radiobrowser, "_zone_table",
+                        lambda: {"Europe/Berlin": "DE"})
+    monkeypatch.setenv("TZ", "Europe/Berlin")
+    assert radiobrowser.derived_country() == "DE"
+
+
+def test_derived_country_falls_back_to_the_timezone(monkeypatch):
+    _no_locale(monkeypatch)
+    monkeypatch.setattr(radiobrowser, "_zone_table",
+                        lambda: {"Europe/Berlin": "DE",
+                                 "America/New_York": "US"})
+    monkeypatch.setenv("TZ", "Europe/Berlin")
+    assert radiobrowser.derived_country() == "DE"
+    monkeypatch.setenv("TZ", "America/New_York")
+    assert radiobrowser.derived_country() == "US"
+    # A zone the OS map does not know, and no locale: the shipped fallback.
+    monkeypatch.setenv("TZ", "Mars/Olympus")
+    assert radiobrowser.derived_country() == radiobrowser.DEFAULT_COUNTRY
+
+
+def test_derived_country_reads_etc_timezone_when_tz_is_unset(monkeypatch):
+    """``TZ`` unset → ``/etc/timezone`` (the task's fallback chain)."""
+    _no_locale(monkeypatch)
+    monkeypatch.delenv("TZ", raising=False)
+    monkeypatch.setattr(radiobrowser, "_zone_table",
+                        lambda: {"Europe/Berlin": "DE"})
+
+    class _FakePath:
+        def __init__(self, path):
+            self.path = str(path)
+
+        def read_text(self, **_kwargs):
+            return "Europe/Berlin\n"
+
+    monkeypatch.setattr(radiobrowser, "Path", _FakePath)
+    assert radiobrowser.derived_country() == "DE"
+
+
+def test_zone_table_is_the_operating_systems_own_map():
+    """The zone → country map is read from ``zone.tab``, not invented."""
+    table = radiobrowser._zone_table()
+    if not table:
+        pytest.skip("no /usr/share/zoneinfo/zone.tab on this host")
+    assert table.get("Europe/Berlin") == "DE"
+    assert table.get("America/New_York") == "US"
+
+
+def test_local_country_pref_wins_and_empty_means_all_countries(monkeypatch):
+    monkeypatch.setenv("LC_ALL", "en_US.UTF-8")
+    monkeypatch.setattr(radiobrowser, "_stored_country", lambda: "fr")
+    assert radiobrowser.local_country() == "FR"          # pref, not the locale
+    monkeypatch.setattr(radiobrowser, "_stored_country", lambda: "")
+    assert radiobrowser.local_country() == ""            # "" = all countries
+    monkeypatch.setattr(radiobrowser, "_stored_country", lambda: "  ")
+    assert radiobrowser.local_country() == ""            # blank behaves the same
+    monkeypatch.setattr(radiobrowser, "_stored_country", lambda: None)
+    assert radiobrowser.local_country() == "US"          # never set → derived
+
+
+@pytest.fixture
+def prefs_store():
+    """In-memory preference store (the pattern of ``tests/test_web_settings.py``)."""
+    from lyrion.config import _PREF_DB_SCHEMA, get_prefs
+
+    store = get_prefs()
+    opened = False
+    if getattr(store, "_db", None) is None:
+        async def _open() -> None:
+            store._db = await aiosqlite.connect(":memory:")
+            store._db.row_factory = aiosqlite.Row
+            await store._db.executescript(_PREF_DB_SCHEMA)
+
+        asyncio.run(_open())
+        opened = True
+    yield store
+    db = getattr(store, "_db", None)
+    if opened and db is not None:
+        try:
+            asyncio.run(db.close())
+        except Exception:  # noqa: BLE001 — Aufräumen darf nicht scheitern
+            pass
+        store._db = None
+
+
+async def _clear_pref(store, name: str) -> None:
+    store._cache.pop(name, None)
+    if store._db is not None:
+        await store._db.execute("DELETE FROM prefhash WHERE name = ?", (name,))
+        await store._db.commit()
+
+
+def test_ensure_country_pref_stores_the_derivation_once(monkeypatch, prefs_store):
+    """Perl ``Slim/Utils/Prefs/Base.pm:178-234``: the CODE default runs once."""
+    name = radiobrowser.COUNTRY_PREF
+    asyncio.run(_clear_pref(prefs_store, name))
+    monkeypatch.setenv("LC_ALL", "de_DE.UTF-8")
+    assert asyncio.run(radiobrowser.ensure_country_pref()) == "DE"
+    assert prefs_store.get(name) == "DE"
+
+    # From then on the stored value wins — a later locale change (or an empty
+    # "all countries" choice) is never overwritten by the derivation.
+    monkeypatch.setenv("LC_ALL", "en_US.UTF-8")
+    assert asyncio.run(radiobrowser.ensure_country_pref()) == "DE"
+    asyncio.run(prefs_store.set(name, ""))
+    assert asyncio.run(radiobrowser.ensure_country_pref()) == ""
+    assert prefs_store.get(name) == ""
+    asyncio.run(_clear_pref(prefs_store, name))
+
+
+def test_local_feed_without_a_country_asks_for_the_unfiltered_list(monkeypatch):
+    """"" (empty pref) = all countries → ``/json/stations/search``, no filter."""
+    monkeypatch.setattr(radiobrowser, "_stored_country", lambda: "")
+    seen: list[tuple[str, dict]] = []
+
+    async def fake(path: str, params: Optional[dict] = None):
+        seen.append((path, params or {}))
+        return [ROW]
+
+    monkeypatch.setattr(radiobrowser, "_get_json", fake)
+
+    rows = asyncio.run(radiobrowser.index_rows(RadioNode("index", "local")))
+    assert [label for label, _child in rows] == [radiobrowser.STATIONS_TITLE]
+    child = rows[0][1]
+    assert (child.kind, child.feed, child.arg) == ("stations", "local", "")
+
+    stations = asyncio.run(radiobrowser.stations_for(child, limit=20, offset=0))
+    assert [s.name for s in stations] == ["Test FM"]
+    path, params = seen[-1]
+    assert path == "/json/stations/search"
+    assert not any("country" in key for key in params), params
+    assert params["order"] == "clickcount" and params["hidebroken"] == "true"
+
+
+def test_local_feed_with_a_country_pref_filters_by_that_country(monkeypatch):
+    """The pref, not the locale, decides — even with an English locale."""
+    monkeypatch.setenv("LC_ALL", "en_US.UTF-8")
+    monkeypatch.setattr(radiobrowser, "_stored_country", lambda: "de")
+    seen: list[str] = []
+
+    async def fake(path: str, params: Optional[dict] = None):
+        seen.append(path)
+        if path == "/json/countries":
+            return [{"name": "Germany", "iso_3166_1": "DE", "stationcount": 9}]
+        return [ROW]
+
+    monkeypatch.setattr(radiobrowser, "_get_json", fake)
+
+    rows = asyncio.run(radiobrowser.index_rows(RadioNode("index", "local")))
+    assert [label for label, _child in rows] == \
+        [radiobrowser.STATIONS_TITLE, "Alle Germany"]
+    child = rows[0][1]
+    assert (child.feed, child.arg) == ("local", "DE")
+    asyncio.run(radiobrowser.stations_for(child, limit=20, offset=0))
+    assert seen[-1] == "/json/stations/bycountrycodeexact/DE"

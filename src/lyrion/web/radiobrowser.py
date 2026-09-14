@@ -46,10 +46,13 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
+import re
 import time
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Optional
 
 logger = logging.getLogger("lyrion.web.radiobrowser")
@@ -283,6 +286,21 @@ async def stations_by_language(language: str, limit: int = 20,
         _station_params(limit, offset)))
 
 
+async def top_stations(limit: int = 20, offset: int = 0) -> list[Station]:
+    """``/json/stations/search`` without a filter — radio-browser's top list.
+
+    The "all countries" answer of the ``local`` node (:data:`COUNTRY_PREF`
+    empty): the same parameters as every other search (``hidebroken``, ordered
+    by ``clickcount``, :data:`_SEARCH_PARAMS`) but no name/tag/country filter,
+    i.e. the stations the community listens to most.  Perl has no unfiltered
+    "local" feed (its ``local`` is always the geolocated country,
+    ``TuneIn.pm:38-40``), so this is the honest rendering of "no country
+    filter" — never an invented list.
+    """
+    return _stations(await _get_json("/json/stations/search",
+                                     _station_params(limit, offset)))
+
+
 async def countries() -> list[dict]:
     """``/json/countries`` → ``[{name, code, stationcount}]`` (name-sorted)."""
     payload = await _get_json("/json/countries")
@@ -406,28 +424,197 @@ TAG_INDEX: dict[str, tuple[str, ...]] = {
 }
 
 #: The country the ``local`` node shows.  Perl gets "nearby stations" from
-#: TuneIn (IP geolocation); this port derives the country from the server
-#: locale and lets the ``radiobrowser_country`` pref override it.
+#: TuneIn (IP geolocation, ``Slim/Plugin/InternetRadio/TuneIn.pm`` ``local``
+#: entry at :38-40) and has **no** pref for it — the whole ``%defaults`` table
+#: (``Slim/Utils/Prefs.pm:132-279``) carries neither ``country`` nor any
+#: location pref.  With radio-browser as the source (the approved deviation
+#: above) the country becomes a server pref the user can set in the web UI:
+#: ISO-3166-1 alpha-2 (``DE``); the *empty* value means "all countries".
+COUNTRY_PREF = "radiobrowser_country"
+
+#: Default of :func:`derived_country` when neither the locale nor the timezone
+#: names a region.  Perl's locale default is the language ``EN``
+#: (``Slim/Utils/OS.pm:411`` ``return $language || 'EN';``); the equivalent
+#: fallback for a *country* is the value this port used before the pref existed.
 DEFAULT_COUNTRY = "DE"
+
+#: Locale variables in POSIX precedence order (``LC_ALL`` overrides the
+#: category, which overrides ``LANG``).
+_LOCALE_VARS: tuple[str, ...] = ("LC_ALL", "LC_MESSAGES", "LANG")
+
+#: The operating system's own timezone → ISO-3166 map (one line per zone:
+#: ``country<TAB>coordinates<TAB>zone<TAB>comment``).  Nothing is invented here:
+#: the OS ships the mapping, so no hand-written zone table can go stale.
+_ZONE_TAB = Path("/usr/share/zoneinfo/zone.tab")
+_ZONE_TABLE: dict[str, str] = {}
+_ZONE_TABLE_READ = False
+
+
+def _region_of_locale(value: str) -> str:
+    """Territory of a POSIX locale string (``de_DE.UTF-8`` → ``DE``), else ``""``.
+
+    Perl parses the very same string in ``Slim/Utils/OS.pm:406-414``
+    (``_parseLanguage``, reached through ``getSystemLanguage`` :399-404 and the
+    ``language`` default :675-677)::
+
+        $language = uc($language);          # :409
+        $language =~ s/\\.UTF.*$//;          # :410
+        $language =~ s/(?:_|-|\\.)\\w+$//;   # :411
+
+    — it upper-cases, drops the codeset and then drops everything behind
+    ``_``/``-``/``.``, because it wants the *language*
+    (``de_DE.UTF-8`` → ``DE`` → ``DE`` is accidental; ``en_US.UTF-8`` → ``EN``).
+    A country is exactly the piece Perl throws away, so the same two steps run
+    here with the roles swapped: the codeset/modifier is split off first
+    (``[.@]``, matching :410), then the territory behind the separator is the
+    answer.  ``LANG=C``/``POSIX`` name no territory (Perl answers its ``EN``
+    default at :411) → ``""``, so the caller can try the timezone.
+    """
+    text = (value or "").strip().upper()
+    if not text:
+        return ""
+    text = re.split(r"[.@]", text, 1)[0]              # OS.pm:410  s/\.UTF.*$//
+    parts = re.split(r"[-_]", text)                   # OS.pm:411  language[_territory]
+    if len(parts) < 2:
+        return ""
+    region = parts[1].strip()
+    return region if len(region) == 2 and region.isalpha() else ""
+
+
+def _zone_table() -> dict[str, str]:
+    """``zone.tab`` as ``{IANA zone: ISO country}`` (read once, cached)."""
+    global _ZONE_TABLE_READ
+    if _ZONE_TABLE_READ:
+        return _ZONE_TABLE
+    _ZONE_TABLE_READ = True
+    try:
+        text = _ZONE_TAB.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:  # no tzdata / other OS layout
+        logger.debug("radio country: no %s: %s", _ZONE_TAB, exc)
+        return _ZONE_TABLE
+    for line in text.splitlines():
+        if not line or line.startswith("#"):
+            continue
+        fields = line.split("\t")
+        if len(fields) >= 3:
+            _ZONE_TABLE[fields[2].strip()] = fields[0].strip().upper()
+    return _ZONE_TABLE
+
+
+def _region_of_timezone() -> str:
+    """Country of the server timezone — ``TZ`` first, then ``/etc/timezone``.
+
+    The task's fallback when the locale names no region.  Perl has no
+    counterpart (it never derives a country), so the only rule applied is the
+    OS's own: the zone name is looked up in ``zone.tab`` (:func:`_zone_table`).
+    """
+    name = os.environ.get("TZ", "").strip().lstrip(":")
+    if not name:
+        try:
+            name = Path("/etc/timezone").read_text(
+                encoding="utf-8", errors="replace").strip()
+        except OSError as exc:
+            logger.debug("radio country: no /etc/timezone: %s", exc)
+            return ""
+    if not name:
+        return ""
+    return _zone_table().get(name, "")
+
+
+def _locale_region() -> str:
+    """Region of the server locale under POSIX precedence, else ``""``.
+
+    ``LC_ALL`` overrides every category, then the category (``LC_MESSAGES``)
+    wins over ``LANG`` — the order ``POSIX::setlocale(LC_CTYPE)`` resolves in,
+    which is what Perl reads (``Slim/Utils/OS.pm:399-404``).  The first variable
+    that is *set and non-empty* therefore decides; if it names no territory the
+    answer is empty and the caller goes on to the timezone, exactly like Perl
+    answers its ``EN`` default for ``LANG=C`` (``:411``).
+    """
+    for var in _LOCALE_VARS:
+        value = os.environ.get(var, "")
+        if value.strip():
+            return _region_of_locale(value)
+    return ""
+
+
+def derived_country() -> str:
+    """First-start value of :data:`COUNTRY_PREF` from the server settings.
+
+    Perl derives such a pref default once at init: ``Slim/Utils/Prefs.pm:161``
+    maps ``'language' => \\&defaultLanguage``, ``:676-678`` resolves that to
+    ``Slim::Utils::OSDetect->getOS->getSystemLanguage`` →
+    ``POSIX::setlocale(LC_CTYPE)`` → ``_parseLanguage``
+    (``Slim/Utils/OS.pm:399-414``).  The rule here is the same two sources the
+    task names, in that order: the region of the locale
+    (:func:`_locale_region`), else the country of the timezone
+    (:func:`_region_of_timezone`), else :data:`DEFAULT_COUNTRY`.
+    """
+    return _locale_region() or _region_of_timezone() or DEFAULT_COUNTRY
+
+
+def _stored_country() -> Optional[str]:
+    """Raw value of :data:`COUNTRY_PREF`, ``None`` when it was never set."""
+    try:
+        from lyrion.config import get_prefs
+        value = get_prefs().get(COUNTRY_PREF)
+    except Exception:  # noqa: BLE001 — pref store not available
+        return None
+    return None if value is None else str(value)
+
+
+def _as_country_code(value: Any) -> str:
+    """ISO-3166-1 alpha-2 of a stored pref value (``""`` = all countries)."""
+    text = str(value or "").strip().upper()
+    return text[:2] if len(text) >= 2 and text[:2].isalpha() else ""
 
 
 def local_country() -> str:
-    """ISO-3166-1 alpha-2 of the server locale (``de_DE.UTF-8`` → ``DE``)."""
-    try:
-        from lyrion.config import get_config
-        pref = get_config().get("radiobrowser_country")
-        if pref:
-            return str(pref).strip().upper()[:2]
-    except Exception:  # noqa: BLE001 — pref store not available
-        pass
-    import os
+    """The country of the ``local`` node: the pref, else its derived default.
 
-    for var in ("LC_ALL", "LC_MESSAGES", "LANG"):
-        value = os.environ.get(var) or ""
-        parts = value.split(".")[0].split("@")[0].split("_")
-        if len(parts) >= 2 and len(parts[1]) >= 2 and parts[1][:2].isalpha():
-            return parts[1][:2].upper()
-    return DEFAULT_COUNTRY
+    The stored value wins in *every* case — including the empty string, which
+    means "all countries".  Only when the pref was never set does the derived
+    first-start value answer; Perl's read-side counterpart of that fallback is
+    ``Slim/Utils/Light.pm:95`` ``$language ||= getPref('language') ||
+    $os->getSystemLanguage();`` (the server path writes the default once
+    instead — see :func:`ensure_country_pref`).
+    """
+    raw = _stored_country()
+    if raw is None:
+        return derived_country()
+    return _as_country_code(raw)
+
+
+async def ensure_country_pref() -> str:
+    """Store the derived first-start value once, like Perl's pref ``init``.
+
+    ``Slim/Utils/Prefs/Base.pm:178-234``: for every pref of the defaults table
+    that does not exist yet, a ``CODE`` default is *called*
+    (:204-206 ``$value = $hash->{ $pref }->( $class->_obj );``), put into the
+    prefs hash (:226) and written to disk (:233 ``$class->_root->save if
+    $changed;``) — the derivation runs exactly once, from then on the value is
+    an ordinary pref a web page can change.
+
+    ``radiobrowser_country`` has no ``%defaults`` entry yet (``config.py`` is
+    outside this change's file scope), so the same code runs when the settings
+    page is opened: an *unset* pref is filled once, a stored one — the empty
+    "all countries" value included — is never touched again.  Returns the
+    effective country (``""`` = all).
+
+    The feed path deliberately does **not** call this: browsing Radio must not
+    write settings, and until the pref is stored :func:`local_country` derives
+    the value live anyway (Perl's ``Light.pm:95`` read-side order).
+    """
+    from lyrion.config import get_prefs
+    prefs = get_prefs()
+    if COUNTRY_PREF in prefs:                 # set (any value, "" included)
+        return local_country()
+    value = derived_country()
+    try:
+        await prefs.set(COUNTRY_PREF, value)
+    except Exception as exc:  # noqa: BLE001 — never break a page/feed read
+        logger.debug("radio country: storing %s failed: %s", COUNTRY_PREF, exc)
+    return value
 
 
 # ── the node model ────────────────────────────────────────────────────────
@@ -513,7 +700,20 @@ async def index_rows(node: RadioNode) -> list[tuple[str, RadioNode]]:
     per-session feed cache does for the item ids.
     """
     if node.feed == "local":
+        # The pref is read here, never written: a browse must not change the
+        # server's settings.  An unset pref answers with the derived default
+        # (``local_country`` → ``derived_country``); Perl's read-side rule is
+        # the same (``Slim/Utils/Light.pm:95``), its write happens at init
+        # (``Slim/Utils/Prefs/Base.pm:178-234``) — see
+        # :func:`ensure_country_pref` for the port's equivalent call site.
         code = local_country()
+        if not code:
+            # ``radiobrowser_country`` empty = all countries.  Perl's second
+            # "Alle <Land>" row (the country-name variant of the same stations)
+            # has no country to name here, so the level carries the one row
+            # whose list is unfiltered (:func:`top_stations`).
+            return [(STATIONS_TITLE, RadioNode("stations", "local", "",
+                                               STATIONS_TITLE))]
         name = (await country_name(code)).removeprefix("The ")
         return [(STATIONS_TITLE, RadioNode("stations", "local", code,
                                            STATIONS_TITLE)),
@@ -547,6 +747,9 @@ async def stations_for(node: RadioNode, *, limit: int, offset: int) -> list[Stat
     """The station list of a leaf node (dispatch by feed)."""
     if node.feed == "search":
         return await search_stations(node.arg, limit=limit, offset=offset)
+    if node.feed == "local" and not node.arg.strip():
+        # Radiobrowser_country empty ("all countries"): no country filter at all.
+        return await top_stations(limit=limit, offset=offset)
     if node.feed in ("location", "local"):
         return await stations_by_country(node.arg, limit=limit, offset=offset)
     if node.feed == "language":
@@ -909,6 +1112,7 @@ def home_menu_items() -> list[dict[str, Any]]:
 
 __all__ = [
     "CACHE_TTL",
+    "COUNTRY_PREF",
     "DEFAULT_COUNTRY",
     "FEED_TITLES",
     "HTTP_TIMEOUT",
@@ -924,7 +1128,9 @@ __all__ = [
     "Station",
     "countries",
     "country_name",
+    "derived_country",
     "empty_placeholder",
+    "ensure_country_pref",
     "home_menu_items",
     "index_child",
     "index_rows",
@@ -947,4 +1153,5 @@ __all__ = [
     "stations_by_language",
     "stations_by_tag",
     "stations_for",
+    "top_stations",
 ]

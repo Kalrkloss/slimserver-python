@@ -26,6 +26,21 @@ Seiten + Feldlisten (je ``page()``/``prefs()``/``handler()``)
   ``page`` :23-25, ``prefs`` :27-29 (``language playlistdir libraryname``),
   ``mediadirs``/``ignoreInAudioScan`` :88-121, Vorlage
   ``HTML/EN/settings/server/basic.html:37,48,63,66,80``.
+  Zusatzfeld dieses Ports: ``pref_radiobrowser_country`` (Land des
+  ``local``-Radio-Knotens). Perl hat dafür KEINE Pref (``Slim/Utils/Prefs.pm:132-279``
+  kennt kein ``country``; ``local`` ist TuneIns geolokalisierter Knoten,
+  ``Slim/Plugin/InternetRadio/TuneIn.pm:38-40``) und keine Server-Seite — wir
+  hängen das Feld an dieselbe Seite, auf der Perls vergleichbare
+  Locale-abgeleitete Pref ``language`` liegt (``Slim/Utils/Prefs.pm:161`` →
+  ``:676-678`` → ``Slim/Utils/OS.pm:399-414``). Form (2-stelliges ISO-Feld) und
+  Beschriftung kommen aus Perls einziger „country“-Einstellung, dem
+  Plugin-Feld ``pref_country`` (``Slim/Plugin/Podcast/Settings.pm:19,29-31``,
+  ``HTML/EN/plugins/Podcast/settings/basic.html:81-87``,
+  ``Slim/Plugin/Podcast/strings.txt`` ``PLUGIN_PODCAST_COUNTRY``); dessen
+  String-Tabelle ist in Perls globale Tabelle eingemischt (``Slim/Utils/Strings.pm``
+  lädt auch ``Slim/Plugin/*/strings.txt``), der Schlüssel ist also global gültig.
+  Die Auswahlliste ist eine Zutat dieses Ports (radio-browser statt TuneIn) und
+  kommt aus ``lyrion.web.radiobrowser.countries()``.
 * ``GET|POST /settings/player/audio.html`` — ``.../Player/Audio.pm``: ``page`` :22-24,
   ``needsClient`` :26-28, ``prefs`` :30-120 (hier die unbedingten: :33),
   ``HTML/EN/settings/player/audio.html:4,144,348,367``.
@@ -53,6 +68,14 @@ UNKLAR / bewusst nicht nachgebildet (kein Blindflug, keine erfundenen Felder)
   Listen-Format unseres Stores (``lyrion/config.py:271-273`` ``_coerce_type``), nicht
   Perls Array-Ref. Die Änderungs-Erkennung aus ``Basic.pm:118`` (nur sie steuert den
   Rescan) entfällt: wir schreiben die Liste immer.
+* ``radiobrowser_country`` wird hier wie jeder andere Pref geschrieben, hat aber
+  (noch) keinen Eintrag in ``lyrion/config.py`` ``_register_known_prefs``. Perl
+  registriert den abgeleiteten Default in der ``%defaults``-Tabelle
+  (``Slim/Utils/Prefs.pm:161``) und wertet ihn in ``Slim/Utils/Prefs/Base.pm:178-234``
+  beim Start EINMAL aus; unser Erst-Wert entsteht deshalb beim ersten Lesen
+  (``lyrion/web/radiobrowser.py`` ``ensure_country_pref``). Die Validierung des
+  Formularwerts läuft hier (``Settings.pm:154-171``) — die Pref selbst hat in
+  unserem Store keine Validator-Registrierung wie Perls ``setValidate``.
 * ``Player/Audio`` + ``Player/Display`` blenden Felder abhängig von den
   Player-Fähigkeiten ein (``Audio.pm:35-117``, ``Display.pm:44-61``); wir liefern die
   unbedingten Prefs beider ``prefs()``-Listen.
@@ -66,6 +89,7 @@ UNKLAR / bewusst nicht nachgebildet (kein Blindflug, keine erfundenen Felder)
 
 from __future__ import annotations
 
+import asyncio
 import html
 import json
 import logging
@@ -88,6 +112,41 @@ _MINUTES_TO_SECONDS = {
     "alarmTimeoutMinutes": "alarmTimeoutSeconds",
 }
 
+#: Die Pref dieses Ports für das Land des ``local``-Radio-Knotens
+#: (``lyrion/web/radiobrowser.py`` ``COUNTRY_PREF``).
+_RADIO_COUNTRY_PREF = "radiobrowser_country"
+
+
+def _string(key: str, default: str) -> str:
+    """Beschriftung eines Feldes aus der ``strings.txt``-Tabelle dieses Ports.
+
+    Perl rendert Settings-Seiten mit ``Slim::Utils::Strings::string`` in der
+    Server-Sprache (``Slim/Utils/Strings.pm:525-536``, Sprache =
+    ``language``-Pref, ``Strings.pm:622-624`` ``getLanguage`` → ``$prefs->get
+    ('language') || $failsafeLang``); ``lyrion.i18n`` ist genau diese Tabelle
+    (``EN`` failsafe :62, ``DE``-Spalte) und liefert bei fehlender Zeile den
+    übergebenen Literal — dieselbe Kette wie ``Strings.pm:414-416``.
+    """
+    from lyrion.i18n import get_string, resolve_language
+
+    return get_string(key, resolve_language(), default=default)
+
+
+def _is_country_code(value: str) -> bool:
+    """Leer oder ISO-3166-1 alpha-2 in Grossbuchstaben.
+
+    Perls ``set`` prüft Werte gegen den Validator der Pref
+    (``Slim/Utils/Prefs/Base.pm:83-100`` ``validate``); der Podcast-Country
+    kennt keine eigene Regel (``Slim/Plugin/Podcast/Settings.pm:19`` listet
+    ``country`` nur als *hidden*), und das Feld selbst ist ein 2-Zeichen-Feld
+    (``HTML/EN/plugins/Podcast/settings/basic.html:84`` ``size="2"``).  Eine
+    leere Auswahl heisst hier „alle Länder“.
+    """
+    text = (value or "").strip()
+    if not text:
+        return True
+    return len(text) == 2 and text.isalpha() and text.isupper()
+
 
 @dataclass(frozen=True)
 class Field:
@@ -99,12 +158,16 @@ class Field:
     kind: str = "text"                       # text | select
     options: tuple[tuple[str, str, str], ...] = ()   # (value, label_key, label_default)
     perl_source: str = ""
+    #: Werte-Prüfung des Feldes; ``None`` = jeder Wert wird geschrieben.  Perl
+    #: prüft beim ``set`` gegen den Validator der Pref und meldet einen
+    #: abgelehnten Wert als ``SETTINGS_INVALIDVALUE`` (``Settings.pm:162-169``).
+    validator: Optional[Callable[[str], bool]] = None
 
     def label(self) -> str:
-        return get_string(self.label_key, default=self.label_default)
+        return _string(self.label_key, self.label_default)
 
     def option_label(self, key: str, default: str) -> str:
-        return get_string(key, default=default)
+        return _string(key, default)
 
 
 @dataclass(frozen=True)
@@ -139,6 +202,16 @@ _BASIC_SERVER = SettingsPage(
               perl_source="Basic.pm:28; basic.html:48 (name=pref_libraryname)"),
         Field("playlistdir", "SETUP_PLAYLISTDIR", "Playlists Folder",
               perl_source="Basic.pm:28; basic.html:80 (name=pref_playlistdir)"),
+        # Perl's own locale-derived pref lives on this page (Basic.pm:28) — the
+        # country this port derives from the same locale goes next to it.
+        # Label/form: Perl's only country setting, the Podcast plugin's field.
+        Field(_RADIO_COUNTRY_PREF, "PLUGIN_PODCAST_COUNTRY", "Country",
+              "select", options=(),
+              validator=_is_country_code,
+              perl_source=("Basic.pm:23-29 (page/prefs) + Prefs.pm:161 (locale-default);"
+                           " Podcast/Settings.pm:19,29-31 + HTML/EN/plugins/Podcast/settings/"
+                           "basic.html:81-87 + Podcast/strings.txt PLUGIN_PODCAST_COUNTRY"
+                           " (no Perl country pref for TuneIn's local node, TuneIn.pm:38-40)")),
     ),
 )
 
@@ -333,11 +406,61 @@ def _field_id(pref: str) -> str:
     return pref
 
 
+async def _radio_country_options() -> tuple[tuple[str, str, str], ...]:
+    """``(value, label_key, label_default)``-Zeilen des Länder-``select``.
+
+    Erste Zeile ist der leere Wert — „alle Länder“ — mit Perls ``ALL``-Token
+    (``strings.txt`` ``ALL``: EN ``all``, DE ``Alle``).  Danach radio-browsers
+    Länderliste (``/json/countries``, ``lyrion.web.radiobrowser.countries()``);
+    deren Namen sind *Daten* der API, keine ``strings.txt``-Zeile, deshalb
+    stehen sie als Label-Default drin.  Ist radio-browser nicht erreichbar,
+    bleibt nur die „alle“-Zeile: die Seite rendert trotzdem, und der
+    gespeicherte Wert bleibt wählbar (:func:`_options_for`) — statt eines
+    Fehlers oder einer erfundenen Liste.
+    """
+    from lyrion.web import radiobrowser
+
+    options: list[tuple[str, str, str]] = [("", "ALL", "all")]
+    try:
+        rows = await asyncio.wait_for(radiobrowser.countries(),
+                                      timeout=radiobrowser.HTTP_TIMEOUT)
+    except Exception as exc:  # noqa: BLE001 — die Seite darf daran nicht scheitern
+        logger.debug("settings: Länderliste nicht verfügbar: %s", exc)
+        rows = []
+    options.extend((r["code"], r["code"], r["name"]) for r in rows)
+    return tuple(options)
+
+
+def _options_for(f: Field, value: str, extra: dict[str, tuple[tuple[str, str, str], ...]]
+                 ) -> tuple[tuple[str, str, str], ...]:
+    """Optionen eines ``select`` — der gespeicherte Wert ist immer dabei.
+
+    Perls Vorlagen listen die Optionen fest auf, ein gespeicherter Wert kommt
+    darin vor.  Eine *dynamische* Liste (unsere Länderliste — ``/json/countries``
+    kann ein Land jederzeit fallen lassen) würde den Wert sonst nicht rendern,
+    und der Browser schickte beim nächsten Speichern die erste Option.  Fehlt
+    der Wert in der Liste, wird er angehängt.
+    """
+    options = extra.get(f.pref) or f.options
+    if not options or not value:
+        return options
+    if any(str(opt[0]) == str(value) for opt in options):
+        return options
+    return tuple(options) + ((str(value), str(value), str(value)),)
+
+
 # ── Pref-Werte lesen/schreiben ──────────────────────────────────────────────
 
 def _server_value(pref: str) -> str:
     value = get_prefs().get(pref)
     if value is None:
+        if pref == _RADIO_COUNTRY_PREF:
+            # Never-set pref: show the first-start derivation even if storing it
+            # failed (no pref DB yet).  Perl's read-side rule is the same order —
+            # Light.pm:95 ``$language ||= getPref('language') || $os->getSystemLanguage()``.
+            from lyrion.web import radiobrowser
+
+            return radiobrowser.derived_country()
         return ""
     if isinstance(value, (list, tuple)):
         return ", ".join(str(v) for v in value)
@@ -362,8 +485,15 @@ def _client_value(page: SettingsPage, f: Field, player) -> str:
 
 
 async def _save_simple_prefs(page: SettingsPage, params: dict[str, str],
-                             player) -> list[str]:
-    """``Settings.pm:154-171``: ``pref_<name>`` → ``$prefsClass->set``."""
+                             player, invalid: Optional[list[tuple[str, str]]] = None
+                             ) -> list[str]:
+    """``Settings.pm:154-171``: ``pref_<name>`` → ``$prefsClass->set``.
+
+    ``invalid`` sammelt die abgelehnten ``(pref, wert)``-Paare: Perl prüft jeden
+    Wert beim ``set`` (``Base.pm:83-100`` ``validate``), meldet einen Fehlschlag
+    als ``SETTINGS_INVALIDVALUE`` und setzt ``validated`` auf 0
+    (``Settings.pm:162-169``); der Wert wird dann NICHT gespeichert.
+    """
     written: list[str] = []
     for f in page.fields:
         key = "pref_" + f.pref
@@ -385,6 +515,10 @@ async def _save_simple_prefs(page: SettingsPage, params: dict[str, str],
             apply_player_pref(player, real, value)
             written.append(real)
         else:
+            if f.validator is not None and not f.validator(raw):
+                if invalid is not None:
+                    invalid.append((f.pref, raw))
+                continue
             await get_prefs().set(f.pref, raw)
             written.append(f.pref)
     return written
@@ -408,13 +542,14 @@ def _as_list(value: Any) -> list[str]:
 
 
 async def _save_server_basic(params: dict[str, str], page: SettingsPage,
-                             player) -> list[str]:
+                             player, invalid: Optional[list[tuple[str, str]]] = None
+                             ) -> list[str]:
     """Zusatz-Schreibpfade von ``Server/Basic.pm:81-128``.
 
     ``mediadirs`` / ``ignoreInAudioScan`` kommen als ``pref_mediadirs0``,
     ``pref_mediadirs1`` … (Template ``basic.html:63``: ``name="pref_mediadirs[% loop.index %]"``).
     """
-    written = await _save_simple_prefs(page, params, player)
+    written = await _save_simple_prefs(page, params, player, invalid)
 
     paths: list[str] = []
     ignored: list[str] = []
@@ -441,14 +576,15 @@ def _esc(value: Any) -> str:
     return html.escape("" if value is None else str(value), quote=True)
 
 
-def _render_input(f: Field, value: str) -> str:
+def _render_input(f: Field, value: str,
+                  options: tuple[tuple[str, str, str], ...] = ()) -> str:
     fid = _field_id(f.pref)
     name = "pref_" + f.pref
-    if f.kind == "select" and f.options:
+    if f.kind == "select" and options:
         opts = []
-        for val, key, default in f.options:
+        for val, key, default in options:
             sel = " selected" if str(value) == val else ""
-            label = get_string(key, default=default)
+            label = _string(key, default)
             opts.append(f'<option value="{_esc(val)}"{sel}>{_esc(label)}</option>')
         return (f'<select class="stdedit" name="{name}" id="{_esc(fid)}">'
                 + "".join(opts) + "</select>")
@@ -516,7 +652,9 @@ def _information_sections() -> str:
 
 
 def _render_page(page: SettingsPage, params: dict[str, str], player,
-                 warning: Optional[str]) -> bytes:
+                 warning: Optional[str],
+                 extra_options: Optional[dict[str, tuple[tuple[str, str, str], ...]]] = None
+                 ) -> bytes:
     action = page.route
     pid = params.get("playerid", "")
     if pid:
@@ -527,7 +665,13 @@ def _render_page(page: SettingsPage, params: dict[str, str], player,
         '<html lang="en"><head><meta charset="utf-8">',
         f"<title>{_esc(get_string(page.title_key, default=page.title_default))}</title>",
         "</head><body>",
-        f'<div id="statusarea" class="statusarea">{_esc(warning) if warning else ""}</div>',
+        # ``warning`` wird WIE IN PERL roh eingesetzt — die Vorlage schreibt
+        # ``[% warning %]`` ohne Escaping (``HTML/EN/settings/header.html:42-43``)
+        # und Perl legt HTML hinein (``Settings.pm:193-195`` baut die Scan-Warnung
+        # als ``<span id="rescanWarning">…</span>``, ``:167-168`` hängt ``<br/>``
+        # an).  Der eingesetzte *Wert* einer abgelehnten Pref wird beim Bauen der
+        # Warnung escaped; Perls ``sprintf`` setzt ihn roh ein.
+        f'<div id="statusarea" class="statusarea">{warning or ""}</div>',
     ]
 
     if page is _INFORMATION:
@@ -546,8 +690,9 @@ def _render_page(page: SettingsPage, params: dict[str, str], player,
     for f in page.fields:
         value = (_client_value(page, f, player) if page.scope == "client"
                  else _server_value(f.pref))
+        options = _options_for(f, value, extra_options or {})
         parts.append(f'<div class="settingGroup"><label for="{_esc(_field_id(f.pref))}">'
-                     f'{_esc(f.label())}</label>{_render_input(f, value)}</div>')
+                     f'{_esc(f.label())}</label>{_render_input(f, value, options)}</div>')
 
     if page is _BASIC_SERVER:
         parts.append(_render_mediadirs())
@@ -561,14 +706,17 @@ def _render_page(page: SettingsPage, params: dict[str, str], player,
     return "\n".join(parts).encode("utf-8")
 
 
-def _render_ajax(warning: Optional[str], written: list[str]) -> bytes:
+def _render_ajax(warning: Optional[str], written: list[str],
+                 invalid: Optional[list[tuple[str, str]]] = None) -> bytes:
     """Fragment ``settings/ajaxSettings.txt`` (``Settings.pm:286``).
 
     Zeile 1 ``warning|<text>``; danach eine Zeile ``<pref>|<valid>`` je
-    validierter Pref (``Settings.pm:165-166``).
+    validierter Pref (``Settings.pm:164-168`` ``$paramRef->{'validated'}->{$pref}``
+    = 1 bzw. 0, Vorlage ``HTML/EN/settings/ajaxSettings.txt:2-4``).
     """
     lines = ["warning|" + (warning or "")]
     lines.extend(f"{pref}|1" for pref in written)
+    lines.extend(f"{pref}|0" for pref, _value in (invalid or []))
     return ("\n".join(lines) + "\n").encode("utf-8")
 
 
@@ -612,6 +760,19 @@ async def handle_settings_request(scope: dict, receive, send) -> None:
 
     warning: Optional[str] = None
     written: list[str] = []
+    invalid: list[tuple[str, str]] = []
+
+    # Der Erst-Wert der Radio-Pref entsteht beim ersten Lesen, nicht im
+    # Pref-Init (``config.py`` liegt ausserhalb dieser Änderung) — Perl wertet
+    # den abgeleiteten Default beim Start in ``Slim/Utils/Prefs/Base.pm:178-234``
+    # aus. Ohne das zeigte das Formular beim ersten Aufruf einen leeren Wert
+    # statt der Server-Einstellung.
+    extra_options: dict[str, tuple[tuple[str, str, str], ...]] = {}
+    if any(f.pref == _RADIO_COUNTRY_PREF for f in page.fields):
+        from lyrion.web import radiobrowser
+
+        await radiobrowser.ensure_country_pref()
+        extra_options[_RADIO_COUNTRY_PREF] = await _radio_country_options()
 
     if method == "POST" and "saveSettings" in params:
         if page.needs_client and player is None:
@@ -619,18 +780,31 @@ async def handle_settings_request(scope: dict, receive, send) -> None:
             warning = get_string("SETUP_NO_PREFS",
                                  default="There are no settings for this player on this page")
         else:
+            invalid = []
             if page is _BASIC_SERVER:
-                written = await _save_server_basic(params, page, player)
+                written = await _save_server_basic(params, page, player, invalid)
             else:
-                written = await _save_simple_prefs(page, params, player)
-            warning = get_string("SETUP_CHANGES_SAVED", default="Changes have been saved.")
+                written = await _save_simple_prefs(page, params, player, invalid)
+            # Perl ``Settings.pm:167-169`` hängt je abgelehntem Wert
+            # ``sprintf(SETTINGS_INVALIDVALUE, $wert, $pref) . '<br/>'`` an die
+            # Warnung; ``:198-200`` setzt SETUP_CHANGES_SAVED nur, wenn noch
+            # KEINE Warnung steht — die Fehlermeldung ersetzt also die
+            # Erfolgsmeldung (Perl-Verhalten, nicht additiv).
+            for pref, value in invalid:
+                warning = (warning or "") + (
+                    _string("SETTINGS_INVALIDVALUE",
+                            'Invalid value "%s" for %s') % (_esc(value), pref)) + "<br/>"
+            if not warning:
+                warning = get_string("SETUP_CHANGES_SAVED",
+                                     default="Changes have been saved.")
             logger.info("settings: %s saved %s", page.route, written)
     elif page.needs_client and player is None:
         warning = get_string("SETUP_NO_PREFS",
                              default="There are no settings for this player on this page")
 
     if str(params.get("useAJAX", "0")) == "1":
-        await _send(send, 200, "text/plain", _render_ajax(warning, written))
+        await _send(send, 200, "text/plain", _render_ajax(warning, written, invalid))
         return
 
-    await _send(send, 200, "text/html", _render_page(page, params, player, warning))
+    await _send(send, 200, "text/html",
+                _render_page(page, params, player, warning, extra_options))

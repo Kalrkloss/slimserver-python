@@ -102,4 +102,11 @@ STRINGS_DE: dict[str, str] = {
     # Der jive-Popup-Text nach `favorites add` (Favorites/Plugin.pm:904-911).
     'FAVORITES_ADDING': 'Favoriten werden gespeichert ...',  # Favorites/strings.txt:38/:41
     'HOME': 'Hauptmenü',  # strings.txt:3140
+    # Land des "Lokales Radio"-Feeds (web/settings.py, Pref
+    # `radiobrowser_country`) — Perls einzige "country"-Beschriftung.
+    'PLUGIN_PODCAST_COUNTRY': 'Land',  # Slim/Plugin/Podcast/strings.txt:270 (DE :273)
+    # Option "alle Länder" derselben Auswahlliste.
+    'ALL': 'Alle',  # strings.txt:11281 (DE :11284)
+    # Settings.pm:168 — Warnung für einen abgelehnten Pref-Wert.
+    'SETTINGS_INVALIDVALUE': '"%s" ist kein gültiger Wert für %s',  # strings.txt:10145 (DE :10148)
 }

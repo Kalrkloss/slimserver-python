@@ -48,6 +48,7 @@ import pytest
 from lyrion.config import _PREF_DB_SCHEMA, get_prefs
 from lyrion.player.manager import PlayerManager
 from lyrion.player.state import PlayerState
+from lyrion.web import radiobrowser
 from lyrion.web.app import create_app
 
 MAC = "1C:87:2C:47:FC:36"
@@ -300,3 +301,107 @@ def test_ajax_post_returns_the_ajaxsettings_fragment():
 def test_unknown_settings_path_is_404():
     res = _request("GET", "/settings/server/bogus.html")
     assert res.status_code == 404
+
+
+# ── Das Radio-Land (``radiobrowser_country``, Feld auf Basic.pm:23-29) ──────
+#
+# Perl hat keine solche Pref (``Slim/Utils/Prefs.pm:132-279`` kennt kein
+# ``country``; der ``local``-Knoten ist TuneIns geolokalisierter,
+# ``TuneIn.pm:38-40``).  Form und Beschriftung kommen aus Perls einziger
+# country-Einstellung (Podcast-Plugin: ``Settings.pm:19,29-31``,
+# ``HTML/EN/plugins/Podcast/settings/basic.html:81-87``,
+# ``strings.txt`` ``PLUGIN_PODCAST_COUNTRY``), der Erst-Wert aus den
+# Server-Einstellungen (Locale → Zeitzone, ``Slim/Utils/OS.pm:399-414``).
+
+
+def _clear_radio_country() -> None:
+    """Pref ``radiobrowser_country`` aus Cache und DB entfernen (nie gesetzt)."""
+    store = get_prefs()
+    name = radiobrowser.COUNTRY_PREF
+    store._cache.pop(name, None)
+    if getattr(store, "_db", None) is not None:
+        async def _delete() -> None:
+            await store._db.execute("DELETE FROM prefhash WHERE name = ?", (name,))
+            await store._db.commit()
+
+        asyncio.run(_delete())
+
+
+def _stub_countries(monkeypatch) -> None:
+    """Länderliste ohne radio-browser-Roundtrip (deren Spiegel-Test liegt in
+    ``tests/test_radiobrowser.py``)."""
+    async def _countries():
+        return [{"name": "Germany", "code": "DE", "stationcount": 9},
+                {"name": "France", "code": "FR", "stationcount": 4}]
+
+    monkeypatch.setattr(radiobrowser, "countries", _countries)
+
+
+def test_radio_country_field_renders_the_country_list(monkeypatch):
+    _stub_countries(monkeypatch)
+    _clear_radio_country()
+    monkeypatch.setenv("LC_ALL", "de_DE.UTF-8")
+    monkeypatch.delenv("LANG", raising=False)
+    monkeypatch.delenv("LC_MESSAGES", raising=False)
+
+    body = _request("GET", "/settings/server/basic.html").text
+
+    assert 'name="pref_radiobrowser_country" id="radiobrowser_country"' in body
+    # Erste Option = leerer Wert, Beschriftung aus Perls ``ALL``-Token.
+    assert '<option value="">all</option>' in body
+    # Die abgeleitete Server-Einstellung ist vorbelegt.
+    assert '<option value="DE" selected>Germany</option>' in body
+    assert '<option value="FR">France</option>' in body
+    # Label aus der String-Tabelle (PLUGIN_PODCAST_COUNTRY).
+    assert 'for="radiobrowser_country">Country</label>' in body
+
+
+def test_radio_country_first_get_stores_the_derived_country(monkeypatch):
+    """Erst-Vorbelegung: ``Slim/Utils/Prefs/Base.pm:178-234`` wertet den
+    abgeleiteten Default einmal aus und speichert ihn."""
+    _stub_countries(monkeypatch)
+    _clear_radio_country()
+    monkeypatch.setenv("LC_ALL", "en_US.UTF-8")
+
+    assert get_prefs().get(radiobrowser.COUNTRY_PREF) is None
+    _request("GET", "/settings/server/basic.html")
+    assert get_prefs().get(radiobrowser.COUNTRY_PREF) == "US"
+
+    # Danach gewinnt der gespeicherte Wert — eine andere Locale ändert ihn nicht.
+    monkeypatch.setenv("LC_ALL", "de_DE.UTF-8")
+    _request("GET", "/settings/server/basic.html")
+    assert get_prefs().get(radiobrowser.COUNTRY_PREF) == "US"
+
+
+def test_radio_country_post_writes_the_pref(monkeypatch):
+    _stub_countries(monkeypatch)
+
+    res = _request("POST", "/settings/server/basic.html",
+                   data={"saveSettings": "1", "pref_radiobrowser_country": "FR"})
+    assert res.status_code == 200
+    assert get_prefs().get(radiobrowser.COUNTRY_PREF) == "FR"
+    assert radiobrowser.local_country() == "FR"
+
+    # "alle Länder" ist der *gespeicherte* leere Wert, nicht "nie gesetzt".
+    _request("POST", "/settings/server/basic.html",
+             data={"saveSettings": "1", "pref_radiobrowser_country": ""})
+    assert get_prefs().get(radiobrowser.COUNTRY_PREF) == ""
+    assert radiobrowser.local_country() == ""
+
+
+def test_radio_country_rejects_an_invalid_value(monkeypatch):
+    """``Settings.pm:162-169``: nicht speichern + ``SETTINGS_INVALIDVALUE``."""
+    _stub_countries(monkeypatch)
+    _request("POST", "/settings/server/basic.html",
+             data={"saveSettings": "1", "pref_radiobrowser_country": "FR"})
+
+    res = _request("POST", "/settings/server/basic.html",
+                   data={"saveSettings": "1", "pref_radiobrowser_country": "XYZ"})
+    assert 'Invalid value "XYZ" for radiobrowser_country' in res.text   # strings.txt
+    assert get_prefs().get(radiobrowser.COUNTRY_PREF) == "FR"           # unverändert
+
+    ajax = _request("POST", "/settings/server/basic.html",
+                    data={"saveSettings": "1", "useAJAX": "1",
+                          "pref_radiobrowser_country": "de"})
+    assert "radiobrowser_country|0" in ajax.text.splitlines()           # validated=0
+    assert get_prefs().get(radiobrowser.COUNTRY_PREF) == "FR"

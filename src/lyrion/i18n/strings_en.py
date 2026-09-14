@@ -106,4 +106,15 @@ STRINGS_EN: dict[str, str] = {
     # The jive popup after `favorites add` (Favorites/Plugin.pm:904-911).
     'FAVORITES_ADDING': 'Saving favorites...',  # Slim/Plugin/Favorites/strings.txt:38/:42
     'HOME': 'Home',  # strings.txt:3140
+    # Country of the "Lokales Radio" feed (web/settings.py, pref
+    # `radiobrowser_country`).  Perl's global table has exactly one "country"
+    # label — the Podcast plugin's field (Strings.pm loads plugin tables too);
+    # measured in the reference tree /tmp/lms-full/Slim, where the Favorites
+    # refs above come from: PLUGIN_PODCAST_COUNTRY key :270, EN :274.
+    'PLUGIN_PODCAST_COUNTRY': 'Country',  # Slim/Plugin/Podcast/strings.txt:270 (EN :274)
+    # "all" option of that select (an empty pref means all countries).
+    'ALL': 'all',  # strings.txt:11281 (EN :11285)
+    # Settings.pm:168 `sprintf(SETTINGS_INVALIDVALUE, $value, $pref)` — the
+    # warning for a pref value the validator rejected.
+    'SETTINGS_INVALIDVALUE': 'Invalid value "%s" for %s',  # strings.txt:10145 (EN :10149)
 }
