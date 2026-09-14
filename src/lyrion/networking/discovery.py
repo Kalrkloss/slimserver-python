@@ -358,22 +358,21 @@ class DiscoveryService:
             # /html/...), so the native server answers non-Cometd GETs with
             # a 302 redirect to the real web port — that keeps cover art
             # working without moving the Cometd endpoint.
-            # Perl kündigt seinen HTTP-/Webport an (live: "JSON\x049000").
-            # Zuvor stand hier der native Cometd-Port (9080), weil der
-            # HTTP/ASGI-Pfad Streaming-Verbindungen monopolistisch hielt:
-            # uvicorn/h11 puffern gepipelinede Requests bis zum Response-Ende,
-            # der POST hinter dem Stream blieb unbedient und libcometd riss
-            # nach seinem 10-s-maxNetworkDelay ab (libcometd.js:1268,
-            # :380-389). Seit Cometd-Fix 63056abd7 endet der Stream nach
-            # RETRY_DELAY (5 s) Stille, die Verbindung wird vor dem
-            # terminierenden []-Chunk freigegeben und es gilt Perls 10-s-Grace
-            # (Slim/Web/Cometd.pm:1010-1014) — damit ist 9000 für
-            # SqueezePlay (streaming) und Squeeze Client (JSON-RPC) tragfähig.
-            # Der native Server proxyt GET/POST an 9000 weiter
-            # (cometd_stream.py:202-230, :270-283), bleibt also unberührt.
-            http_port = int(get_config().get("httpport")
-                            or get_config().get("web_port")
-                            or DEFAULT_HTTP_PORT)
+            # Angekündigt wird der NATIVE Cometd-Port (9080), NICHT Perls
+            # Webport 9000 (live Perl: "JSON\x049000"). Grund (mehrfach
+            # gemessen 2026-09-13/14): SqueezePlay pipelinet mehrere POSTs auf
+            # EINEM Socket, bevor es liest — uvicorn/h11 puffern aber bis zum
+            # Response-Ende (h11_impl.py:191-197/:278,
+            # httptools_impl.py:291-297), egal wie früh der Stream endet
+            # (Cometd-Fix 63056abd7 löst nur den Fall "Request hinter offenem
+            # Stream"). Auf 9000 angekündigt => "SqueezePlay kann nicht
+            # verbinden"; auf 9080 => SqueezePlay läuft.
+            # Der native Server proxyt GET/HEAD und POST /jsonrpc.js an 9000
+            # weiter (cometd_stream.py:202-230, :270-283), damit auch
+            # JSON-RPC-Clients bedient werden. Offen: Squeeze Client braucht
+            # auf 9080 noch eine Lösung (eigene Aufgabe).
+            http_port = int(get_config().get("cometd_stream_port")
+                            or DEFAULT_NATIVE_PORT)
         except Exception:
             http_port = DEFAULT_HTTP_PORT
 
