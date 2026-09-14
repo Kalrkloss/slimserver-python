@@ -342,13 +342,17 @@ def test_stream_start_pushes_the_jive_block(monkeypatch):
 
 
 def test_icy_bitrate_parser_scales_low_values_like_perl():
-    """``HTTP.pm:731-734``: ``icy-br`` < 8000 wird mit 1000 multipliziert."""
-    from lyrion.player.manager import _icy_bitrate_from_headers
+    """``Scanner/Remote.pm:543``: ``icy-br`` wird im Scan ``* 1000`` gerechnet.
 
-    assert _icy_bitrate_from_headers({"icy-br": "256"}) == 256000
-    assert _icy_bitrate_from_headers({"x-audiocast-bitrate": "128"}) == 128000
-    assert _icy_bitrate_from_headers({"icy-br": "256000"}) == 256000
-    assert _icy_bitrate_from_headers({}) == 0
+    (Der Scan legt die Bitrate über ``setBitrate`` am Track ab — die
+    Player-Stream-Variante ``HTTP.pm:731-734`` mit ihrer 8000er-Schwelle gilt
+    hier nicht, weil dieses Port den Stream des Players nie sieht.)
+    """
+    from lyrion.formats.stream_probe import bitrate_from_headers
+
+    assert bitrate_from_headers({"icy-br": "256"}) == 256000
+    assert bitrate_from_headers({"x-audiocast-bitrate": "128"}) == 128000
+    assert bitrate_from_headers({}) == 0
 
 
 def test_connect_advice_has_no_superset_keys():

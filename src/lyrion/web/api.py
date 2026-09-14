@@ -4910,7 +4910,6 @@ class JSONRPCAPI:
         # cur_info/elapsed are derived later in this function.
         _cur = player.playlist_position or 0
         _cur_tid = playlist_ids[_cur] if 0 <= _cur < len(playlist_ids) else None
-        _elapsed = float(getattr(player, "elapsed", 0) or 0)
         _cur_title = getattr(player, "current_title", "") or ""
         _cur_artist = ""
         _cur_track = _cur_title
@@ -4986,8 +4985,15 @@ class JSONRPCAPI:
                 return cover
             return None
 
+        # Welche Playlist-Einträge RemoteTracks sind (`$track->remote`): wird
+        # im Menü-Zweig gebraucht (Queries.pm:5576) und darf NICHT als Feld im
+        # `playlist_loop`-Item landen (live 192.168.1.90 hat dort kein
+        # `trackType`).
+        _remote_flags: list[bool] = []
+
         for i, tid in enumerate(playlist_ids):
             tid_local = _local_id(tid)
+            _remote_flags.append(tid_local is None)
             _simg = ""
             if tid_local is not None:
                 info = track_rows.get(tid_local, {})
@@ -5018,12 +5024,14 @@ class JSONRPCAPI:
                        else _remote_track_id(tid)),
                 "playlist index": i,
             }
-            # title/trackType are always present (Orange Squeeze does
-            # firstItem.get("trackType").asText() — a missing field is a
-            # NULL NPE crash).
+            # title is always present. Perl's ``playlist_loop`` (the NON-menu
+            # _addSong shape, Queries.pm:4353) carries NEITHER ``text`` NOR
+            # ``trackType`` — live 192.168.1.90 `status 0 2 tags:d|gald|galdu`
+            # answered a remote stream item with exactly {id,title,duration,
+            # artist,url,playlist index}. Those two fields belong to the
+            # MENU shape (_addJiveSong, Queries.pm:5576/:5620), which the
+            # menu branch below builds into ``item_loop``.
             item["title"] = title
-            item["text"] = title          # SqueezePlay _extractTrackInfo fallback
-            item["trackType"] = "local" if tid_local is not None else "remote"
             # SqueezePlay now-playing reads _track.track/.artist/.album —
             # provide them for LOCAL tracks (a remote stream intentionally
             # omits `track` so SqueezePlay falls back to text + current_title).
@@ -5066,7 +5074,13 @@ class JSONRPCAPI:
                     item["track"] = _cur_track or item.get("title", "")
                     item["artist"] = _cur_artist or ""
                     item["album"] = ""
-                    item["duration"] = _elapsed
+                # Perl publishes a RemoteTrack's `duration` as a STRING: live
+                # 192.168.1.90 `status 0 2 tags:galdu` → `"duration": "0"`
+                # (RemoteTrack keeps it in a text column, Queries.pm:5920
+                # passes it through unchanged). A live stream has no duration
+                # — the port used to put the PLAYING TIME (`_elapsed`) there,
+                # which Perl never sends.
+                item["duration"] = "0"
             for code, field in TAG_FIELDS.items():
                 if not tag_ok(code):
                     continue
@@ -5309,6 +5323,7 @@ class JSONRPCAPI:
         # schaltet item_loop/count/offset/preset_loop zu (Request.pm-Param).
         menu_mode = "menu:menu" in (args or [])
         window_loop = loop[win_start:win_end + 1] if win_start <= win_end else []
+        window_remote = _remote_flags[win_start:win_end + 1] if win_start <= win_end else []
         item_loop = window_loop
         if menu_mode:
             # Perl's MENU mode builds its own loop through _addJiveSong
@@ -5323,10 +5338,11 @@ class JSONRPCAPI:
             # CurrentTrack.java:33) — precisely the fields that were missing
             # for a hirschmilch.de radio stream ("Unknown artist/album").
             np_loop: list[dict] = []
-            for it in item_loop:
+            for it, is_remote in zip(item_loop, window_remote):
                 np_it = dict(it)
                 line1 = it.get("title") or ""
-                is_remote = it.get("trackType") != "local"
+                # `is_remote` = `$track->remote` (Perl Queries.pm:5576) — siehe
+                # `_remote_flags`; das Item selbst führt das Feld nicht mehr.
                 if is_remote and it.get("playlist index") == int(cur):
                     np_track = _cur_track or line1
                     np_artist = _cur_artist

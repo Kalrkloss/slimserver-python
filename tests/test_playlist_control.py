@@ -84,7 +84,7 @@ class _FakeHandler:
         self.strm.append(track_id)
         return True
 
-    async def send_remote_stream(self, mac, url, codec="m"):
+    async def send_remote_stream(self, mac, url, codec="m", **kw):
         self.remote.append((url, codec))
         return True
 

@@ -21,6 +21,7 @@ from lyrion.formats.stream_probe import (
     codec_for_stream_url,
     perl_type_from_response,
     probe_remote_type,
+    scan_stream_url,
 )
 
 AAC_URL = "https://stream02.pcradio.app/Garik_Sukachov-hi"
@@ -95,8 +96,17 @@ def test_shoutcast_without_content_type_but_icy_name_is_mp3():
 
 
 class _FakeResponse:
-    def __init__(self, headers):
+    def __init__(self, headers, status_code=200, url="http://x/stream",
+                 reason="OK", body=b""):
         self.headers = headers
+        self.status_code = status_code
+        self.reason_phrase = reason
+        self.url = url
+        self._body = body
+
+    async def aiter_bytes(self):
+        if self._body:
+            yield self._body
 
 
 class _FakeStreamCtx:
@@ -113,9 +123,15 @@ class _FakeStreamCtx:
 class _FakeClient:
     """httpx-Ersatz: liefert die Header eines echten Senders (read-only)."""
 
-    def __init__(self, *, headers=None, head_fails=False, **kw):
+    def __init__(self, *, headers=None, head_fails=False, status_code=200,
+                 url="http://x/stream", body=b"", **kw):
         self._headers = headers or {}
         self._head_fails = head_fails
+        self._status = status_code
+        self._url = url
+        self._body = body
+        self.methods: list[str] = []
+        _FakeClient.last = self
 
     async def __aenter__(self):
         return self
@@ -124,12 +140,22 @@ class _FakeClient:
         return False
 
     async def head(self, url):
+        self.methods.append("HEAD")
         if self._head_fails:
             raise RuntimeError("HEAD not allowed")
         return _FakeResponse(self._headers)
 
     def stream(self, method, url):
-        return _FakeStreamCtx(_FakeResponse(self._headers))
+        self.methods.append(method)
+        return _FakeStreamCtx(_FakeResponse(
+            self._headers, status_code=self._status, url=self._url,
+            reason="Service Unavailable" if self._status >= 400 else "OK",
+            body=self._body))
+
+    async def get(self, url, **kw):
+        self.methods.append("GET")
+        return _FakeResponse(self._headers, status_code=self._status,
+                             url=self._url, body=self._body)
 
 
 def _patch_httpx(monkeypatch, **kwargs):
@@ -145,14 +171,81 @@ def test_probe_reads_content_type(monkeypatch):
     assert stream_probe._TYPE_CACHE[AAC_URL] == "aac"
 
 
-def test_probe_falls_back_to_get_when_head_is_refused(monkeypatch):
-    _patch_httpx(monkeypatch, headers={"content-type": "audio/aac"}, head_fails=True)
+def test_probe_scans_with_get_like_perl_scanurl(monkeypatch):
+    """Perl öffnet die URL mit GET (Scanner/Remote.pm:205) — nie HEAD."""
+    _patch_httpx(monkeypatch, headers={"content-type": "audio/aac"})
     assert asyncio.run(probe_remote_type(AAC_URL)) == "aac"
+    assert _FakeClient.last.methods == ["GET"]
 
 
 def test_probe_uses_icy_name_when_no_content_type(monkeypatch):
     _patch_httpx(monkeypatch, headers={"icy-name": "Some Radio"})
     assert asyncio.run(probe_remote_type("http://x/stream")) == "mp3"
+
+
+def test_probe_falls_back_to_get_when_head_is_refused(monkeypatch):
+    # Der historische Fall (Server lehnt HEAD ab) ist mit dem GET-Scan
+    # strukturell erledigt: HEAD wird gar nicht mehr benutzt.
+    _patch_httpx(monkeypatch, headers={"content-type": "audio/aac"}, head_fails=True)
+    assert asyncio.run(probe_remote_type(AAC_URL)) == "aac"
+
+
+def test_http_503_is_a_scan_failure(monkeypatch):
+    """1.FM live 2026-09-14: die Probe bekam 503 und wurde folgenlos verworfen.
+
+    Perl wertet einen Status außerhalb 2xx/3xx als Fehler
+    (Slim/Networking/Async/HTTP.pm:434-435 → Scanner/Remote.pm:228-238) und
+    bricht den Play ab (Song.pm:302-312) — kein Format, kein strm.
+    """
+    _patch_httpx(monkeypatch, headers={}, status_code=503,
+                 url="http://strm112.1.fm/ambientpsy_mobile_mp3")
+    scan = asyncio.run(scan_stream_url("http://strm112.1.fm/ambientpsy_mobile_mp3"))
+    assert scan.failed
+    assert scan.error == "503 Service Unavailable"
+    assert scan.type is None
+    # Der Aufrufer bekommt KEIN Format und keinen Codec aus der Endung.
+    assert asyncio.run(probe_remote_type("http://strm112.1.fm/ambientpsy_mobile_mp3")) is None
+
+
+def test_2xx_without_type_or_icy_name_is_playlist_no_items(monkeypatch):
+    # Remote.pm:416 → isSong() false → Playlist-Zweig → :1172-1179
+    _patch_httpx(monkeypatch, headers={}, status_code=200)
+    scan = asyncio.run(scan_stream_url("http://x/stream"))
+    assert scan.failed and scan.error == "PLAYLIST_NO_ITEMS_FOUND"
+
+
+def test_scan_reports_the_icy_bitrate_of_the_same_response(monkeypatch):
+    # Remote.pm:530-545 liest icy-br aus DERSELBEN Scan-Antwort.
+    _patch_httpx(monkeypatch, headers={"content-type": "audio/mpeg", "icy-br": "256"})
+    scan = asyncio.run(scan_stream_url("http://x/mp3"))
+    assert not scan.failed and scan.type == "mp3"
+    assert scan.bitrate == 256000.0
+
+
+def test_playlist_body_is_followed_to_its_entry(monkeypatch):
+    # Remote.pm:1195-1214 — Einträge werden erneut gescannt; der erste
+    # brauchbare gewinnt.
+    calls: list[str] = []
+
+    class _Client(_FakeClient):
+        def stream(self, method, url):
+            calls.append(url)
+            if url.endswith(".m3u"):
+                return _FakeStreamCtx(_FakeResponse(
+                    {"content-type": "audio/x-mpegurl"}, url=url,
+                    body=b"http://dead.example/x\nhttp://live.example/y.mp3\n"))
+            if "dead" in url:
+                return _FakeStreamCtx(_FakeResponse({}, status_code=503, url=url))
+            return _FakeStreamCtx(_FakeResponse(
+                {"content-type": "audio/mpeg"}, url=url))
+
+    import httpx
+
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: _Client(**kw))
+    scan = asyncio.run(scan_stream_url("http://x/list.m3u"))
+    assert calls[0] == "http://x/list.m3u"
+    assert scan.url == "http://live.example/y.mp3"
+    assert not scan.failed and scan.type == "mp3"
 
 
 def test_codec_byte_for_aac_station_is_a(monkeypatch):
@@ -169,3 +262,4 @@ def test_codec_falls_back_to_the_url_guess_on_failure(monkeypatch):
 
     monkeypatch.setattr(httpx, "AsyncClient", _boom)
     assert asyncio.run(codec_for_stream_url("http://x/stream.mp3", fallback="m")) == "m"
+

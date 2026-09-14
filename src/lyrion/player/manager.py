@@ -74,102 +74,6 @@ NOTHING_TEXT = "Nothing"           # strings.txt:469
 OUT_OF_TEXT = "of"                 # strings.txt:781
 
 
-# ── Stream-Bitrate (Perl ``HTTP::parseDirectHeaders``) ─────────────────────
-#: ICY-Bitrate je Stream-URL — Perl cached sie in ``Slim::Music::Info``
-#: (``setBitrate``/``getBitrate``), liest den Header also einmal je URL.
-_stream_bitrate_cache: dict[str, float] = {}
-_stream_bitrate_failed: set[str] = set()
-
-
-def _icy_bitrate_from_headers(headers: dict) -> float:
-    """Perl ``HTTP::parseDirectHeaders`` (``HTTP.pm:714-805``)::
-
-        elsif ($header =~ /^(?:icy-br|x-audiocast-bitrate):\\s*(.+)/i) {
-            if ($song && !$song->bitrate) {
-                $bitrate = $1;
-                $bitrate *= 1000 if $bitrate < 8000;
-            }
-        }
-
-    Returns bits/s; ``0`` when the stream announces none (``HTTP.pm:870-872``
-    then falls back to the cached ``Slim::Music::Info::getBitrate``).
-    """
-    for name in ("icy-br", "x-audiocast-bitrate"):
-        value = (headers or {}).get(name)
-        if not value:
-            continue
-        try:
-            bitrate = float(str(value).strip())
-        except (TypeError, ValueError):
-            continue
-        if bitrate < 8000:
-            bitrate *= 1000                       # HTTP.pm:734
-        return bitrate
-    return 0.0
-
-
-async def probe_stream_bitrate(url: str, timeout: float = 5.0) -> float:
-    """ICY/audiocast bitrate of ``url`` in bits/s (Perl ``HTTP.pm``).
-
-    Perl reads the header while opening the stream (``parseDirectHeaders``,
-    ``HTTP.pm:714-805``); this port never gets the player's stream, so the
-    headers are read separately — HEAD first, then a header-only GET, the same
-    order :mod:`lyrion.formats.stream_probe` uses for the content type.
-    Failures are never fatal: the caller keeps 0 and Perl's own fallback
-    (``$track->prettyBitRate``, ``Track.pm:353-363``) answers 0 too.
-    """
-    if not url:
-        return 0.0
-    if url in _stream_bitrate_cache:
-        return _stream_bitrate_cache[url]
-    if url in _stream_bitrate_failed:
-        return 0.0
-    try:
-        import httpx
-
-        headers: dict = {}
-
-        async def _fetch(method: str) -> dict:
-            async with httpx.AsyncClient(
-                timeout=httpx.Timeout(connect=timeout, read=timeout,
-                                      write=timeout, pool=timeout),
-                follow_redirects=True,
-            ) as client:
-                if method == "HEAD":
-                    resp = await client.head(url)
-                    return {k.lower(): v for k, v in resp.headers.items()}
-                async with client.stream("GET", url) as resp:
-                    return {k.lower(): v for k, v in resp.headers.items()}
-
-        try:
-            headers = await _fetch("HEAD")
-        except Exception:  # noqa: BLE001 — HEAD nicht unterstützt
-            headers = {}
-        # The ICY headers ride on the AUDIO response; a server that answers
-        # HEAD without them (or rejects HEAD outright) still announces the
-        # bitrate on the GET Perl itself performs (HTTP.pm:824
-        # ``parseDirectHeaders`` runs on the stream response).
-        if not _icy_bitrate_from_headers(headers):
-            try:
-                get_headers = await _fetch("GET")
-                headers = get_headers or headers
-            except Exception:  # noqa: BLE001
-                pass
-        bitrate = _icy_bitrate_from_headers(headers)
-        if bitrate:
-            _stream_bitrate_cache[url] = bitrate
-            logger.info("Stream bitrate for %s: %.0f bps (%s)",
-                        url[:60], bitrate,
-                        headers.get("icy-br") or headers.get("x-audiocast-bitrate"))
-            return bitrate
-        logger.debug("Stream %s announces no bitrate (headers: %s)",
-                     url[:60], ",".join(sorted(headers))[:200])
-    except Exception as exc:  # noqa: BLE001 — Netzfehler nie fatal
-        logger.debug("Bitrate-Probe für %s fehlgeschlagen: %s", url[:70], exc)
-    _stream_bitrate_failed.add(url)
-    return 0.0
-
-
 def _library_db_path() -> str:
     """Pfad der Bibliotheks-DB (Test-/Dev-Läufe nutzen LYRION_SERVERDATA)."""
     try:
@@ -1147,27 +1051,44 @@ class PlayerManager:
         player.playlist = [url]
         player.playlist_position = 0
         player.playlist_total = 1
-        # Determine the source codec the way Perl does: read the stream's
-        # HTTP headers and map the content type (Slim/Utils/Scanner/Remote.pm:
-        # 333-390). The URL suffix alone lies — an AAC station without ".aac"
-        # in its URL was announced as 'm', so the client decoded AAC with the
-        # MP3 decoder ("AAC radio stream geht nicht", live 2026-09-12). The
-        # suffix guess stays as the fallback when the probe fails.
+        # Determine the source codec the way Perl does: ONE GET scan of the
+        # URL maps the response content type (Slim/Utils/Scanner/Remote.pm:
+        # 205-233 request, :333-390 type rules) — and the scan's OUTCOME
+        # decides whether there is anything to play at all. A failed scan
+        # (connection error, or a status outside 2xx/3xx like 1.FM's
+        # "503 Service Unavailable") makes Async::HTTP call onError
+        # (Slim/Networking/Async/HTTP.pm:434-435) → Remote.pm:228-238 →
+        # Song.pm:302-312 notifies `playlist cant_open` and fails the play.
+        # Perl sends NO strm in that case and has no proxy fallback — the old
+        # port ignored the 503, kept the URL-suffix guess 'm' and pointed the
+        # player at a dead source, which is why the stream stayed silent
+        # (live 2026-09-14).
         from lyrion.networking.protocol import SlimProtoClient
-        from lyrion.formats.stream_probe import codec_for_stream_url
+        from lyrion.formats.lms_types import FORMAT_TO_BYTE
+        from lyrion.formats.stream_probe import scan_stream_url
 
         suffix_codec = SlimProtoClient._guess_codec_from_url(url)
-        # Perl reads the stream's headers once (Scanner/Remote content type,
-        # HTTP.pm ICY bitrate); both probes run together so a stream start
-        # pays for one round-trip, not two.
-        codec, stream_bitrate = await asyncio.gather(
-            codec_for_stream_url(url, fallback=suffix_codec),
-            probe_stream_bitrate(url),
-        )
+        scan = await scan_stream_url(url)                 # Perl scanURL
+        if scan.failed:
+            logger.warning(
+                "play_url %s: Stream-Scan für %s fehlgeschlagen: %s "
+                "(Song.pm:302-312 'playlist cant_open' — kein strm, kein Proxy)",
+                player_id, url[:70], scan.error)
+            player.playlist = old_playlist
+            player.playlist_position = old_position
+            return False
+        # Perl's format byte comes from the scanned content type
+        # (`$song->wantFormat`); the URL suffix ("getFormatForURL") and 'mp3'
+        # are only the fallbacks of Squeezebox.pm:585-593.
+        url = scan.url                                     # redirect/playlist target
+        byte = FORMAT_TO_BYTE.get((scan.type or "").lower())
+        codec = byte or suffix_codec
+        stream_bitrate = scan.bitrate                      # Remote.pm:530-545
         if codec != suffix_codec:
             logger.info("Stream codec from headers: %s (suffix said '%s')",
                         codec, suffix_codec)
-        ok = await handler.send_remote_stream(player.mac, url, codec)
+        ok = await handler.send_remote_stream(player.mac, url, codec,
+                                              resolved=True)
         if ok:
             logger.info("play_url codec guess: %s -> '%s'", url[:60], codec)
         if ok:

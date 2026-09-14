@@ -76,7 +76,7 @@ class _RecorderHandler:
         self.flushed.append(mac)
         return True
 
-    async def send_remote_stream(self, mac, url, codec):
+    async def send_remote_stream(self, mac, url, codec, **kw):
         return True
 
 

@@ -21,7 +21,7 @@ class _FakeHandler:
     async def send_strm_to_player(self, mac, track_id):
         return True
 
-    async def send_remote_stream(self, mac, url, codec):
+    async def send_remote_stream(self, mac, url, codec, **kw):
         return True
 
 

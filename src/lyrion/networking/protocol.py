@@ -2408,13 +2408,17 @@ class SlimProtoClient:
         ]
 
     async def _first_reachable(self, candidates: list[str]) -> str | None:
-        """First playlist candidate that answers HEAD < 400, trying an
+        """First playlist candidate that answers GET < 400, trying an
         https→http fallback per candidate. Stream ports (8000/8060/…)
         are often plain HTTP even when the playlist advertises https —
         e.g. 1Mix: TuneIn lists https://fr2.1mix.co.uk:8060/320h, the
         working stream is http://fr2.1mix.co.uk:8060/320.
 
-        All HEADs run in parallel (asyncio.gather) — with a dead station
+        GET, not HEAD — Perl re-scans each playlist entry with a GET
+        (Scanner/Remote.pm:1195-1214 → :205) and a 503 on HEAD would
+        discard a perfectly fine candidate.
+
+        All probes run in parallel (asyncio.gather) — with a dead station
         a sequential scan would block the play request for the sum of
         all timeouts (60 s+); parallel it is just one timeout.
         """
@@ -2431,9 +2435,9 @@ class SlimProtoClient:
 
             async def test(v: str) -> str | None:
                 try:
-                    r = await client.head(v, headers=headers)
-                    if r.status_code < 400:
-                        return str(r.url)
+                    async with client.stream("GET", v, headers=headers) as r:
+                        if r.status_code < 400:
+                            return str(r.url)
                 except Exception:
                     pass
                 return None
@@ -2471,34 +2475,36 @@ class SlimProtoClient:
             timeout = httpx.Timeout(connect=8.0, read=8.0, write=8.0, pool=8.0)
             async with httpx.AsyncClient(timeout=timeout,
                                          follow_redirects=True) as client:
-                # HEAD first: follows redirects, cheap, no audio body.
-                resp = await client.head(url, headers=headers)
-                final = str(resp.url)
-                ctype = resp.headers.get("content-type", "").lower()
-                is_playlist = ("playlist" in ctype or "mpegurl" in ctype
-                               or final.lower().endswith((".pls", ".m3u", ".m3u8")))
-                if is_playlist:
-                    # Read the playlist body (bounded), then pick the first
-                    # REACHABLE URL (HEAD test, https→http fallback) — the
-                    # playlist often lists dead/mis-schemed URLs first
-                    # (1Mix: TuneIn lists https://…:8000, working stream
-                    # is http://…:8060/…).
-                    try:
-                        resp = await client.get(url, headers=headers)
-                        body = b""
-                        async for chunk in resp.aiter_bytes():
-                            body += chunk
-                            if len(body) > 128 * 1024:
-                                break
-                        candidates = self._pick_playlist_url(body)
-                        if candidates:
-                            reachable = await self._first_reachable(candidates)
-                            result = reachable or candidates[0]
-                    except Exception as exc:
-                        logger.warning("Playlist resolve failed for %s: %s",
-                                       url[:60], exc)
-                elif final != url and resp.status_code < 400:
-                    result = final
+                # GET, not HEAD: Perl's scanURL is a GET
+                # (Scanner/Remote.pm:205) and some Icecast/DAS edges answer
+                # HEAD with 503 while serving the audio fine on GET.
+                async with client.stream("GET", url, headers=headers) as resp:
+                    final = str(resp.url)
+                    ctype = resp.headers.get("content-type", "").lower()
+                    is_playlist = ("playlist" in ctype or "mpegurl" in ctype
+                                   or final.lower().endswith((".pls", ".m3u", ".m3u8")))
+                    if is_playlist:
+                        # Read the playlist body (bounded, Perl: readLimit
+                        # 128*1024, Remote.pm:1180-1206), then pick the first
+                        # REACHABLE URL (GET test, https→http fallback) — the
+                        # playlist often lists dead/mis-schemed URLs first
+                        # (1Mix: TuneIn lists https://…:8000, working stream
+                        # is http://…:8060/…).
+                        try:
+                            body = b""
+                            async for chunk in resp.aiter_bytes():
+                                body += chunk
+                                if len(body) > 128 * 1024:
+                                    break
+                            candidates = self._pick_playlist_url(body)
+                            if candidates:
+                                reachable = await self._first_reachable(candidates)
+                                result = reachable or candidates[0]
+                        except Exception as exc:
+                            logger.warning("Playlist resolve failed for %s: %s",
+                                           url[:60], exc)
+                    elif final != url and resp.status_code < 400:
+                        result = final
         except Exception as exc:
             logger.warning("Stream URL resolve failed for %s (%s) — using as-is",
                            url[:60], exc)
@@ -2508,7 +2514,9 @@ class SlimProtoClient:
         self._url_resolve_cache[url] = (now, result)
         return result
 
-    async def send_remote_stream(self, mac: str, url: str, codec: str = "m") -> bool:
+    async def send_remote_stream(self, mac: str, url: str, codec: str = "m",
+                                 *,
+                                 resolved: bool = False) -> bool:
         """Send a strm frame for an EXTERNAL stream URL (radio/favorites).
 
         LMS behaviour (Squeezebox.pm stream_s, $isDirect branch): the player
@@ -2539,7 +2547,11 @@ class SlimProtoClient:
 
         # Resolve redirects / M3U/PLS playlists server-side (Squeezelite
         # can do neither) — like the Perl LMS does before direct streams.
-        url = await self._resolve_stream_url(url)
+        # ``resolved=True`` means the caller already probed the URL the way
+        # Perl's scanURL does (Slim/Utils/Scanner/Remote.pm:205-233) and
+        # hands over the FINAL URL, so this HEAD/GET round-trip is skipped.
+        if not resolved:
+            url = await self._resolve_stream_url(url)
 
         # Keep the player playlist in sync: the proxy endpoint resolves
         # the track from player.playlist, so it must hold the RESOLVED

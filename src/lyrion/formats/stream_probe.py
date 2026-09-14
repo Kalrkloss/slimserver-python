@@ -24,15 +24,41 @@ strm-Frames: ``Slim/Utils/Scanner/Remote.pm:333-390`` (scanURL-Callback):
 Das Ergebnis wird dort als Content-Type des Tracks zwischengespeichert
 (``Slim::Music::Info::setContentType``), damit der nächste Start nicht erneut
 proben muss — hier als kleiner In-Process-Cache.
+
+Die Probe selbst ist EIN ``GET`` (``scanURL``), nicht HEAD:
+
+    my $request = HTTP::Request->new( GET => $url );
+    ...
+    my $timeout = preferences('server')->get('remotestreamtimeout');
+    $http->send_request( { request => $request, onRedirect => \\&handleRedirect,
+        onHeaders => \\&readRemoteHeaders, onError => sub {...}, Timeout => $timeout } )
+
+(Slim/Utils/Scanner/Remote.pm:205-233; Timeout-Default 15 s =
+Slim/Utils/Prefs.pm:209). Ein Fehlerstatus ist ein FEHLER, kein Header-Satz:
+Async/HTTP.pm:434-435 ruft bei ``$code !~ /[23]\\d\\d/`` ``onError`` mit der
+Statuszeile, Remote.pm:228-238 macht daraus ``$cb->(undef, $error, ...)``.
+Der Aufrufer (Play-Pfad) bricht damit ab — Perl hat keinen Proxy-Fallback:
+
+    Slim/Player/Song.pm:302-312  (scanUrl-Callback, Fehlerzweig)
+        Slim::Control::Request::notifyFromArray( $client,
+            [ 'playlist', 'cant_open', $url, $error ] );
+        $error ||= 'PROBLEM_OPENING_REMOTE_URL';
+        $failCb->($error, $url);
+
+Genau der gemeldete 1.FM-Fall (live 2026-09-14): der Sender antwortete der
+Probe mit ``503 Service Unavailable``; die alte Fassung verwarf das (HEAD-Probe
+ohne Statusprüfung, Fallback auf die URL-Endung) und schickte den Stream
+trotzdem DIRECT → Player still.
 """
 
 from __future__ import annotations
 
 import logging
 import re
+from dataclasses import dataclass, field
 from typing import Mapping, Optional
 
-from .lms_types import format_byte, type_from_mime, type_from_suffix
+from .lms_types import type_from_mime, type_from_suffix
 
 logger = logging.getLogger(__name__)
 
@@ -47,8 +73,43 @@ _RE_MP4_TAIL = re.compile(r"(?:m4a|mp4)$")
 
 # Cache des ermittelten Typs pro URL (Perl: Slim::Music::Info::setContentType).
 _TYPE_CACHE: dict[str, str] = {}
-# Cache der Fehlschläge, damit ein toter Sender nicht jeden Start ausbremst.
-_TYPE_FAIL_CACHE: set[str] = set()
+# Cache der ICY-Bitrate pro URL — Perl liest sie aus DERSELBEN Scan-Antwort
+# (Remote.pm:530-545) und legt sie über setBitrate am Track ab.
+_BITRATE_CACHE: dict[str, float] = {}
+
+# Perl: ``preferences('server')->get('remotestreamtimeout')`` — Default 15
+# (Slim/Utils/Prefs.pm:209), benutzt als ``Timeout`` der Scan-Anfrage
+# (Slim/Utils/Scanner/Remote.pm:214/:232).
+REMOTE_STREAM_TIMEOUT = 15.0
+
+# Perl liest den Playlist-Body bounded ein: ``readLimit => 128 * 1024``
+# (Slim/Utils/Scanner/Remote.pm:1179-1206, parsePlaylist).
+PLAYLIST_READ_LIMIT = 128 * 1024
+
+# Playlist-Typen, deren Body Perl als URL-Liste liest (Remote.pm:416 →
+# else-Zweig :587-597; die Endungsliste steht in Remote.pm:357).
+PLAYLIST_TYPES = ("m3u", "pls", "asx", "wpl")
+
+
+@dataclass
+class StreamScan:
+    """Ergebnis EINER Perl-gleichen Probe (``scanURL``).
+
+    ``error`` ist gesetzt, wenn Perl an dieser Stelle abbrechen würde
+    (Remote.pm:228-238 → Song.pm:302-312); ``type``/``bitrate``/``url`` sind
+    dann nicht verwertbar.
+    """
+
+    url: str
+    status: int = 0
+    type: Optional[str] = None
+    bitrate: float = 0.0
+    error: Optional[str] = None
+    headers: dict = field(default_factory=dict)
+
+    @property
+    def failed(self) -> bool:
+        return self.error is not None
 
 
 def perl_type_from_response(
@@ -87,55 +148,149 @@ def perl_type_from_response(
     return type_ or None
 
 
-async def probe_remote_type(url: str, timeout: float = 5.0) -> Optional[str]:
-    """HTTP-Header eines Streams lesen und den Perl-Typ bestimmen.
+def bitrate_from_headers(headers: Mapping[str, str]) -> float:
+    """ICY-Bitrate aus den Scan-Headern (``Remote.pm:530-560``).
 
-    Perl nutzt einen GET (scanURL) und wertet nur die Header aus; wir probieren
-    zuerst HEAD und fallen auf einen abgebrochenen GET zurück, weil manche
-    Icecast-Server HEAD ablehnen. Fehler/Timeouts sind kein Grund, die
-    Wiedergabe zu verhindern — dann gilt die URL-Endung (Rückgabewert None).
+    Perl liest sie in ``readRemoteHeaders`` aus der Antwort des Scans::
+
+        # Look for bitrate information in header indicating it's an Icy stream
+        elsif ( $bitrate = ( $http->response->header('icy-br')
+                || $http->response->header('x-audiocast-bitrate') || 0 ) * 1000 ) { ... }
+        if ( $bitrate ) {
+            if ( $bitrate < 1000 ) { $bitrate *= 1000; }
+            Slim::Music::Info::setBitrate( $track, $bitrate, $vbr );
+        }
     """
-    if url in _TYPE_CACHE:
-        return _TYPE_CACHE[url]
-    if url in _TYPE_FAIL_CACHE:
-        return None
+    value = (headers or {}).get("icy-br") or (headers or {}).get("x-audiocast-bitrate")
+    if not value:
+        return 0.0
+    match = re.search(r"(\d+(?:\.\d+)?)", str(value))
+    if not match:
+        return 0.0
     try:
-        import httpx
+        bitrate = float(match.group(1)) * 1000            # Remote.pm:543 `* 1000`
+    except ValueError:                                    # pragma: no cover
+        return 0.0
+    if bitrate and bitrate < 1000:                        # Remote.pm:551-552
+        bitrate *= 1000
+    return bitrate
 
-        headers: Mapping[str, str] = {}
-        content_type: Optional[str] = None
+
+def _playlist_entry_urls(body: bytes) -> list[str]:
+    """Spielbare URL-Zeilen eines M3U/PLS-Bodys (Perl ``parsePlaylist``).
+
+    Perl übergibt den Body der Format-Klasse (``Slim/Formats/Playlists/
+    M3U.pm`` / ``PLS.pm``) und scannt die gefundenen Einträge danach erneut
+    (Remote.pm:1195-1214). ``File1=``-Zeilen eines PLS liefert diese Liste
+    mit, weil das Suffix-Schema dieselbe Zeilenform benutzt.
+    """
+    out: list[str] = []
+    for line in body.decode("utf-8", errors="replace").splitlines():
+        line = line.strip()
+        if "=" in line and not line.lower().startswith(("http://", "https://")):
+            # PLS: ``File1=http://...``
+            line = line.split("=", 1)[1].strip()
+        if line.startswith(("http://", "https://")):
+            out.append(line)
+    return out
+
+
+async def scan_stream_url(
+    url: str, timeout: float = REMOTE_STREAM_TIMEOUT, _depth: int = 0
+) -> StreamScan:
+    """EINE Probe wie Perls ``scanURL``: GET, Statuszeile, Header, Redirects.
+
+    Perl öffnet die URL mit ``GET`` (Slim/Utils/Scanner/Remote.pm:205) und
+    einem ``Timeout`` von ``remotestreamtimeout`` (:214/:232). Redirects folgen
+    über ``handleRedirect`` (:285-300, Async/HTTP.pm:433-475) — die maßgebliche
+    URL ist die FINALE (``$http->request->uri``, :309). Ein Status außerhalb
+    2xx/3xx ist ein Fehler (Async/HTTP.pm:434-435 → Remote.pm:228-238).
+    Ist das Ergebnis eine Playlist, wird sie wie in Perl gelesen und der erste
+    Eintrag erneut gescannt (:587-597 → :1195-1214).
+
+    Der Rückgabewert ist NIE ``None``: ``StreamScan.error`` trägt den
+    Perl-Fehlercode, damit der Aufrufer wie ``Song.pm:302-312`` abbrechen kann.
+    """
+    if _TYPE_CACHE.get(url) and url in _BITRATE_CACHE:
+        return StreamScan(url=url, status=200, type=_TYPE_CACHE[url],
+                          bitrate=_BITRATE_CACHE[url])
+
+    import httpx
+
+    scan = StreamScan(url=url)
+    try:
         async with httpx.AsyncClient(
-            timeout=httpx.Timeout(connect=timeout, read=timeout, write=timeout,
-                                  pool=timeout),
+            timeout=httpx.Timeout(connect=timeout, read=timeout,
+                                  write=timeout, pool=timeout),
             follow_redirects=True,
         ) as client:
-            try:
-                resp = await client.head(url)
-                headers = {k.lower(): v for k, v in resp.headers.items()}
-                content_type = resp.headers.get("content-type")
-            except Exception:  # noqa: BLE001 — HEAD nicht unterstützt
-                headers = {}
-            if not headers:
-                # GET, aber nur die Header: der Body wird sofort verworfen.
-                async with client.stream("GET", url) as resp:
-                    headers = {k.lower(): v for k, v in resp.headers.items()}
-                    content_type = resp.headers.get("content-type")
-        type_ = perl_type_from_response(url, content_type, headers)
-        if type_:
-            _TYPE_CACHE[url] = type_
-            logger.debug("Stream-Format für %s: %s (content-type %r)",
-                         url[:70], type_, content_type)
-            return type_
-        logger.debug("Stream-Format für %s unbestimmt (content-type %r)",
-                     url[:70], content_type)
-    except Exception as exc:  # noqa: BLE001 — Netzfehler nie fatal
-        logger.debug("Stream-Format-Probe für %s fehlgeschlagen: %s", url[:70], exc)
-    _TYPE_FAIL_CACHE.add(url)
-    return None
+            async with client.stream("GET", url) as resp:
+                scan.status = resp.status_code
+                scan.headers = {k.lower(): v for k, v in resp.headers.items()}
+                scan.url = str(resp.url)                  # finale URL nach Redirect
+                if not (200 <= resp.status_code < 400):
+                    # Async/HTTP.pm:434-435 — onError mit der Statuszeile
+                    # ("503 Service Unavailable").
+                    scan.error = f"{resp.status_code} {resp.reason_phrase}".strip()
+                    logger.warning("Stream-Scan %s: %s", url[:70], scan.error)
+                    return scan
+
+                scan.type = perl_type_from_response(
+                    scan.url, resp.headers.get("content-type"), scan.headers)
+                scan.bitrate = bitrate_from_headers(scan.headers)
+
+                if scan.type in PLAYLIST_TYPES and _depth < 2:
+                    body = b""
+                    async for chunk in resp.aiter_bytes():
+                        body += chunk
+                        if len(body) > PLAYLIST_READ_LIMIT:
+                            break
+                    entries = _playlist_entry_urls(body)
+                    if not entries:
+                        # Remote.pm:1172-1179 — ``!scalar @results``
+                        scan.error = "PLAYLIST_NO_ITEMS_FOUND"
+                        logger.warning("Stream-Scan %s: Playlist ohne Einträge (%s)",
+                                       url[:70], scan.type)
+                        return scan
+                    # Perl scannt ALLE Einträge und nimmt den ersten
+                    # brauchbaren (Remote.pm:1195-1214). Wir bleiben bei einer
+                    # kleinen, sequenziellen Auswahl, damit ein toter Eintrag
+                    # nicht die Summe aller Timeouts kostet.
+                    last = scan
+                    for entry in entries[:3]:
+                        sub = await scan_stream_url(entry, timeout=timeout,
+                                                    _depth=_depth + 1)
+                        if not sub.failed:
+                            return sub
+                        last = sub
+                    return last
+    except Exception as exc:  # noqa: BLE001 — Netzfehler sind Fehler, nicht "unklar"
+        scan.error = str(exc) or "PROBLEM_OPENING_REMOTE_URL"
+        logger.warning("Stream-Scan %s fehlgeschlagen: %s", url[:70], exc)
+        return scan
+
+    if scan.type:
+        _TYPE_CACHE[url] = scan.type                       # Perl setContentType
+        if scan.bitrate:
+            _BITRATE_CACHE[url] = scan.bitrate
+    else:
+        # Perl: ``isSong($track, undef)`` ist falsch → der Body wird als
+        # Playlist gelesen → keine Einträge → Remote.pm:1172-1179.
+        scan.error = "PLAYLIST_NO_ITEMS_FOUND"
+        logger.warning("Stream-Scan %s: kein Format erkennbar (Header: %s)",
+                       url[:70], ",".join(sorted(scan.headers))[:160])
+    return scan
+
+
+async def probe_remote_type(url: str,
+                            timeout: float = REMOTE_STREAM_TIMEOUT) -> Optional[str]:
+    """Perl-Typ einer Remote-URL — ``None``, wenn der Scan scheitert."""
+    scan = await scan_stream_url(url, timeout=timeout)
+    return None if scan.failed else scan.type
 
 
 async def codec_for_stream_url(url: str, fallback: str = "m",
-                               timeout: float = 5.0) -> str:
+                               timeout: float = REMOTE_STREAM_TIMEOUT) -> str:
     """strm-Codec-Byte für eine Remote-URL — Header-Probe, sonst ``fallback``.
 
     Der Rückgabewert ist das Format-Byte des strm-Frames
@@ -143,6 +298,7 @@ async def codec_for_stream_url(url: str, fallback: str = "m",
     """
     type_ = await probe_remote_type(url, timeout=timeout)
     if type_:
+        from .lms_types import format_byte
         byte = format_byte(type_)
         if byte:
             return byte
@@ -152,4 +308,4 @@ async def codec_for_stream_url(url: str, fallback: str = "m",
 def clear_stream_type_cache() -> None:
     """Cache leeren (Tests / Konfigurationswechsel)."""
     _TYPE_CACHE.clear()
-    _TYPE_FAIL_CACHE.clear()
+    _BITRATE_CACHE.clear()

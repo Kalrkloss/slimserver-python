@@ -28,7 +28,7 @@ class _FakeHandler:
         self.unpaused.append(mac)
         return True
 
-    async def send_remote_stream(self, mac, url, codec):
+    async def send_remote_stream(self, mac, url, codec, **kw):
         return True
 
     async def send_strm_to_player(self, mac, track_id):
