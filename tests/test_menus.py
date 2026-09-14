@@ -233,16 +233,46 @@ def test_years_base_actions_target_yearinfo():
 
 
 def test_more_is_emitted_per_mode_and_omitted_for_non_live_probed_kinds():
-    """``more`` je Modus; für ``folder`` fehlt die Live-Probe der
-    ``menu:1``-bmf-Basis → Knoten wird weggelassen statt tot zu sein."""
+    """``more`` je Modus — auch für ``folder`` (Default-Base des Fensters).
+
+    ``XMLBrowser.pm:888-941``: der **Default-Base** eines Menü-Fensters trägt
+    ``more`` bereits selbst — ``cmd => [$query,'items']``,
+    ``itemsParams => 'params'``, ``params = {menu => $query}
+    + $feed->{query}`` und ``window {isContextMenu:1}`` (:932-938).  Ein
+    ``info``-Sub-Feed überschreibt es nur, wenn er ``actions`` mit
+    ``info`` definiert (``$subFeed->{'actions'}`` → ``_makeAction(...,
+    'info', ...)``, :943-950).
+
+    ``menus.more_action`` ist genau dieser ``info``-Zweig (die Feeds
+    trackinfo/albuminfo/artistinfo/genreinfo/yearinfo), deshalb ist er für
+    ``folder`` ``None``: das ``folderinfo`` sitzt dort **pro Item** in
+    ``itemActions.info`` (``BrowseLibrary.pm:2067-2071`` →
+    ``XMLBrowser.pm:1289-1290``, geprüft in ``test_musicdir_bmf``).
+    Die frühere Erwartung „für folder gar kein ``more``“ war nie gegen den
+    ``menu:1``-bmf-Fall gehalten — Live Perl 9.1.1 (read-only, 2026-09-14)::
+
+        browselibrary items 0 2 menu:1 mode:bmf
+        base.actions = {add, add-hold, go, more, play, playControl}
+        more = {"cmd":["browselibrary","items"],"itemsParams":"params",
+                "params":{"menu":"browselibrary","mode":"bmf"},
+                "player":0,"window":{"isContextMenu":1}}
+
+    und ``base.actions.more`` ist in *jedem* Modus vorhanden (live: albums,
+    artists, genres, years, tracks, bmf).
+    """
     expected = {"tracks": "trackinfo", "albums": "albuminfo",
                 "artists": "artistinfo", "genres": "genreinfo",
                 "years": "yearinfo"}
     for kind, feed in expected.items():
         assert menus.more_action(kind, {})["cmd"] == [feed, "items"], kind
     assert menus.more_action("folder") is None
-    assert "more" not in JSONRPCAPI._browselibrary_menu_actions(
-        "folder", None, 0, 2)
+    assert JSONRPCAPI._browselibrary_menu_actions("folder", None, 0, 2)["more"] == {
+        "player": 0,
+        "cmd": ["browselibrary", "items"],
+        "itemsParams": "params",
+        "params": {"mode": "bmf", "menu": "browselibrary"},
+        "window": {"isContextMenu": 1},
+    }
 
 
 # ── MENU-05: presetParams je Item-Typ ─────────────────────────────────────
