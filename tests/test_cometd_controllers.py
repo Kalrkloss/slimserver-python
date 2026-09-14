@@ -92,14 +92,19 @@ async def _handshake(mgr) -> str:
 # ---------------------------------------------------------------------------
 
 def test_handshake_ack_matches_perl_shape():
-    """version/supportedConnectionTypes/clientId/advice + timestamp.
+    """version/supportedConnectionTypes/clientId/advice — and nothing else.
 
-    Perl Cometd.pm:254-262: the handshake ack carries ``version``,
+    Perl Cometd.pm:254-262 spreads EXACTLY ``id``, ``channel``, ``version``,
     ``supportedConnectionTypes => ['long-polling','streaming']``, the new
     ``clientId``, ``successful => true`` and ``advice => {reconnect =>
     'retry', interval => LONG_POLLING_INTERVAL, timeout =>
-    LONG_POLLING_TIMEOUT}`` (60000 ms). ``timestamp`` comes from
-    ``time2str(time())`` (HTTP::Date, RFC 1123 GMT).
+    LONG_POLLING_TIMEOUT}`` (60000 ms).  There is NO ``timestamp`` in a
+    handshake answer — ``time2str`` appears only in /meta/(re)connect (:276)
+    and /meta/disconnect (:338).  Live Perl 9.1.1 192.168.1.90:
+    ``[{"successful":true,"supportedConnectionTypes":["long-polling",
+    "streaming"],"id":1,"channel":"/meta/handshake","clientId":"a1632b04",
+    "version":"1.0","advice":{"timeout":60000,"reconnect":"retry",
+    "interval":0}}]``.
     """
     async def run():
         mgr, _rec = _manager()
@@ -115,14 +120,13 @@ def test_handshake_ack_matches_perl_shape():
     assert ack["supportedConnectionTypes"] == ["long-polling", "streaming"]
     assert ack["clientId"]
     assert mgr.get(ack["clientId"]) is not None
+    assert set(ack) == {"channel", "id", "successful", "version",
+                        "clientId", "supportedConnectionTypes", "advice"}
     advice = ack["advice"]
     assert advice["reconnect"] == "retry"
     assert advice["interval"] == LONG_POLLING_INTERVAL == 0
     # milliseconds, exactly like Perl's handshake advice (Cometd.pm:251)
     assert advice["timeout"] == LONG_POLL_TIMEOUT_MS == 60000
-    # RFC 1123, GMT — Perl time2str(time()) (HTTP::Date)
-    assert re.match(r"^[A-Z][a-z]{2}, \d{2} [A-Z][a-z]{2} \d{4} "
-                    r"\d{2}:\d{2}:\d{2} GMT$", ack["timestamp"]), ack["timestamp"]
 
 
 def test_rehandshake_with_known_uuid_keeps_subscriptions():

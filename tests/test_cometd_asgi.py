@@ -260,7 +260,16 @@ def _asgi_handshake(mgr) -> tuple[str, dict]:
 # ---------------------------------------------------------------------------
 
 def test_asgi_handshake_advice_timeout_is_60000_ms():
-    """``timeout => LONG_POLLING_TIMEOUT`` = 60000 ms, interval 0 (:248-252)."""
+    """``timeout => LONG_POLLING_TIMEOUT`` = 60000 ms, interval 0 (:248-252).
+
+    Perl's handshake frame carries no ``timestamp`` (Cometd.pm:254-262) — the
+    RFC 1123 stamp is used for /meta/(re)connect (:276) and /meta/disconnect
+    (:338) only.  Live Perl 9.1.1 192.168.1.90:
+    ``[{"successful":true,"supportedConnectionTypes":["long-polling",
+    "streaming"],"id":1,"channel":"/meta/handshake","clientId":"a1632b04",
+    "version":"1.0","advice":{"timeout":60000,"reconnect":"retry",
+    "interval":0}}]``.
+    """
     mgr, _rec = _manager()
     _cid, ack = _asgi_handshake(mgr)
     assert ack["successful"] is True
@@ -270,8 +279,7 @@ def test_asgi_handshake_advice_timeout_is_60000_ms():
                              "interval": LONG_POLLING_INTERVAL,
                              "timeout": LONG_POLL_TIMEOUT_MS}
     assert ack["advice"]["timeout"] == 60000
-    assert re.match(r"^[A-Z][a-z]{2}, \d{2} [A-Z][a-z]{2} \d{4} "
-                    r"\d{2}:\d{2}:\d{2} GMT$", ack["timestamp"]), ack["timestamp"]
+    assert "timestamp" not in ack, "Perl's handshake has no timestamp"
 
 
 # ---------------------------------------------------------------------------

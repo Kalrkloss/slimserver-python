@@ -892,14 +892,27 @@ def test_asgi_long_poll_removes_client_on_aborted_response():
     assert client is None, "aborted long-poll must drop the client"
 
 
-def test_connect_ack_position_is_documented_perl_deviation():
+def test_connect_ack_is_the_first_event_like_perl():
     """Perl forces the /meta/(re)connect reply to be the FIRST event of the
-    response (Cometd.pm:279-292, ``first_event``). Python keeps it after the
-    batch acks. That is a deliberate, documented deviation: the
-    Android/libcometd clients could not be exercised in this test suite, so
-    the shipped order is pinned here instead of being changed silently
-    (review P3-4). Flip this test and both transports together when a device
-    can verify the reordering."""
+    response (Cometd.pm:269-271, ``first_event``: "We want the
+    /meta/(re)connect response to always be the first event sent in the
+    response, so it's stored in the special first_event slot").
+
+    Measured live: Perl 9.1.1 192.168.1.90 answers SqueezeClient's
+    ``[{connect},{/meta/subscribe /<cid>/**}]`` batch with
+    ``[{advice:{interval:5000},channel:/meta/connect,…},
+      {channel:/meta/subscribe,id:3,…}]`` — connect first.  We used to append
+    it after the batch acks; the deviation was pinned here as P3-4 until a
+    device could verify the reordering.
+
+    Device evidence for the flip (Waydroid, Squeeze Client
+    de.maniac103.squeezeclient, maniac103/squeezeclient):
+    ``CometdClient.startListening`` (CometdClient.kt:187-199) checks
+    ``successful`` on the first two messages it receives, and
+    ``readFromEventStream`` (:227-273) parses whole arrays, so both orders
+    complete the connect — but a strict Bayeux client reads ``messages[0]`` as
+    its /meta/connect answer, and Perl sends the connect ack there.
+    """
     async def run():
         mgr = CometdManager(_StubRPC())
         server = await start_cometd_server(mgr, "127.0.0.1", 0)
@@ -921,8 +934,11 @@ def test_connect_ack_position_is_documented_perl_deviation():
             await server.wait_closed()
 
     follow = _run(run())
-    assert [m["channel"] for m in follow] == ["/meta/subscribe", "/meta/connect"]
-    assert follow[0]["channel"] != "/meta/connect"
+    # Perl order: the connect answer leads, the batch acks follow.
+    assert [m["channel"] for m in follow] == ["/meta/connect", "/meta/subscribe"]
+    assert follow[0]["successful"] is True
+    assert follow[0]["id"] == 4
+    assert follow[1]["successful"] is True
 
 
 # ---------------------------------------------------------------------------

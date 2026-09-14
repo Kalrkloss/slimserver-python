@@ -494,16 +494,18 @@ def connect_advice(connection_type: str = "") -> dict:
 def connect_ack(msg: dict, client_id: str) -> dict:
     """The single /meta/(re)connect ack (Perl Cometd.pm:271-280).
 
-    Perl stores it in ``first_event`` and every field is fixed there:
-    ``id``, ``channel``, ``clientId``, ``successful``, ``timestamp``
-    (``time2str(time())``, :276) and ``advice => { interval => $streaming ?
-    RETRY_DELAY : 0 }`` (:278). Both transports must emit exactly this
-    frame — it is the one and only answer to a /meta/connect
-    (``handle_messages`` deliberately never answers that channel).
+    Perl stores it in the response's ``first_event`` slot so it is *always the
+    first event* of that response (Cometd.pm:269-271: "We want the
+    /meta/(re)connect response to always be the first event sent in the
+    response, so it's stored in the special first_event slot").  Every field is
+    fixed there: ``id``, ``channel``, ``clientId``, ``successful``,
+    ``timestamp`` (``time2str(time())``, :276) and
+    ``advice => { interval => $streaming ? RETRY_DELAY : 0 }`` (:278).
 
-    ``advice.timeout`` is the documented Python superset of Perl's connect
-    advice (see ``connect_advice``); it must be the 60 s *milliseconds*
-    value, not 60, or a client reads it as a 60 ms server timeout.
+    Both transports must emit exactly this frame — it is the one and only
+    answer to a /meta/connect (``handle_messages`` deliberately never answers
+    that channel) — and the caller must put it FIRST in the batch
+    (``[connect_ack(...)] + acks``), never after the batch acks.
     """
     return {
         "channel": "/meta/connect",
@@ -1375,10 +1377,16 @@ class CometdManager:
                     "version": "1.0",
                     "clientId": client.client_id,
                     "supportedConnectionTypes": ["long-polling", "streaming"],
-                    "timestamp": _http_timestamp(),
-                    # Perl Cometd.pm:248-252: the handshake advice carries
-                    # reconnect/interval AND the 60 s hold time in ms. The
-                    # timeout was missing here.
+                    # Perl Cometd.pm:254-262 spreads EXACTLY id, channel,
+                    # version, supportedConnectionTypes, clientId, successful
+                    # and advice — there is no ``timestamp`` in a handshake
+                    # answer (``time2str`` is only used for /meta/(re)connect,
+                    # :276, and /meta/disconnect, :338).  Live Perl 9.1.1
+                    # 192.168.1.90:
+                    #   [{…,"channel":"/meta/handshake","clientId":"a1632b04",
+                    #     "version":"1.0","advice":{"timeout":60000,
+                    #     "reconnect":"retry","interval":0}}]
+                    # The extra key we sent was an invented superset.
                     "advice": {"reconnect": "retry",
                                "interval": LONG_POLLING_INTERVAL,
                                "timeout": LONG_POLL_TIMEOUT_MS},
@@ -1432,7 +1440,16 @@ class CometdManager:
                 for sub in acks:
                     ack = dict(reply)
                     ack["successful"] = True
-                    ack["error"] = None
+                    # Perl's success ack carries NO ``error`` key at all —
+                    # ``error`` is only added on the failure paths
+                    # (Cometd.pm:200-212 "No clientId found", :386-392).
+                    # Ours sent ``error: null``, an invented key.  Live Perl
+                    # 9.1.1 192.168.1.90 for the client's own
+                    # ``/meta/subscribe /<cid>/**``:
+                    #   {"id":3,"clientId":"a1632b04",
+                    #    "channel":"/meta/subscribe",
+                    #    "subscription":"/a1632b04/**","successful":true}
+                    ack.pop("error", None)
                     # Perl puts clientId into every subscribe ack
                     # (Cometd.pm:363 / :456); libcometd (SqueezeClient)
                     # requires the subscription field — else 'Subscription

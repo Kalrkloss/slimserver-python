@@ -41,6 +41,7 @@ from lyrion.web.cometd import (
     LONG_POLL_TIMEOUT,
     _client_id_from_channel,
     _http_timestamp,
+    connect_ack,
     connect_advice,
     has_invalid_client_advice,
 )
@@ -727,18 +728,22 @@ async def _handle_connection(manager, reader: asyncio.StreamReader,
                 logger.info("NativeCometd connect: cid=%s (POST hatte %d Nachrichten: %s)",
                             cid, len(messages),
                             ",".join(m.get("channel", "?") for m in messages))
-                connect_ack = {
-                    "channel": "/meta/connect", "successful": True,
-                    "clientId": cid, "id": msg.get("id", ""),
-                    # Perl Cometd.pm:274-280: the ack is stamped and its
-                    # advice carries RETRY_DELAY (5000 ms) for a streaming
-                    # connect, 0 for long-polling (Cometd.pm:45, :278).
-                    "timestamp": _http_timestamp(),
-                    "advice": connect_advice(msg.get("connectionType", "")),
-                }
+                connect_reply = connect_ack(msg, cid)
+                # Per Cometd.pm:269-271 the /meta/(re)connect ack is stored in
+                # the response's ``first_event`` slot — "We want the
+                # /meta/(re)connect response to always be the first event sent
+                # in the response".  We used to append it AFTER the batch acks
+                # (``replies + [ack]``), so Perl and we ordered the SAME two
+                # frames differently: live Perl 9.1.1 192.168.1.90 answers
+                # SqueezeClient's ``[connect, /meta/subscribe /<cid>/**]`` with
+                #   [{"advice":{"interval":5000},"channel":"/meta/connect",…},
+                #    {"channel":"/meta/subscribe","id":3,…}]
+                # — connect first.  Measured against our :9000 the order was
+                # reversed; a Bayeux client that reads messages[0] as its
+                # connect answer must not see the subscribe ack there.
                 # handle_messages() deliberately does NOT answer
                 # /meta/connect, so this is the one and only connect ack.
-                first = list(replies) + [connect_ack]
+                first = [connect_reply] + list(replies)
                 events = await manager.wait_for_events(cid, timeout=0)
                 first.extend(events)
                 # Chunked transfer: the app's HttpResponseInputStream
@@ -870,14 +875,13 @@ async def _handle_connection(manager, reader: asyncio.StreamReader,
                             if stream_cid:
                                 conn_cids.add(stream_cid)
                                 manager.register_connection(stream_cid, owner)
-                            payload = list(nreplies) + [{
-                                "channel": "/meta/connect",
-                                "successful": True,
-                                "clientId": nc.get("clientId", ""),
-                                "id": nc.get("id", ""),
-                                "timestamp": _http_timestamp(),
-                                "advice": connect_advice(
-                                    nc.get("connectionType", ""))}]
+                            # Perl stores the (re)connect answer in the
+                            # response's ``first_event`` slot, so it always
+                            # leads the batch (Cometd.pm:269-271); the shared
+                            # helper keeps this frame byte-identical to the
+                            # ASGI path's.
+                            payload = [connect_ack(nc, new_cid or stream_cid)] \
+                                + list(nreplies)
                             nchunk = json.dumps(payload).encode("utf-8")
                             await _send(
                                 writer,
