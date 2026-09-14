@@ -103,5 +103,7 @@ STRINGS_EN: dict[str, str] = {
     'ADD': 'Add',  # strings.txt:11263
     'DELETE': 'Delete',  # strings.txt:16045
     'FAVORITES': 'Favorites',  # Slim/Plugin/Favorites/strings.txt:3
+    # The jive popup after `favorites add` (Favorites/Plugin.pm:904-911).
+    'FAVORITES_ADDING': 'Saving favorites...',  # Slim/Plugin/Favorites/strings.txt:38/:42
     'HOME': 'Home',  # strings.txt:3140
 }

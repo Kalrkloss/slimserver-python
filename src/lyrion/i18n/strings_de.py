@@ -99,5 +99,7 @@ STRINGS_DE: dict[str, str] = {
     'ADD': 'Hinzufügen',  # strings.txt:11263
     'DELETE': 'Löschen',  # strings.txt:16045
     'FAVORITES': 'Favoriten',  # Slim/Plugin/Favorites/strings.txt:3
+    # Der jive-Popup-Text nach `favorites add` (Favorites/Plugin.pm:904-911).
+    'FAVORITES_ADDING': 'Favoriten werden gespeichert ...',  # Favorites/strings.txt:38/:41
     'HOME': 'Hauptmenü',  # strings.txt:3140
 }

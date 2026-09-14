@@ -1254,6 +1254,27 @@ _KNOWN_JSON_COMMANDS = frozenset({
 })
 
 
+def _favorites_icon(url: str) -> str:
+    """``$favs->icon($url)`` — the icon of a favourites entry.
+
+    ``Slim/Plugin/Favorites/OpmlFavorites.pm:83-88``::
+
+        return Slim::Player::ProtocolHandlers->iconForURL($url)
+            || 'html/images/favorites.png';
+
+    ``iconForURL`` asks the URL's protocol handler (``ProtocolHandlers.pm:
+    138-153``); an http(s) stream answers ``HTTP.pm:1138-1147`` →
+    ``'html/images/radio.png'``, which is the same fallback the port uses for
+    stream artwork (:data:`REMOTE_ART_FALLBACK`).  Everything else (a file URL,
+    a folder) gets the favourites icon.
+    """
+    from lyrion.web.favorites_menu import FAVORITES_ICON
+
+    if str(url).lower().startswith(("http://", "https://")):
+        return REMOTE_ART_FALLBACK
+    return FAVORITES_ICON
+
+
 def _jive_string(key: str) -> str:
     """Perl ``$client->string($key)`` (Slim/Utils/Strings.pm:525-536).
 
@@ -2934,7 +2955,7 @@ class JSONRPCAPI:
             resp["title"] = _jive_string("FAVORITES")
             return resp
 
-    async def _json_favorites_add(self, args: list) -> dict:
+    async def _json_favorites_add(self, pid: str | None, args: list) -> dict:
         """``favorites add url:<url> title:<title> [type:<t> icon:<i>]``.
 
         Perl ``cliAdd`` (``Slim/Plugin/Favorites/Plugin.pm:821-922``) reads
@@ -2947,7 +2968,9 @@ class JSONRPCAPI:
           (:855);
         * inserts at ``item_id`` when given, otherwise appends at the end
           (:880-893);
-        * answers ``count`` 1 (:859) after ``$favs->save`` (:895).
+        * answers ``count`` 1 (:859) after ``$favs->save`` (:895);
+        * fires the jive feedback popup ("show feedback to jive", :902-912)
+          — ``showBriefly`` with the ``favorite`` style hash below.
 
         ``addlevel`` creates a *folder* (:861-870, title only).  Positional
         fallbacks (``favorites add <url> <title> [<parent_id>]``) are additive —
@@ -2990,7 +3013,68 @@ class JSONRPCAPI:
         if new_id is None:
             return {}
         logger.info("favorites add: %s (%s) -> %s", title, url, new_id)
+        # Perl fires the popup for BOTH commands — it sits after ``save`` and
+        # outside the add/addlevel branch (Plugin.pm:895-912); an ``addlevel``
+        # has no url, so ``icon($url)`` falls back to favorites.png
+        # (OpmlFavorites.pm:87-88).
+        await self._favorites_add_feedback(
+            pid, str(title), str(url or ""), tagged.get("icon"))
         return {"count": 1}                     # Favorites/Plugin.pm:859
+
+    async def _favorites_add_feedback(self, pid: str | None, title: str,
+                                      url: str, icon: str | None) -> None:
+        """The jive popup Perl shows after ``favorites add``.
+
+        ``Slim/Plugin/Favorites/Plugin.pm:902-912``::
+
+            # show feedback to jive
+            if ($request->source && $request->source =~ /\\/slim\\/request/) {
+                $client->showBriefly({
+                    jive => {
+                        type => 'mixed',
+                        style => 'favorite',
+                        'icon' => $icon || $favs->icon($url),
+                        text => [ $client->string('FAVORITES_ADDING'), $title ],
+                    },
+                });
+            }
+
+        ``showBriefly`` then (``Slim/Display/Display.pm``):
+
+        * caches the popup for the ``showBriefly`` field of ``status``
+          (``renderCache->{showBriefly}``, :280-283, 15 s ttl — the port's
+          ``set_pending_display``);
+        * fires ``notify('showbriefly', $parts, $duration)`` (:285-288) →
+          ``['displaynotify', 'showbriefly', $parts, $duration]`` →
+          ``displaystatus`` subscribers (:905-913), which is exactly the event
+          the controller renders as the confirmation popup.
+
+        The recipients are the controllers subscribed to ``displaystatus`` for
+        this player (Perl needs ``notifyLevel >= 1``, i.e. a
+        ``subscribe:showbriefly`` registration, ``Queries.pm:1758-1759``);
+        ``CometdManager.notify_display`` applies that same filter, so a caller
+        that is not a jive controller (plain ``/jsonrpc.js``, CLI) — which Perl
+        excludes via the source check above — receives nothing either.
+        """
+        if not pid:
+            return
+        jive: dict = {
+            "type": "mixed",                                # Plugin.pm:906
+            "style": "favorite",                            # Plugin.pm:907
+            "icon": icon or _favorites_icon(url),           # Plugin.pm:908
+            "text": [_jive_string("FAVORITES_ADDING"),      # Plugin.pm:909
+                     str(title)],
+        }
+        self.set_pending_display(jive, "showbriefly")       # Display.pm:280-283
+        try:
+            from lyrion.web.cometd import get_manager
+            mgr = get_manager()
+            if mgr is not None:
+                # Display.pm:285-288 → notify_display → 'displaynotify' on the
+                # displaystatus channel (Display.pm:905-913).
+                await mgr.notify_display(pid, "showbriefly", jive)
+        except Exception as exc:  # noqa: BLE001 — a popup must never break the add
+            logger.debug("favorites add popup for %s failed: %s", pid, exc)
 
     async def _json_favorites_delete(self, args: list) -> dict:
         """``favorites delete [url:<url>] [title:<t>] [item_id:<id>]``.
@@ -3903,7 +3987,7 @@ class JSONRPCAPI:
         # answers ``count`` 1 (:859).  Our former path handed the CLI echo
         # (a text list) back, which the JSON clients cannot read.
         if cmd == "favorites" and args and str(args[0]) in ("add", "addlevel"):
-            return await self._json_favorites_add(args)
+            return await self._json_favorites_add(pid, args)
 
         # favorites delete — Perl dispatch ['favorites','delete']
         # (Slim/Plugin/Favorites/Plugin.pm:80 addDispatch → cliDelete :925-970).
