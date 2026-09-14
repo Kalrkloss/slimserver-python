@@ -1248,6 +1248,305 @@ def _client_string(token: str) -> str:
     return get_string(str(token).upper(), lang=resolve_language(), default="")
 
 
+# ---------------------------------------------------------------------------
+# Perl's date/time strings (Slim/Utils/DateTime.pm) and the jive display block
+# (Slim/Player/Player.pm:488-706 currentSongLines)
+# ---------------------------------------------------------------------------
+
+#: ``strings.txt`` carries the locale NAME per language (``LOCALE``);
+#: ``Strings.pm:712-728`` ``setLocale`` installs it on LC_TIME at startup:
+#: ``setlocale(LC_TIME, string('LOCALE') . '.UTF-8')``.  Live Perl 9.1.1:
+#: ``getstring LOCALE,LOCALE_WIN`` -> ``de_DE`` / ``deu_deu``.
+_PERL_LOCALES: dict[str, str] = {"DE": "de_DE", "EN": "en_US"}
+
+#: ``DateTime.pm:450-452`` seeds the prefs ``longdateFormat``/``timeFormat``
+#: from the string table at startup; the values below are the ``DE``/``EN``
+#: rows of ``strings.txt`` (``SETUP_LONGDATEFORMAT_DEFAULT`` /
+#: ``SETUP_TIMEFORMAT_DEFAULT``).  Live Perl 9.1.1 (de_DE):
+#: ``%A, |%d. %B %Y`` and ``%H:%M``.
+_PERL_DATE_FORMATS: dict[str, tuple[str, str]] = {
+    "DE": ("%A, |%d. %B %Y", "%H:%M"),
+    "EN": ("%A, %B |%d, %Y", "|%I:%M %p"),
+}
+
+#: Perl's no-padding flag ``|``, as stripped AFTER strftime:
+#: ``DateTime.pm:57`` ``$date =~ s/\|0*//`` (longDateF) and :102
+#: ``$time =~ s/\|0?(\d+)/$1/`` (timeF).
+_PIPE_STRIP_ALL_ZEROS = re.compile(r"\|0*")
+_PIPE_STRIP_ONE_ZERO = re.compile(r"\|0?(\d+)")
+
+#: LC_TIME already installed by :func:`_perl_set_time_locale` (Perl calls
+#: ``setLocale`` once at startup, not per request).
+_perl_time_locale_lang: str = ""
+
+
+def _perl_set_time_locale(lang: str) -> str:
+    """Install LC_TIME for ``lang`` — Perl ``Strings::setLocale`` (:712-728).
+
+    ``setlocale(LC_TIME, string('LOCALE'))``; Perl appends ``.UTF-8`` when the
+    current locale is UTF-8 (:715-716).  Returns the locale now in effect
+    (``C`` when the system has no such locale, so ``strftime`` keeps the
+    C names instead of raising).
+    """
+    global _perl_time_locale_lang
+    if _perl_time_locale_lang == lang:
+        return lang
+    import locale as _locale
+
+    name = _PERL_LOCALES.get(lang) or _PERL_LOCALES["EN"]
+    try:
+        _locale.setlocale(_locale.LC_TIME, name)
+    except _locale.Error:
+        for candidate in (f"{name}.UTF-8", f"{name}.utf8", "C"):
+            try:
+                _locale.setlocale(_locale.LC_TIME, candidate)
+                break
+            except _locale.Error:
+                continue
+    _perl_time_locale_lang = lang
+    return lang
+
+
+def _perl_date_part(fmt: str, tm: time.struct_time, one_zero: bool) -> str:
+    """``strftime`` + Perl's ``|`` padding-flag strip (``DateTime.pm:52-105``).
+
+    Perl renders with the pref format and then removes the flag from the
+    OUTPUT string (``s/\\|0*//`` for longDateF, ``s/\\|0?(\\d+)/$1/`` for
+    timeF), which is what glibc leaves behind for ``|%d``/``|%I``.
+    """
+    rendered = time.strftime(fmt, tm)
+    if one_zero:
+        return _PIPE_STRIP_ONE_ZERO.sub(r"\1", rendered)
+    return _PIPE_STRIP_ALL_ZEROS.sub("", rendered)
+
+
+def _perl_date_prefs() -> tuple[str, str]:
+    """The prefs ``longdateFormat``/``timeFormat`` (seeded, ``DateTime.pm:450``).
+
+    Our port does not seed them at startup, so the string-table defaults stand
+    in — read through the i18n table so a later port of the startup seeding
+    wins automatically.
+    """
+    from lyrion.i18n import get_string, resolve_language
+
+    lang = resolve_language()
+    long_default, time_default = _PERL_DATE_FORMATS.get(
+        lang, _PERL_DATE_FORMATS["EN"])
+    long_fmt = time_fmt = ""
+    try:
+        from lyrion.config import get_prefs
+
+        prefs = get_prefs()
+        long_fmt = str(prefs.get("longdateFormat") or "")
+        time_fmt = str(prefs.get("timeFormat") or "")
+    except Exception:  # noqa: BLE001 — Prefs dürfen die Anzeige nie stören
+        pass
+    if not long_fmt:
+        long_fmt = get_string("SETUP_LONGDATEFORMAT_DEFAULT", lang,
+                              default=long_default)
+    if not time_fmt:
+        time_fmt = get_string("SETUP_TIMEFORMAT_DEFAULT", lang,
+                              default=time_default)
+    return long_fmt, time_fmt
+
+
+def _perl_added_time(now: float | None = None) -> str:
+    """Perl ``Track::addedTime`` for a REMOTE track (``Track.pm:325-341``).
+
+    ``addedTime`` is ``buildModificationTime($self->added_time)``, i.e.
+    ``join(', ', longDateF($time), timeF($time))``.  A
+    ``Slim::Schema::RemoteTrack`` never gets an ``added_time`` (the attribute
+    exists, ``RemoteTrack.pm:46``, but only DB writes fill it —
+    ``Schema.pm:1740``, local tracks), so both helpers fall back to *now*
+    (``DateTime.pm:53`` ``my $time = shift || time()``).
+
+    Live Perl 9.1.1 on the ``de_DE`` server: ``remoteMeta.addedTime`` =
+    ``Montag, 14. September 2026, 14:19`` — and re-querying a minute later
+    returned ``… 14:19`` again, i.e. the QUERY time, never a stored value.
+    """
+    from lyrion.i18n import resolve_language
+
+    lang = resolve_language()
+    _perl_set_time_locale(lang)
+    long_fmt, time_fmt = _perl_date_prefs()
+    tm = time.localtime(now if now is not None else time.time())
+    return (f"{_perl_date_part(long_fmt, tm, one_zero=False)}, "
+            f"{_perl_date_part(time_fmt, tm, one_zero=True)}")
+
+
+def _perl_pretty_bitrate(bps: float | int | str | None,
+                         vbr_scale: object = None) -> object:
+    """Perl ``Track::buildPrettyBitRate`` (``Track.pm:353-363``).
+
+    ``sprintf("%d", $bitrate / 1000) . string('KBPS') . ' ' . $mode`` where
+    ``$mode`` is ``VBR`` when a ``vbr_scale`` exists, else ``CBR``; ``0`` when
+    no bitrate is known (Perl returns the number 0).  Live Perl for the 1.FM
+    stream (ICY ``icy-br: 256``, ``HTTP.pm:731-734`` scales < 8000 by 1000):
+    ``"256kb/s CBR"``.
+    """
+    from lyrion.i18n import get_string, resolve_language
+
+    try:
+        value = float(bps or 0)
+    except (TypeError, ValueError):
+        value = 0.0
+    if not value:
+        return 0
+    mode = "VBR" if vbr_scale is not None else "CBR"
+    # strings.txt KBPS = "kb/s" (live Perl getstring KBPS -> "kb/s").
+    return (f"{int(value / 1000)}"
+            f"{get_string('KBPS', resolve_language(), default='kb/s')} {mode}")
+
+
+#: Perl tag letter -> ``_songData`` result key for a remote track.  Only the
+#: letters whose SOURCE exists in this port are listed; every other letter
+#: yields no key for a stream in Perl either (live ``status - 1
+#: tags:ABCDEKJZlcuxyrtSgad`` on a stream: artist, addedTime, artwork_url,
+#: coverid, url, remote, year, bitrate, duration).
+_REMOTE_TAG_KEYS: dict[str, str] = {
+    "a": "artist", "A": "artist",
+    "l": "album",
+    "d": "duration",
+    "D": "addedTime",
+    "r": "bitrate",
+    "u": "url",
+    "x": "remote",
+    "y": "year",
+    "c": "coverid",
+    "K": "artwork_url",
+    "j": "coverart",
+    "J": "artwork_track_id",
+    "N": "remote_title",
+}
+
+
+def _perl_proxied_image(url: object, force: bool = False) -> object:
+    """Perl ``Slim::Web::ImageProxy::proxiedImage`` (``ImageProxy.pm:407-425``).
+
+    ``return $url unless $force || ($url && $url =~ /^https?:/);`` — only
+    external URLs are wrapped; the extension is taken from the URL (default
+    ``.png``, ``jpeg`` -> ``jpg``).
+    """
+    if not isinstance(url, str) or not url:
+        return url
+    if not (force or url.startswith("http:") or url.startswith("https:")):
+        return url
+    from urllib.parse import quote
+
+    ext = ".png"
+    m = re.search(r"(\.(?:jpg|jpeg|png|gif))", url)
+    if m:
+        ext = m.group(1).replace("jpeg", "jpg")
+    # URI::Escape::uri_escape_utf8 leaves A-Za-z0-9-_. alone.
+    return f"/imageproxy/{quote(url, safe='-_.')}/image{ext}"
+
+
+def _stream_display_title(player: object, entry: object) -> str:
+    """Perl ``$track->title`` for the playing entry — ``Player.pm:653``.
+
+    For a remote stream that is the RemoteTrack's title (the ICY/stream title,
+    live ``Life Breath (oct12)``); for a local track the DB title.  The raw ICY
+    value in ``player.current_title`` is ``Artist - Title`` (Perl sends it as
+    ``current_title``, Queries.pm:4089-4090) — the item/jive title is the part
+    after the separator, exactly like the status builder's ``_cur_track``.
+    """
+    local_id = _playlist_local_id(entry)
+    if local_id is not None:
+        rows = _db_query("SELECT title FROM tracks WHERE id = ? LIMIT 1",
+                         (local_id,))
+        return str((rows[0]["title"] if rows else "") or "")
+    url = str(getattr(player, "current_url", "")
+              or (entry if isinstance(entry, str) else "") or "")
+    title = str((getattr(player, "stream_titles", {}) or {}).get(url, "") or "")
+    if title:
+        return title
+    raw = str(getattr(player, "current_title", "") or "")
+    if " - " in raw:
+        head, _, tail = raw.partition(" - ")
+        if tail.strip():
+            return tail.strip() if head.strip() else raw
+    return raw or url
+
+
+async def jive_now_playing_display(player: object) -> dict | None:
+    """Perl ``Slim::Player::Player::currentSongLines`` jive block.
+
+    ``Player.pm:506-673``::
+
+        if ($playlistlen < 1) { $status = string('NOTHING'); … }      # :509-518
+        else {
+            if ($playmode eq "pause") { $status = string('PAUSED'); …} # :521-535
+            elsif ($playmode eq "stop") { $status = string('STOPPED'); …} # :541-553
+            else { $status = string('PLAYING'); … }                    # :571-585
+            …
+            $jive = { 'type' => 'icon',
+                      'text' => [ $status, $track ? $track->title : undef ],
+                      'style' => $jiveIconStyle,        # = $playmode
+                      'play-mode' => $playmode,
+                      'is-remote' => $track->isRemoteURL };  # :651-668
+            if ($imgKey) { $jive->{$imgKey} = proxiedImage($artwork); } # :669-673
+        }
+
+    ``$jiveIconStyle`` defaults to ``$playmode`` (:507); the ``rew``/``fwd``
+    styles belong to the jump command (Commands.pm:1026-1034) and are not used
+    on a plain start.  ``$status`` is the BARE status string — the ``" (i OUT_OF
+    n) "`` suffix is added to ``$lines[0]`` only (:530-535), never to the jive
+    text.  Returns ``None`` when the playlist is empty: that branch never sets
+    ``$jive`` (:509-518), so ``$parts->{'jive'}`` stays undefined and
+    ``displaystatusQuery`` falls back to the line text (:1691-1695).
+    """
+    playlist = list(getattr(player, "playlist", None) or [])
+    if len(playlist) < 1:
+        return None
+    from lyrion.player.manager import (      # Now-Playing strings of the port
+        NOW_PLAYING_TEXT, PAUSED_TEXT, STOPPED_TEXT,
+    )
+
+    mode = str(getattr(player, "mode", "stop") or "stop")
+    if mode == "pause":
+        status = PAUSED_TEXT               # Player.pm:521-535
+    elif mode == "stop":
+        status = STOPPED_TEXT              # Player.pm:541-553
+    else:
+        status = NOW_PLAYING_TEXT          # Player.pm:571-585 (string('PLAYING'))
+    index = int(getattr(player, "playlist_position", 0) or 0)
+    entry = playlist[index] if 0 <= index < len(playlist) else None
+    title = _stream_display_title(player, entry)
+    is_remote = _playlist_local_id(entry) is None
+    jive: dict[str, Any] = {
+        "type": "icon",
+        "text": [status, title or None],   # :651-655
+        "style": mode,                     # :507 jiveIconStyle = playmode
+        "play-mode": mode,
+        "is-remote": 1 if is_remote else 0,
+    }
+    if is_remote:
+        # Player.pm:584-630: a handler cover wins ('icon'), then a handler icon
+        # ('icon-id'); without either, Perl falls back to the radio default
+        # with 'icon-id' (:623-626).
+        url = str(getattr(player, "current_url", "")
+                  or (entry if isinstance(entry, str) else "") or "")
+        art = str((getattr(player, "stream_images", {}) or {}).get(url, "") or "")
+        if art:
+            jive["icon"] = _perl_proxied_image(art)          # :594-596
+        else:
+            jive["icon-id"] = _perl_proxied_image(
+                RADIO_PLACEHOLDER_ICON)                      # :623-626 + :670
+    else:
+        # Player.pm:628-631: `$imgKey = 'icon-id'; $artwork = $album->artwork || 0`
+        art_id: Any = 0
+        local_id = _playlist_local_id(entry)
+        if local_id is not None:
+            rows = _db_query(
+                "SELECT al.id AS id FROM albums al "
+                "JOIN tracks_albums ta ON ta.album = al.id "
+                "WHERE ta.track = ? LIMIT 1", (local_id,))
+            if rows and rows[0]["id"]:
+                art_id = rows[0]["id"]
+        jive["icon-id"] = _perl_proxied_image(art_id)        # :670-671
+    return jive
+
+
 def _debug_category_level(flag: str) -> str | None:
     """Antwortwert für ``debug <flag> ?`` (Perl ``debugQuery``, Queries.pm:1517-1549).
 
@@ -2566,14 +2865,18 @@ class JSONRPCAPI:
         jive-Format (:1673-1687).
 
         Squeezer liest genau das: ``Util.getRecord(data, "display")``
-        (CometClient.java:475-487) — der frühere Schlüssel ``jive`` wurde
+        (``CometClient.java:475-487``) — der frühere Schlüssel ``jive`` wurde
         deshalb nie gefunden. ``showBriefly:<text> [<dauer>]`` setzt das
         Popup (Standarddauer 5 s).
+
+        Die gespeicherte notification läuft NICHT ab: Perl hält sie in
+        ``privateData`` der Subskription und ersetzt sie erst durch die
+        nächste ``displaynotify`` (``displaystatusQuery_filter`` :1616-1620).
+        Nur das ``showBriefly``-FELD von ``status`` hat die 15-s-Grenze
+        (``renderCache->{showBriefly}{ttl}``, Display.pm:280-283 +
+        Queries.pm:4062-4066).
         """
         now = time.time()
-        if self._popup_expires and now > self._popup_expires:
-            self._popup = None
-            self._popup_expires = 0.0
         for i, a in enumerate(args or []):
             s = str(a)
             if s.startswith("showBriefly:"):
@@ -2583,26 +2886,56 @@ class JSONRPCAPI:
                 if nxt.isdigit():
                     duration = int(nxt)
                 self._popup = {
-                    "jive": {"text": text, "type": "showbriefly",
-                             "duration": duration}
+                    "jive": None, "kind": "showbriefly",
+                    "line": [text], "duration": duration,
                 }
                 self._popup_expires = now + duration
         if not self._popup:
             return {}
-        # ``_popup`` bleibt intern ``{"jive": {...}}`` (an anderen Stellen
-        # dieser Datei gesetzt, u. a. Preset-/Sync-Popups); nach außen wird
-        # daraus die Perl-Antwortform ``{type, display:{…}}``.
-        jive = dict(self._popup.get("jive") or {})
-        text: Any = jive.get("text", "")
-        if isinstance(text, (list, tuple)):
-            text = "\n".join(str(part) for part in text)
-        display: dict[str, Any] = {"text": str(text)}
-        duration = jive.get("duration")
+        # Perl ``displaystatusQuery`` (:1653-1697) gibt den jive-Teil UNVERÄNDERT
+        # als ``display`` aus: bei einer ``displaynotify`` vom Typ
+        # 'showbriefly' ist ``$parts`` der ``$parts``-Hash des
+        # ``showBriefly``-Aufrufs, und ``$parts->{'jive'}`` gilt, sobald er ein
+        # HASH/ARRAY/CODE ist (:1683-1689 ``addResult('display', …)``) — der
+        # Text bleibt dort eine LISTE (die Popup-Aufrufer setzen
+        # ``text => [ $string ]``, z. B. Commands.pm:1567/:1923/:2357).
+        # Fehlt der jive-Teil (``display <line1> <line2>`` → Commands.pm:444-472
+        # ``showBriefly({line => [$line1, $line2]})``, kein ``jive``), nimmt
+        # Perl ``$screen1->{'line'}`` als Text-LISTE und ergänzt ``duration``
+        # (:1691-1695).
+        jive = self._popup.get("jive")
+        kind = str(self._popup.get("kind") or "showbriefly")
+        if isinstance(jive, dict) and jive:
+            return {"type": kind, "display": jive}
+        line: Any = self._popup.get("line")
+        if isinstance(line, (list, tuple)):
+            lines: list[Any] = list(line)
+        else:
+            lines = ["" if line is None else str(line)]
+        display: dict[str, Any] = {"text": lines}
+        duration = self._popup.get("duration")
         if duration:
-            # Perl fügt duration nur bei gesetzter Dauer hinzu (:1685).
+            # Perl fügt duration nur in diesem Zweig hinzu (:1694).
             display["duration"] = int(duration)
-        return {"type": str(jive.get("type") or "showbriefly"),
-                "display": display}
+        return {"type": kind, "display": display}
+
+    def set_pending_display(self, jive: dict | None, kind: str = "showbriefly",
+                            duration: int | None = None,
+                            ttl: float = 15.0) -> None:
+        """Store a display notification for the next ``displaystatus`` answer.
+
+        Perl keeps the notification in the subscription's ``privateData``
+        (``displaystatusQuery_filter``, Queries.pm:1616-1620) and answers the
+        next ``displaystatus`` from it (:1655-1697).  ``jive`` is the
+        notification's ``$parts->{'jive'}`` (the icon block of
+        ``currentSongLines`` or a popup hash); without it only ``duration``
+        and a line list can be published.  ``ttl`` mirrors the 15 s
+        ``renderCache->{showBriefly}{ttl}`` Perl writes in ``Display.pm:280-283``.
+        """
+        self._popup = {"jive": jive, "kind": str(kind or "showbriefly")}
+        if duration:
+            self._popup["duration"] = int(duration)
+        self._popup_expires = time.time() + max(0.0, float(ttl))
 
 
     async def _slim_request(self, player_id: str, command: list[str]) -> Any:
@@ -4859,49 +5192,95 @@ class JSONRPCAPI:
         if player.mode == "stop":
             elapsed = 0
 
-        # remoteMeta: SqueezeClient / ioBroker expect the live-stream
-        # metadata block for remote streams (radio).
+        # remoteMeta: Perl's statusQuery adds `_songData($request, $track,
+        # $tags)` for a non-local remote URL (Queries.pm:4385-4391
+        # `if ( _notLocalTrackAndRemoteUrl($track) ) { my $metadata =
+        # _songData($request, $track, $tags);
+        # $request->addResult('remoteMeta', $metadata); }`): the SAME tag-driven
+        # field set as the playlist item, in the SAME order — `_songData` ties
+        # its result hash to Tie::IxHash (:5898-5900), so the insertion order IS
+        # the tag order.
+        #
+        # Effective tag set (Queries.pm:4012 `my $tags =
+        # $request->getParam('tags') || '';` + :4356-4364): menuMode forces
+        # 'aAlKNcxJ', otherwise the `tags:` param verbatim — the
+        # `$tags = 'gald' if !defined $tags` fallback (:4363) never fires
+        # because `|| ''` already made $tags defined.  Live Perl 9.1.1:
+        #   `status - 1`                             -> {id,title}
+        #   `status - 1 tags:gald`                   -> {id,title,artist,duration}
+        #   `status - 1 tags:d`                      -> {id,title,"duration":"0"}
+        #   `status - 10 menu:menu useContextMenu:1` -> {id,title,artist,
+        #        artwork_url,remote_title,coverid,remote}
+        #   `status - 1 tags:ABCDEKJZlcuxyrtSgad`    -> {id,title,artist,
+        #        addedTime,artwork_url,coverid,url,remote,year,bitrate,duration}
+        # A value is published when it is defined AND non-empty (:6104-6108) —
+        # `0` counts as a value; `id`/`title` always lead (:5970-5971).
         remote_meta = {}
         cur_url = getattr(player, "current_url", None)
         if cur_url and cur_local is None:
-            # Station logo if one is stored (playlist add image:<path>),
-            # else a default placeholder (Perl uses html/images/favorites.png
-            # — the "heart" SqueezePlay draws for cover-less streams).
+            # Station logo if one is stored (playlist add image:<path>), else
+            # the skin-relative default Perl's `$track->coverurl` yields
+            # (html/images/radio.png / favorites.png — data of the stored
+            # entry, not a constant).
             _stream_img = getattr(player, "stream_images", {}).get(cur_url, "") or ""
             if _stream_img.startswith("html/"):
                 _stream_img = _stream_img[len("html/"):]
-            # Perl's remoteMeta is `_songData` over the stream
-            # (Queries.pm:4385-4391: `my $metadata = _songData($request,
-            # $track, $tags); $request->addResult('remoteMeta', $metadata)`) —
-            # i.e. THE SAME field set as the playlist item, artwork fields
-            # included.  Live Perl 9.1.1 (``status - 1 tags:ABCDEKJZlcuxyrtS``
-            # on a stream):
-            #   "remoteMeta": {"id": "-94115167939280", "title": "Life Breath
-            #   (oct12)", "artist": "Dj Fada 2", "addedTime": …, "artwork_url":
-            #   "html/images/favorites.png", "coverid": "-94115167939280",
-            #   "url": …, "remote": 1, "year": "0", "bitrate": "256kb/s CBR"}
-            # Missing artwork here is what a controller renders/crashes on:
-            # the fields below therefore mirror the item, not a hand-made
-            # subset (addedTime/bitrate stay out — this port stores neither
-            # for a stream; UNKLAR).
-            remote_meta = {
-                "id": _remote_track_id(cur_url),
-                "title": _cur_track or cur_info.get("title", ""),
-                "artist": _cur_artist or cur_info.get("artist", ""),
-                "album": cur_info.get("album", ""),
-                "artwork_url": _stream_img or REMOTE_ART_FALLBACK,
-                "coverid": _remote_track_id(cur_url),
-                "url": cur_url,
-                "remote": 1,
-                "duration": cur_info.get("duration", 0) or 0,
-                # Tag 'N' — the station name (tagMap :5717, :5968-5981).
-                "remote_title": station_title,
+            # Live Perl sends the stream duration as a STRING ("0", "7").
+            _rm_duration = cur_info.get("duration", 0) or 0
+            try:
+                if float(_rm_duration).is_integer():
+                    _rm_duration = str(int(float(_rm_duration)))
+                else:
+                    _rm_duration = str(_rm_duration)
+            except (TypeError, ValueError):
+                _rm_duration = str(_rm_duration)
+            _remote_values: dict[str, Any] = {
+                "a": _cur_artist or cur_info.get("artist", ""),
+                "A": _cur_artist or cur_info.get("artist", ""),
+                "l": cur_info.get("album", ""),
+                # `$remoteMeta->{d} = ($remoteMeta->{duration} ||
+                # $remoteMeta->{secs} || 0) + 0` (:5934)
+                "d": _rm_duration,
+                # `$remoteMeta->{D}` is never set for a stream, so tag 'D'
+                # falls through to `$track->addedTime` (:5937, :6100-6102) —
+                # which for a RemoteTrack is the QUERY time (Track.pm:325-341).
+                "D": _perl_added_time(),
+                # `$remoteMeta->{r} = $remoteMeta->{bitrate}` (:5937): the ICY
+                # bitrate the stream handler read (HTTP.pm:731-734).  Without a
+                # known bitrate Perl's `$track->prettyBitRate` answers 0
+                # (Track.pm:353-363).
+                "r": _perl_pretty_bitrate(
+                    getattr(player, "stream_bitrate", 0) or 0),
+                "u": cur_url,
+                "x": 1,
+                "y": "0",      # `$remoteMeta->{y}` = handler year; live "0"
+                "c": _remote_track_id(cur_url),
+                "K": _stream_img or REMOTE_ART_FALLBACK,
+                # Tag 'j' → `$track->coverArtExists`; a RemoteTrack answers a
+                # hard 0 (``Slim/Schema/RemoteTrack.pm`` ``sub coverArtExists
+                # {0}``) — live Perl ``status - 1 tags:…j…`` on a stream:
+                # ``"coverart": "0"`` (a STRING), artwork present or not.
+                "j": "0",
+                "N": station_title,
             }
-            if tag_ok("y"):
-                # Perl's remoteMeta->{y} = 0 (remoteMeta defaults, :5904-5920
-                # and the tag map 'y' => 'tracks.year'); live Perl sends the
-                # STRING "0" for a stream.
-                remote_meta["year"] = "0"
+            _meta: dict[str, Any] = {
+                "id": _remote_track_id(cur_url),                   # :5970
+                "title": _cur_track or cur_info.get("title", ""),  # :5971
+            }
+            _seen_tags: set[str] = set()
+            for _code in ("aAlKNcxJ" if "menu:menu" in (args or [])
+                          else str(tags or "")):
+                if _code in _seen_tags:     # `next if $seen{$tag}++` (:5966)
+                    continue
+                _seen_tags.add(_code)
+                _key = _REMOTE_TAG_KEYS.get(_code)
+                if _key is None or _key in _meta:
+                    continue
+                _value = _remote_values.get(_code)
+                if _value is None or _value == "":
+                    continue
+                _meta[_key] = _value
+            remote_meta = _meta
 
         menu_block = None
         if "menu:menu" in (args or []):

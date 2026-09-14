@@ -74,6 +74,102 @@ NOTHING_TEXT = "Nothing"           # strings.txt:469
 OUT_OF_TEXT = "of"                 # strings.txt:781
 
 
+# ── Stream-Bitrate (Perl ``HTTP::parseDirectHeaders``) ─────────────────────
+#: ICY-Bitrate je Stream-URL — Perl cached sie in ``Slim::Music::Info``
+#: (``setBitrate``/``getBitrate``), liest den Header also einmal je URL.
+_stream_bitrate_cache: dict[str, float] = {}
+_stream_bitrate_failed: set[str] = set()
+
+
+def _icy_bitrate_from_headers(headers: dict) -> float:
+    """Perl ``HTTP::parseDirectHeaders`` (``HTTP.pm:714-805``)::
+
+        elsif ($header =~ /^(?:icy-br|x-audiocast-bitrate):\\s*(.+)/i) {
+            if ($song && !$song->bitrate) {
+                $bitrate = $1;
+                $bitrate *= 1000 if $bitrate < 8000;
+            }
+        }
+
+    Returns bits/s; ``0`` when the stream announces none (``HTTP.pm:870-872``
+    then falls back to the cached ``Slim::Music::Info::getBitrate``).
+    """
+    for name in ("icy-br", "x-audiocast-bitrate"):
+        value = (headers or {}).get(name)
+        if not value:
+            continue
+        try:
+            bitrate = float(str(value).strip())
+        except (TypeError, ValueError):
+            continue
+        if bitrate < 8000:
+            bitrate *= 1000                       # HTTP.pm:734
+        return bitrate
+    return 0.0
+
+
+async def probe_stream_bitrate(url: str, timeout: float = 5.0) -> float:
+    """ICY/audiocast bitrate of ``url`` in bits/s (Perl ``HTTP.pm``).
+
+    Perl reads the header while opening the stream (``parseDirectHeaders``,
+    ``HTTP.pm:714-805``); this port never gets the player's stream, so the
+    headers are read separately — HEAD first, then a header-only GET, the same
+    order :mod:`lyrion.formats.stream_probe` uses for the content type.
+    Failures are never fatal: the caller keeps 0 and Perl's own fallback
+    (``$track->prettyBitRate``, ``Track.pm:353-363``) answers 0 too.
+    """
+    if not url:
+        return 0.0
+    if url in _stream_bitrate_cache:
+        return _stream_bitrate_cache[url]
+    if url in _stream_bitrate_failed:
+        return 0.0
+    try:
+        import httpx
+
+        headers: dict = {}
+
+        async def _fetch(method: str) -> dict:
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(connect=timeout, read=timeout,
+                                      write=timeout, pool=timeout),
+                follow_redirects=True,
+            ) as client:
+                if method == "HEAD":
+                    resp = await client.head(url)
+                    return {k.lower(): v for k, v in resp.headers.items()}
+                async with client.stream("GET", url) as resp:
+                    return {k.lower(): v for k, v in resp.headers.items()}
+
+        try:
+            headers = await _fetch("HEAD")
+        except Exception:  # noqa: BLE001 — HEAD nicht unterstützt
+            headers = {}
+        # The ICY headers ride on the AUDIO response; a server that answers
+        # HEAD without them (or rejects HEAD outright) still announces the
+        # bitrate on the GET Perl itself performs (HTTP.pm:824
+        # ``parseDirectHeaders`` runs on the stream response).
+        if not _icy_bitrate_from_headers(headers):
+            try:
+                get_headers = await _fetch("GET")
+                headers = get_headers or headers
+            except Exception:  # noqa: BLE001
+                pass
+        bitrate = _icy_bitrate_from_headers(headers)
+        if bitrate:
+            _stream_bitrate_cache[url] = bitrate
+            logger.info("Stream bitrate for %s: %.0f bps (%s)",
+                        url[:60], bitrate,
+                        headers.get("icy-br") or headers.get("x-audiocast-bitrate"))
+            return bitrate
+        logger.debug("Stream %s announces no bitrate (headers: %s)",
+                     url[:60], ",".join(sorted(headers))[:200])
+    except Exception as exc:  # noqa: BLE001 — Netzfehler nie fatal
+        logger.debug("Bitrate-Probe für %s fehlgeschlagen: %s", url[:70], exc)
+    _stream_bitrate_failed.add(url)
+    return 0.0
+
+
 def _library_db_path() -> str:
     """Pfad der Bibliotheks-DB (Test-/Dev-Läufe nutzen LYRION_SERVERDATA)."""
     try:
@@ -217,6 +313,35 @@ class PlayerManager:
             wiring = DisplayWiring(handler)
             self._display_wiring = wiring
         return wiring
+
+    async def notify_now_playing_display(self, player: PlayerState,
+                                         kind: str = "showbriefly",
+                                         duration: int | None = None) -> None:
+        """Perl ``Display::notify`` for the now-playing display (jive block).
+
+        Perl notifies the ``displaystatus`` subscriptions on every playmode
+        change: ``playcontrolCommand`` ends with
+        ``$client->showBriefly($client->currentSongLines(), …)``
+        (``Commands.pm:758-765`` for pause/stop, ``:958-965`` via playlist jump
+        for play), and ``Display::showBriefly`` fires
+        ``notify('showbriefly', $parts, $duration)`` (``Display.pm:285-288``) →
+        ``displaystatusQuery`` publishes ``$parts->{'jive'}`` — the icon block
+        of ``Player.pm:651-673`` — on the controller's displaystatus channel.
+
+        ``kind`` is the notification type (``showbriefly`` for a ``showBriefly``
+        call, ``update`` for a plain ``$client->update()``, ``Display.pm:214-217``).
+        """
+        try:
+            from lyrion.web.api import jive_now_playing_display
+            from lyrion.web.cometd import get_manager
+
+            mgr = get_manager()
+            if mgr is None:
+                return
+            block = await jive_now_playing_display(player)
+            await mgr.notify_display(player.mac, kind, block, duration)
+        except Exception as exc:  # noqa: BLE001 — Anzeige darf nie stören
+            logger.debug("display notify for %s failed: %s", player.mac, exc)
 
     async def _display_update(self, player: PlayerState) -> list[str]:
         """Perl ``$client->update()`` — ``Player.pm:152`` -> ``Display.pm:141``.
@@ -993,6 +1118,9 @@ class PlayerManager:
             # display when buffering ends / the track starts
             # (Player.pm:1115-1116, :1250-1252).
             await self._display_update(player)
+            # A track change notifies the displaystatus subscribers with the
+            # jive icon block (Commands.pm:758-765 / :958-965 -> Display.pm:287).
+            await self.notify_now_playing_display(player, "showbriefly")
         return ok
 
     async def play_url(self, player_id: str, url: str, title: str = "") -> bool:
@@ -1029,7 +1157,13 @@ class PlayerManager:
         from lyrion.formats.stream_probe import codec_for_stream_url
 
         suffix_codec = SlimProtoClient._guess_codec_from_url(url)
-        codec = await codec_for_stream_url(url, fallback=suffix_codec)
+        # Perl reads the stream's headers once (Scanner/Remote content type,
+        # HTTP.pm ICY bitrate); both probes run together so a stream start
+        # pays for one round-trip, not two.
+        codec, stream_bitrate = await asyncio.gather(
+            codec_for_stream_url(url, fallback=suffix_codec),
+            probe_stream_bitrate(url),
+        )
         if codec != suffix_codec:
             logger.info("Stream codec from headers: %s (suffix said '%s')",
                         codec, suffix_codec)
@@ -1043,10 +1177,17 @@ class PlayerManager:
             player.current_url = url
             player.current_track_id = None
             player.remote = 1  # radio stream: never "track end"
+            player.stream_bitrate = float(stream_bitrate or 0)
             player.mode = "play"
             player.last_activity = time.time()
             # PROT-18: screen change on a new stream (Player.pm:1115-1116).
             await self._display_update(player)
+            # Perl's play path ends with
+            # `$client->showBriefly($client->currentSongLines(), {duration => 2})`
+            # (playcontrolCommand Commands.pm:758-765 → playlist jump :958-965);
+            # that fires the displaynotify carrying the jive icon block
+            # (Display.pm:285-288 → Player.pm:651-673).
+            await self.notify_now_playing_display(player, "showbriefly")
             logger.info("play_url %s: %s (%s)", player_id, title or url, url[:60])
         else:
             player.playlist = old_playlist
@@ -1076,6 +1217,8 @@ class PlayerManager:
             # PROT-18: playmode change -> the always-on visualizer is hidden
             # (Squeezebox2.pm:252-257 showVisualizer, :301-305 -> visu [0]).
             await self._display_update(player)
+            # playcontrolCommand's stop branch shows the status (Commands.pm:758-765).
+            await self.notify_now_playing_display(player, "showbriefly")
         return ok
 
     async def pause_player(self, player_id: str, pause: bool) -> bool:
@@ -1118,6 +1261,8 @@ class PlayerManager:
                 player.last_activity = time.time()
                 # PROT-18: playmode change (Squeezebox2.pm:252-257/:301-305).
                 await self._display_update(player)
+                # Pause notifies the display (Commands.pm:758-765).
+                await self.notify_now_playing_display(player, "showbriefly")
             return ok
         # resume — continue the paused output in place, never re-stream
         ok = await handler.send_unpause_to_player(player.mac)
@@ -1131,6 +1276,8 @@ class PlayerManager:
             # PROT-18: playmode change -> the always-on visualizer returns
             # (Squeezebox2.pm:252-257).
             await self._display_update(player)
+            # Resume notifies the display (Commands.pm:758-765).
+            await self.notify_now_playing_display(player, "showbriefly")
         return ok
 
     # ------------------------------------------------------------------

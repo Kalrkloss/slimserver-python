@@ -176,29 +176,37 @@ def test_displaystatus_answers_with_type_and_display_record():
 
     Squeezer holt genau ``display`` ab: ``Util.getRecord(data, "display")``
     (``CometClient.java:475-487``) — der alte Schlüssel ``jive`` wurde nie
-    gefunden.
+    gefunden.  Ohne jive-Teil (``display <line1> <line2>``,
+    ``Commands.pm:444-472`` ruft ``showBriefly({line => […]})``) nimmt Perl
+    ``$screen1->{'line'}`` als Text-LISTE und ergänzt ``duration``
+    (``Queries.pm:1691-1695``).
     """
     _pm()
     res = asyncio.run(JSONRPCAPI()._slim_request(
         MAC, ["displaystatus", "showBriefly:Hallo Welt", "5"]))
     assert set(res) == {"type", "display"}, res
-    assert isinstance(res["type"], str)
-    assert isinstance(res["display"], dict)
+    assert res["type"] == "showbriefly"
     assert set(res["display"]) <= {"text", "duration"}
-    assert isinstance(res["display"]["text"], str)
-    assert res["display"]["text"] == "Hallo Welt"
+    assert res["display"]["text"] == ["Hallo Welt"]
     assert res["display"]["duration"] == 5
 
 
-def test_displaystatus_flattens_list_text():
-    """Menü-Popups halten Text als Liste; Perl liefert einen String."""
+def test_displaystatus_publishes_the_jive_hash_untouched():
+    """Ein Popup mit jive-Teil geht WÖRTLICH als ``display`` raus.
+
+    ``Queries.pm:1683-1689`` reicht ``$parts->{'jive'}`` unverändert an
+    ``addResult('display', …)`` weiter — die Popups setzen dort
+    ``text => [ $string ]`` (Commands.pm:1567/:1923/:2357), also bleibt der
+    Text eine LISTE (Squeezer liest ``display``, nicht ``display.text``).
+    """
     api = JSONRPCAPI()
     _pm()
-    api._popup = {"jive": {"type": "popupplay", "text": ["Zeile 1", "Zeile 2"]}}
+    jive = {"type": "popupplay", "text": ["Zeile 1", "Zeile 2"]}
+    api._popup = {"jive": jive, "kind": "showbriefly"}
     api._popup_expires = 9e9
     res = asyncio.run(api._slim_request(MAC, ["displaystatus", "0", "2"]))
-    assert isinstance(res["display"]["text"], str), res
-    assert res["display"]["text"] == "Zeile 1\nZeile 2"
+    assert res["type"] == "showbriefly", res
+    assert res["display"] == jive, res
 
 
 # ── getstring (Queries.pm:1988-2016) ─────────────────────────────────────

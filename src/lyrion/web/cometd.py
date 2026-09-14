@@ -264,6 +264,44 @@ def _status_channel_player(channel: str) -> str:
     return ""
 
 
+def _display_subscribe_type(data) -> str:
+    """The ``subscribe:`` type of a displaystatus request, ``''`` when none.
+
+    Perl matches the notification type against the subscription's type
+    (``Queries.pm:1622-1623``)::
+
+        if ($subs eq $type || ($subs eq 'bits' && $type ne 'showbriefly') || $subs eq 'all') { … }
+
+    The client sends it as the ``subscribe:<type>`` token of its
+    ``displaystatus`` request (live SqueezePlay/Squeezer: ``subscribe:showbriefly``).
+    """
+    request = _stored_request(data)
+    if request is None:
+        return ""
+    for item in request:
+        tokens = item if isinstance(item, list) else [item]
+        for token in tokens:
+            if isinstance(token, str) and token.startswith("subscribe:"):
+                return token[len("subscribe:"):].split("_")[0].lower()
+    return ""
+
+
+def _is_display_status_subscription(channel: str) -> bool:
+    """True when a channel is a ``/<cid>/slim/displaystatus/<mac>`` sink.
+
+    jive subscribes ``/<cid>/slim/displaystatus/<id>`` (SqueezePlay, live log
+    2026-09-11: ``serverstatus``, ``menustatus``, ``displaystatus`` and the
+    ``/<cid>/**`` glob) and reads the pushed record's ``display`` key —
+    Squeezer's ``parseDisplayStatus`` does ``Util.getRecord(data, "display")``
+    (``CometClient.java:475-487``).  Those events come from Perl's
+    ``displaynotify`` (``Display.pm:910-913``), never from a player status.
+    """
+    if not isinstance(channel, str):
+        return False
+    parts = channel.split("/")
+    return len(parts) >= 2 and parts[-2] == "displaystatus"
+
+
 def _set_target(targets: dict[str, tuple[dict, bool]], channel: str,
                 stored: dict, exact: bool) -> None:
     """Record one client's delivery on a concrete channel.
@@ -428,24 +466,28 @@ def _http_timestamp() -> str:
 
 
 def connect_advice(connection_type: str = "") -> dict:
-    """Advice for a /meta/(re)connect reply (Perl Cometd.pm:277-279).
+    """Advice for a /meta/(re)connect reply (Perl Cometd.pm:271-279).
 
-    Perl: ``advice => { interval => $streaming ? RETRY_DELAY : 0 }`` where
-    ``RETRY_DELAY`` is 5000 (Cometd.pm:45). Bayeux advice values are
-    milliseconds, so a streaming connect advertises the 5000 ms retry delay
-    and a long-polling connect advertises 0 (re-poll immediately,
-    Cometd.pm:47). ``timeout`` is the 60 s hold time in milliseconds — the
-    same number Perl puts into the handshake advice (Cometd.pm:251); it used
-    to go out as ``60``, i.e. 60 ms.
+    Perl (``Cometd.pm:271-279``)::
 
-    ``reconnect => 'retry'`` is kept from the previous Python form: Perl's
-    connect advice carries only ``interval``, this is a documented superset.
+        $conn->[HTTP_CLIENT]->first_event( {
+            id => $msgid, channel => $obj->{channel}, clientId => $clid,
+            successful => JSON::XS::true, timestamp => time2str( time() ),
+            advice => {
+                interval => $streaming ? RETRY_DELAY : 0, # update interval for streaming mode
+            },
+        } );
+
+    The advice carries EXACTLY one key, ``interval``: ``RETRY_DELAY`` (5000 ms,
+    Cometd.pm:45) for a streaming connect, ``0`` for long-polling
+    (``LONG_POLLING_INTERVAL``, Cometd.pm:47).  ``timeout``/``reconnect`` were
+    a Python superset (Parity-Audit D1) — a strict Bayeux client may not
+    invent them, and Perl's handshake advice (Cometd.pm:248-253) is the only
+    one that carries ``reconnect``/``timeout``.
     """
     streaming = connection_type == "streaming"
     return {
-        "reconnect": "retry",
         "interval": RETRY_DELAY_MS if streaming else LONG_POLLING_INTERVAL,
-        "timeout": LONG_POLL_TIMEOUT_MS,
     }
 
 
@@ -968,6 +1010,88 @@ class CometdManager:
                     and _channel_matches(pattern, sub):
                 return sub
         return next((c for c in base if _channel_matches(pattern, c)), "")
+
+    async def notify_display(self, player_id: str, kind: str = "showbriefly",
+                             jive: dict | None = None,
+                             duration: int | None = None) -> None:
+        """Perl ``Display::notify`` → ``displaystatus`` subscribers.
+
+        ``Display.pm:910-913``::
+
+            sub notify {
+                my ($display, $type, $info, $duration) = @_;
+                # send a notification for this display update to 'displaystatus' queries
+                Slim::Control::Request->new($display->client->id,
+                    ['displaynotify', $type, $info, $duration])->notify('displaystatus');
+            }
+
+        ``Display.pm:285-288`` fires it from ``showBriefly`` with the
+        ``$parts`` hash of the call (type ``showbriefly``); ``Display.pm:214-217``
+        fires ``update`` whenever the display rendered with ``notifyLevel == 2``.
+        The displaystatus request the controller registered then re-executes
+        (``registerAutoExecute``, ``Queries.pm:1728-1746``) and its result is
+        delivered on the controller's response channel.
+
+        Here the payload is exactly that re-executed request's result — the
+        ``displaystatusQuery`` record ``{type, display}`` (``Queries.pm:1666-1697``),
+        NOT a hand-built frame: the pending display notification stored on the
+        JSON-RPC handler is what ``displaystatusQuery`` would answer a poll with.
+        ``jive`` is the notification's ``$parts->{'jive'}`` (the icon block of
+        ``Player.pm:651-673`` for a track change, a popup hash for the preset /
+        sync / sleep callers).
+        """
+        store = getattr(self._jsonrpc, "set_pending_display", None)
+        if callable(store):
+            try:
+                store(jive, kind, duration)
+            except Exception:  # noqa: BLE001 — Anzeige darf nie stören
+                pass
+        for client in list(self._clients.values()):
+            spelling = self._registered_player_spelling(client, player_id)
+            for sub in list(client.subscriptions):
+                if _is_display_status_subscription(sub):
+                    sub_player = _channel_player(sub)
+                    if sub_player and _same_player(sub_player, player_id):
+                        spelling = sub_player      # the client's own spelling
+                        break
+            base = [f"/{client.client_id}/slim/displaystatus/{spelling}",
+                    f"/slim/displaystatus/{spelling}"]
+            targets: dict[str, tuple[dict, bool]] = {}
+            for sub, data in list(client.subscriptions.items()):
+                stored = data if isinstance(data, dict) else {}
+                if _is_glob(sub):
+                    channel = next(
+                        (c for c in base if _channel_matches(sub, c)), "")
+                    if channel:
+                        _set_target(targets, channel, stored, False)
+                    continue
+                if not _is_display_status_subscription(sub):
+                    continue
+                sub_player = _channel_player(sub)
+                if sub_player and sub_player not in _ANY_PLAYER \
+                        and not _same_player(sub_player, player_id):
+                    continue
+                # Perl's type filter (Queries.pm:1622-1623): only the
+                # subscribed type is delivered; `bits` gets everything but
+                # `showbriefly`, `all` gets everything.
+                subs = _display_subscribe_type(stored)
+                if subs and not (subs == kind
+                                 or (subs == "bits" and kind != "showbriefly")
+                                 or subs == "all"):
+                    continue
+                _set_target(targets, sub, stored, True)
+            for channel, data in self._pick_targets(targets, base):
+                request = _stored_request(data)
+                if request is None:
+                    # Perl's subscription always stores the displaystatus
+                    # request; a channel-only registration gets the jive form.
+                    request = [player_id, ["displaystatus", kind]]
+                try:
+                    result = await self._dispatch(request)
+                    self.push(client.client_id,
+                              {"channel": channel, "data": result, "id": 0})
+                except Exception:  # noqa: BLE001
+                    pass
 
     def push(self, client_id: str, event: dict) -> None:
         client = self._clients.get(client_id)

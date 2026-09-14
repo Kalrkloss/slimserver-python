@@ -461,13 +461,14 @@ def test_connect_advice_uses_retry_delay_for_streaming():
     """Perl Cometd.pm:267,277-279: streaming -> RETRY_DELAY, else 0.
 
     ``RETRY_DELAY`` is 5000 ms (Cometd.pm:45); Bayeux advice values are
-    milliseconds.
+    milliseconds.  The 60 s ``timeout`` belongs to the HANDSHAKE advice
+    (:248-253), not to the connect advice (Parity-Audit D1).
     """
-    assert connect_advice("streaming")["interval"] == RETRY_DELAY_MS == 5000
+    assert RETRY_DELAY_MS == 5000
+    assert connect_advice("streaming") == {"interval": RETRY_DELAY_MS}
     assert connect_advice("long-polling")["interval"] == LONG_POLLING_INTERVAL
     assert connect_advice("")["interval"] == LONG_POLLING_INTERVAL
-    # ms, not seconds — the same number Perl puts into its handshake advice
-    assert connect_advice("streaming")["timeout"] == LONG_POLL_TIMEOUT_MS
+    assert "timeout" not in connect_advice("streaming")
 
 
 def test_unknown_clientid_is_answered_with_rehandshake_advice():
@@ -622,8 +623,8 @@ def test_streaming_connect_ack_carries_advice_and_timestamp():
     assert ack["successful"] is True
     assert ack["clientId"] == cid
     assert ack["id"] == 2
-    assert ack["advice"]["interval"] == RETRY_DELAY_MS
-    assert ack["advice"]["timeout"] == LONG_POLL_TIMEOUT_MS
+    assert ack["advice"] == {"interval": RETRY_DELAY_MS}
+    assert "timeout" not in ack["advice"]
     assert re.match(r"^[A-Z][a-z]{2}, \d{2} [A-Z][a-z]{2} \d{4} "
                     r"\d{2}:\d{2}:\d{2} GMT$", ack["timestamp"]), ack["timestamp"]
 

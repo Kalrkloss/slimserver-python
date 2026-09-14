@@ -278,8 +278,12 @@ def test_asgi_handshake_advice_timeout_is_60000_ms():
 # /meta/connect advice + ack (Perl Cometd.pm:271-280, 302-306)
 # ---------------------------------------------------------------------------
 
-def test_long_polling_connect_advice_interval_zero_and_timeout_60000_ms():
-    """Perl :277-279: interval 0 for long-polling; timeout in ms, not 60."""
+def test_long_polling_connect_advice_has_interval_only():
+    """Perl Cometd.pm:277-279: the connect advice carries ONLY ``interval``.
+
+    ``advice => { interval => $streaming ? RETRY_DELAY : 0 }`` — the 60 s hold
+    time lives in the HANDSHAKE advice (:248-253), not here (Parity-Audit D1).
+    """
     mgr, _rec = _manager()
     cid, _hs = _asgi_handshake(mgr)
     tr = _post(mgr, [{"channel": "/meta/connect", "clientId": cid, "id": 2,
@@ -291,8 +295,8 @@ def test_long_polling_connect_advice_interval_zero_and_timeout_60000_ms():
     assert ack["successful"] is True
     assert ack["clientId"] == cid
     assert ack["id"] == 2
+    assert ack["advice"] == {"interval": LONG_POLLING_INTERVAL}
     assert ack["advice"]["interval"] == LONG_POLLING_INTERVAL == 0
-    assert ack["advice"]["timeout"] == LONG_POLL_TIMEOUT_MS == 60000
     assert re.match(r"^[A-Z][a-z]{2}, \d{2} [A-Z][a-z]{2} \d{4} "
                     r"\d{2}:\d{2}:\d{2} GMT$", ack["timestamp"]), ack["timestamp"]
 
@@ -350,7 +354,7 @@ def test_streaming_connect_uses_retry_delay_interval():
     ack = acks[0]
     assert ack["clientId"] == cid
     assert ack["advice"]["interval"] == RETRY_DELAY_MS == 5000
-    assert ack["advice"]["timeout"] == LONG_POLL_TIMEOUT_MS
+    assert ack["advice"] == {"interval": RETRY_DELAY_MS}
     assert "timestamp" in ack
     # uvicorn derives ``Transfer-Encoding: chunked`` from the ASGI framing; the
     # handler's contract is the held-open body (more_body=True), which the live

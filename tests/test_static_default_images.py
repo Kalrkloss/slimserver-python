@@ -241,15 +241,55 @@ def test_remote_playlist_item_uses_a_stored_station_logo():
 
 
 def test_remote_meta_mirrors_the_item_field_set():
-    """Perl: ``remoteMeta`` IS ``_songData`` of the stream (Queries.pm:4385-4391)."""
-    _player([STREAM_URL])
-    res = _status(_player([STREAM_URL]), ["-", 1, f"tags:{TAGS}"])
+    """Perl: ``remoteMeta`` IS ``_songData`` of the stream (Queries.pm:4385-4391).
+
+    Die angeforderten Tags entscheiden Feldmenge UND Reihenfolge (``_songData``
+    bindet seinen Hash an Tie::IxHash, :5898-5900).  Live Perl 9.1.1
+    ``status - 1 tags:ABCDEKJZlcuxyrtS`` auf dem 1.FM-Stream: ``id, title,
+    artist, artwork_url, coverid, url, remote, year, bitrate, duration`` —
+    ``artist`` erscheint nur, weil die ICY-Metadaten einen liefern
+    (:5925-5935), und ``bitrate`` kommt aus dem ICY-Header (``HTTP.pm:731-734``)
+    bzw. ist ohne Wert ``0`` (``Track.pm:362``).
+    """
+    player = _player([STREAM_URL])
+    player.current_title = "Dj Fada 2 - Life Breath (oct12)"
+    res = _status(player, ["-", 1, f"tags:{TAGS}"])
     meta = res["remoteMeta"]
-    for field in ("id", "title", "artist", "artwork_url", "coverid", "url",
-                  "remote", "year", "duration"):
-        assert field in meta, f"remoteMeta misses {field}: {sorted(meta)}"
+    # Live Perl 9.1.1, derselbe Tag-Satz auf dem 1.FM-Stream:
+    # {"id","title","artist","addedTime","artwork_url","coverart":"0",
+    #  "coverid","url","remote","year","bitrate"} — genau diese Reihenfolge
+    # (Tag 'd' ist in TAGS nicht enthalten, deshalb kein "duration").
+    assert list(meta) == ["id", "title", "artist", "addedTime",
+                          "artwork_url", "coverart", "coverid", "url",
+                          "remote", "year", "bitrate"], meta
     assert meta["artwork_url"] == REMOTE_ART_FALLBACK
     assert meta["coverid"] == meta["id"]
+    assert meta["coverart"] == "0"        # RemoteTrack::coverArtExists = 0
+    assert meta["remote"] == 1 and meta["year"] == "0"
+    assert isinstance(meta["addedTime"], str) and ", " in meta["addedTime"]
+
+
+def test_remote_meta_without_tags_is_id_and_title_only():
+    """Live Perl ``status - 1`` (kein ``tags:``): ``{id, title}``.
+
+    ``Queries.pm:4012`` setzt ``$tags = $request->getParam('tags') || ''``;
+    die Zeile ``$tags = 'gald' if !defined $tags`` (:4363) greift nie.
+    """
+    meta = _status(_player([STREAM_URL]), ["-", 1])["remoteMeta"]
+    assert list(meta) == ["id", "title"], meta
+
+
+def test_remote_meta_added_time_appears_for_tag_d():
+    """Tag 'D' → ``addedTime`` aus ``$track->addedTime`` (``Track.pm:325-341``).
+
+    Ein ``RemoteTrack`` hat nie ein ``added_time``, also formatiert Perl die
+    QUERY-Zeit (``longDateF(undef) . ', ' . timeF(undef)`` — beide fallen auf
+    ``time()`` zurück, ``DateTime.pm:53``).  Live Perl 9.1.1:
+    ``"addedTime": "Montag, 14. September 2026, 14:19"``.
+    """
+    meta = _status(_player([STREAM_URL]), ["-", 1, "tags:rD"])["remoteMeta"]
+    assert list(meta) == ["id", "title", "bitrate", "addedTime"], meta
+    assert isinstance(meta["addedTime"], str) and ", " in meta["addedTime"]
 
 
 def test_local_playlist_item_carries_artwork_ids():

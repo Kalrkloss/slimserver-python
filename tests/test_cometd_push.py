@@ -1186,20 +1186,23 @@ def test_p0_asgi_non_connect_post_abort_keeps_client(caplog):
 # ---------------------------------------------------------------------------
 
 
-def test_connect_advice_is_a_documented_superset_of_perl():
+def test_connect_advice_carries_the_perl_interval_only():
+    """Perl Cometd.pm:277-279 — ``advice => { interval => … }`` and nothing else.
+
+    ``reconnect``/``timeout`` were a Python superset (Parity-Audit D1); the
+    handshake advice (Cometd.pm:248-253) is the only one that carries them.
+    """
     from lyrion.web.cometd import (
         LONG_POLLING_INTERVAL,
-        LONG_POLL_TIMEOUT_MS,
         RETRY_DELAY_MS,
         connect_advice,
     )
 
     streaming = connect_advice("streaming")
-    assert streaming["interval"] == RETRY_DELAY_MS == 5000
-    assert connect_advice("long-polling")["interval"] == LONG_POLLING_INTERVAL
-    assert streaming["timeout"] == LONG_POLL_TIMEOUT_MS == 60000
-    # superset fields (Perl's connect advice has interval only)
-    assert streaming["reconnect"] == "retry"
+    assert RETRY_DELAY_MS == 5000
+    assert streaming == {"interval": RETRY_DELAY_MS}
+    assert connect_advice("long-polling") == {
+        "interval": LONG_POLLING_INTERVAL}
 
 
 def test_connect_with_unknown_clientid_is_not_acked_as_success():

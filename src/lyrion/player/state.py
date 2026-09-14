@@ -99,6 +99,11 @@ class PlayerState:
     playerprefs: dict = field(default_factory=dict)  # per-player prefs (playerpref)
     stream_titles: dict = field(default_factory=dict)  # stream URL -> display title
     stream_images: dict = field(default_factory=dict)  # stream URL -> logo/artwork path
+    # Perl keeps the bitrate the stream handler read from the ICY headers on
+    # the SONG (`$song->streambitrate()`, Slim/Player/Song.pm) — the value the
+    # status/remoteMeta `bitrate` field is built from (Queries.pm:4119-4123,
+    # Track.pm:353-363).  Bits per second; 0 = unknown.
+    stream_bitrate: float = 0.0
     # P6-2: playlist holds track ids AND stream URLs (radio/favorites).
     playlist: list[int | str] = field(default_factory=list)
     sync_master: Optional[str] = None
