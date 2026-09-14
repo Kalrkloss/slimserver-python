@@ -193,6 +193,38 @@ def _client_player_form(player_id: str) -> str:
     return player_id.lower()
 
 
+#: Internal key of the stored subscription that remembers the ``/slim/
+#: subscribe`` message id (Perl keeps it in the request's ``source``,
+#: ``Cometd.pm:805/852``, and stamps every push with it, ``:963-970``).
+#: Underscore-prefixed so it can never collide with a client's request data.
+_SUBSCRIBE_ID_KEY = "_subscribe_msg_id"
+
+
+def _subscription_msg_id(data) -> int:
+    """Perl's ``id`` for a PUSHED event: the ``/slim/subscribe`` message id.
+
+    Perl's ``handleRequest`` puts the message id into the request's source
+    string (``Cometd.pm:805`` ``$request->source("$response|$id|$priority|
+    $clid|$ua")`` — for a plain (non-``subscribe:N``) subscription, and
+    ``:852-857`` for a request+subscribe, which also arms
+    ``autoExecuteCallback(\\&requestCallback)``).  ``requestCallback`` splits
+    it back out and stamps the pushed event with it
+    (``:942`` ``my ($channel, $id, …) = split /\\|/, $request->source, 5``,
+    ``:963-970`` ``{channel, id, data, ext}``).  A message without an id
+    defaults to ``0`` (``:769`` ``my $id = $params->{id} || 0``).
+
+    Our pushes used ``event_frame(channel, result)`` and therefore always
+    carried ``id: 0`` — every controller saw the same id for every push, so a
+    client correlating a push with its subscribe request could not.
+    """
+    if isinstance(data, dict):
+        for key in (_SUBSCRIBE_ID_KEY, "id"):
+            value = data.get(key)
+            if value:
+                return value
+    return 0
+
+
 def event_frame(channel: str, data, msg_id: int = 0,
                 priority: str = "") -> dict:
     """One pushed subscription event, shaped like Perl's.
@@ -1156,7 +1188,8 @@ class CometdManager:
                     request = [player_id, ["displaystatus", kind]]
                 try:
                     result = await self._dispatch(request)
-                    self.push(client.client_id, event_frame(channel, result))
+                    self.push(client.client_id, event_frame(
+                        channel, result, _subscription_msg_id(data)))
                 except Exception:  # noqa: BLE001
                     pass
 
@@ -1206,7 +1239,8 @@ class CometdManager:
                 try:
                     request = _stored_request(data) or ["", list(JIVE_SERVERSTATUS_REQUEST)]
                     result = await self._dispatch(request)
-                    self.push(client.client_id, event_frame(channel, result))
+                    self.push(client.client_id, event_frame(
+                        channel, result, _subscription_msg_id(data)))
                 except Exception:  # noqa: BLE001
                     pass
 
@@ -1299,7 +1333,10 @@ class CometdManager:
                     else:
                         request = [player_id, list(JIVE_STATUS_REQUEST)]
                     result = await self._dispatch(request)
-                    self.push(client.client_id, event_frame(channel, result))
+                    # Perl stamps the push with the /slim/subscribe id
+                    # (Cometd.pm:942-970) — not 0.
+                    self.push(client.client_id, event_frame(
+                        channel, result, _subscription_msg_id(data)))
                 except Exception:  # noqa: BLE001
                     pass
 
@@ -1310,11 +1347,12 @@ class CometdManager:
         ['favorites', ['changed']] and reloads the list on the event.
         """
         for client in list(self._clients.values()):
-            for sub in list(client.subscriptions.keys()):
+            for sub, data in list(client.subscriptions.items()):
                 if "favorites" not in sub:
                     continue
                 self.push(client.client_id,
-                          event_frame(sub, ["favorites", ["changed"]]))
+                          event_frame(sub, ["favorites", ["changed"]],
+                                      _subscription_msg_id(data)))
 
     # ------------------------------------------------------------------
     # subscribe:N keep-alive
@@ -1375,7 +1413,8 @@ class CometdManager:
                     try:
                         result = await self._dispatch(
                             data.get("request") or ["", ["status", "-", "1"]])
-                        self.push(client.client_id, event_frame(sub, result))
+                        self.push(client.client_id, event_frame(
+                            sub, result, _subscription_msg_id(data)))
                     except Exception:  # noqa: BLE001
                         pass
             # Drop bookkeeping for clients the idle reaper removed — a
@@ -1519,6 +1558,11 @@ class CometdManager:
                     if sub:
                         stored = _merged_subscription(
                             client.subscriptions.get(sub), data)
+                        if isinstance(stored, dict):
+                            # Perl remembers THIS message's id on the request
+                            # (``Cometd.pm:805``/``:852``) and every later push
+                            # for that subscription carries it (:963-970).
+                            stored[_SUBSCRIBE_ID_KEY] = msg.get("id") or 0
                         client.subscriptions[sub] = stored
                         logger.info("Cometd %s subscribed %s", cid, sub)
                         # Deliver the initial result of the subscription
