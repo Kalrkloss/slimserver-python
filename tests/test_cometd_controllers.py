@@ -31,9 +31,11 @@ import pytest
 
 from lyrion.networking.cometd_stream import start_cometd_server
 from lyrion.web.cometd import (
+    DISCONNECT_GRACE,
     LONG_POLLING_INTERVAL,
     LONG_POLL_TIMEOUT_MS,
     RETRY_DELAY_MS,
+    STREAMING_HOLD_WINDOW,
     CometdManager,
     _channel_matches,
     _default_request,
@@ -710,3 +712,86 @@ def test_connection_lost_mid_push_drops_client_without_error():
     names = [type(ctx.get("exception")).__name__
              for ctx in captured if ctx.get("exception")]
     assert names == [], f"unexpected asyncio errors: {captured}"
+
+
+# ---------------------------------------------------------------------------
+# Perl's disconnect grace (webCloseHandler -> disconnectClient, RETRY_DELAY*2)
+# ---------------------------------------------------------------------------
+
+def test_release_connection_arms_the_grace_and_a_reconnect_kills_it():
+    """Cometd.pm:1010-1014 / :283 — a lost connection keeps the client 10 s.
+
+    Perl's webCloseHandler unregisters the *connection* of a client whose
+    socket died and arms ``disconnectClient`` for RETRY_DELAY * 2 = 10 s; the
+    next /meta/(re)connect kills that timer (``killTimers($clid,
+    \\&disconnectClient)``). Python used to remove the client immediately, so a
+    client that merely reconnected lost its subscriptions and every event
+    queued for it — the app then re-handshook and its pending request was gone.
+    """
+    now = [1000.0]
+    rec = _Recorder()
+    mgr = CometdManager(rec, clock=lambda: now[0])
+    cid = mgr.handshake().client_id
+    client = mgr.get(cid)
+    client.subscriptions["/slim/serverstatus"] = {"request": ["", ["serverstatus"]]}
+
+    owner = object()
+    mgr.register_connection(cid, owner)
+    mgr.connection_open(cid)
+    # the app's teardown order: close the transport, then release the client
+    mgr.connection_closed(cid)
+    assert mgr.release_connection(cid, owner) is True
+
+    assert client.owner is None and client.connections == 0
+    assert client.transport == ""            # untouched by the release
+    assert client.disconnect_at == 1000.0 + DISCONNECT_GRACE
+    assert DISCONNECT_GRACE == (RETRY_DELAY_MS / 1000.0) * 2 == 10.0
+    # A stale connection cannot release a client it no longer owns.
+    assert mgr.release_connection(cid, object()) is False
+    # While the grace runs the client is kept, subscriptions included.
+    assert mgr.kill_idle_clients() == []
+    assert mgr.get(cid) is client
+    assert client.subscriptions
+
+    # The reconnect kills Perl's timer (Cometd.pm:283) ...
+    other = object()
+    mgr.register_connection(cid, other)
+    assert mgr.get(cid).disconnect_at is None
+    assert mgr.get(cid).subscriptions      # ... and the session survived
+
+
+def test_grace_expiry_reaps_a_client_that_never_reconnected():
+    """Cometd.pm:1049-1074 — disconnectClient removes the client.
+
+    The sweep is Python's form of Perl's timer: the client disappears only
+    once the grace has really expired, never before.
+    """
+    now = [2000.0]
+    rec = _Recorder()
+    mgr = CometdManager(rec, clock=lambda: now[0])
+    cid = mgr.handshake().client_id
+    owner = object()
+    mgr.register_connection(cid, owner)
+    mgr.connection_open(cid)
+    mgr.connection_closed(cid)
+    mgr.release_connection(cid, owner)
+
+    now[0] += DISCONNECT_GRACE - 0.1
+    assert mgr.kill_idle_clients() == [], "reaped before the grace expired"
+    now[0] += 0.2
+    assert mgr.kill_idle_clients() == [cid]
+    assert mgr.get(cid) is None
+
+
+def test_streaming_connect_advice_and_window_come_from_perl_retry_delay():
+    """Both numbers are Perl's RETRY_DELAY (Cometd.pm:45), never invented.
+
+    The streaming ack advertises ``interval => RETRY_DELAY`` (Cometd.pm:278)
+    and the ASGI hold window is that same interval, so a client whose stream
+    ends is already told to come back after it. The disconnect grace is Perl's
+    ``RETRY_DELAY * 2`` (Cometd.pm:1010-1014).
+    """
+    assert STREAMING_HOLD_WINDOW == RETRY_DELAY_MS / 1000.0 == 5.0
+    assert DISCONNECT_GRACE == (RETRY_DELAY_MS / 1000.0) * 2 == 10.0
+    assert connect_advice("streaming")["interval"] == RETRY_DELAY_MS
+    assert connect_advice("long-polling")["interval"] == LONG_POLLING_INTERVAL

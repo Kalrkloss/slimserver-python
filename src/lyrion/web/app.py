@@ -16,6 +16,7 @@ import uvicorn
 from .api import JSONRPCAPI, WebAPIHandler
 from .cometd import (
     LONG_POLL_TIMEOUT,
+    STREAMING_HOLD_WINDOW,
     CometdManager,
     _client_id_from_channel,
     connect_ack,
@@ -135,7 +136,10 @@ async def _handle_streaming_connect(
     it never waits for a timeout. ``CometdManager.push`` does exactly that
     here (append + ``notify.set()``). ``advice.timeout`` is only honoured by
     the *long-polling* branch (Cometd.pm:302-306); a streaming connect keeps
-    ``LONG_POLLING_TIMEOUT``, used below as the liveness re-check interval.
+    ``LONG_POLLING_TIMEOUT`` as its advertised advice and is held for
+    ``STREAMING_HOLD_WINDOW`` of silence (see that constant: Perl holds it
+    forever, uvicorn cannot — it defers pipelined requests until the response
+    completes, so the client's queued POSTs would never be served).
     """
     import asyncio as _asyncio
     import json as _json
@@ -164,6 +168,10 @@ async def _handle_streaming_connect(
     # is reported as ``http.disconnect`` (Perl's webCloseHandler ->
     # disconnectClient, Cometd.pm:1003).
     gone = _asyncio.ensure_future(_watch_disconnect(receive))
+    # True once the connect ack reached the client (see the first send below).
+    delivered = False
+    # True once the connection was unregistered (window closed cleanly).
+    released = False
     try:
         await send({
             "type": "http.response.start",
@@ -174,6 +182,11 @@ async def _handle_streaming_connect(
         await send({"type": "http.response.body",
                     "body": _json.dumps(first).encode("utf-8"),
                     "more_body": True})
+        # The connect ack reached the client: from here on the connection is
+        # a real one and its loss is handled like Perl's webCloseHandler (grace
+        # period, see below). If the very first send fails, the client never
+        # saw the ack and must re-handshake anyway — it is dropped instead.
+        delivered = True
 
         # Keep the stream open and push event batches as they arrive. The
         # uvicorn path (port 9000) serves clients that connect directly to
@@ -183,9 +196,26 @@ async def _handle_streaming_connect(
         #
         # The wait for events races the disconnect watcher: a push wakes the
         # wait (Perl Manager::deliver_events -> sendResponse), a vanished peer
-        # ends it at once (http.disconnect), and a silent-but-alive client
-        # ends it after LONG_POLLING_TIMEOUT (Cometd.pm:48) so a half-dead
-        # socket that never delivered http.disconnect is caught by the write.
+        # ends it at once (http.disconnect).
+        #
+        # The response is NOT held open forever: uvicorn queues HTTP pipelined
+        # requests until the CURRENT response completes (h11_impl.py:191-197
+        # pauses the read flow on h11.PAUSED, on_response_complete starts the
+        # queued cycle at :278; httptools_impl.py:291-297 does the same), while
+        # Perl keeps reading the socket and answers such a POST at once
+        # (measured: 0.8 s, stream stays open — Slim/Web/HTTP.pm:277 +
+        # addHTTPResponse :1895-1960 via Cometd.pm:734). A POST the client sent
+        # behind this stream therefore stayed unanswered and its own network
+        # deadline fired: libcometd gives a NON-connect message exactly
+        # maxNetworkDelay = 10000 ms (html/material/html/lib/libcometd.js:1268,
+        # :380-389 adds advice.timeout only for metaConnect) — the 10 s after
+        # which the app re-handshaked and lost the request. So: after
+        # STREAMING_HOLD_WINDOW of silence (RETRY_DELAY, Cometd.pm:45/:278 —
+        # the interval the ack above tells the client to wait before
+        # reconnecting) the empty batch is written as the LAST body event and
+        # the response completes, which lets uvicorn serve the queued POSTs.
+        # Every pushed event restarts the window, so a busy stream stays open.
+        closed_cleanly = False
         while not gone.done():
             # A vanished client (meta/disconnect) makes wait_for_events
             # return [] immediately — without the existence check the
@@ -193,7 +223,7 @@ async def _handle_streaming_connect(
             if cometd.get(cid) is None:
                 break
             events_task = _asyncio.ensure_future(
-                cometd.wait_for_events(cid, timeout=LONG_POLL_TIMEOUT))
+                cometd.wait_for_events(cid, timeout=STREAMING_HOLD_WINDOW))
             try:
                 done, _pending = await _asyncio.wait(
                     {events_task, gone},
@@ -212,12 +242,30 @@ async def _handle_streaming_connect(
             events = events_task.result() if events_task in done else []
             if not events:
                 # A whole hold window passed with nothing to say: emit the
-                # empty batch the native stream emits (cometd_stream.py
-                # ``_push_events``, Perl's 60 s LONG_POLLING_TIMEOUT). The
+                # empty batch the native stream emits (Perl answers an empty
+                # sendResponse the same way) and terminate the response. The
                 # write is also a liveness probe — a half-dead socket raises
                 # here — and the poll re-arms the client's autokill window
                 # (``sendHTTPResponse``, Cometd.pm:687-695).
                 cometd.touch(cid)
+                # Release the connection BEFORE the terminating body event:
+                # uvicorn starts the request it queued behind this response as
+                # soon as the response is complete, and that POST's own result
+                # must therefore find no live connection — Perl unregisters the
+                # connection with the finished response as well
+                # (sendHTTPResponse, Cometd.pm:682-696) and then answers the
+                # queued POST from ``get_pending_events`` (Cometd.pm:645-648).
+                cometd.connection_closed(cid)
+                if delivered:
+                    cometd.release_connection(cid, owner)
+                else:
+                    cometd.remove_if_owner(cid, owner)
+                released = True
+                await send({"type": "http.response.body",
+                            "body": _json.dumps(events).encode("utf-8"),
+                            "more_body": False})
+                closed_cleanly = True
+                break
             await send({"type": "http.response.body",
                         "body": _json.dumps(events).encode("utf-8"),
                         "more_body": True})
@@ -231,13 +279,29 @@ async def _handle_streaming_connect(
             await gone
         except (_asyncio.CancelledError, Exception):  # noqa: BLE001
             pass
-        cometd.connection_closed(cid)
-        cometd.remove_if_owner(cid, owner)
-        try:
-            await send({"type": "http.response.body", "body": b"",
-                        "more_body": False})
-        except Exception:
-            pass
+        if not released:
+            cometd.connection_closed(cid)
+            if delivered:
+                # The connection is gone (peer vanished): Perl's webCloseHandler
+                # (Cometd.pm:1002-1015) unregisters the connection and only arms
+                # ``disconnectClient`` for RETRY_DELAY * 2 (10 s), which the
+                # client's next /meta/connect kills (:283). Removing the client
+                # here threw away its subscriptions and everything queued for it
+                # whenever a stream ended — the app then re-handshook and lost
+                # the pending request.
+                cometd.release_connection(cid, owner)
+            else:
+                # The connect ack never reached the client: it has no live
+                # connection and has to handshake again, so there is nothing to
+                # keep for a reconnect (pinned by
+                # tests/test_cometd_push.py::test_asgi_streaming_connect_removes_client_on_abort).
+                cometd.remove_if_owner(cid, owner)
+        if not closed_cleanly:
+            try:
+                await send({"type": "http.response.body", "body": b"",
+                            "more_body": False})
+            except Exception:
+                pass
 
 
 async def _handle_cometd(cometd: CometdManager, path: str, receive, send) -> None:

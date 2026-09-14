@@ -86,9 +86,11 @@ import time
 
 from lyrion.web.app import _handle_cometd
 from lyrion.web.cometd import (
+    DISCONNECT_GRACE,
     LONG_POLL_TIMEOUT_MS,
     LONG_POLLING_INTERVAL,
     RETRY_DELAY_MS,
+    STREAMING_HOLD_WINDOW,
     CometdManager,
     connect_timeout,
 )
@@ -1077,13 +1079,20 @@ def test_live_long_polling_honours_the_client_advice_timeout():
     assert LONG_POLL_TIMEOUT_MS == 60000
 
 
-def test_live_dead_streaming_client_is_reaped():
-    """A streaming socket that dies must release its client (Perl webCloseHandler).
+def test_live_dead_streaming_client_runs_perls_disconnect_grace():
+    """A streaming socket that dies releases the client after Perl's grace.
 
     uvicorn does NOT cancel the ASGI task when the peer vanishes; it hands the
     app ``http.disconnect`` on ``receive()``.  The old streaming loop never
     called ``receive()`` again, so ``CometdManager.get(cid)`` stayed set
     forever and the client leaked (Perl: Cometd.pm:1003 -> disconnectClient).
+
+    Perl does not drop the client at the moment the connection is lost: its
+    webCloseHandler (Cometd.pm:1002-1015) unregisters the *connection* and arms
+    ``disconnectClient`` for RETRY_DELAY * 2 = 10 s, a timer the next
+    /meta/(re)connect kills (:283) — that is what lets a client that reconnects
+    right away keep its subscriptions and its queued events. So the client must
+    survive the loss and be reaped once the grace has expired, not before.
     """
     async def run():
         rpc = _LiveRPC()
@@ -1098,13 +1107,25 @@ def test_live_dead_streaming_client_is_reaped():
             assert mgr.get(cid) is not None
             stream.close()                      # the peer disappears
             for _ in range(100):
-                if mgr.get(cid) is None:
+                client = mgr.get(cid)
+                if client is not None and not client.connections \
+                        and client.disconnect_at is not None:
                     break
                 await asyncio.sleep(0.05)
-            return mgr.get(cid)
+            released = mgr.get(cid)
+            # Not dropped while the grace runs (Perl's timer is still pending)
+            still_there = mgr.kill_idle_clients()
+            # ... and gone once it has expired (idle sweep = disconnectClient)
+            mgr._clock = lambda: time.time() + DISCONNECT_GRACE + 1
+            reaped = mgr.kill_idle_clients()
+            return cid, released, still_there, reaped, mgr.get(cid)
 
-    leaked = asyncio.run(run())
-    assert leaked is None, "a dead streaming connection leaked its cometd client"
+    cid, released, still_there, reaped, after = asyncio.run(run())
+    assert released is not None, "a lost connection dropped the client at once"
+    assert released.connections == 0
+    assert released.disconnect_at is not None, "Perl's disconnect timer unset"
+    assert cid not in still_there and after is None, cid
+    assert cid in reaped, f"grace expiry did not reap {cid}"
 
 
 def test_live_push_right_after_a_command_reaches_the_open_stream():
@@ -1229,3 +1250,166 @@ def test_live_long_polling_request_result_rides_in_the_post_response():
         f"the long-polling client waited {latency:.3f}s for its own reply")
     assert not poll_answered, (
         "the result was delivered twice: the held connect answered as well")
+
+
+# ---------------------------------------------------------------------------
+# Streaming hold window + Perl's disconnect grace (the 10 s app teardown)
+# ---------------------------------------------------------------------------
+
+def test_streaming_hold_window_closes_the_response_and_arms_the_grace():
+    """After STREAMING_HOLD_WINDOW of silence the stream ends — client kept.
+
+    Perl holds a streaming response for as long as the socket lives
+    (Cometd.pm:288-297 arms no timer for that branch; live probe: 20 s of
+    silence on a bare connect). uvicorn cannot: it queues HTTP pipelined
+    requests until the response completes (h11_impl.py:191-197, :278), so a
+    POST the client sent behind the stream was never served — the app's own
+    deadline for a non-connect message is libcometd's ``maxNetworkDelay``
+    = 10000 ms (libcometd.js:1268, :380-389 adds advice.timeout only for
+    ``metaConnect``), which is the 10 s after which the app re-handshaked.
+
+    The window's value is Perl's RETRY_DELAY (Cometd.pm:45), the interval the
+    connect ack advertises for re-connecting (Cometd.pm:277-279). The client
+    itself is NOT dropped when the window closes: Perl's webCloseHandler arms
+    ``disconnectClient`` for RETRY_DELAY * 2 (Cometd.pm:1010-1014) instead.
+    """
+    async def run():
+        import lyrion.web.app as app_mod
+
+        mgr, _rec = _manager()
+        cid, _hs = await _handshake_async(mgr)
+        old = app_mod.STREAMING_HOLD_WINDOW
+        app_mod.STREAMING_HOLD_WINDOW = 0.1        # keep the test short
+        try:
+            tr = _HeldTransport([{"channel": "/meta/connect", "clientId": cid,
+                                  "id": 2, "connectionType": "streaming"}])
+            task = asyncio.create_task(
+                _handle_cometd(mgr, "/cometd", tr.receive, tr.send))
+            for _ in range(200):
+                if not tr.streaming:
+                    break
+                await asyncio.sleep(0.02)
+            client = mgr.get(cid)
+            await asyncio.wait_for(task, timeout=5)
+        finally:
+            app_mod.STREAMING_HOLD_WINDOW = old
+        return tr, client
+
+    tr, client = asyncio.run(run())
+    bodies = [e for e in tr.sent if e.get("type") == "http.response.body"]
+    assert bodies[0]["more_body"] is True               # ack first, held open
+    assert bodies[-1]["more_body"] is False, "the window did not close it"
+    assert json.loads(bodies[-1]["body"]) == []         # Perl's empty batch
+    assert not tr.streaming
+    assert client is not None, "the client was dropped while its grace ran"
+    assert client.connections == 0
+    assert client.disconnect_at is not None             # Perl's 10 s timer
+    assert STREAMING_HOLD_WINDOW == RETRY_DELAY_MS / 1000.0 == 5.0
+    assert DISCONNECT_GRACE == 10.0
+
+
+def test_streaming_hold_window_is_restarted_by_every_pushed_event():
+    """A stream that keeps delivering events is not closed by the window."""
+    async def run():
+        import lyrion.web.app as app_mod
+
+        mgr, _rec = _manager()
+        cid, _hs = await _handshake_async(mgr)
+        old = app_mod.STREAMING_HOLD_WINDOW
+        app_mod.STREAMING_HOLD_WINDOW = 0.3
+        try:
+            tr = _HeldTransport([{"channel": "/meta/connect", "clientId": cid,
+                                  "id": 2, "connectionType": "streaming"}])
+            task = asyncio.create_task(
+                _handle_cometd(mgr, "/cometd", tr.receive, tr.send))
+
+            async def feed():
+                for n in range(6):
+                    await asyncio.sleep(0.15)
+                    mgr.push(cid, {"channel": f"/{cid}/slim/x", "id": 0,
+                                   "data": {"n": n}})
+
+            pusher = asyncio.create_task(feed())
+            await asyncio.sleep(0.8)                   # > 1 event, > 2 windows
+            open_after_events = tr.streaming
+            await pusher
+            for _ in range(200):
+                if not tr.streaming:
+                    break
+                await asyncio.sleep(0.02)
+            await asyncio.wait_for(task, timeout=5)
+        finally:
+            app_mod.STREAMING_HOLD_WINDOW = old
+        return tr, open_after_events
+
+    tr, open_after_events = asyncio.run(run())
+    assert open_after_events, (
+        "an event-carrying stream was closed after one idle window")
+    pushed = [m for chunk in tr.chunks for m in json.loads(chunk)
+              if isinstance(m, dict) and str(m.get("channel", "")).startswith("/")]
+    assert any(str(m.get("channel", "")).endswith("/slim/x") for m in pushed)
+
+
+def test_live_post_behind_an_open_stream_is_served():
+    """The app's real pattern: connect AND its next POST on one socket.
+
+    Perl answers the queued POST while the stream is still open (measured
+    live against LMS 9.1.1: 0.8 s — its HTTP layer keeps reading the socket,
+    Slim/Web/HTTP.pm:277, and writes each response on its own,
+    addHTTPResponse HTTP.pm:1895-1960). uvicorn defers pipelined requests
+    until the response completes, so without the hold window this POST stayed
+    unanswered until the client gave up — the reported
+    "favourites never open" symptom.
+    """
+    async def run():
+        import lyrion.web.app as app_mod
+
+        rpc = _LiveRPC()
+        mgr = CometdManager(rpc)
+        old = app_mod.STREAMING_HOLD_WINDOW
+        app_mod.STREAMING_HOLD_WINDOW = 0.3
+        try:
+            async with _live_server(mgr) as port:
+                cid = await _live_handshake(port)
+                client = await _Client.open(port)
+                # both POSTs back to back on ONE socket, like the Android apps
+                await client.post([{"channel": "/meta/connect", "clientId": cid,
+                                    "id": 2, "connectionType": "streaming"}])
+                await client.post([{
+                    "channel": "/slim/request", "clientId": cid, "id": 3,
+                    "data": {"request": [PLAYER, ["favorites", "items", "0", "100"]],
+                             "response": f"/{cid}/slim/request/7"}}])
+                started = time.monotonic()
+                await client.read_headers()
+                ack = json.loads(await client.read_chunk())
+                while await client.read_chunk(timeout=5.0):
+                    pass
+                await client.reader.readexactly(2)     # chunked-body terminator
+                awaited = time.monotonic() - started
+                _status, headers = await client.read_headers(timeout=5.0)
+                if headers.get("transfer-encoding", "").lower() == "chunked":
+                    parts = []
+                    while True:
+                        part = await client.read_chunk(timeout=5.0)
+                        if not part:
+                            break
+                        parts.append(part)
+                    payload = b"".join(parts)
+                else:
+                    payload = await client.reader.readexactly(
+                        int(headers["content-length"]))
+                client.close()
+                return cid, ack, json.loads(payload), awaited, mgr.get(cid), headers
+        finally:
+            app_mod.STREAMING_HOLD_WINDOW = old
+
+    cid, ack, reply, awaited, client, headers = asyncio.run(run())
+    print(f"\n[len] queued POST behind the open stream served after "
+          f"{awaited:.2f}s, headers={headers}")
+    assert ack[0]["channel"] == "/meta/connect" and ack[0]["successful"] is True
+    channels = [m.get("channel") for m in reply]
+    assert f"/{cid}/slim/request/7" in channels, reply
+    # inside the client's own deadline for a non-connect message (10 s)
+    assert awaited < 10.0, f"the queued POST waited {awaited:.1f}s"
+    # ... and the client survived the end of that stream (Perl's grace)
+    assert client is not None

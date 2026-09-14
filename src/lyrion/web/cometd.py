@@ -17,16 +17,16 @@ or the per-client response channel. The request payloads are exactly
 slim.request params (player + command array) and are dispatched through
 the JSON-RPC handler.
 
-Client lifecycle: a client is removed on /meta/disconnect, when the
-transport connection that handled its /meta/connect closes
-(cometd_stream.py, and the ASGI streaming handler in web/app.py), or when
-it goes idle past LONG_POLLING_AUTOKILL — Perl's disconnect timer, which
-catches the handshake-only and non-connecting clients no close handler can
-see. A connection that merely carried a handshake/subscribe/request POST
-never removes the client: those POSTs normally live on another socket than
-the connect (HTTP long-polling, Comet.lua:184), and Perl registers a
-connection with the manager only in the /meta/(re)connect branch
-(Slim/Web/Cometd.pm:286).
+Client lifecycle: a client is removed on /meta/disconnect, after its transport
+connection was lost and Perl's disconnect grace expired (RETRY_DELAY * 2 = 10 s,
+armed by ``release_connection`` / webCloseHandler Cometd.pm:1010-1014 and
+cancelled by the next /meta/(re)connect, :283), or when it goes idle past
+LONG_POLLING_AUTOKILL — Perl's disconnect timer, which catches the
+handshake-only and non-connecting clients no close handler can see. A
+connection that merely carried a handshake/subscribe/request POST never removes
+the client: those POSTs normally live on another socket than the connect (HTTP
+long-polling, Comet.lua:184), and Perl registers a connection with the manager
+only in the /meta/(re)connect branch (Slim/Web/Cometd.pm:286).
 """
 from __future__ import annotations
 
@@ -67,6 +67,49 @@ RETRY_DELAY_MS = 5000
 # /meta/disconnect. Python implements it as an idle sweep instead of a timer.
 LONG_POLLING_AUTOKILL = 180.0
 
+# Hold window of an ASGI streaming /meta/connect. Perl holds a streaming
+# response open for as long as the socket lives — it has no timer for that
+# branch at all (Cometd.pm:288-297 only sets ``Transfer-Encoding: chunked``
+# and marks the transport; only the long-polling branch arms a timer,
+# Cometd.pm:302-325). Live probe against LMS 9.1.1: a bare streaming connect
+# stays open and SILENT for at least 20 s (no heartbeat, no empty chunk —
+# Perl sends nothing) and its queued events are written the moment they exist
+# (Manager::deliver_events, Manager.pm:247-263 -> sendResponse Cometd.pm:661).
+#
+# The ASGI transport cannot copy that: uvicorn queues HTTP pipelined requests
+# until the CURRENT response completes (h11: h11_impl.py:191-197 pauses the
+# read flow on ``h11.PAUSED`` and on_response_complete starts the queued cycle,
+# :278; httptools: httptools_impl.py:291-297 "Pipelined HTTP requests need to
+# be queued up"). Perl instead keeps reading the socket while the stream is
+# open (processHTTP stays in the read set, Slim/Web/HTTP.pm:277) and writes
+# every response independently (addHTTPResponse, HTTP.pm:1895-1960, called
+# from Cometd.pm:734): measured live, a POST sent right behind a streaming
+# connect is answered in 0.8 s while the stream stays open, while the same
+# POST on this ASGI path is not answered for as long as the stream is held.
+#
+# So the ASGI stream is closed after this much *silence* (every pushed event
+# restarts the window, a busy stream therefore stays open) to give the client's
+# queued POSTs their turn. The value is Perl's RETRY_DELAY (Cometd.pm:45) —
+# the interval Perl's own streaming connect ack tells the client to wait
+# before re-connecting (Cometd.pm:277-279), so the client is prepared for a
+# stream end. It must stay below the client's network deadline for a
+# NON-connect message: libcometd allows exactly ``maxNetworkDelay`` = 10000 ms
+# there (html/material/html/lib/libcometd.js:1268, and :380-389 adds
+# ``advice.timeout`` only for ``metaConnect``) — that 10 s is the deadline the
+# app hit before re-handshaking.
+STREAMING_HOLD_WINDOW = RETRY_DELAY_MS / 1000.0  # 5.0 s
+
+# Grace period for a streaming client whose connection is gone. Perl does NOT
+# drop the client when its connection is lost: webCloseHandler unregisters the
+# connection and arms ``disconnectClient`` for RETRY_DELAY * 2 (Cometd.pm:1010
+# -1014, identical in cliCloseHandler :1035-1039); a subsequent /meta/(re)
+# connect kills that timer (Cometd.pm:283 ``killTimers($clid,
+# \&disconnectClient)``), so a client that reconnects with the same clientId
+# keeps its subscriptions and any events queued for it. Python used to
+# disconnect immediately, which threw away the subscriptions and the events of
+# a client that was simply between two connections.
+DISCONNECT_GRACE = (RETRY_DELAY_MS / 1000.0) * 2  # 10.0 s
+
 # Upper bound for one client's pending-event queue. Perl has no explicit cap
 # (it relies on LONG_POLLING_AUTOKILL / webCloseHandler to drop dead clients);
 # this is a Python-side safety net so a stalled or half-dead client cannot grow
@@ -98,6 +141,11 @@ class CometdClient:
     # /meta/(re)connect branch, Cometd.pm:295/300, and routes a finished
     # request by it, Cometd.pm:584-589).
     transport: str = ""
+    # Wall clock at which the client may be dropped although it is between two
+    # connections — Perl's ``disconnectClient`` timer, armed by webCloseHandler
+    # for RETRY_DELAY * 2 (Cometd.pm:1010-1014) and killed by the next
+    # /meta/(re)connect (:283). ``None`` while no such timer runs.
+    disconnect_at: float | None = None
 
 
 # Module-level manager singleton — lets the slimproto layer wake
@@ -606,6 +654,46 @@ class CometdManager:
             return
         client.owner = owner
         client.last_seen = self._clock()
+        # Perl Cometd.pm:283: a (re)connect kills the pending disconnectClient
+        # timer, which is what lets a client survive a lost connection with
+        # its subscriptions and queued events intact.
+        client.disconnect_at = None
+
+    def arm_disconnect(self, client_id: str, delay: float | None = None) -> None:
+        """Arm Perl's disconnectClient timer for a client between connections.
+
+        webCloseHandler (Cometd.pm:1010-1014) does not drop the client of a
+        lost connection: it unregisters the connection and schedules
+        ``disconnectClient`` for RETRY_DELAY * 2 (10 s). The next
+        /meta/(re)connect kills the timer (:283) — a client that is only
+        briefly between two connections keeps its subscriptions.
+        """
+        client = self._clients.get(client_id)
+        if client is None or client.connections:
+            return
+        client.disconnect_at = self._clock() + (
+            DISCONNECT_GRACE if delay is None else delay)
+        self.ensure_autokill()
+        logger.debug("Cometd disconnect armed for %s in %.1fs", client_id,
+                     DISCONNECT_GRACE if delay is None else delay)
+
+    def release_connection(self, client_id: str, owner: object) -> bool:
+        """Give up ownership of ``client_id`` and arm the disconnect grace.
+
+        Perl's webCloseHandler (Cometd.pm:1002-1015): only the connection that
+        carried the client's /meta/connect may release it, and the release only
+        *unregisters the connection* — the client itself is dropped by
+        ``disconnectClient`` RETRY_DELAY * 2 later unless a new connect arrives
+        first (:283, :1010-1014). This is the difference to ``remove_if_owner``:
+        a client that reconnects right after its stream ended keeps its
+        subscriptions and the events queued for it.
+        """
+        client = self._clients.get(client_id)
+        if client is None or client.owner is not owner:
+            return False
+        client.owner = None
+        self.arm_disconnect(client_id)
+        return True
 
     def remove_if_owner(self, client_id: str, owner: object) -> bool:
         """Remove the client only while ``owner`` is its current connection.
@@ -708,6 +796,9 @@ class CometdManager:
             return
         client.connections += 1
         client.last_seen = self._clock()
+        # An open transport means the (re)connect arrived: Perl's pending
+        # disconnectClient timer is gone (Cometd.pm:283).
+        client.disconnect_at = None
 
     def connection_closed(self, client_id: str) -> None:
         client = self._clients.get(client_id)
@@ -723,12 +814,24 @@ class CometdManager:
         that stops polling, never connects after a handshake, or dies without
         /meta/disconnect is removed so notify_* / keepalive_loop stop doing
         work for it. Clients with an open transport are never reaped.
+
+        A client whose connection was lost first runs through Perl's shorter
+        ``disconnectClient`` timer (RETRY_DELAY * 2, Cometd.pm:1010-1014 —
+        ``client.disconnect_at``), which a (re)connect cancels (:283): that is
+        what lets a streaming client reconnect after an ended stream without
+        losing its subscriptions.
         """
         limit = LONG_POLLING_AUTOKILL if timeout is None else timeout
         now = self._clock()
         reaped: list[str] = []
         for client_id, client in list(self._clients.items()):
             if client.connections:
+                continue
+            if client.disconnect_at is not None and now >= client.disconnect_at:
+                self.remove(client_id)
+                reaped.append(client_id)
+                logger.info("Cometd disconnect (grace expired) -> client %s",
+                            client_id)
                 continue
             if now - client.last_seen >= limit:
                 self.remove(client_id)
