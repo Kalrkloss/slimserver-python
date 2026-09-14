@@ -102,10 +102,13 @@ def _manager_with_sub(subscribe: str):
 def test_stmu_frame_pushes_the_display_only_on_a_changed_title(monkeypatch):
     """``Slim/Music/Info.pm:516`` — nur ein **neuer** Titel löst den Push aus."""
     _pm(_player(current_title=""))
-    calls: list[str] = []
+    calls: list[tuple] = []
 
-    async def _fake(mac: str) -> None:
-        calls.append(mac)
+    # ``_notify_metadata_display(mac, url, title)`` — die zwei Werte sind
+    # ``$url``/``$title`` des ``setCurrentTitle($url,$title,$client)``-Aufrufs
+    # (``Info.pm:513-534``).
+    async def _fake(mac: str, url: str = "", title: str = "") -> None:
+        calls.append((mac, url, title))
 
     monkeypatch.setattr(protocol_mod, "_notify_metadata_display", _fake)
     client = SlimProtoClient()
@@ -123,16 +126,16 @@ def test_stmu_frame_pushes_the_display_only_on_a_changed_title(monkeypatch):
     assert player.current_title == ICY                 # wie bisher gesetzt
     assert player.remote_meta["artist"] == "Dj Fada 2"
     assert player.remote_meta["title"] == "Life Breath (oct12)"
-    spawn_test_expectation = [MAC]                     # genau EIN Push
-    assert calls == spawn_test_expectation, calls
+    # Genau EIN Push, und zwar mit dem Stream-URL und dem neuen ICY-Titel.
+    assert calls == [(MAC, STREAM, ICY)], calls
 
 
 def test_stmu_without_a_known_player_pushes_nothing(monkeypatch):
     PlayerManager().players = {}
-    calls: list[str] = []
+    calls: list[tuple] = []
 
-    async def _fake(mac: str) -> None:
-        calls.append(mac)
+    async def _fake(mac: str, url: str = "", title: str = "") -> None:
+        calls.append((mac, url, title))
 
     monkeypatch.setattr(protocol_mod, "_notify_metadata_display", _fake)
     _run(_async_handle(SlimProtoClient(), MAC, FRAME))

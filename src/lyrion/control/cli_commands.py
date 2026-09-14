@@ -257,22 +257,60 @@ async def cmd_listen(
     ctx: CLIContext,
     args: list[str],
 ) -> list[str]:
-    """listen <on|off> | listen ? — one escaped line.
+    """listen [<on|off>] | listen ? — one escaped line.
 
     'listen' is registered twice by the CLI plugin itself
     (``Slim/Plugin/CLI/Plugin.pm:103-106``): as a command with ``_newvalue``
     (:0,0,0) and as a query (:0,1,0).  ``listenCommand`` adds no result
     (:799-828) → the answer is the echoed request; ``listenQuery`` adds the
-    bare result ``_listen`` (:829-845, ``defined(...) || 0``).  Live Perl
-    2026-09-12: ``listen ?`` → ``listen 0``.
+    bare result ``_listen`` (:829-845, ``defined($connections{$sock}
+    {'subscribe'}{'listen'}) || 0``).  Live Perl 2026-09-12: ``listen ?`` →
+    ``listen 0``.
 
-    This server does not push CLI notifications, so a fresh session always
-    answers ``listen 0`` — exactly what Perl answers before anything
-    subscribed.
+    The command itself subscribes this connection to the notification stream
+    (:809-834):
+
+    * no parameter            → toggle (``!defined $connections{..}{'subscribe'}``)
+    * ``$param == 0``         → ``cli_subscribe_terms_none`` (:826-828) — a
+      Perl numeric comparison, so ``listen off``/``listen on`` fall in here too
+      ('on'/'off' numify to 0) and only a numeric non-zero subscribes
+    * ``$param == 1``         → ``cli_subscribe_terms_all`` (:829-831), i.e.
+      ``$connections{$sock}{'subscribe'}{'listen'} = '*'`` (:910-918)
+
+    A listening connection then receives every notification line
+    (``cli_subscribe_notification``, :970-1017), e.g.
+    ``<clientid> playlist newsong <title> <index>``.
     """
     if _is_query_echo(args):
-        return _command_line(["listen"], [], [], results=[("_listen", 0)])
+        from lyrion.control import notifications
+
+        return _command_line(["listen"], [], [],
+                             results=[("_listen",
+                                       notifications.cli_get_listen(ctx.client_id))])
+
+    param: Any = args[0] if args else None
+    if param is None:
+        # Perl: ``$param = !defined($connections{$client_socket}{'subscribe'})``
+        param = 0 if ctx.listen is not None else 1
+    # ``$param == 0`` / ``$param == 1`` — Perl's numeric comparison.
+    if _perl_num(param) == 0:
+        handler.set_listen(False)
+    elif _perl_num(param) == 1:
+        handler.set_listen(True)
     return _command_echo(["listen"], args, ["_newvalue"])
+
+
+def _perl_num(value: Any) -> float:
+    """Perl's numeric coercion of a string (leading number, else 0)."""
+    import re
+
+    match = re.match(r"\s*[-+]?\d*\.?\d+", str(value))
+    if not match:
+        return 0.0
+    try:
+        return float(match.group(0))
+    except ValueError:  # pragma: no cover — the regex guarantees a number
+        return 0.0
 
 
 # ---------------------------------------------------------------------------

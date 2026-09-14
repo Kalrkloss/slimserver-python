@@ -52,6 +52,7 @@ UNKLAR / deliberately NOT implemented (needs a real client or codec)
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from enum import IntEnum
 from typing import Any, Callable, Optional
@@ -384,6 +385,119 @@ class StreamingHooks:
 
 
 # ---------------------------------------------------------------------------
+# Perl's own side effects — the default hooks of the live server
+# ---------------------------------------------------------------------------
+
+def default_hooks() -> StreamingHooks:
+    """The hooks a live controller carries: Perl's own notification path.
+
+    Only ``playback_started`` has an implementation here, because it is the
+    one side effect of the state machine that needs no player socket and no
+    codec: it is a ``notifyFromArray`` call. Every other hook stays optional
+    (``$player->play``/``stop``/``flush`` need the player), see
+    :class:`StreamingHooks`.
+    """
+    return StreamingHooks(playback_started=_on_playback_started)
+
+
+def _on_playback_started(*, master: str = "", song: Any = None, **_: Any) -> None:
+    """``_Playing`` tail — ``StreamingController.pm:381-393``.
+
+    ``if ( $last_song ) { Slim::Control::Request::notifyFromArray(
+    $self->master(), ['playlist','newsong', ...,$last_song->index()] ) }``
+
+    ``notifyFromArray`` only *queues* the request (``Request.pm:852``; the
+    idle loop sends it, :856-862), so the port schedules the task instead of
+    doing a blocking title lookup inside the event dispatch.
+    """
+    if not master or song is None:          # ``if ( $last_song )``
+        return
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return               # no loop → no idle loop → nothing to deliver to
+    loop.create_task(send_newsong_playing(master, song))
+
+
+async def send_newsong_playing(master: str, song: Any = None) -> None:
+    """Send ``['playlist','newsong', title, index]`` — 4 elements (``:381-393``).
+
+    Perl builds the array as ``('playlist', 'newsong',
+    Slim::Music::Info::standardTitle($self->master(), $last_song->currentTrack()),
+    $last_song->index())``: the verb pair, then the display title of the song
+    that just started, then its *playlist* index. ``newsong`` declares no
+    parameters (``Request.pm:645`` → ``[1,0,0,undef]``), so the two values land
+    as ``_p2``/``_p3`` and render as bare elements (``Request.pm:1049-1061``).
+
+    The notification's client id is ``$self->master()->id()``
+    (``Request.pm:846-848``) — the player's own MAC, not the controller's
+    normalised registry key.
+    """
+    from lyrion.control.notifications import notify_from_array
+    from lyrion.player.manager import PlayerManager
+
+    song = song if song is not None else _controller_song(master)
+    if song is None:                        # ``if ( $last_song )``
+        return
+    player = PlayerManager().get_player(master)
+    client_id = str(getattr(player, "mac", "") or master) if player else master
+    index = _song_index(song, player)
+    title = await standard_title(player)
+    notify_from_array(client_id, ["playlist", "newsong", title, index])
+
+
+def _controller_song(master: str) -> Any:
+    ctl = controller_for(master)
+    return ctl.playing_song() if ctl is not None else None
+
+
+def _song_index(song: Any, player: Any) -> Optional[int]:
+    """``$last_song->index()`` — the song's index in the play list.
+
+    ``Slim/Player/Song.pm:81-121``: ``Slim::Player::Song->new($owner, $index,
+    $seekdata)`` looks the track up as ``Slim::Player::Playlist::track($client,
+    $index)`` and stores ``index => $index``, so it is the playlist position of
+    the song. Our song queue holds the *track id* on the live stream paths
+    (``networking/protocol.py:2440`` ``note_strm_sent(mac, track_id)``), so the
+    position comes from the player; a song object that carries its own
+    ``index`` (Perl-shaped, and what the unit tests use) wins.
+    """
+    value: Any = None
+    if isinstance(song, dict):
+        value = song.get("index")
+    elif song is not None:
+        attr = getattr(song, "index", None)
+        value = attr() if callable(attr) else attr
+    if value is not None:
+        return int(value)
+    if player is None:
+        return None
+    return int(getattr(player, "playlist_position", 0) or 0)
+
+
+async def standard_title(player: Any) -> str:
+    """``Slim::Music::Info::standardTitle($master, $track)`` — ``Info.pm:701-739``.
+
+    ``standardTitle`` formats the track with the client's ``titleFormat``,
+    default ``'TITLE'`` (``Utils/Prefs.pm:249-250`` + ``Client.pm:52-53``),
+    which ``TitleFormatter.pm:44-51`` resolves to the track's own title. The
+    port's title formatter is ``PlayerManager._current_song_title``
+    (``getCurrentTitle``, ``Info.pm:556-583``) — the same text the status and
+    the display show, so the notification and the status can never disagree.
+    """
+    if player is None:
+        return ""
+    from lyrion.player.manager import PlayerManager
+
+    try:
+        return await PlayerManager()._current_song_title(player)  # noqa: SLF001
+    except Exception as exc:  # noqa: BLE001 — a notification must never raise
+        logger.debug("standardTitle for %s failed: %s",
+                     getattr(player, "mac", "?"), exc)
+        return str(getattr(player, "current_title", "") or "")
+
+
+# ---------------------------------------------------------------------------
 # The controller
 # ---------------------------------------------------------------------------
 
@@ -622,7 +736,10 @@ class StreamingController:
         if not self.rebuffering:
             self._set_playing_state(PlayingState.PLAYING)
         self.consecutive_errors = 0              # :350
-        self._hook("playback_started")           # newsong notification :381-393
+        # :381-393 — the 4-element ``playlist newsong`` notification, fired
+        # only while ``$last_song`` exists.
+        self._hook("playback_started", master=self.master_id,
+                   song=self.playing_song())
 
     def _act_resume(self, event, **p):
         """``_Resume`` — resume -> Playing (:1620-1656)."""
@@ -1049,17 +1166,29 @@ def _normalize(mac: str) -> str:
 
 def get_controller(mac: str, hooks: StreamingHooks | None = None
                    ) -> StreamingController:
-    """Return (creating if needed) the controller for ``mac``."""
+    """Return (creating if needed) the controller for ``mac``.
+
+    A fresh controller gets :func:`default_hooks` — Perl's own side effects,
+    of which ``playback_started`` (the ``playlist newsong`` notification) is
+    the only one that needs no player socket. An explicit ``hooks`` argument
+    replaces them (that is how the unit tests observe the transitions).
+    """
     key = _normalize(mac)
     ctl = _controllers.get(key)
     if ctl is None:
-        ctl = StreamingController(master_id=key, hooks=hooks)
+        ctl = StreamingController(master_id=key,
+                                  hooks=hooks if hooks is not None else default_hooks())
         ctl.all_players = [key]
         ctl.players = [key]
         _controllers[key] = ctl
     elif hooks is not None:
         ctl.hooks = hooks
     return ctl
+
+
+def controller_for(mac: str) -> Optional[StreamingController]:
+    """The controller already registered for ``mac`` — creates nothing."""
+    return _controllers.get(_normalize(mac))
 
 
 def reset(mac: Optional[str] = None) -> None:

@@ -102,6 +102,10 @@ class CLIContext:
     charset: str = "utf-8"
     subscribed_player: Optional[str] = None
     subscribe_interval: int = 0  # seconds between keep-alive status pushes
+    # ``$connections{$client_socket}{'subscribe'}{'listen'}``
+    # (Slim/Plugin/CLI/Plugin.pm:892-931): None = not listening, '*' = every
+    # notification, a list of term groups for specific notifications.
+    listen: Any = None
     command: str = ""  # the command name actually invoked (for aliases)
     # Der Client, den DIESER Request aus der Request-Zeile aufgelöst hat — nur
     # wenn das erste Token ein Player ist (``Slim/Control/Stdio.pm:96-116``
@@ -182,9 +186,76 @@ class CLIHandler:
         self._auth_password: Optional[str] = None
         # Subscriptions: player_mac -> asyncio.Queue of events
         self._subscriptions: dict[str, asyncio.Queue[list[str]]] = {}
+        # The socket + session of THIS connection. Perl keeps both in
+        # ``%connections{$client_socket}`` (Plugin/CLI/Plugin.pm:892-931) and
+        # uses the socket itself as the connection id for notifications
+        # (:979-1017); the port's CLI server hands one CLIHandler to each
+        # connection, so the handler owns them.
+        self._writer: Optional[asyncio.StreamWriter] = None
+        self._ctx: Optional[CLIContext] = None
 
     # All active CLI handler instances (for cross-layer status pushes).
     _active_handlers: set["CLIHandler"] = set()
+
+    @property
+    def connection_id(self) -> str:
+        """The Perl connection id (the socket) — here the session's client id."""
+        ctx = self._ctx
+        return ctx.client_id if ctx is not None else ""
+
+    # -----------------------------------------------------------------------
+    # Notification delivery (Slim/Plugin/CLI/Plugin.pm:969-1017)
+    # -----------------------------------------------------------------------
+
+    def set_listen(self, value: Any) -> None:
+        """``listen``/``subscribe`` bookkeeping for this connection.
+
+        ``value`` is ``True`` for 'listen everything' (Perl stores ``'*'``),
+        a list of term groups for specific notifications, or ``None``/``False``
+        to cancel (``cli_subscribe_terms_none``, Plugin.pm:899-907).
+        """
+        ctx = self._ctx
+        if ctx is None:
+            return
+        if value is True:
+            ctx.listen = "*"
+        elif value in (False, None):
+            ctx.listen = None
+        else:
+            ctx.listen = value
+        from lyrion.control import notifications
+
+        notifications.cli_set_listen(ctx.client_id, ctx.listen)
+
+    def write_notification(self, line: str) -> None:
+        """Write ONE already-rendered notification line to this connection.
+
+        Perl's ``cli_request_write`` writes ``$output . $terminator`` directly
+        to the socket (Plugin/CLI/Plugin.pm:700-702) — a notification is not a
+        reply to a request and carries the same single terminator.
+        """
+        ctx = self._ctx
+        writer = self._writer
+        if ctx is None or writer is None:
+            return
+        term = getattr(ctx, "terminator", None) or self.LINE_END
+        try:
+            writer.write(line.encode(ctx.charset, errors="replace") + term)
+        except Exception:  # noqa: BLE001 — a dead socket must not raise here
+            return
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(self._drain(writer))
+        except RuntimeError:
+            pass
+
+    @staticmethod
+    async def _drain(writer: asyncio.StreamWriter) -> None:
+        try:
+            await writer.drain()
+        except Exception:  # noqa: BLE001
+            pass
+
 
     @classmethod
     def notify_subscribers(cls, player_id: str) -> None:
@@ -268,10 +339,21 @@ class CLIHandler:
         ctx = CLIContext(client_id=client_id)
         ctx.player_id = self._get_default_player()
         self._active_handlers.add(self)
+        self._writer = writer
+        self._ctx = ctx
+        # Perl stores the connection in ``%connections{$client_socket}``
+        # (Plugin/CLI/Plugin.pm:892-931) — notifications are written to it
+        # from cli_subscribe_notification (:970-1017) at any time.
+        from lyrion.control import notifications
+
+        notifications.register_cli_connection(client_id, self.write_notification)
         try:
             yield ctx
         finally:
+            notifications.unregister_cli_connection(client_id)
             self._active_handlers.discard(self)
+            self._writer = None
+            self._ctx = None
             # Drop subscriptions for this client
             self._subscriptions.clear()
             # KEINE Extra-Bytes beim Schließen: Perl schreibt genau einen
