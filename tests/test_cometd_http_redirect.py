@@ -65,12 +65,27 @@ def test_post_cometd_still_reads_the_body():
     req = _run(raw)
     assert req is not None
     assert req["body"] == body
-    assert "method" not in req
+    # The head is reported for EVERY method now: the connection loop needs the
+    # method/target to route Bayeux natively and everything else to the
+    # internal ASGI app (see tests/test_single_port_frontend.py).
+    assert req["method"] == "POST"
+    assert req["target"] == b"/cometd"
+    assert req["version"] == "HTTP/1.1"
 
 
-def test_other_verbs_are_still_ignored():
+def test_other_verbs_are_reported_for_relaying():
+    """DELETE / PUT / PATCH used to be dropped (``None`` = close the socket).
+
+    With one public port the native server is the frontend for the WHOLE web
+    surface, so it must hand every non-Bayeux method to the internal app
+    instead of hanging up on it (the web UI and the settings pages use them).
+    """
     raw = b"DELETE /whatever HTTP/1.1\r\nHost: h:9080\r\n\r\n"
-    assert _run(raw) is None
+    req = _run(raw)
+    assert req is not None
+    assert req["method"] == "DELETE"
+    assert req["target"] == b"/whatever"
+    assert "body" not in req
 
 
 # ── proxy ────────────────────────────────────────────────────────────────

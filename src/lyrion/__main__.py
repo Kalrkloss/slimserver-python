@@ -137,12 +137,20 @@ async def _run_server(
     # Use None as sentinel so absent arg != explicit False.
     cli_noweb: bool | None = getattr(cfg.cli_args, "noweb", None)
     noweb = cli_noweb if cli_noweb is not None else bool(cfg.get("noweb", False))
-    http_port = int(getattr(cfg.cli_args, "httpport", None)
-                    or cfg.get("serverport", 9000))
+    # ONE public port (Perl parity): the native, pipelining-capable frontend
+    # owns `public_http_port` and uvicorn serves `internal_http_port` behind it
+    # (loopback only). `http_port` below is always the PUBLIC one — it is what
+    # players are pointed at for /stream.mp3, what the TLV/beacon announce and
+    # what serverstatus reports.
+    from lyrion.config import frontend_enabled, http_ports
+    public_port, internal_port = http_ports(cfg)
+    http_port = public_port
+    frontend = frontend_enabled(cfg)
     cli_port = int(getattr(cfg.cli_args, "cliport", None)
                    or cfg.get("cliport", 9090))
 
-    log.info("Starting server on http://:%s (web=%s)", http_port, not noweb)
+    log.info("Starting server on http://:%s (web=%s, frontend=%s, internal=%s)",
+             http_port, not noweb, frontend, internal_port)
 
     _uvicorn_server: uvicorn.Server | None = None
 
@@ -200,16 +208,17 @@ async def _run_server(
         log.info("DiscoveryService started on port %d", slimproto_port)
 
         # Periodic server announcement broadcast so remote apps find us.
-        # The JSON beacon must name the SAME port the discovery TLV
-        # announces: the native cometd port (9080). It serves Bayeux
-        # directly (SqueezePlay pipelines POSTs on one socket, which
-        # uvicorn/h11 cannot, h11_impl.py:191-197) and proxies /jsonrpc.js
-        # to the web app (networking/cometd_stream.py:202-230). Two beacons
-        # naming different ports send apps to a front-end that is not the
-        # intended one — measured 2026-09-14: the TLV said 9080 while this
-        # beacon said 9000, so JSON-beacon apps landed on uvicorn.
+        # The JSON beacon names the SAME port the discovery TLV announces:
+        # the ONE public port. It is served by the native frontend, which
+        # answers the Bayeux POSTs directly (SqueezePlay pipelines several on
+        # ONE socket, which uvicorn/h11 cannot, h11_impl.py:191-197) and
+        # relays everything else (/jsonrpc.js, artwork, /stream.mp3) to the
+        # internal ASGI app. Two beacons naming different ports send apps to
+        # a front-end that is not the intended one — measured 2026-09-14: the
+        # TLV said 9080 while this beacon said 9000, so JSON-beacon apps
+        # landed on uvicorn and SqueezePlay kept two sessions in parallel.
         asyncio.create_task(_broadcast_server_presence(
-            log, slimproto_port, int(cfg.get("cometd_stream_port", 9080))))
+            log, slimproto_port, http_port))
     except Exception as exc:
         log.warning("Could not start discovery service: %s", exc)
 
@@ -245,15 +254,23 @@ async def _run_server(
             if not html_dir.is_dir():
                 html_dir = Path.cwd() / "html"    # last resort
             static_dir = str(html_dir)
+            # uvicorn is the INTERNAL app in the consolidated layout: it owns
+            # routing/JSON-RPC/static files and listens on loopback only, while
+            # the native frontend owns the public port and relays to it. In the
+            # rollback layout (frontend disabled) uvicorn is the public server
+            # again and binds 0.0.0.0, exactly as before.
+            from lyrion.config import asgi_bind
+            asgi_host, asgi_port = asgi_bind(cfg)
             config_uvicorn = create_config(
-                host="0.0.0.0",
-                port=http_port,
+                host=asgi_host,
+                port=asgi_port,
                 static_dir=static_dir,
                 jsonrpc=jsonrpc_api,
                 cometd=cometd_mgr,
             )
             _uvicorn_server = uvicorn.Server(config=config_uvicorn)
-            log.info("Web server starting on http://0.0.0.0:%d", http_port)
+            log.info("Web server (intern) starting on http://%s:%d",
+                     asgi_host, asgi_port)
             # Run uvicorn as a background task so our shutdown loop below can
             # observe both `_running` (our SIGTERM handler) and uvicorn's own
             # should_exit. A plain `await serve()` blocks forever because
@@ -261,16 +278,22 @@ async def _run_server(
             # would hang in "deactivating").
             uvicorn_task = asyncio.create_task(_uvicorn_server.serve())
 
-            # Native Cometd streaming server (SqueezePlay/Orange Squeeze
-            # pipeline POSTs over one socket with an open response —
-            # uvicorn cannot serve that). Advertised via TLV discovery.
+            # The native server is the FRONTEND on the public port: Perl
+            # serves its one HTTP port itself and pipelines requests on it
+            # (Slim/Web/HTTP.pm:2065-2072), which uvicorn cannot
+            # (h11_impl.py:191-197). It answers /cometd natively and relays
+            # every other request to the internal ASGI port above.
             try:
-                from lyrion.networking.cometd_stream import start_cometd_server
-                cometd_stream_port = int(cfg.get("cometd_stream_port", 9080))
-                asyncio.create_task(start_cometd_server(
-                    cometd_mgr, "0.0.0.0", cometd_stream_port, http_port))
+                if frontend:
+                    from lyrion.networking.cometd_stream import start_cometd_server
+                    asyncio.create_task(start_cometd_server(
+                        cometd_mgr, "0.0.0.0", public_port, asgi_port))
+                else:
+                    log.info("Native frontend disabled (public=%d internal=%d) "
+                             "— uvicorn serves the public port alone",
+                             public_port, internal_port)
             except Exception as exc:
-                log.warning("Could not start native Cometd server: %s", exc)
+                log.warning("Could not start native frontend: %s", exc)
 
             # Wait for shutdown signal or uvicorn stopping itself.
             # Active SIGTERM/SIGINT handler is bootstrap.request_shutdown,
@@ -348,7 +371,12 @@ async def _background_scan(log: logging.Logger) -> None:
 
 
 async def _broadcast_server_presence(log: logging.Logger, slimproto_port: int, http_port: int) -> None:
-    """Periodically broadcast server presence via UDP so remote apps can discover us."""
+    """Periodically broadcast server presence via UDP so remote apps can discover us.
+
+    ``http_port`` is the ONE public port (the native frontend), never the
+    internal ASGI port — JSON-beacon apps must land on the same server the
+    TLV discovery names.
+    """
     import json as _json, socket as _socket, asyncio as _asyncio
     try:
         # Get primary network IP
@@ -376,7 +404,9 @@ async def _broadcast_server_presence(log: logging.Logger, slimproto_port: int, h
                     "jsonrpc": f"http://{server_ip}:{http_port}/jsonrpc.js",
                 }).encode()
                 await _asyncio.to_thread(sock.sendto, msg, ("255.255.255.255", 3483))
-                log.debug("Server presence broadcast sent to 255.255.255.255:3483")
+                log.debug("Server presence broadcast sent to 255.255.255.255:3483 "
+                          "(port %d, jsonrpc %s)", http_port,
+                          f"http://{server_ip}:{http_port}/jsonrpc.js")
             except Exception as exc:
                 log.debug("Broadcast error: %s", exc)
             await _asyncio.sleep(30)
@@ -500,6 +530,18 @@ Examples:
     parser.add_argument(
         "--httpport", type=int, metavar="PORT",
         help="HTTP port for web interface (default: 9000)",
+    )
+    parser.add_argument(
+        "--public-http-port", type=int, metavar="PORT",
+        help=("The ONE HTTP port every client is told about (default: 9000, "
+              "served by the native frontend). 0 — or the same value as "
+              "--internal-http-port — rolls the single-port consolidation "
+              "back: uvicorn serves the public port alone."),
+    )
+    parser.add_argument(
+        "--internal-http-port", type=int, metavar="PORT",
+        help=("Internal port of the ASGI app behind the native frontend "
+              "(default: 9001, loopback only, never announced)."),
     )
     parser.add_argument(
         "--cliport", type=int, metavar="PORT",

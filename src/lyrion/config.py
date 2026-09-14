@@ -538,6 +538,21 @@ class LyrionConfig:
             help="HTTP port for web interface (default: 9000)",
         )
         parser.add_argument(
+            "--public-http-port",
+            type=int,
+            metavar="PORT",
+            help=("The ONE port every client is told about (default: 9000). "
+                  "Set 0 together with --internal-http-port 9000 to roll the "
+                  "single-port consolidation back (uvicorn serves it itself)."),
+        )
+        parser.add_argument(
+            "--internal-http-port",
+            type=int,
+            metavar="PORT",
+            help=("Internal port for the ASGI app behind the native frontend "
+                  "(default: 9001, loopback only)."),
+        )
+        parser.add_argument(
             "--cliport",
             type=int,
             metavar="PORT",
@@ -587,6 +602,18 @@ class LyrionConfig:
         """Register the standard set of Lyrion preferences with defaults."""
         prefs = self._prefs
         await prefs.init_preference("serverport", default=9000, type_name="int", category="server")
+        # Single-port layout (Perl parity): every client is told about
+        # `public_http_port` (the native, pipelining-capable frontend);
+        # `internal_http_port` is where uvicorn listens — loopback only.
+        # `web/api.py` (serverstatus.httpport), `networking/discovery.py`
+        # (TLV) and the JSON presence beacon in `__main__.py` all announce the
+        # public one (`config.http_ports()`).
+        await prefs.init_preference(
+            "public_http_port", default=DEFAULT_PUBLIC_HTTP_PORT,
+            type_name="int", category="server")
+        await prefs.init_preference(
+            "internal_http_port", default=DEFAULT_INTERNAL_HTTP_PORT,
+            type_name="int", category="server")
         await prefs.init_preference("cliport", default=9090, type_name="int", category="server")
         await prefs.init_preference("noweb", default=0, type_name="bool", category="server")
         await prefs.init_preference("loglevel", default="info", category="server")
@@ -641,3 +668,91 @@ def get_config() -> LyrionConfig:
 def get_prefs() -> PreferenceStore:
     """Return the global PreferenceStore instance."""
     return _preference_store
+
+
+# ---------------------------------------------------------------------------
+# HTTP port layout (Perl parity: ONE public port)
+# ---------------------------------------------------------------------------
+
+#: The ONE port every client is told about — Perl's ``httpport``.
+DEFAULT_PUBLIC_HTTP_PORT = 9000
+
+#: Where uvicorn's ASGI app listens; loopback only, never announced.
+DEFAULT_INTERNAL_HTTP_PORT = 9001
+
+
+def http_ports(cfg: "LyrionConfig | None" = None) -> tuple[int, int]:
+    """Resolve the ``(public, internal)`` HTTP ports from the running config.
+
+    Perl has a single HTTP port and serves EVERYTHING on it itself
+    (``Slim/Web/HTTP.pm``), Bayeux included, because it supports pipelined
+    requests (``Slim/Web/HTTP.pm:2065-2072``). The Python stack needs two
+    processes for that: the native, pipelining-capable server is the FRONTEND
+    on ``public_http_port`` (default 9000, bound on 0.0.0.0) and uvicorn moves
+    to ``internal_http_port`` (default 9001, 127.0.0.1 only) behind it. Every
+    announcement (TLV discovery, JSON presence beacon, ``serverstatus``'s
+    ``httpport``) names the PUBLIC port, so the apps never see the internal
+    one.
+
+    Rollback needs no code revert: set ``public_http_port`` to 0 (or to the
+    same value as ``internal_http_port``) and the frontend is not started,
+    uvicorn binds the internal port itself — with both at 9000 the
+    pre-consolidation layout is back.
+
+    ``--httpport`` (the documented "HTTP port for web interface") still names
+    the public port.
+    """
+    cfg = cfg or get_config()
+
+    def _int(value: Any, default: int) -> int:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
+    # CLI flags win (that is also how the rollback is switched off for a
+    # single run); otherwise the stored pref, otherwise the default.
+    cli = getattr(cfg, "cli_args", None)
+    cli_public = getattr(cli, "public_http_port", None)
+    if cli_public is None:
+        cli_public = getattr(cli, "httpport", None)
+    cli_internal = getattr(cli, "internal_http_port", None)
+
+    internal = (_int(cli_internal, DEFAULT_INTERNAL_HTTP_PORT)
+                if cli_internal is not None
+                else _int(cfg.get("internal_http_port"),
+                          DEFAULT_INTERNAL_HTTP_PORT))
+    public = (_int(cli_public, DEFAULT_PUBLIC_HTTP_PORT)
+              if cli_public is not None
+              else _int(cfg.get("public_http_port"), DEFAULT_PUBLIC_HTTP_PORT))
+    return public, internal
+
+
+def public_http_port(cfg: "LyrionConfig | None" = None) -> int:
+    """The single advertised HTTP port (see :func:`http_ports`)."""
+    return http_ports(cfg)[0]
+
+
+def frontend_enabled(cfg: "LyrionConfig | None" = None) -> bool:
+    """True when the native frontend serves the public port.
+
+    False means the single-port consolidation is rolled back: uvicorn binds
+    the public port itself and no native streaming server is started.
+    """
+    public, internal = http_ports(cfg)
+    return public > 0 and public != internal
+
+
+def asgi_bind(cfg: "LyrionConfig | None" = None) -> tuple[str, int]:
+    """``(host, port)`` uvicorn must bind.
+
+    The ASGI app always listens on ``internal_http_port``; only its exposure
+    differs. Normally the native frontend owns the public port and uvicorn is
+    reachable on loopback alone. In the rollback layout (frontend disabled)
+    uvicorn IS the public server again and binds 0.0.0.0 — with
+    ``internal_http_port`` set back to 9000 that restores the old
+    single-uvicorn-port setup without a code revert.
+    """
+    if frontend_enabled(cfg):
+        return "127.0.0.1", http_ports(cfg)[1]
+    return "0.0.0.0", http_ports(cfg)[1]

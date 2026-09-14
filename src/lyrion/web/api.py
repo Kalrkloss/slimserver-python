@@ -2646,8 +2646,11 @@ class JSONRPCAPI:
             from lyrion import __version__
             from lyrion.config import get_config
             players = pm.get_all_players() if pm else []
+            # The ONE public port (native frontend) — same value the TLV
+            # discovery and the JSON presence beacon announce.
             try:
-                http_port = int(get_config().get("serverport", 9000))
+                from lyrion.config import public_http_port
+                http_port = public_http_port()
             except Exception:
                 http_port = 9000
             # Local IP + stable UUID like the real LMS (prefs 'server_uuid').
@@ -2678,19 +2681,22 @@ class JSONRPCAPI:
                 "version": __version__,
                 "uuid": server_uuid,
                 "name": server_name,
-                # Perl gibt hier seinen HTTP-Port aus (live: 9000). Wir nennen
-                # dagegen den NATIVEN Cometd-Port (9080), also genau den, den
-                # TLV- und JSON-Beacon ankündigen: Jive/SqueezePlay liest dieses
-                # Feld und wechselt darauf für seine weiteren Verbindungen
-                # (gemessen 2026-09-14: mit "httpport": 9000 hielt SqueezePlay
-                # zwei Sessions parallel — ASGI 9000 plus nativ 9080 — und
-                # flatterte; auf dem ASGI-Pfad endet der Streaming-Stream nach
-                # RETRY_DELAY (5 s) Stille, ohne Events in der Zeit => Abriss,
-                # Neu-Handshake, "Verbindung geht mal und mal nicht").
-                # Der native Port bedient Jive direkt und proxyt /jsonrpc.js an
-                # die Web-App (networking/cometd_stream.py:202-230), ist also
-                # für alle Clients die richtige Adresse.
-                "httpport": int(get_config().get("cometd_stream_port") or 9080),
+                # Perl reports its ONE HTTP port here (live: 9000). Now we
+                # report ours: `public_http_port` — the native, pipelining
+                # frontend, which is also what the TLV and the JSON presence
+                # beacon announce. Jive/SqueezePlay reads this field and
+                # switches to it for its further connections, so all three
+                # announcements MUST name the same port: while the TLV said
+                # 9080 and this field 9000, SqueezePlay held two sessions in
+                # parallel (ASGI plus native) and fluttered — on the ASGI path
+                # the streaming response ended after RETRY_DELAY (5 s) of
+                # silence without events => abort, re-handshake, "Verbindung
+                # geht mal und mal nicht" (measured 2026-09-14). The frontend
+                # answers Jive's Bayeux POSTs on its own socket and relays
+                # /jsonrpc.js, artwork and /stream.mp3 to the internal ASGI
+                # app (networking/cometd_stream.py `_relay_request`), so one
+                # port is enough for every client.
+                "httpport": http_port,
                 "ip": local_ip,
                 "player count": len(players),
                 "other player count": 0,

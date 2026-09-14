@@ -9,7 +9,10 @@
 set -uo pipefail
 
 cd /home/keiner/Downloads/git/slimserver-python || exit 1
-PORTS=(9000 9090 9080 3483)
+# Single-port layout (Perl parity): 9000 is the PUBLIC port served by the
+# native frontend, 9001 the internal ASGI app behind it (loopback), 9090 the
+# CLI listener and 3483 SlimProto/discovery. 9080 no longer exists.
+PORTS=(9000 9001 9090 3483)
 LOG=/tmp/lyrion-live.log
 
 port_count() {

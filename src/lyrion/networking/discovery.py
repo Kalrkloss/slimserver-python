@@ -49,8 +49,11 @@ logger = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 DISCOVERY_PORT = 3483
-DEFAULT_HTTP_PORT = 9000      # Perls Standard-httpport (nicht angekündigt)
-DEFAULT_NATIVE_PORT = 9080    # nativer Cometd-Port — wird im JSON-TLV angekündigt
+#: The ONE public HTTP port — announced in the JSON TLV, exactly like Perl's
+#: ``httpport`` (live Perl: "JSON\x049000"). The single-port consolidation
+#: made 9080 obsolete: the native server that used to live there is now the
+#: frontend ON this port.
+DEFAULT_HTTP_PORT = 9000
 
 
 def server_uuid() -> str:
@@ -350,29 +353,20 @@ class DiscoveryService:
             except Exception:
                 pass
         try:
-            from lyrion.config import get_config
-            # Advertise the native Cometd streaming port (9080): Jive apps
-            # (SqueezePlay, Orange Squeeze) run their Bayeux session against
-            # it and it is the path proven to work with them. Jive builds
-            # EVERY other URL from this address too (artwork /music/...,
-            # /html/...), so the native server answers non-Cometd GETs with
-            # a 302 redirect to the real web port — that keeps cover art
-            # working without moving the Cometd endpoint.
-            # Angekündigt wird der NATIVE Cometd-Port (9080), NICHT Perls
-            # Webport 9000 (live Perl: "JSON\x049000"). Grund (mehrfach
-            # gemessen 2026-09-13/14): SqueezePlay pipelinet mehrere POSTs auf
-            # EINEM Socket, bevor es liest — uvicorn/h11 puffern aber bis zum
-            # Response-Ende (h11_impl.py:191-197/:278,
-            # httptools_impl.py:291-297), egal wie früh der Stream endet
-            # (Cometd-Fix 63056abd7 löst nur den Fall "Request hinter offenem
-            # Stream"). Auf 9000 angekündigt => "SqueezePlay kann nicht
-            # verbinden"; auf 9080 => SqueezePlay läuft.
-            # Der native Server proxyt GET/HEAD und POST /jsonrpc.js an 9000
-            # weiter (cometd_stream.py:202-230, :270-283), damit auch
-            # JSON-RPC-Clients bedient werden. Offen: Squeeze Client braucht
-            # auf 9080 noch eine Lösung (eigene Aufgabe).
-            http_port = int(get_config().get("cometd_stream_port")
-                            or DEFAULT_NATIVE_PORT)
+            from lyrion.config import public_http_port
+            # Announce the ONE public port, exactly like the Perl LMS
+            # (live Perl: "JSON\x049000"). The native frontend owns it
+            # (networking/cometd_stream.py): it answers the Bayeux POSTs
+            # itself — SqueezePlay pipelines several of them on ONE socket
+            # before reading, which uvicorn/h11 cannot (h11_impl.py:191-197,
+            # httptools_impl.py:291-297) — and RELAYS everything else
+            # (artwork, /html/..., /jsonrpc.js, /stream.mp3) to the internal
+            # ASGI app as a streaming pipe, so a single advertised port serves
+            # every client. Announcing a second port here (9080) is what made
+            # Jive/SqueezePlay hop between transports and flutter
+            # (measured 2026-09-14: TLV 9080 + beacon 9000 => two parallel
+            # sessions, ASGI streaming stream aborted after RETRY_DELAY).
+            http_port = public_http_port()
         except Exception:
             http_port = DEFAULT_HTTP_PORT
 
@@ -521,7 +515,9 @@ class DiscoveryService:
         """Best-effort (ip, http_port) of THIS server for discovery replies.
 
         The IP is the local address reachable from the requester's subnet
-        probe; the port comes from the running config ('serverport').
+        probe; the port is the ONE public HTTP port (``public_http_port``) —
+        the native frontend answers every client there, so discovery must
+        never name the internal ASGI port.
         """
         import socket as _socket
         local_ip = "0.0.0.0"
@@ -538,10 +534,10 @@ class DiscoveryService:
             except Exception:
                 continue
         try:
-            from lyrion.config import get_config
-            http_port = int(get_config().get("serverport", 9000) or 9000)
+            from lyrion.config import public_http_port
+            http_port = public_http_port()
         except Exception:
-            http_port = 9000
+            http_port = DEFAULT_HTTP_PORT
         return local_ip, http_port
 
     async def _handle_ssdp(
