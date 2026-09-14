@@ -283,19 +283,36 @@ def _defeat_pref_default() -> Any:
 _REMOTE_TRACK_IDS: dict[str, int] = {}
 _REMOTE_TRACK_URLS: dict[int, str] = {}
 
-#: Perl's cover-less remote fallback (``_addJiveSong``, Queries.pm:5628-5630
-#: — ``/html/images/radio.png`` through the skin alias).  Our HTTP layer only
-#: serves the skin-qualified file (curl 2026-09-13: skin-relative → 404,
-#: ``/html/EN/html/images/radio.png`` → 200 ``image/png``), and it is the same
-#: image file Perl points at.
-RADIO_PLACEHOLDER_ICON = "/html/EN/html/images/radio.png"
+#: Perl's cover-less remote fallback — the *skin-relative* spelling
+#: ``Slim/Control/Queries.pm:5633`` (``_addJiveSong``) and
+#: ``Slim/Player/Player.pm:620-623`` (display status) hand out literally
+#: ``/html/images/radio.png``, and ``Slim/Schema/RemoteTrack.pm``'s default
+#: artwork_url for a stream is the same path without the leading slash (live
+#: Perl 9.1.1 ``status - 1 tags:ABCDEKJZlcuxyrtS`` on a plain stream:
+#: ``"artwork_url": "html/images/radio.png"``, ``"coverid":
+#: "-94115161401160"``).
+#:
+#: The path used to 404 here (``_serve_static`` had no skin fallback), so this
+#: constant carried the ``/html/EN/…`` variant that happened to answer.  The
+#: static resolver now serves Perl's spelling as well (``HTML/EN/html/images/``
+#: skin fallback, see ``app._static_path_variants``), so the emitted path is
+#: Perl's character for character.
+RADIO_PLACEHOLDER_ICON = "/html/images/radio.png"
 
-#: Our own stand-in for the current cover-less stream item's ``artwork_url``
-#: (non-menu ``playlist_loop`` shape, api.py `_json_player_status`).  It is
+#: The same default for the ``artwork_url`` FIELD: Perl's ``$track->coverurl``
+#: for a remote track without a stored logo returns the skin-relative path
+#: (live Perl: ``"html/images/radio.png"`` for a bare stream URL,
+#: ``"html/images/favorites.png"`` for a favourites entry that carries that
+#: icon — the value comes from the stored station entry, so it is data, not a
+#: constant).
+REMOTE_ART_FALLBACK = "html/images/radio.png"
+
+#: Marker for the ``icon``/``icon-id`` split of the *Menu* shape: our own
+#: stand-in for the current cover-less stream item's ``artwork_url``.  It is
 #: NOT artwork: Perl's precedence (``_addJiveSong``, Queries.pm:5618-5630)
 #: must not mistake it for a real ``artwork_url``, otherwise the radio
 #: placeholder never applies to the Menu-Status item.
-_REMOTE_ART_PLACEHOLDER = "/html/images/favorites.png"
+_REMOTE_ART_PLACEHOLDER = REMOTE_ART_FALLBACK
 
 
 def _remote_track_id(url: object) -> int:
@@ -796,6 +813,48 @@ def _folder_dir_by_id(value: object, root: str) -> str | None:
     if wanted < 0:
         return None
     return _bmf_dir_index(root).get(wanted)
+
+
+def _bmf_index_dir(index_path: str, root: str) -> str | None:
+    """Directory Perl's bmf ``item_id`` index path points at.
+
+    Perl's „Musikordner" feed hands every row ``params.item_id`` — the
+    *index path* of that folder inside the feed — and the client sends it
+    straight back on the next ``browselibrary items`` request.  Live Perl
+    9.1.1 (2026-09-14): the top rows carry ``item_id: "0"``/``"1"``/``"2"``,
+    and the tapped child of row 0 answers with ``item_id: "0.0"`` — Perl
+    resolves those against the feed it has cached in the browse session
+    (``Slim/Control/XMLBrowser.pm``'s ``SID``-indexed feed cache).
+
+    This port keeps no such cache, so an index path is resolved by walking
+    the same folder tree in the same order the rows were listed in
+    (:func:`_bmf_children`: folders sorted, then the directory's loose
+    files).  ``None`` = not resolvable → the caller keeps its fallback.
+
+    SqueezePlay's log line
+    ``_getArtworkThumbSink(/html/images/genres_40x40_m.png)`` shows the same
+    "index back into the current window" pattern; for the folder feed the
+    value is what Perl sends, so it must at least resolve to a directory.
+    """
+    text = str(index_path or "").strip()
+    if not text:
+        return None
+    directory = root
+    for comp in text.split("."):
+        comp = comp.strip()
+        if not comp.isdigit():
+            return None
+        idx = int(comp)
+        rows, _total = _bmf_children(directory, 0, idx + 1)
+        if idx >= len(rows):
+            return None
+        row = rows[idx]
+        if str(row.get("type") or "") != "folder":
+            return None
+        directory = str(row.get("path") or "")
+        if not directory:
+            return None
+    return directory
 
 
 def _bmf_children(directory: str, start: int = 0,
@@ -3385,7 +3444,7 @@ class JSONRPCAPI:
         # ── browselibrary (SqueezePlay My-Music children; LMS 'browselibrary
         #    items <start> <count> mode:<albums|artists|genres|years|bmf|search>') ──
         if cmd == "browselibrary":
-            return await self._json_browselibrary(cmd, args)
+            return await self._json_browselibrary(cmd, args, pid)
 
         # ── contextmenu (SqueezePlay press-and-hold context menus) ─────
         # Perl parity: a *wrapper* around '<menu>info items <index> <qty>
@@ -4572,8 +4631,31 @@ class JSONRPCAPI:
             """
             return title + "\n" + " - ".join(p for p in (artist, album) if p)
 
+        def _artwork_id(inf: dict) -> object | None:
+            """The id our ``/music/<id>/cover.jpg`` route accepts for a track.
+
+            Perl publishes ``tracks.coverid`` / ``albums.artwork`` there
+            (``Slim/Control/Queries.pm:5713-5731`` tag map c/J, ``:5789-5791``
+            colMap; live Perl ``songinfo … tags:KJcj`` on a track with art:
+            ``{"artwork_track_id": "232bde3b"}`` ``{"coverid": "232bde3b"}``
+            ``{"coverart": "1"}``).  Our importer never fills the schema's
+            ``tracks.cover``/``coverid`` columns, so the ALBUM id — the value
+            every other cover field in this port already uses
+            (``_load_tracks`` sets ``artwork_url = /music/<album_id>/cover.jpg``)
+            — is the id we publish.  ``None`` = the album has no artwork, and
+            then Perl omits the fields too (``addResultLoopIfValueDefined``,
+            ``:864``).
+            """
+            if inf.get("artwork_url") and inf.get("album_id"):
+                return inf["album_id"]
+            cover = inf.get("cover")
+            if cover not in (None, "", 0, "0"):
+                return cover
+            return None
+
         for i, tid in enumerate(playlist_ids):
             tid_local = _local_id(tid)
+            _simg = ""
             if tid_local is not None:
                 info = track_rows.get(tid_local, {})
                 title = info.get("title", "Unknown")
@@ -4617,39 +4699,78 @@ class JSONRPCAPI:
                 item["artist"] = info.get("artist", "")
                 item["album"] = info.get("album", "")
                 item["duration"] = duration
-            elif i == player.playlist_position:
-                # Enrich the CURRENT stream item so SqueezePlay's Now-Playing
-                # has artist/duration/url to render (Perl's playlist item is
-                # rich: artist/title/artwork_url/duration/url/remote).
-                item["url"] = str(tid)
-                item["track"] = _cur_track or item.get("title", "")
-                item["artist"] = _cur_artist or ""
-                item["album"] = ""
-                item["duration"] = _elapsed
-                # Artwork so the Now-Playing shows a placeholder for
-                # cover-less streams (Perl provides artwork_url). Prefer a
-                # stored station logo, else the heart placeholder.
-                _simg = getattr(player, "stream_images", {}).get(str(tid), "") or ""
-                item["artwork_url"] = _simg or "/html/images/favorites.png"
-                item["coverart"] = 1
+            else:
+                # Perl's remote-track field set (`_songData`, Queries.pm:
+                # 5940-6120 over a RemoteTrack — live Perl 9.1.1 answered a
+                # stream item with exactly `id`, `title`, `url`, `remote`,
+                # `coverid`, `artwork_url`): the artwork fields are NOT
+                # optional there.  `coverid` is the RemoteTrack id (the same
+                # negative number as `id`, RemoteTrack.pm:317 → live
+                # `"coverid": "-94115161401160"`) and `artwork_url` is
+                # `$track->coverurl`: the stored station logo, else the
+                # skin-relative default `html/images/radio.png`.
+                _simg = str(getattr(player, "stream_images", {}).get(str(tid), "")
+                            or "")
+                if _simg.startswith("/"):
+                    # Perl's field value is skin-relative (no leading slash);
+                    # SqueezePlay then asks for /html/EN/<value> (the skin
+                    # base), Squeeze Client for the origin + "/" + value — both
+                    # resolve against the fixed static resolver.
+                    _simg = _simg[1:]
+                item["coverid"] = item["id"]
+                item["artwork_url"] = _simg or REMOTE_ART_FALLBACK
+                if tag_ok("x"):
+                    # Perl emits `remote` only for tag x (:5994-5996), but the
+                    # ARTWORK fields above stay unconditional: this port's
+                    # clients read them without listing the tag letter (the
+                    # crash class this change fixes), and a missing field is
+                    # what kills them.
+                    item["remote"] = 1
+                if i == player.playlist_position:
+                    # Enrich the CURRENT stream item so SqueezePlay's
+                    # Now-Playing has artist/duration/url to render.
+                    item["url"] = str(tid)
+                    item["track"] = _cur_track or item.get("title", "")
+                    item["artist"] = _cur_artist or ""
+                    item["album"] = ""
+                    item["duration"] = _elapsed
             for code, field in TAG_FIELDS.items():
                 if not tag_ok(code):
+                    continue
+                if code in ("c", "j", "J"):
+                    # coverid / coverart / artwork_track_id — the three fields
+                    # Perl fills from the DB (Queries.pm:5713-5731 tag map,
+                    # live `songinfo … tags:KJcj`: artwork_track_id + coverid +
+                    # coverart "1").  Keyed on the TAG letter, not on the
+                    # field name: the previous check compared the field
+                    # against "cover", a name no TAG_FIELDS entry uses — so
+                    # every local row silently lost its cover id.
+                    # The value does NOT come from ``info["cover"]`` either:
+                    # our importer never fills the schema's ``tracks.cover``
+                    # column, so the album-artwork id is derived instead (see
+                    # _artwork_id).
+                    art_id = _artwork_id(info)
+                    if art_id is not None:
+                        if tag_ok("c"):
+                            item["coverid"] = art_id
+                        if tag_ok("j"):
+                            item["coverart"] = 1
+                        if tag_ok("J"):
+                            item["artwork_track_id"] = art_id
+                    elif tag_ok("j"):
+                        # Perl: `'j' => sub { $c->{'tracks.cover'} ? 1 : 0 }`
+                        # (:5782) — coverart is present for every row; 1 only
+                        # for a local track whose album carries artwork, and
+                        # "0" for a remote stream (live Perl status of a
+                        # stream: `"coverart": "0"`).  A client that reads it
+                        # to decide between cover art and the default icon
+                        # needs the field, not its absence.
+                        item["coverart"] = 0
                     continue
                 value = info.get(field)
                 if value is None or value == "":
                     continue
-                if field == "cover":
-                    # coverid/coverart/artwork for the /music/<id>/cover.jpg
-                    # route (LMS convention).
-                    if tag_ok("c"):
-                        item["coverid"] = value
-                    if tag_ok("j"):
-                        item["coverart"] = 1
-                    if tag_ok("J"):
-                        item["artwork_track_id"] = value
-                    if tag_ok("K"):
-                        item["artwork_url"] = f"/music/{value}/cover.jpg"
-                elif field == "remote":
+                if field == "remote":
                     item["remote"] = 1 if value else 0
                 else:
                     item[field] = value
@@ -4671,29 +4792,31 @@ class JSONRPCAPI:
             item["params"] = params
             # Perl marks every playable jive item as style 'itemplay'.
             item["style"] = "itemplay"
-            # Artwork (Perl _addJiveSong, Queries.pm:5619-5629):
-            # artwork_url -> 'icon', else coverid/artwork_track_id ->
-            # 'icon-id', else the radio placeholder for a cover-less remote
-            # item. SqueezePlay reads both (Player.lua:282).
-            _art = item.get("artwork_url") or info.get("artwork_url") or ""
-            if _art and _art != _REMOTE_ART_PLACEHOLDER:
-                item["icon"] = _art
-            elif info.get("cover"):
-                # Jive builds '/music/' .. iconId .. '/cover' .. size from
-                # `icon-id`/`icon` (SlimServer.lua:1189) — a URL here would
-                # be concatenated into garbage and the cover never loads.
-                item["icon-id"] = str(info["cover"])
-                item["icon"] = f"music/{info['cover']}/cover"
-            elif tid_local is None:
-                # "send radio placeholder art for remote tracks with no art"
-                # — Perl's fallback (Queries.pm:5628-5630).  Perl names the
-                # skin-relative ``/html/images/radio.png``; our HTTP layer
-                # only serves the skin-qualified file, so we emit the path
-                # that really answers (curl 2026-09-13: ``/html/images/
-                # radio.png`` → 404, ``/html/EN/html/images/radio.png`` →
-                # 200 image/png; Squeezer prefixes the origin either way,
-                # ``Util.getAbsoluteUrl`` Util.java:239-245).
-                item["icon-id"] = RADIO_PLACEHOLDER_ICON
+            # Artwork for the JIVE clients (Perl _addJiveSong, Queries.pm:
+            # 5618-5633): artwork_url -> 'icon', else coverid/artwork_track_id
+            # -> 'icon-id', else the radio placeholder for a cover-less remote
+            # item.  SqueezePlay reads both (Player.lua:282), Squeezer reads
+            # icon-id first (JiveItem.java:250).
+            if tid_local is None:
+                if _simg:
+                    item["icon"] = _simg
+                else:
+                    # "send radio placeholder art for remote tracks with no
+                    # art" — Queries.pm:5633, Perl's literal path.
+                    item["icon-id"] = RADIO_PLACEHOLDER_ICON
+            else:
+                _art = info.get("artwork_url") or ""
+                _aid = _artwork_id(info)
+                if _art:
+                    # A defined ``artwork_url`` wins in Perl (Queries.pm:
+                    # 5625-5627 sends it as 'icon' before looking at the ids).
+                    item["icon"] = _art
+                elif _aid is not None:
+                    # Jive builds '/music/' .. iconId .. '/cover' .. size from
+                    # `icon-id`/`icon` (SlimServer.lua:1189) — a URL here would
+                    # be concatenated into garbage and the cover never loads.
+                    item["icon-id"] = str(_aid)
+                    item["icon"] = f"music/{_aid}/cover"
             loop.append(item)
 
         # A negative/absent position must never index the list (-1 would hit
@@ -4747,18 +4870,38 @@ class JSONRPCAPI:
             _stream_img = getattr(player, "stream_images", {}).get(cur_url, "") or ""
             if _stream_img.startswith("html/"):
                 _stream_img = _stream_img[len("html/"):]
+            # Perl's remoteMeta is `_songData` over the stream
+            # (Queries.pm:4385-4391: `my $metadata = _songData($request,
+            # $track, $tags); $request->addResult('remoteMeta', $metadata)`) —
+            # i.e. THE SAME field set as the playlist item, artwork fields
+            # included.  Live Perl 9.1.1 (``status - 1 tags:ABCDEKJZlcuxyrtS``
+            # on a stream):
+            #   "remoteMeta": {"id": "-94115167939280", "title": "Life Breath
+            #   (oct12)", "artist": "Dj Fada 2", "addedTime": …, "artwork_url":
+            #   "html/images/favorites.png", "coverid": "-94115167939280",
+            #   "url": …, "remote": 1, "year": "0", "bitrate": "256kb/s CBR"}
+            # Missing artwork here is what a controller renders/crashes on:
+            # the fields below therefore mirror the item, not a hand-made
+            # subset (addedTime/bitrate stay out — this port stores neither
+            # for a stream; UNKLAR).
             remote_meta = {
-                # Perl's remoteMeta is _songData():5900-5955 over the stream —
-                # title/artist are the ICY-parsed pair (live Perl: title
-                # "pulchra somnium", artist "Goabert"), plus 'N' remote_title
-                # (tagMap :5717 / :5968-5981), the station name.
+                "id": _remote_track_id(cur_url),
                 "title": _cur_track or cur_info.get("title", ""),
                 "artist": _cur_artist or cur_info.get("artist", ""),
                 "album": cur_info.get("album", ""),
-                "remote_title": station_title,
-                "duration": cur_info.get("duration", 0) or 0,
+                "artwork_url": _stream_img or REMOTE_ART_FALLBACK,
+                "coverid": _remote_track_id(cur_url),
                 "url": cur_url,
+                "remote": 1,
+                "duration": cur_info.get("duration", 0) or 0,
+                # Tag 'N' — the station name (tagMap :5717, :5968-5981).
+                "remote_title": station_title,
             }
+            if tag_ok("y"):
+                # Perl's remoteMeta->{y} = 0 (remoteMeta defaults, :5904-5920
+                # and the tag map 'y' => 'tracks.year'); live Perl sends the
+                # STRING "0" for a stream.
+                remote_meta["year"] = "0"
 
         menu_block = None
         if "menu:menu" in (args or []):
@@ -6697,7 +6840,8 @@ class JSONRPCAPI:
         return await handle_contextmenu(
             self, pm, pid, [index, quantity, f"menu:{entity}"] + tokens)
 
-    async def _json_browselibrary(self, cmd: str, args: list[str]) -> dict:
+    async def _json_browselibrary(self, cmd: str, args: list[str],
+                                  pid: str | None = None) -> dict:
         """browselibrary items <start> <count> mode:<albums|artists|genres|
         years|bmf|search> — the My-Music children navigation.
 
@@ -6708,6 +6852,22 @@ class JSONRPCAPI:
         controllers render and navigate. Each item also carries the go/play
         actions so clients that drive navigation from actions work too.
         """
+        # Perl's ``<feed> playlist <verb>`` action — the target of the bmf
+        # feed's OWN base actions (``browselibrary playlist add|insert|play``,
+        # live Perl 9.1.1 ``browselibrary items 0 3 menu:1 mode:bmf``).
+        # ``Slim/Control/XMLBrowser.pm`` routes it to the feed's playlist
+        # command; this port has one such handler — the ``playlist`` command —
+        # which already resolves ``folder_id`` (Commands.pm:1887 allowed cmds
+        # load|insert|add|delete, :1354-1359 items).  Without this branch the
+        # request fell through to the ITEMS listing: a folder's "play" action
+        # answered the album list instead of loading the folder.
+        if args and str(args[0]) == "playlist":
+            sub = str(args[1]) if len(args) > 1 else ""
+            if sub in ("add", "insert", "play", "load"):
+                await self._json_control(None, pid, "playlist",
+                                         [sub] + [str(a) for a in args[2:]])
+            return {}
+
         nums = [int(s) for s in args if str(s).isdigit()]
         start = nums[0] if nums else 0
         count = nums[1] if len(nums) > 1 else 512
@@ -6720,13 +6880,25 @@ class JSONRPCAPI:
         # Accept all of them for bmf so a folder tap really descends;
         # a purely numeric item_id is a track id, not a folder path.
         if mode in ("bmf", "musicfolder") and not search:
-            for _k in ("folder_id", "url", "item_id"):
+            for _k in ("folder_id", "url"):
                 _tok = next((str(a)[len(_k) + 1:] for a in args
                              if str(a).startswith(_k + ":")
                              and str(a)[len(_k) + 1:].strip()), "")
-                if _tok and not (_k == "item_id" and _tok.isdigit()):
+                if _tok:
                     search = _tok
                     break
+        if mode in ("bmf", "musicfolder") and not search:
+            # Perl's canonical bmf drill: the tapped row's own ``params``
+            # (``item_id`` = the folder's index path inside the feed) rides
+            # back on the request and Perl resolves it against its cached
+            # feed.  We resolve the index path by walking the folder tree
+            # (``_bmf_index_dir``); a token that is no index path stays the
+            # legacy path/url token the older clients sent.
+            _tok = next((str(a)[len("item_id:") :] for a in args
+                         if str(a).startswith("item_id:")
+                         and str(a)[len("item_id:"):].strip()), "")
+            if _tok:
+                search = _bmf_index_dir(_tok, _bmf_music_root()) or _tok
         # Drill-down ids SqueezePlay merges from the parent item's
         # commonParams (album_id:45, artist_id:…, year:…, genre_id:…).
         filters: dict = {}
@@ -7061,8 +7233,26 @@ class JSONRPCAPI:
                 # a directory is a ``tracks`` row there, Queries.pm:2311),
                 # 'url' keeps the absolute path for older taps; the bmf
                 # branch accepts both (api._bmf_resolve_dir).
-                item["commonParams"] = {"folder_id": ident,
-                                        "url": str(r.get("path") or ident)}
+                #
+                # ``params`` is PERL's key for this feed: live Perl 9.1.1
+                # bmf rows carry exactly ``"params": {"item_id": "0",
+                # "isContextMenu": 1}`` and ``base.actions.go`` names
+                # ``itemsParams: "params"`` (menus.base_actions), so the tap
+                # sends ``browselibrary items … menu:browselibrary mode:bmf
+                # item_id:0 isContextMenu:1`` and drills.  We add folder_id/
+                # url INSIDE that same map: they are the tokens this server
+                # can resolve without Perl's browse-session feed cache
+                # (:func:`_bmf_index_dir` handles a bare item_id), and a
+                # client that drops unknown keys still descends.
+                _fpath = str(r.get("path") or ident)
+                item["params"] = {"item_id": str(start + pos),
+                                  "isContextMenu": 1,
+                                  "folder_id": ident, "url": _fpath}
+                # ``commonParams`` is this port's older spelling of the same
+                # map (Perl uses it for the albums/artists/years feeds, NOT
+                # for bmf); kept so in-tree readers that still merge it keep
+                # working.
+                item["commonParams"] = {"folder_id": ident, "url": _fpath}
                 # Perl bmf folder item (BrowseLibrary): add/add-hold/play
                 # carry the folder id, so they load the whole folder.
                 item["actions"] = {
@@ -7833,16 +8023,36 @@ class JSONRPCAPI:
                 if r["duration"] is not None:
                     fields.append(("duration", round(float(r["duration"]), 3)))
                 al = db.execute(
-                    "SELECT al.id, al.title FROM albums al JOIN tracks_albums ta "
+                    "SELECT al.id, al.title, al.artwork, al.artwork_front "
+                    "FROM albums al JOIN tracks_albums ta "
                     "ON ta.album = al.id WHERE ta.track = ? LIMIT 1",
                     (r["id"],)).fetchone()
+                # Artwork ids — Perl's songinfo DEFAULT tag set contains c/j:
+                # live `songinfo 0 10 track_id:155361` (no tags) answers
+                # `{"coverid": "067cd484"}` and `{"coverart": "1"}`, while
+                # `tags:gald` omits both (tagMap c/J/j, Queries.pm:5713-5725).
+                # The id published here is the one our /music/<id>/cover.jpg
+                # route accepts (see _artwork_id in the status builder): this
+                # port's importer leaves the schema's tracks.cover empty and
+                # the album id is what every other cover field carries.
+                has_art = bool(al and (al["artwork"] or al["artwork_front"]))
+                if has_art and ((not tags) or "c" in tags):
+                    fields.append(("coverid", str(al["id"])))
                 if al:
                     fields.append(("album_id", str(al["id"])))
                 if r["filesize"]:
                     fields.append(("filesize", str(r["filesize"])))
                 if r["genre"]:
                     fields.append(("genre", r["genre"]))
-                # coverart: no artwork in the small test library — omit
+                # Artwork (see above): Perl answers artwork_track_id for tag J
+                # and always the coverart flag in its default set.
+                if has_art and "J" in tags:
+                    # Perl answers artwork_track_id only for tag J (its
+                    # default set has c/j but not J — live no-tags songinfo
+                    # carries coverid + coverart, no artwork_track_id).
+                    fields.append(("artwork_track_id", str(al["id"])))
+                if (not tags) or "j" in tags:
+                    fields.append(("coverart", "1" if has_art else "0"))
                 if al:
                     fields.append(("album", al["title"]))
                 if r["modtime"]:
@@ -7957,29 +8167,36 @@ class WebAPIHandler:
 
         from pathlib import Path
 
+        from lyrion.web.app import _STATIC_SIZE_RE, _resize_skin_image, \
+            _static_path_variants
+
         if path == "/":
             path = "/index.html"
         elif path == "/material" or path == "/material/":
             # Material Skin (Jive controller UI) SPA entry
             path = "/material/index.html"
 
-        rel = path.lstrip("/")
-        # static_dir already contains "html/" (set in __main__.py to
-        # <base>/html). A URL path like /html/images/x.png therefore must
-        # have its leading "html/" stripped, else the prefix is DOUBLED
-        # and every image 404s (<base>/html/html/images/x.png).
-        if rel.startswith("html/"):
-            rel = rel[len("html/"):]
-
         # Resolve the real path and enforce it stays inside the static root.
         # A naive string-prefix check on the unresolved path is bypassable
         # (e.g. "html/../secret.txt" literally starts with "html/").
         base = self._static_dir.resolve()
-        file_path = (self._static_dir / rel).resolve()
-        if not file_path.is_relative_to(base):
-            return 403, {}, b"Forbidden"
 
-        if not file_path.is_file():
+        def _resolve(rel: str) -> Path | None:
+            try:
+                resolved = (self._static_dir / rel).resolve()
+            except OSError:
+                return None
+            if not resolved.is_relative_to(base) or not resolved.is_file():
+                return None
+            return resolved
+
+        file_path: Path | None = None
+        for rel in _static_path_variants(path):
+            file_path = _resolve(rel)
+            if file_path is not None:
+                break
+
+        if file_path is None:
             # Jive asks for LMS size-encoded static images
             # ('/html/images/albums_40x40_m.png', 'genres_40x40_m.png', …)
             # after its 'artworkspec add 40x40_m squeezeplayskin'. We ship
@@ -7987,20 +8204,32 @@ class WebAPIHandler:
             # the unsized one — otherwise those list icons 404 (live client
             # log: '_getArtworkThumbSink(/html/images/genres_40x40_m.png)
             # error: HTTP/1.1 404 Not Found').
-            import re as _re_static
-
-            m = _re_static.match(
-                r"^(?P<base>.+?)_(\d+)x(\d+)(?:_[a-z])?(?P<ext>\.(?:png|jpe?g|gif))$",
-                file_path.name,
-            )
-            if m:
-                unsized = file_path.with_name(m.group("base") + m.group("ext"))
-                if unsized.is_relative_to(base) and unsized.is_file():
-                    file_path = unsized
-                else:
-                    return 404, {}, b"Not found"
-            else:
-                return 404, {}, b"Not found"
+            #
+            # Live Perl RESIZES for that request (curl 2026-09-14:
+            # /html/images/genres_40x40_m.png → 200 image/png 1514 B,
+            # radio_40x40_m.png → 200, 1961 B, 40x40 RGBA PNG); shipping the
+            # 512x512 original answered 200 too but sent ~15× the bytes, so
+            # the sized request is scaled here and the original is only the
+            # fallback when Pillow cannot read the file.
+            for rel in _static_path_variants(path):
+                m = _STATIC_SIZE_RE.match(Path(rel).name)
+                if not m:
+                    continue
+                unsized = _resolve(str(Path(rel).with_name(
+                    m.group("base") + m.group("ext"))))
+                if unsized is None:
+                    continue
+                try:
+                    raw = unsized.read_bytes()
+                except OSError:
+                    continue
+                resized = _resize_skin_image(
+                    raw, (int(m.group("w")), int(m.group("h"))))
+                return (200,
+                        {"Content-Type": "image/png",
+                         "Cache-Control": "max-age=604800"},
+                        resized if resized is not None else raw)
+            return 404, {}, b"Not found"
 
         import mimetypes
         mime, _ = mimetypes.guess_type(str(file_path))
@@ -8010,6 +8239,12 @@ class WebAPIHandler:
             # HTML without cache so UI updates are picked up immediately
             if mime == "text/html":
                 headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+            # Perl answers skin images with a one-week cache (live:
+            # Cache-Control: max-age=604800) — Jive re-fetches them per list
+            # otherwise.
+            elif (mime or "").startswith("image/") or mime in (
+                    "image/svg+xml",):
+                headers["Cache-Control"] = "max-age=604800"
             return 200, headers, content
         except Exception as e:
             return 500, {}, str(e).encode()

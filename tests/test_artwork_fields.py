@@ -299,6 +299,13 @@ _VERIFIED_PATHS = {
     "/html/EN/html/images/radio.png",
     "/music/1/cover.jpg",
     "/html/images/albums.png",
+    # Perl's own spelling of the radio placeholder — served by the skin
+    # fallback in app._static_path_variants since 2026-09-14 (curl: 200,
+    # 16749 B, the same file Perl answers).
+    "/html/images/radio.png",
+    # …and the doubled-skin spelling SqueezePlay builds from a
+    # skin-relative field (live client log 2026-09-14).
+    "/html/EN/html/images/favorites.png",
 }
 
 
@@ -321,15 +328,16 @@ def test_emitted_artwork_paths_answer_on_the_live_server(path):
     assert status == 200, f"{path} → {status}"
 
 
-def test_the_path_perl_names_is_missing_here_and_must_not_be_emitted():
-    """``/html/images/radio.png`` is Perl's spelling but 404s on our server.
+def test_perl_radio_placeholder_path_is_served_now():
+    """``/html/images/radio.png`` is Perl's spelling and answers 200.
 
-    Kept as an executable note: if a later change routes the skin alias, this
-    test tells you the emitted constant can go back to Perl's exact string.
+    It used to 404 (``_serve_static`` had no skin fallback), which is why
+    ``RADIO_PLACEHOLDER_ICON`` carried the ``/html/EN/…`` spelling.  Perl
+    resolves a skin-relative URL against ``HTML/EN/``
+    (``Slim/Web/HTTP.pm`` + SkinManager); ``app._static_path_variants``
+    mirrors that order, so the constant is Perl's literal string again.
     """
-    status, _ = _get("/html/images/radio.png")
-    if status == 200:
-        pytest.skip("skin alias now resolves — RADIO_PLACEHOLDER_ICON may "
-                    "return to Perl's literal path")
-    assert status == 404
-    assert RADIO_PLACEHOLDER_ICON != "/html/images/radio.png"
+    assert RADIO_PLACEHOLDER_ICON == "/html/images/radio.png"
+    status, ctype = _get("/html/images/radio.png")
+    assert status == 200, f"/html/images/radio.png → {status}"
+    assert "image/" in (ctype or "") or ctype == ""

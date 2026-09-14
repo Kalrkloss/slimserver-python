@@ -209,18 +209,64 @@ def base_actions(kind: str, filters: dict | None = None, start: int = 0,
                 "params": {"cmd": "add", "menu": 1}},
         "add-hold": add_hold_action(kind),
     }
+    if kind == "folder":
+        # ── Perl's "Musikordner" feed (mode:bmf) ─────────────────────────
+        # Live Perl 9.1.1 (read-only, 2026-09-14):
+        #   browselibrary items 0 3 menu:1 mode:bmf
+        #   base.actions.go = {"cmd": ["browselibrary", "items"],
+        #                      "itemsParams": "params",
+        #                      "params": {"mode": "bmf",
+        #                                 "menu": "browselibrary"}}
+        # i.e. the bmf feed's own commonVariables are ``params`` (not
+        # ``commonParams`` as in the albums/artists/years feeds) and its
+        # ``menu`` value is the FEED NAME, not ``1``.  The tap the client
+        # builds from that is
+        # ``browselibrary items … menu:1 mode:bmf menu:browselibrary
+        #   item_id:<index> isContextMenu:1`` — the item's own ``params``
+        # (see ``_browselibrary_menu_items``) supply the drill target.  Our
+        # previous shape pointed ``go`` at ``playControlParams`` with
+        # ``window.isContextMenu`` (the press-and-hold variant), so a plain
+        # tap produced no drill request at all: "Musikordner sieht nur die
+        # folder, kann sie aber nicht öffnen".
+        go_params: dict = {"mode": "bmf", "menu": "browselibrary"}
+        cm_action: dict = {
+            "player": 0, "cmd": ["browselibrary", "items"],
+            "itemsParams": "playControlParams",
+            "window": {"isContextMenu": 1},
+            "params": {"mode": "bmf", "_quantity": str(count),
+                       "_index": str(start), "menu": "1"},
+        }
+        folder_actions: dict = {
+            "go": {"player": 0, "cmd": ["browselibrary", "items"],
+                   "itemsParams": "params", "params": dict(go_params)},
+            "play": {"player": 0, "cmd": ["browselibrary", "playlist", "play"],
+                     "itemsParams": "params", "params": dict(go_params),
+                     "nextWindow": "nowPlaying"},
+            "add": {"player": 0, "cmd": ["browselibrary", "playlist", "add"],
+                    "itemsParams": "params", "params": dict(go_params)},
+            "add-hold": {"player": 0,
+                         "cmd": ["browselibrary", "playlist", "insert"],
+                         "itemsParams": "params", "params": dict(go_params)},
+            "more": {"player": 0, "cmd": ["browselibrary", "items"],
+                     "itemsParams": "params", "params": dict(go_params),
+                     "window": {"isContextMenu": 1}},
+            "playControl": cm_action,
+        }
+        if preset_fav_set:
+            folder_actions.update(set_preset_actions())
+        return folder_actions
+
     more = more_action(kind, filters)
     if more is not None:
         actions["more"] = more
-    if kind in ("tracks", "folder"):
-        # Context-menu only (press-and-hold) — a plain tap on an audio row or
-        # folder child must not re-open the same list.  Perl shares the shape
-        # with ``go`` (XMLBrowser.pm:973-983).
+    if kind == "tracks":
+        # Context-menu only (press-and-hold) — a plain tap on an audio row
+        # must not re-open the same list.  Perl shares the shape with ``go``
+        # (XMLBrowser.pm:973-983).
         cm_params: dict = {"mode": go_mode, "menu": 1,
                            "useContextMenu": 1,
                            "_index": start, "_quantity": count}
-        if kind == "tracks":
-            cm_params.update(filters or {})
+        cm_params.update(filters or {})
         cm_action: dict = {"player": 0, "cmd": ["browselibrary", "items"],
                            "itemsParams": "playControlParams",
                            "window": {"isContextMenu": 1},

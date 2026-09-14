@@ -540,9 +540,101 @@ def _resize_cover(data: bytes, size: tuple[int, int]) -> bytes:
         return data
 
 
-# Wurzel der ausgelieferten html/-Dateien (setzt create_app); enthaelt den
-# generischen Cover-Platzhalter, den Perl fuer Alben ohne Bild ausliefert.
+#: Wurzel der ausgelieferten html/-Dateien (setzt create_app); enthaelt den
+#: generischen Cover-Platzhalter, den Perl fuer Alben ohne Bild ausliefert.
 _STATIC_ROOT: Path | None = None
+
+#: Jive/LMS size-encoded skin images (``genres_40x40_m.png``).
+_STATIC_SIZE_RE = _re.compile(
+    r"^(?P<base>.+?)_(?P<w>\d+)x(?P<h>\d+)(?:_[a-z])?(?P<ext>\.(?:png|jpe?g|gif))$")
+
+
+def _static_path_variants(path: str) -> list[str]:
+    """Candidate file paths (relative to the static root) for one URL.
+
+    Perl serves ``html/`` as the web root and resolves every URL against the
+    *skin* directory: ``Slim/Web/HTTP.pm:466-490`` takes ``$uri->path()`` and
+    the SkinManager prepends the skin (``Slim/Web/Template/SkinManager.pm``),
+    so a request for the skin-relative path ``/html/images/radio.png`` is
+    answered from ``HTML/EN/html/images/radio.png``.  Live Perl 9.1.1 proves
+    exactly that pairing (curl, 2026-09-14):
+
+    ==========================================  ======  ====================
+    URL                                         status  served from
+    ==========================================  ======  ====================
+    ``/html/images/radio.png``                  200     ``HTML/EN/html/…``
+    ``/html/EN/html/images/radio.png``          404     (skin doubled)
+    ``/html/images/favorites.png``              200     14815 B
+    ``/html/EN/html/images/favorites.png``      404     (skin doubled)
+    ==========================================  ======  ====================
+
+    Our static root *is* Perl's ``HTML/`` (``html/``), and this port keeps a
+    second copy of some defaults under the bare ``images/`` directory, so the
+    Jive clients' two spellings (server root and skin-prefixed — the live
+    SqueezePlay log asks for both, ``/html/images/radio.png`` **and**
+    ``/html/EN/html/images/radio.png``) must resolve to one file.  Order
+    mirrors Perl: the path as sent, then without a leading ``html/`` (this
+    port's historical layout), then Perl's ``EN/`` skin fallback.
+
+    A stray ``EN/`` segment is also dropped (``/html/EN/html/images/x`` →
+    ``html/images/x``): Perl 404s that doubled spelling, but SqueezePlay
+    builds it from a *skin-relative* item field, and a 404 there is exactly
+    the "no default image" symptom this module fixes.  Being more tolerant
+    than Perl is the deliberate choice — it cannot hide a real file.
+    """
+    out: list[str] = []
+
+    def add(candidate: str) -> None:
+        candidate = candidate.lstrip("/")
+        if candidate and candidate not in out:
+            out.append(candidate)
+
+    raw = path.lstrip("/")
+    add(raw)
+    stripped = raw[len("html/"):] if raw.startswith("html/") else raw
+    add(stripped)
+    if stripped.startswith("EN/"):
+        inner = stripped[len("EN/"):]        # /html/EN/html/images/x → html/images/x
+        add(inner)
+        if inner.startswith("html/"):
+            # …and the layout this port keeps its defaults in (images/x).
+            add(inner[len("html/"):])
+    if raw.startswith("EN/"):
+        add(raw[len("EN/"):])
+    add("EN/" + raw)                        # Perl's HTML/EN/<path> skin fallback
+    if stripped != raw:
+        add("EN/" + stripped)
+    return out
+
+
+def _resize_skin_image(data: bytes, size: tuple[int, int]) -> bytes | None:
+    """Shrink a skin image to ``size`` as PNG — Perl's sized skin answer.
+
+    Jive adds its ``artworkspec`` size when it fetches a list icon, so it asks
+    for ``/html/images/radio_40x40_m.png``; live Perl answers 40x40 RGBA PNG
+    (1961 B for radio, curl 2026-09-14) while we used to ship the 512x512
+    original.  ``None`` means "keep the original bytes" (Pillow missing or a
+    broken file) — never a 404, the image data is what matters.
+    """
+    try:
+        import io as _io
+
+        from PIL import Image
+    except Exception:  # pragma: no cover - Pillow is a project dependency
+        return None
+    try:
+        with Image.open(_io.BytesIO(data)) as im:
+            im = im.convert("RGBA")
+            resample = getattr(
+                getattr(Image, "Resampling", Image), "LANCZOS", None
+            ) or getattr(Image, "LANCZOS", 1)
+            im.thumbnail(size, resample)
+            out = _io.BytesIO()
+            im.save(out, format="PNG")
+            return out.getvalue()
+    except Exception:  # noqa: BLE001 - a bad image must not break the route
+        return None
+
 
 
 def _set_static_root(path: str | Path | None) -> None:
