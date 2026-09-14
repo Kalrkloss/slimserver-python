@@ -50,6 +50,20 @@ def _run(coro):
     return asyncio.run(coro)
 
 
+class _Clock:
+    """Injectable wall clock — ``CometdManager(clock=...)``.
+
+    Lets a test drive Perl's disconnect grace (RETRY_DELAY * 2, Cometd.pm:1010
+    -1014) without sleeping ten real seconds.
+    """
+
+    def __init__(self, start: float = 1000.0) -> None:
+        self.now = start
+
+    def __call__(self) -> float:
+        return self.now
+
+
 def test_channel_glob_matches_perl_semantics():
     """``/foo/**`` and ``/foo/*`` mirror Perl Manager::add_channels.
 
@@ -507,11 +521,20 @@ def test_queue_is_bounded_and_drops_oldest():
     assert events[0]["data"]["n"] == 37                       # oldest dropped
 
 
-def test_abrupt_close_removes_client_and_queue():
-    """No /meta/disconnect (app killed, network gone) must still drop the
-    client — otherwise notify_* keeps filling a queue nobody reads."""
+def test_abrupt_close_keeps_the_client_until_the_grace_expires():
+    """No /meta/disconnect (app killed, network gone): Perl's grace decides.
+
+    webCloseHandler (Cometd.pm:1010-1014) unregisters the connection and arms
+    ``disconnectClient`` for RETRY_DELAY * 2 = 10 s, so a client that only
+    re-pooled its streaming socket keeps its subscriptions and its queued
+    events and does NOT have to re-handshake. The expired grace is what drops
+    the client and its queue — that is the bound this test used to pin by
+    removing the client on the spot.
+    """
+    clock = _Clock()
+
     async def run():
-        mgr = CometdManager(_StubRPC())
+        mgr = CometdManager(_StubRPC(), clock=clock)
         server = await start_cometd_server(mgr, "127.0.0.1", 0)
         try:
             reader, _writer, cid = await _open_stream(server)
@@ -523,23 +546,34 @@ def test_abrupt_close_removes_client_and_queue():
             except Exception:  # noqa: BLE001
                 pass
             for _ in range(60):
-                if mgr.get(cid) is None:
+                c = mgr.get(cid)
+                if c is not None and c.disconnect_at is not None:
                     break
                 await asyncio.sleep(0.05)
-            return cid, mgr.get(cid)
+            client = mgr.get(cid)
+            disconnect_at = client.disconnect_at if client is not None else None
+            if disconnect_at is not None:
+                clock.now = disconnect_at + 0.1
+            reaped = mgr.kill_idle_clients()
+            return cid, client, disconnect_at, reaped
         finally:
             server.close()
             await server.wait_closed()
 
-    _cid, client = _run(run())
-    assert client is None, "client + event queue must be dropped on close"
+    cid, client, disconnect_at, reaped = _run(run())
+    assert client is not None, "a closed stream must not erase the client"
+    assert disconnect_at is not None, "Perl's disconnectClient timer is missing"
+    assert reaped == [cid], "the expired grace must reap the client"
 
 
 def test_truncated_body_closes_cleanly():
     """A body shorter than Content-Length must not leak the socket or
-    surface an unhandled asyncio.IncompleteReadError."""
+    surface an unhandled asyncio.IncompleteReadError. The client itself is
+    kept for Perl's disconnect grace (Cometd.pm:1010-1014), not erased."""
+    clock = _Clock()
+
     async def run():
-        mgr = CometdManager(_StubRPC())
+        mgr = CometdManager(_StubRPC(), clock=clock)
         server = await start_cometd_server(mgr, "127.0.0.1", 0)
         loop = asyncio.get_running_loop()
         captured: list = []
@@ -558,21 +592,28 @@ def test_truncated_body_closes_cleanly():
             except Exception:  # noqa: BLE001
                 pass
             for _ in range(60):
-                if mgr.get(cid) is None:
+                c = mgr.get(cid)
+                if c is not None and c.disconnect_at is not None:
                     break
                 await asyncio.sleep(0.05)
-            return mgr.get(cid), captured
+            client = mgr.get(cid)
+            disconnect_at = client.disconnect_at if client is not None else None
+            if disconnect_at is not None:
+                clock.now = disconnect_at + 0.1
+            reaped = mgr.kill_idle_clients()
+            return client, disconnect_at, reaped, captured
         finally:
             loop.set_exception_handler(prev)
             server.close()
             await server.wait_closed()
 
-    client, captured = _run(run())
+    client, disconnect_at, reaped, captured = _run(run())
     names = [type(ctx.get("exception")).__name__
              for ctx in captured if ctx.get("exception")]
     assert "IncompleteReadError" not in names, captured
     assert "EOFError" not in names, captured
-    assert client is None, "truncated body must close the connection"
+    assert client is not None, "a truncated body must not erase the client"
+    assert reaped == [client.client_id], "the grace must reap it"
 
 
 def test_non_connect_post_on_stream_is_answered_as_a_chunk():
@@ -910,14 +951,17 @@ async def _stream_connect_cid(server, cid, request_id=9):
     return reader, writer
 
 
-def test_p0_connect_socket_close_removes_client():
+def test_p0_connect_socket_close_unregisters_the_client():
     """P0 case (c): the connection that processed /meta/connect owns the
-    client; its close removes it (Perl webCloseHandler, Cometd.pm:1003) even
-    while the client's other POST socket is still open."""
+    client; its close unregisters that connection (Perl webCloseHandler,
+    Cometd.pm:1003) while the client's other POST socket is still open — and
+    the client itself survives for the disconnect grace (:1010-1014) instead
+    of being erased, so its subscriptions are not lost."""
     player = _PLAYER
+    clock = _Clock()
 
     async def run():
-        mgr = CometdManager(_StubRPC())
+        mgr = CometdManager(_StubRPC(), clock=clock)
         server = await start_cometd_server(mgr, "127.0.0.1", 0)
         try:
             port = server.sockets[0].getsockname()[1]
@@ -937,22 +981,31 @@ def test_p0_connect_socket_close_removes_client():
             except Exception:  # noqa: BLE001
                 pass
             for _ in range(60):
-                if mgr.get(cid) is None:
+                c = mgr.get(cid)
+                if c is not None and c.disconnect_at is not None:
                     break
                 await asyncio.sleep(0.05)
-            removed = mgr.get(cid) is None
+            client = mgr.get(cid)
+            disconnect_at = client.disconnect_at if client is not None else None
+            if disconnect_at is not None:
+                clock.now = disconnect_at + 0.1
+            reaped = mgr.kill_idle_clients()
+            kept = bool(client and client.subscriptions)
             w2.close()
             try:
                 await w2.wait_closed()
             except Exception:  # noqa: BLE001
                 pass
-            return cid, removed
+            return cid, client, disconnect_at, kept, reaped
         finally:
             server.close()
             await server.wait_closed()
 
-    _cid, removed = _run(run())
-    assert removed, "closing the /meta/connect connection must drop the client"
+    cid, client, disconnect_at, kept, reaped = _run(run())
+    assert client is not None, "closing the /meta/connect socket erased the client"
+    assert disconnect_at is not None, "Perl's disconnectClient timer is missing"
+    assert kept, "the client's subscriptions were thrown away"
+    assert reaped == [cid], "the expired grace must reap the client"
 
 
 def test_p0_meta_disconnect_removes_client():

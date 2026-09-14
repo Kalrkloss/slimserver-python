@@ -667,15 +667,23 @@ def test_connect_with_unknown_clientid_gets_no_successful_connect_ack():
     assert advices[0]["error"] == "invalid clientId"
 
 
-def test_connection_lost_mid_push_drops_client_without_error():
-    """A client that vanishes during a push is dropped, no stray exception.
+def test_connection_lost_mid_push_keeps_the_client_for_the_grace():
+    """A client whose socket vanishes is unregistered, then reaped by the grace.
 
-    Perl's webCloseHandler -> disconnectClient (Cometd.pm:984-1020) is the
-    path; the events already handed to the transport are lost with the socket
-    (Perl removes them from the queue in ``get_pending_events`` too).
+    Perl's webCloseHandler -> disconnectClient (Cometd.pm:1003-1020) does NOT
+    delete the client: it unregisters the connection and arms the timer for
+    RETRY_DELAY * 2, so a jive app that only re-pooled its streaming socket
+    keeps its subscriptions and the events queued for it (the ASGI path fixed
+    this first, web/app.py:282-292 "the app then re-handshook and lost the
+    pending request"). The expired grace is what finally drops the client and
+    its queue — no stray asyncio exception either way.
     """
+    now = [1000.0]
+
     async def run():
-        mgr, _rec = _manager()
+        rec = _Recorder()
+        mgr = CometdManager(rec, clock=lambda: now[0])
+        mgr._dispatch = rec.dispatch
         server = await start_cometd_server(mgr, "127.0.0.1", 0)
         loop = asyncio.get_running_loop()
         captured: list = []
@@ -698,17 +706,26 @@ def test_connection_lost_mid_push_drops_client_without_error():
             except Exception:  # noqa: BLE001
                 pass
             for _ in range(80):
-                if mgr.get(cid) is None:
+                client = mgr.get(cid)
+                if client is not None and client.disconnect_at is not None:
                     break
                 await asyncio.sleep(0.05)
-            return cid, mgr.get(cid), captured
+            client = mgr.get(cid)
+            kept_subscriptions = bool(client and client.subscriptions)
+            disconnect_at = client.disconnect_at if client is not None else None
+            if disconnect_at is not None:
+                now[0] = disconnect_at + 0.1
+            reaped = mgr.kill_idle_clients()
+            return cid, client, kept_subscriptions, reaped, captured
         finally:
             loop.set_exception_handler(prev)
             server.close()
             await server.wait_closed()
 
-    cid, client, captured = _run(run())
-    assert client is None, "a connection lost mid-push must drop the client"
+    cid, client, kept_subscriptions, reaped, captured = _run(run())
+    assert client is not None, "a lost connection must not erase the client"
+    assert kept_subscriptions, "the client's subscriptions were thrown away"
+    assert reaped == [cid], "the expired grace must reap the client"
     names = [type(ctx.get("exception")).__name__
              for ctx in captured if ctx.get("exception")]
     assert names == [], f"unexpected asyncio errors: {captured}"

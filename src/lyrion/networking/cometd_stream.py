@@ -545,6 +545,35 @@ async def _handle_connection(manager, reader: asyncio.StreamReader,
                                         writer,
                                         f"{len(nack):x}\r\n".encode()
                                         + nack + b"\r\n", write_lock)
+                            else:
+                                # A POST whose body is NOT a Bayeux message
+                                # array: Jive builds EVERY server URL from the
+                                # advertised (Cometd) port, so its JSON-RPC
+                                # calls (``POST /jsonrpc.js``, HTTP/1.0 — 181 of
+                                # them in the live log) are pipelined onto this
+                                # very socket. Perl supports that explicitly
+                                # (HTTP.pm:2065-2072 "We also support pipelined
+                                # cometd requets") and the non-streaming loop
+                                # proxies them too — this branch used to write
+                                # NOTHING back: measured 2026-09-14 against the
+                                # unpatched server, the pipelined POST got
+                                # 0 bytes while the same POST on a plain socket
+                                # was answered; the caller blocked until its own
+                                # network deadline, exactly the "kann sich nicht
+                                # mit dem Server verbinden" the user saw when a
+                                # list was opened. Answer it like the
+                                # non-streaming loop does, as a complete HTTP
+                                # message written under the same lock as the
+                                # pushed chunks (the pipelined GET above does
+                                # the same: Perl interleaves independent
+                                # responses with the open chunked one,
+                                # addHTTPResponse HTTP.pm:1895-1960).
+                                logger.info("NativeCometd Folge-POST: %s (proxy)",
+                                            nxt.get("target", b"").decode(
+                                                "ascii", "replace"))
+                                head, payload = await _proxy_jsonrpc(
+                                    nb, web_port)
+                                await _send(writer, head + payload, write_lock)
                     finally:
                         push_task.cancel()
                         try:
@@ -554,15 +583,21 @@ async def _handle_connection(manager, reader: asyncio.StreamReader,
                         manager.connection_closed(stream_cid)
                         # The streaming connection is gone: client closed it,
                         # app was killed, or the body was truncated — no
-                        # /meta/disconnect ever arrives. Drop the client here,
-                        # but only while this connection is still its owner
-                        # (a newer connect on another socket may have taken
-                        # over). Perl does the same from webCloseHandler ->
-                        # disconnectClient (Cometd.pm:1003). A client that
-                        # never connected on this socket is only reaped by its
-                        # own connect connection, /meta/disconnect, or the idle
-                        # autokill (LONG_POLLING_AUTOKILL).
-                        manager.remove_if_owner(stream_cid, owner)
+                        # /meta/disconnect ever arrives. Do NOT remove the
+                        # client here: Perl's webCloseHandler only UNREGISTERS
+                        # the connection and arms ``disconnectClient`` for
+                        # RETRY_DELAY * 2 (Cometd.pm:1010-1014), and the next
+                        # /meta/(re)connect kills that timer (:283) — which is
+                        # what lets a client that merely re-pools its stream
+                        # socket keep its subscriptions and the events queued
+                        # for it. Removing it threw all of that away and the
+                        # app re-handshaked, losing the request it had just
+                        # sent (the ASGI path documents and fixes the same
+                        # thing, web/app.py:282-292 "the app then re-handshook
+                        # and lost the pending request"). A client that never
+                        # comes back is still reaped: the grace expires and
+                        # the idle sweep (LONG_POLLING_AUTOKILL) drops it.
+                        manager.release_connection(stream_cid, owner)
                     break
                 else:
                     # no connect: reply with acks AND any queued events.
@@ -582,9 +617,31 @@ async def _handle_connection(manager, reader: asyncio.StreamReader,
                         if not cid2:
                             resp = (m.get("data") or {}).get("response", "")
                             cid2 = _client_id_from_channel(resp)
-                        if cid2:
-                            events.extend(
-                                await manager.wait_for_events(cid2, timeout=0))
+                        if not cid2:
+                            continue
+                        # NEVER drain the queue of a client that still has a
+                        # live connection. Perl routes a finished request
+                        # result by the transport of the connection that
+                        # carried it (Cometd.pm:584-589): unless that is
+                        # long-polling it calls ``$manager->deliver_events``,
+                        # which writes into the client's REGISTERED connection
+                        # (Manager.pm:247-263), and only a client WITHOUT a
+                        # connection gets pending events appended to this
+                        # reply (``sendResponse`` -> ``get_pending_events``,
+                        # Cometd.pm:645). Jive keeps its streaming
+                        # /meta/connect on a SECOND socket ("2 pools, 1 for
+                        # chunked responses and 1 for requests",
+                        # Comet.lua:184) and reads its results off the connect
+                        # channel, so draining here STOLE the result out of
+                        # the open stream: the request looked unanswered and
+                        # the app re-handshaked (live 2026-09-14 12:40-12:41,
+                        # "kann sich nicht mit dem Server verbinden"). The
+                        # ASGI path guards this with the same check
+                        # (web/app.py:447-450).
+                        if manager.has_live_connection(cid2):
+                            continue
+                        events.extend(
+                            await manager.wait_for_events(cid2, timeout=0))
                     payload = json.dumps(replies + events).encode("utf-8")
                     writer.write(b"HTTP/1.1 200 OK\r\n"
                                  b"Content-Type: application/json\r\n"
