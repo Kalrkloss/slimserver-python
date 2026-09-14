@@ -189,10 +189,11 @@ async def _handle_streaming_connect(
         delivered = True
 
         # Keep the stream open and push event batches as they arrive. The
-        # uvicorn path (port 9000) serves clients that connect directly to
-        # :9000 (Squeezer manual address) — closing after 0.6 s broke their
-        # connection. Orange Squeeze (pipelined POSTs over one socket) is
-        # served by the native server on 9080.
+        # uvicorn path (internal :9001) serves clients relayed by the native
+        # frontend on the public port (:9000) — closing after 0.6 s broke
+        # their connection. Orange Squeeze (pipelined POSTs over one socket)
+        # is served by the native frontend itself (`public_http_port`, 9000;
+        # the separate 9080 native port was retired in commit 54a201363).
         #
         # The wait for events races the disconnect watcher: a push wakes the
         # wait (Perl Manager::deliver_events -> sendResponse), a vanished peer
