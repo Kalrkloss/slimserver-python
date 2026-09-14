@@ -51,9 +51,16 @@ Documented deviations from Perl (our data model forces them):
   icon column, so both fall back to ``html/images/favorites.png``.
 * ``base.actions.playControl.cmd`` is ``["favorites","items"]`` verbatim
   from Perl — we do not recompute it from the request tokens.
-* ``defeatDestructiveTouchToPlay`` (``base.go = base.playControl`` for
-  old clients) is not implemented; only the ``base.go = base.play``
-  branch of ``XMLBrowser.pm:1430`` is.
+* The fixtures were recorded on a **connected, idle** client, so Perl answered
+  the touch-to-play row (``goAction: "play"``, ``XMLBrowser.pm:1259-1267``).
+  The API resolves that per request (``_defeatDestructiveTouchToPlay``,
+  ``:1951-1983``): a request whose client the server does not know lands on
+  the defeated ``playControl`` row instead (``:1976`` ``|| !$client``; the
+  same happens in-process, because ``PlayerManager`` only knows clients that
+  are actually connected).  The ``idle_client`` fixture below registers the
+  mac these tests use in the player registry so the tested request looks like
+  the recorded one; the defeated branch is covered by
+  ``tests/test_radio_structure.py::test_station_row_defeated_branch_without_client``.
 """
 
 from __future__ import annotations
@@ -145,6 +152,35 @@ class _Favs:
         return True
 
 
+#: The mac the fixtures were recorded with (`tests/fixtures/perl_favorites_*
+#: .json` carry it in ``params[0]``) — an idle SqueezePlay/Squeezebox client.
+TEST_MAC = "1c:87:2c:47:fc:36"
+
+
+@pytest.fixture(autouse=True)
+def idle_client():
+    """Register ``TEST_MAC`` as a connected, idle player for every test.
+
+    Perl's ``_defeatDestructiveTouchToPlay`` asks ``$request->client``
+    (``XMLBrowser.pm:1976`` ``|| !$client``): the fixture answers were recorded
+    on a connected, idle client and therefore carry the touch-to-play row
+    (``goAction: "play"``, ``style: "itemplay"``, ``:1259-1267``).  Without a
+    registered client the port — like Perl — answers the defeated
+    ``playControl`` row, which is why these tests need the client.  The player
+    is removed again so no other test sees it.
+    """
+    from lyrion.player.manager import PlayerManager
+    from lyrion.player.state import PlayerState
+
+    pm = PlayerManager()
+    player = PlayerState(mac=TEST_MAC, name="Fixture Client",
+                         ip="192.168.1.225", port=49314, connected=True,
+                         power=True, mode="stop")
+    pm.players[TEST_MAC.upper()] = player
+    yield player
+    pm.players.pop(TEST_MAC.upper(), None)
+
+
 @pytest.fixture()
 def favs(monkeypatch):
     fake = _Favs()
@@ -153,7 +189,7 @@ def favs(monkeypatch):
     return fake
 
 
-def _items(args: list[Any], pid: str = "1c:87:2c:47:fc:36") -> dict:
+def _items(args: list[Any], pid: str = TEST_MAC) -> dict:
     """``args`` are the full sub-command tokens (`favorites items …`)."""
     rest = [str(a) for a in args]
     assert rest[0] == "items", rest
