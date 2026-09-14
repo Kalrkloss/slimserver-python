@@ -636,6 +636,502 @@ def _resize_skin_image(data: bytes, size: tuple[int, int]) -> bytes | None:
         return None
 
 
+# ---------------------------------------------------------------------------
+# ``/imageproxy/…`` — Perl's Slim::Web::ImageProxy (parity deviation D5)
+#
+# Perl serves radio/TuneIn logos over this route.  Every rule below is the
+# Perl rule with its source:
+#   * routing      ``Slim/Web/HTTP.pm:1208-1212`` → ``Slim/Web/Graphics.pm:150-153``
+#   * spec         ``Slim/Web/Graphics.pm:128-133`` (crop it out of the basename)
+#                  + ``:534-539`` (``parseSpec``)
+#   * proxy        ``Slim/Web/ImageProxy.pm:111-236`` (``getImage``),
+#                  ``:238-261`` (``_gotArtwork``), ``:263-295``
+#                  (``_gotArtworkError``), ``:297-360`` (``_resizeFromFile``),
+#                  ``:362-371`` (``_setHeaders``), ``:373-397`` (``_artworkError``),
+#                  ``:474-493`` (``getRightSize``), ``:531-533`` (cloud WebP
+#                  resizer, 9.1)
+#   * TuneIn logos ``Slim/Plugin/InternetRadio/TuneIn/Metadata.pm:44-62``
+#                  (``registerHandler``) + ``:507-559`` (``artworkUrl``)
+# ---------------------------------------------------------------------------
+
+#: ``ImageProxy.pm:136`` — ``my ($url) = $path =~ m|imageproxy/(.*)/[^/]*|``.
+#: Greedy, because the proxied URL contains slashes itself.
+_IMAGEPROXY_URL_RE = _re.compile(r"imageproxy/(.*)/[^/]*")
+
+#: ``Graphics.pm:131`` — the resize spec carved out of the basename:
+#: ``WxH[_mode][_bgcolor][.ext]``, every part optional.
+_IMAGEPROXY_SPEC_RE = _re.compile(
+    r"_?((?:[0-9X]+x[0-9X]+)?(?:_\w)?(?:_[\da-fA-F]+)?(?:\.\w+)?)$", _re.ASCII)
+
+#: ``Graphics.pm:536`` — ``parseSpec``.
+_IMAGEPROXY_PARSE_RE = _re.compile(
+    r"^(?:([0-9X]+)x([0-9X]+))?(?:_(\w))?(?:_([\da-fA-F]+))?(?:\.(\w+))?$",
+    _re.ASCII)
+
+#: ``ImageProxy.pm:145`` — ``$spec =~ /^\.(?:png|jpe?g)/i`` = "no resizing asked".
+_IMAGEPROXY_NO_RESIZE_RE = _re.compile(r"^\.(?:png|jpe?g)", _re.I)
+_IMAGEPROXY_SVG_RE = _re.compile(r"\.svg$", _re.I)
+_IMAGEPROXY_WEBP_RE = _re.compile(r"^https?:.*\.webp(?:$|\?)", _re.I)
+
+#: ``ImageProxy.pm:94`` — ``ONE_YEAR``.
+_IMAGEPROXY_ONE_YEAR = 86400 * 365
+
+#: ``ImageProxy.pm:96`` (9.1) — ``REDIRECT_IMAGE_TO_COMPATIBLE``.
+_IMAGEPROXY_CLOUD_RESIZER = "https://api.lms-community.org/img/compatible/"
+
+#: ``ImageProxy.pm:94`` — the proxied fetch asks for these formats.
+_IMAGEPROXY_ACCEPT = "image/jpeg,image/png;q=0.9,image/gif;q=0.1"
+
+#: ``Slim/Utils/Misc.pm:1199-1229`` — ``userAgentString('legacy')`` starts with
+#: ``iTunes/4.7.1`` so the CDNs hand out PNG/JPEG instead of WebP.
+_IMAGEPROXY_LEGACY_UA = (
+    "iTunes/4.7.1 (Linux; N; Linux; x86_64-linux; de; de_DE; "
+    "SqueezeCenter, Squeezebox Server, Lyrion Music Server) 9.2.0"
+)
+
+#: TuneIn logo sizes — ``Slim/Plugin/InternetRadio/TuneIn/Metadata.pm:507-517``
+#: (``t`` = 75x75, ``q`` = 145x145, ``d`` = 300x300, ``g`` = 600x600).
+_IMAGEPROXY_TUNEIN_SIZES = {75: "t", 145: "q", 300: "d", 600: "g"}
+
+#: ``Metadata.pm:49-62`` — the artwork URL patterns TuneIn registers.
+_IMAGEPROXY_HANDLERS = (
+    (_re.compile(
+        r"cloudfront\.net/(?:[ps]?\d+|gn/[A-Z0-9]+)[tqgd]?\.(?:jpe?g|png|gif)$"),
+     "tunein"),
+    (_re.compile(
+        r"cdn-profiles\.tunein\.com/.*/logo[tqgd]\.(?:jpe?g|png|gif)"),
+     "tunein"),
+    (_re.compile(
+        r"cdn-radiotime-logos\.tunein\.com/s\d+[tqdg]\.(?:jpe?g|png|gif)"),
+     "tunein"),
+)
+
+#: Artwork cache of ``ImageProxy.pm:499-523`` (Perl: 30 days on disk).  The
+#: observable behaviour is the byte-identical replay with ``_setHeaders``
+#: (``:126-134``), so an in-process LRU carries it.
+_IMAGEPROXY_CACHE_MAX = 256
+_imageproxy_cache: "OrderedDict[str, tuple[str, bytes]]" = OrderedDict()
+#: Perl's request queue (``ImageProxy.pm:194-214``) downloads a URL once and
+#: hands the same bytes to every queued caller — one lock per URL.
+_imageproxy_locks: dict = {}
+
+
+def _imageproxy_cache_get(key: str) -> tuple[str, bytes] | None:
+    hit = _imageproxy_cache.get(key)
+    if hit is None:
+        return None
+    _imageproxy_cache.move_to_end(key)
+    return hit
+
+
+def _imageproxy_cache_put(key: str, fmt: str, data: bytes) -> None:
+    _imageproxy_cache[key] = (fmt, data)
+    _imageproxy_cache.move_to_end(key)
+    while len(_imageproxy_cache) > _IMAGEPROXY_CACHE_MAX:
+        _imageproxy_cache.popitem(last=False)
+
+
+def _imageproxy_parse_spec(spec: str) -> tuple[str, str, str, str, str]:
+    """Perl ``Slim::Web::Graphics->parseSpec`` (``Graphics.pm:534-539``).
+
+    Returns ``(width, height, mode, bgcolor, ext)``; missing parts are ``""``
+    (Perl's ``undef``).
+    """
+    m = _IMAGEPROXY_PARSE_RE.match(spec or "")
+    if not m:
+        return ("", "", "", "", "")
+    return tuple(g or "" for g in m.groups())  # type: ignore[return-value]
+
+
+def _imageproxy_spec(path: str) -> str:
+    """Resize spec of an ``/imageproxy/…`` path (``Graphics.pm:128-133``)."""
+    m = _IMAGEPROXY_SPEC_RE.search(Path(path).name)
+    return m.group(1) if m else ""
+
+
+def _imageproxy_get_right_size(spec: str, sizes: dict) -> str | None:
+    """Perl ``Slim::Web::ImageProxy->getRightSize`` (``ImageProxy.pm:474-493``)."""
+    width, height, _mode, _bg, _ext = _imageproxy_parse_spec(spec)
+    if width or height:
+        # ``$width ||= $height; $height ||= $width;``
+        width = width or height
+        height = height or width
+
+        def _num(value: str) -> int:
+            # Perl compares numerically; 'X' (the auto axis) is 0.
+            try:
+                return int(value)
+            except ValueError:
+                return 0
+
+        minimum = max(_num(width), _num(height))
+        # smallest size larger than what we need
+        for size in sorted(sizes):
+            if size >= minimum:
+                return sizes[size]
+    return None
+
+
+def _imageproxy_tunein_artwork(url: str, spec: str) -> str:
+    """Perl ``artworkUrl`` — ``TuneIn/Metadata.pm:521-559``.
+
+    Picks the smallest TuneIn file that fits the requested spec.
+    """
+    # "shortcut for station logo" (:526-531)
+    m = _re.search(r"(/images/logo)(?:[tgqd])", url)
+    if m:
+        return f"{url[:m.start()]}{m.group(1)}g{url[m.end():]}"
+    m = _re.search(r"(cdn-radiotime-logos\.tunein\.com/s\d+)[tqdg](\.png)", url)
+    if m:
+        return f"{url[:m.start()]}{m.group(1)}g{m.group(2)}{url[m.end():]}"
+
+    # (:533-554)
+    m = _re.search(r"/([ps]?)(\d+)([tqgd]?)\.(jpg|jpeg|png|gif)$", url, _re.I)
+    logo = m.group(1) if m else ""
+    size = (m.group(3) if m else "").lower()
+    if not (logo and size):
+        size = "g"
+    ext = _imageproxy_parse_spec(spec)[4]
+    minimum = _imageproxy_get_right_size(spec, _IMAGEPROXY_TUNEIN_SIZES)
+    for key in sorted(_IMAGEPROXY_TUNEIN_SIZES):
+        if _IMAGEPROXY_TUNEIN_SIZES[key] == minimum:
+            size = minimum
+            break
+        if _IMAGEPROXY_TUNEIN_SIZES[key] == size:
+            break
+    if size:
+        url = _re.sub(rf"[tqgd]?\.{_re.escape(ext)}$", f"{size}.{ext}", url)
+    return url
+
+
+def _imageproxy_handler_for(url: str):
+    """Perl ``ImageProxy->getHandlerFor`` (``ImageProxy.pm:457-460``)."""
+    for pattern, kind in _IMAGEPROXY_HANDLERS:
+        if pattern.search(url):
+            return _imageproxy_tunein_artwork
+    return None
+
+
+def _imageproxy_is_http(url: str) -> bool:
+    return bool(_re.match(r"^https?:", url, _re.I))
+
+
+def _imageproxy_magic_type(data: bytes) -> str | None:
+    """``Slim/Utils/GDResizer.pm`` ``_content_type`` — type from magic bytes."""
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png"
+    if data[:3] == b"\xff\xd8\xff":
+        return "image/jpeg"
+    if data[:6] in (b"GIF87a", b"GIF89a"):
+        return "image/gif"
+    return None
+
+
+def _imageproxy_headers(fmt: str) -> dict[str, str]:
+    """Perl ``_setHeaders`` — ``ImageProxy.pm:362-371``."""
+    ct = fmt if "image" in fmt else f"image/{fmt}"
+    ct = ct.replace("jpg", "jpeg")
+    import time as _time
+    from email.utils import formatdate
+    return {
+        "Content-Type": ct,
+        "Cache-Control": f"max-age={_IMAGEPROXY_ONE_YEAR}",
+        "Expires": formatdate(_time.time() + _IMAGEPROXY_ONE_YEAR, usegmt=True),
+    }
+
+
+def _imageproxy_error_headers(fmt: str = "png") -> dict[str, str]:
+    """Perl ``_artworkError`` header block — ``ImageProxy.pm:388-394``."""
+    ct = fmt if "image" in fmt else f"image/{fmt}"
+    ct = ct.replace("jpg", "jpeg")
+    import time as _time
+    from email.utils import formatdate
+    return {
+        "Content-Type": ct,
+        # ``$response->expires( time() - 1 )`` + ``Cache-Control: no-cache``
+        "Cache-Control": "no-cache",
+        "Expires": formatdate(_time.time() - 1, usegmt=True),
+    }
+
+
+def _imageproxy_resize(data: bytes, spec: str, source_format: str,
+                       use_spec_ext: bool = True) -> tuple[bytes, str] | None:
+    """Perl ``Slim::Utils::ImageResizer``/``GDResizer::resize``.
+
+    ``ImageResizer.pm`` hands the spec to ``GDResizer`` (``GDResizer.pm:33-250``):
+    ``$mode`` defaults to ``'m'`` (:108-111, "default mode is always max"),
+    ``'m'``/``'p'`` keep the aspect ratio and never upscale (:140-171), the
+    output format is the requested extension and falls back to the source
+    format (:124-131) — except "Bug 17140" (:142-149) which switches to PNG
+    whenever the result would be padded.  ``_artworkError`` passes no format
+    (``use_spec_ext=False``), so the placeholder keeps the source format.
+    """
+    width, height, mode, _bg, ext = _imageproxy_parse_spec(spec)
+    want = (ext if use_spec_ext else "") or source_format or ""
+    want = want.split("/")[-1].lower()
+    fmt = "jpg" if want in ("jpg", "jpeg") else (want or "png")
+    try:
+        import io as _io
+
+        from PIL import Image
+    except Exception:  # pragma: no cover - Pillow is a project dependency
+        return None
+    try:
+        with Image.open(_io.BytesIO(data)) as im:
+            ow, oh = im.size
+            if not ow or not oh:
+                return None
+            # ``$width = undef if $width eq 'X'`` (:87-89)
+            req_w = None if (not width or width == "X") else int(width)
+            req_h = None if (not height or height == "X") else int(height)
+            if req_w and not req_h:
+                req_h = max(1, int(round(req_w * oh / ow)))
+            elif req_h and not req_w:
+                req_w = max(1, int(round(req_h * ow / oh)))
+            if not req_w and not req_h:
+                return None
+            box_w = int(req_w or ow)
+            box_h = int(req_h or oh)
+            resample = getattr(
+                getattr(Image, "Resampling", Image), "LANCZOS", None
+            ) or getattr(Image, "LANCZOS", 1)
+            out_im = im.copy()
+            if str(mode).lower() in ("c", "f") or (str(mode) == "F"
+                                                   and (box_w < ow or box_h < oh)):
+                # crop/fill to the exact box (Image::Scale keep_aspect => 0)
+                scale = max(box_w / ow, box_h / oh)
+                box = (max(1, int(round(ow * scale))),
+                       max(1, int(round(oh * scale))))
+                out_im = out_im.resize(box, resample)
+                left = (box[0] - box_w) // 2
+                top = (box[1] - box_h) // 2
+                out_im = out_im.crop((left, top, left + box_w, top + box_h))
+            else:
+                # mode 'm' (default) / 'p': fit, never upscale (:151-161)
+                out_im.thumbnail((box_w, box_h), resample)
+                # Bug 17140 (:140-149): a padded result must be PNG
+                if fmt != "png":
+                    if (oh / ow) != (box_h / box_w):
+                        fmt = "png"
+            out = _io.BytesIO()
+            if fmt == "jpg":
+                out_im.convert("RGB").save(out, format="JPEG", quality=85)
+            elif fmt == "gif":
+                out_im.convert("RGB").save(out, format="GIF")
+            else:
+                fmt = "png"
+                out_im.convert("RGBA").save(out, format="PNG")
+            return out.getvalue(), fmt
+    except Exception:  # noqa: BLE001 - a bad image must never break the route
+        return None
+
+
+def _imageproxy_placeholder_path() -> Path | None:
+    """Perl ``_artworkError`` source file — ``ImageProxy.pm:382``.
+
+    ``Slim::Web::HTTP::fixHttpPath($prefs->get('skin'), 'html/images/radio.png')``
+    — the skin's generic radio image.
+    """
+    root = _static_root()
+    if root is None:
+        return None
+    for rel in _static_path_variants("/html/images/radio.png"):
+        cand = root / rel
+        if cand.is_file():
+            return cand
+    return None
+
+
+async def _imageproxy_placeholder(spec: str) -> tuple[int, dict[str, str], bytes]:
+    """Perl ``_artworkError`` — ``ImageProxy.pm:373-397``.
+
+    It serves the skin's ``html/images/radio.png`` (resized to the spec) with
+    ``Cache-Control: no-cache``.  Perl deliberately does NOT set the error code
+    (``# $response->code($code);``, ``:391``), so a failed fetch answers **200**
+    with the placeholder — live Perl 9.1.1, 2026-09-14:
+    ``/imageproxy/test.jpg`` → ``200 image/png 16749 B`` and
+    ``/imageproxy/<defunct tunein id>/image.png`` → ``200 image/png`` (radio.png).
+    """
+    p = _imageproxy_placeholder_path()
+    data = None
+    if p is not None:
+        try:
+            data = p.read_bytes()
+        except OSError:
+            data = None
+    if data is None:
+        return 404, {"Content-Type": "text/plain"}, b"no artwork"
+    fmt = "png"
+    width, height = _imageproxy_parse_spec(spec)[:2]
+    if width or height:
+        res = _imageproxy_resize(data, spec, fmt, use_spec_ext=False)
+        if res is not None:
+            data, fmt = res
+    return 200, _imageproxy_error_headers(fmt), data
+
+
+def _imageproxy_read_file_url(url: str) -> tuple[bytes, str] | None:
+    """Perl ``Slim::Utils::Misc::pathFromFileURL`` (``ImageProxy.pm:208-211``)."""
+    from urllib.parse import unquote, urlparse
+
+    parsed = urlparse(url)
+    if parsed.scheme != "file":
+        return None
+    path = unquote(parsed.path)
+    if parsed.netloc and parsed.netloc not in ("", "localhost"):
+        path = f"//{parsed.netloc}{path}"
+    try:
+        data = Path(path).read_bytes()
+    except OSError:
+        return None
+    ctype = _MIME_BY_EXT.get(Path(path).suffix.lower(), "")
+    mime = _imageproxy_magic_type(data)
+    return data, (mime or ctype)
+
+
+async def _imageproxy_proxied(url: str, spec: str, cache_path: str,
+                             original_url: str | None = None
+                             ) -> tuple[int, dict[str, str], bytes]:
+    """Perl ``$handleProxiedUrl`` + ``_gotArtwork`` + ``_resizeFromFile``.
+
+    ``ImageProxy.pm:157-236``, ``:238-261``, ``:297-360``.
+    """
+    if not url or not (_imageproxy_is_http(url) or url.lower().startswith("file:")):
+        # :160-165 — "No artwork found, returning 404"
+        return await _imageproxy_placeholder(spec)
+
+    headers = {
+        "Accept": _IMAGEPROXY_ACCEPT,
+        "User-Agent": _IMAGEPROXY_LEGACY_UA,
+    }
+    # :199-205 (9.1) — WebP sources go through the LMS cloud resizer, because
+    # Image::Scale/ImageResize here cannot read WebP.
+    if original_url is None and _IMAGEPROXY_WEBP_RE.match(url):
+        from urllib.parse import quote
+        url = _IMAGEPROXY_CLOUD_RESIZER + quote(url, safe="~")
+        headers["X-LMS-Plugin-ID"] = "Slim::Web::ImageProxy"
+
+    if url.lower().startswith("file:"):
+        got = _imageproxy_read_file_url(url)
+        if got is None:
+            return await _imageproxy_placeholder(spec)   # → _gotArtworkError
+        data, ctype = got
+    else:
+        import httpx
+
+        try:
+            async with httpx.AsyncClient(follow_redirects=True,
+                                         timeout=30.0) as client:
+                resp = await client.get(url, headers=headers)
+        except Exception:  # noqa: BLE001 - network failures end in the placeholder
+            return await _imageproxy_placeholder(spec)
+        ctype = (resp.headers.get("content-type") or "").split(";")[0].strip().lower()
+        data = resp.content
+        if resp.status_code >= 400 or not data:
+            return await _imageproxy_placeholder(spec)
+
+        if "text" in ctype:
+            # :246-258 — many servers lie about playlists/images; guess from
+            # the magic bytes and error out when that fails too.
+            ctype = _imageproxy_magic_type(data) or ""
+            if not ctype:
+                return await _imageproxy_placeholder(spec)
+        elif "webp" in ctype:
+            # :269-288 — one conversion attempt via the cloud resizer, then 500.
+            if original_url is not None:
+                return await _imageproxy_placeholder(spec)
+            from urllib.parse import quote
+            return await _imageproxy_proxied(
+                _IMAGEPROXY_CLOUD_RESIZER + quote(url, safe="~"), spec,
+                cache_path, original_url=url)
+
+    ctype = (ctype or _imageproxy_magic_type(data) or "").lower()
+    # ``_resizeFromFile`` (:311-326): no resizing when the spec asks for the
+    # original extension and the source already is PNG/JPEG.
+    if (_IMAGEPROXY_NO_RESIZE_RE.match(spec)
+            and ctype in ("image/png", "image/jpeg", "image/jpg")):
+        fmt = ctype.split("/", 1)[1].replace("jpeg", "jpg")
+        _imageproxy_cache_put(cache_path, fmt, data)
+        return 200, _imageproxy_headers(fmt), data
+
+    # :328-356 — resize, cache, then answer with the resized bytes.
+    source_format = ctype.split("/", 1)[1] if ctype else ""
+    res = _imageproxy_resize(data, spec, source_format)
+    if res is None:
+        # :341-348 — "resize command failed, return 500" (again: the code is
+        # not sent, the placeholder goes out).
+        return await _imageproxy_placeholder(spec)
+    data, fmt = res
+    _imageproxy_cache_put(cache_path, fmt, data)
+    return 200, _imageproxy_headers(fmt), data
+
+
+async def _serve_imageproxy(path: str) -> tuple[int, dict[str, str], bytes]:
+    """``/imageproxy/<uri_escaped url>/<spec>`` — ``ImageProxy.pm:111-236``.
+
+    Perl's image proxy: it serves the artwork behind a URL locally, resizing
+    on the way — the route SqueezePlay/Squeezer use for radio and TuneIn logos
+    (``proxiedImage`` builds it, ``ImageProxy.pm:407-425``).
+    """
+    spec = _imageproxy_spec(path)
+
+    # Perl unescapes the request path before routing it (``Slim/Utils/Misc.pm
+    # :345-353`` ``unescape``, called from ``Slim/Web/HTTP.pm``), so the
+    # proxied URL arrives decoded — live 9.1.1, 2026-09-14: the lowercase
+    # ``%3a%2f%2f`` spelling answers from the *same* cache entry as the
+    # uppercase one.  ``proxiedImage`` escapes with ``uri_escape_utf8``
+    # (``ImageProxy.pm:424``), i.e. UTF-8 percent escapes.
+    from urllib.parse import unquote
+
+    path = unquote(path, encoding="utf-8", errors="replace")
+
+    # Cache lookup (:119-134): some clients ask with a trailing ".png" that is
+    # not part of the cache key, so both spellings are tried.
+    keys = [path]
+    if path.endswith(".png"):
+        keys.append(path[:-4])
+    for key in keys:
+        hit = _imageproxy_cache_get(key)
+        if hit is not None:
+            fmt, data = hit
+            return 200, _imageproxy_headers(fmt), data
+
+    m = _IMAGEPROXY_URL_RE.search(path)
+    url = m.group(1) if m else ""
+    if not url:
+        # :138-143 — "Artwork ID not found" → _artworkError
+        return await _imageproxy_placeholder(spec)
+
+    handler = _imageproxy_handler_for(url)
+    if handler is None and (
+            _IMAGEPROXY_SVG_RE.search(url)
+            or (_IMAGEPROXY_NO_RESIZE_RE.match(spec) and _imageproxy_is_http(url))):
+        # :145-155 — a ``.png``/``.jpg`` spec asks for the untouched original:
+        # 301 to the source URL (live 9.1.1: 301, Location, Content-Length 0).
+        return 301, {"Location": url,
+                     "Content-Type": "application/octet-stream",
+                     "Content-Length": "0"}, b""
+
+    if handler is not None:
+        # :229-233 — a registered handler (TuneIn) may rewrite the URL.
+        rewritten = handler(url, spec)
+        if rewritten is None:
+            return await _imageproxy_placeholder(spec)
+        url = rewritten
+
+    lock = _imageproxy_locks.get(url)
+    if lock is None:
+        import asyncio as _asyncio
+        lock = _imageproxy_locks[url] = _asyncio.Lock()
+    async with lock:
+        # Perl queued identical requests (:194-214) so the file is downloaded
+        # once; the queued callbacks all get the same bytes.
+        hit = _imageproxy_cache_get(path)
+        if hit is not None:
+            fmt, data = hit
+            return 200, _imageproxy_headers(fmt), data
+        return await _imageproxy_proxied(url, spec, path)
+
 
 def _set_static_root(path: str | Path | None) -> None:
     global _STATIC_ROOT
@@ -910,6 +1406,21 @@ def create_app(
                         return
                 await _serve_album_cover(cover_id, send, cover_size)
                 return
+
+        # Perl's ImageProxy (deviation D5): /imageproxy/<uri-escaped url>/<spec>.
+        # Perl routes it in Slim/Web/HTTP.pm:1208-1212 to
+        # Slim::Web::Graphics::artworkRequest → Slim/Web/Graphics.pm:150-153 →
+        # Slim::Web::ImageProxy->getImage (ImageProxy.pm:111-236).
+        if path.startswith("/imageproxy/") and method in ("GET", "HEAD"):
+            status, headers, body = await _serve_imageproxy(path)
+            await send({
+                "type": "http.response.start",
+                "status": status,
+                "headers": [(k.encode(), v.encode()) for k, v in headers.items()],
+            })
+            await send({"type": "http.response.body",
+                        "body": b"" if method == "HEAD" else body})
+            return
 
         # Cometd (Jive controllers + Material Skin). libcometd sends the
         # action as a path suffix (/cometd/handshake, /cometd/connect,
