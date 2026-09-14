@@ -7398,12 +7398,18 @@ class JSONRPCAPI:
             # Perl's $presetFavSet: _jivePresetBase runs only when an item
             # carried presetParams (XMLBrowser.pm:1131-1135,1427).
             preset_fav_set = any("presetParams" in it for it in menu)
+            # The windowStyle is an item property, not a per-mode constant
+            # (XMLBrowser.pm:1104-1127,1434-1441) — see menus.window_style_
+            # for_items.  Live Perl 9.1.1 (2026-09-14): albums icon_list,
+            # artists home_menu, genres/years/tracks/bmf text_list; this port
+            # answered icon_list for every one of them.
+            from lyrion.web import menus as _menus
             return {
                 "base": {"actions": self._browselibrary_menu_actions(
                     kind, filters, start, count, preset_fav_set)},
                 "count": int(total or len(menu)),
                 "offset": start,
-                "window": {"windowStyle": "icon_list"},
+                "window": _menus.window_style_for_items(menu),
                 "item_loop": menu,
             }
 
@@ -7710,7 +7716,15 @@ class JSONRPCAPI:
                                         "folder_id": ident},
                              "nextWindow": "nowPlaying"},
                 }
-                item["icon"] = "html/images/musicfolder.png"
+                # No icon on a folder row: Perl's bmf feed sets only
+                # type=playlist, url, passthrough and itemActions for a
+                # folder (BrowseLibrary.pm:2051-2083) — live Perl 9.1.1 bmf
+                # rows carry text/textkey/params/actions/type and no
+                # icon/icon-id (read-only probe 2026-09-14).  Only a track
+                # row with a coverid gets ``image`` (:2097-2100), which is
+                # what makes $hasImage set at all in this feed.  An invented
+                # musicfolder.png here is what forced windowStyle home_menu
+                # (XMLBrowser.pm:1434-1441) instead of Perl's text_list.
             else:
                 continue
             # Perl ships a textkey with every list row (albums:

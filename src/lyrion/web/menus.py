@@ -184,6 +184,61 @@ def set_preset_actions() -> dict:
     }
 
 
+def window_style_for_items(items: list[dict]) -> dict:
+    """Perl's ``window.windowStyle`` for an item list (XMLBrowser.pm).
+
+    Perl decides the style from the *items* of the answered window, not from
+    the browse mode — ``Slim/Control/XMLBrowser.pm``::
+
+        :1104-1106  # Bug 13175, support custom windowStyle - this is really naff
+                    $windowStyle = $item->{style} if $item->{style};
+        :1119-1123  if ($item->{'name2'}) { $itemText .= "\\n" . $item->{'name2'};
+                        $windowStyle = 'icon_list' if !$windowStyle; }
+        :1124-1126  elsif (my $line2 = $item->{line2} || $item->{subtext}) {
+                        $windowStyle = 'icon_list';
+                        $itemText = ( $item->{line1} || $nameOrTitle ) . "\\n" . $line2; }
+        :1160-1169  $item->{icon} / $item->{image} / $item->{artwork_track_id}
+                        → $hash{'icon-id'} / {'icon'} and $hasImage = 1
+        :1434-1441  if ($windowStyle) → it
+                    elsif ($hasImage) → 'home_menu'
+                    else              → 'text_list'
+
+    So a window is ``icon_list`` as soon as one of its feed items carries
+    ``name2``/``line2``/``subtext`` (Perl renders those into ``text`` as
+    ``name "\\n" name2``), ``home_menu`` when no item has a second text line
+    but one carries an image, and ``text_list`` otherwise.  Live Perl 9.1.1
+    (read-only, 2026-09-14, player ``ca:c8:c7:26:6d:38``, request
+    ``browselibrary items 0 5 menu:1 mode:<m>``) follows exactly that:
+    ``albums`` (=``text`` has the artist line) ``icon_list``, ``artists``
+    (every row carries ``icon-id: html/images/artists.png``) ``home_menu``,
+    ``genres``/``years``/``tracks``/``bmf`` ``text_list``.
+
+    Our items fold Perl's ``name2``/``line2`` into ``text`` with the same
+    ``"\\n"`` separator, so the rendered newline is the item-level signal;
+    the image keys are Perl's own (``icon-id`` for a relative path — Perl
+    only strips the ``-id`` suffix for ``^https?:`` icons — and ``icon`` for
+    the rest).  ``item["style"]`` is deliberately NOT read: Perl's
+    ``:1104`` looks at the *feed* item's ``style``, while the ``style`` in an
+    answered item is the computed one (``$hash{'style'} = 'item_play'`` /
+    ``'itemNoAction'``, :1111-1113/:1172-1175), and no browselibrary feed of
+    this port sets a feed style.
+    """
+    has_image = False
+    icon_list = False
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        if "\n" in str(it.get("text") or ""):
+            icon_list = True                       # :1119-1126
+        if it.get("icon") or it.get("icon-id") or it.get("artwork_track_id"):
+            has_image = True                       # :1160-1169
+    if icon_list:
+        return {"windowStyle": "icon_list"}
+    if has_image:
+        return {"windowStyle": "home_menu"}
+    return {"windowStyle": "text_list"}
+
+
 def base_actions(kind: str, filters: dict | None = None, start: int = 0,
                  count: int = 1, preset_fav_set: bool = False) -> dict:
     """Perl ``base.actions`` for a browselibrary menu window.
