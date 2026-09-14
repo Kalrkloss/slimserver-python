@@ -190,6 +190,77 @@ def test_root_search_item_carries_perls_input_block():
     assert ours["input"]["softbutton1"] and ours["input"]["softbutton2"]
 
 
+# ── the Radio node's children in the home menu ────────────────────────────
+
+def test_home_menu_carries_the_radio_nodes_children():
+    """Perl's ``@pluginMenus`` rows — the ones that make SqueezePlay show Radio.
+
+    SqueezePlay creates the Radio entry itself
+    (``share/jive/jive/JiveMain.lua:464``) and *ignores* the server's
+    ``id: 'radios'`` row (``applets/SlimMenus/SlimMenusApplet.lua:569-570``);
+    ``ui/HomeMenu.lua:567-580`` only puts that local node into the home menu
+    once an item whose ``node`` is ``'radios'`` exists.  Perl sends one per
+    generated plugin (``Slim/Plugin/InternetRadio/Plugin.pm:150-153`` with
+    ``menu => 'radios'``, registered at ``Slim/Plugin/OPMLBased.pm:48-52``,
+    item shape ``:66-91``, ``input`` block ``:93-106``, collected in
+    ``Slim/Control/Jive.pm:478-529`` and emitted by ``mainMenu``
+    ``Slim/Control/Jive.pm:286``).  Ten of Perl's live 54 home items are these
+    rows; without them the client shows no Radio entry at all.
+    """
+    items = JSONRPCAPI()._home_menu(None)
+    by_id = {i["id"]: i for i in items}
+
+    # the node itself (internetRadioMenu, Jive.pm:1360-1393)
+    assert by_id["radios"]["node"] == "home"
+    assert by_id["radios"]["weight"] == 20
+    assert by_id["radios"]["window"] == {"menuStyle": "album"}
+
+    children = [i for i in items if i.get("node") == "radios"]
+    assert [c["id"] for c in children] == \
+        [f"opml{n['tag']}" for n in radiobrowser.ROOT_NODES]
+    for node, child in zip(radiobrowser.ROOT_NODES, children):
+        assert child["text"] == node["text"]
+        assert child["weight"] == node["weight"]
+        assert child["uuid"] is None              # OPMLBased.pm:70 (no manifest)
+        assert child["displayWhenOff"] == 0       # :73
+        assert child["window"] == {"icon-id": node["icon"],
+                                   "titleStyle": "album"}
+        go = child["actions"]["go"]
+        assert go["player"] == 0
+        assert go["cmd"] == [node["tag"], "items"]      # :78-85
+        assert go["params"]["menu"] == node["tag"]
+
+    # the search row additionally carries Perl's input block (:93-106)
+    search = by_id["opmlsearch"]
+    assert search["actions"]["go"]["params"]["search"] == "__TAGGEDINPUT__"
+    assert set(search["input"]) == {"len", "processingPopup", "softbutton1",
+                                    "softbutton2", "title", "help"}
+    assert search["input"]["len"] == 1
+    assert search["input"]["title"] == "TuneIn durchsuchen"
+
+
+def test_home_menu_children_reach_the_menustatus_notification():
+    """The same rows are what a controller receives as a menustatus push.
+
+    SqueezePlay subscribes to ``/<cid>/slim/menustatus/<mac>`` and merges the
+    pushed items by their ``node`` (``SlimMenusApplet.lua:414-470`` →
+    ``ui/HomeMenu.lua:addItem``); the seed payload of that subscription is our
+    ``menustatus`` answer (``Jive.pm:150-155`` dispatch/subscription,
+    ``:1972``/``:2399-2409`` the notification).
+    """
+    async def _run():
+        api = JSONRPCAPI()
+        body = json.dumps({"id": 1, "method": "slim.request",
+                           "params": [PLAYER, ["menustatus"]]}).encode()
+        return json.loads(await api.handle_request(body))["result"]
+
+    data = asyncio.run(_run())
+    assert isinstance(data, list) and len(data) == 4
+    assert data[2] == "add" and data[3] == PLAYER
+    nodes = [i["node"] for i in data[1] if i.get("node") == "radios"]
+    assert len(nodes) == len(radiobrowser.ROOT_NODES)
+
+
 # ── the sub-feeds ─────────────────────────────────────────────────────────
 
 def test_local_index_matches_perl():

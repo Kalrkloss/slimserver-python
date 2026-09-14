@@ -2992,6 +2992,73 @@ class JSONRPCAPI:
         logger.info("favorites add: %s (%s) -> %s", title, url, new_id)
         return {"count": 1}                     # Favorites/Plugin.pm:859
 
+    async def _json_favorites_delete(self, args: list) -> dict:
+        """``favorites delete [url:<url>] [title:<t>] [item_id:<id>]``.
+
+        Perl ``cliDelete`` (``Slim/Plugin/Favorites/Plugin.pm:925-970``)::
+
+            my $index  = $request->getParam('item_id');
+            my $url    = $request->getParam('url');
+            ...
+            if (!defined $index || !defined $favs->entry($index)) {
+                if ($url) {
+                    $favs->deleteUrl($url);
+                } else {
+                    $request->setStatusBadParams();
+                    return;
+                }
+            }
+            else {
+                $favs->deleteIndex($index);
+            }
+
+        The *index* form addresses Perl's OPML crumb (an ``item_id`` the client
+        echoed from the favourites menu); the *URL* form is what the radio
+        feeds' play-control row ("Favorit löschen", ``XMLBrowser.pm:1871-1900``)
+        and ``jiveFavoritesCommand``'s confirmation item
+        (``Slim/Control/Jive.pm:2670-2690``) send.  Both are honoured; a request
+        that names neither an existing entry nor a URL is bad params and stays
+        resultless (``setStatusBadParams`` → nothing on the wire).  On success
+        Perl only calls ``setStatusDone`` (no result keys) plus the jive popup
+        for a ``/slim/request`` source (:957-967) — the same empty answer we
+        give; the popup is delivered by the displaystatus path.
+        """
+        tokens = [str(a) for a in args[1:]]
+        tagged: dict = {}
+        for token in tokens:
+            if ":" in token and token.split(":", 1)[0] in (
+                    "url", "title", "item_id", "icon"):
+                key, _, value = token.partition(":")
+                tagged[key] = value
+        url = str(tagged.get("url") or "")
+        target = tagged.get("item_id")
+        try:
+            from lyrion.music.favorites import get_favorites_manager
+            fm = get_favorites_manager()
+            fav_id: Optional[int] = None
+            if target:
+                if str(target).isdigit():
+                    fav_id = int(str(target))
+                elif "." in str(target):
+                    # Perl's session crumb '<sid>.<index>…' (XMLBrowser.pm:225).
+                    fav_id = await fm.resolve_path(str(target))
+                if fav_id is not None and await fm.get(fav_id) is None:
+                    fav_id = None                # ``!$favs->entry($index)``
+            if fav_id is None:
+                if not url:
+                    return {}                    # bad params (Plugin.pm:950-952)
+                fav_id = await fm.find_url(url)  # ``$favs->deleteUrl($url)``
+            if fav_id is None:
+                return {}
+            deleted = await fm.delete(fav_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("favorites delete failed: %s", exc)
+            return {}
+        if not deleted:
+            return {}
+        logger.info("favorites delete: id=%s url=%s", fav_id, url)
+        return {}                                # ``setStatusDone`` — no result
+
     async def _displaystatus(self, pid: str | None, args: list[str]) -> dict:
         """displaystatus — now-playing popup / display status.
 
@@ -3837,6 +3904,11 @@ class JSONRPCAPI:
         # (a text list) back, which the JSON clients cannot read.
         if cmd == "favorites" and args and str(args[0]) in ("add", "addlevel"):
             return await self._json_favorites_add(args)
+
+        # favorites delete — Perl dispatch ['favorites','delete']
+        # (Slim/Plugin/Favorites/Plugin.pm:80 addDispatch → cliDelete :925-970).
+        if cmd == "favorites" and args and str(args[0]) == "delete":
+            return await self._json_favorites_delete(args)
 
         if cmd == "favorites" and args and str(args[0]) == "items":
             return await self._json_favorites_items(pid, args[1:])
@@ -5915,6 +5987,20 @@ class JSONRPCAPI:
             {"id": "radios", "text": menus.menu_title("RADIO"), "node": "home",
              "weight": 20, "window": {"menuStyle": "album"},
              "actions": _go(["radios"], {"menu": "radio"})})
+
+        # The Radio node's CHILDREN — Perl's @pluginMenus (Jive.pm:286), one
+        # ``opml<tag>`` row per directory sub-node with ``node: 'radios'``.
+        # SqueezePlay ignores our own ``radios`` row ("shown locally",
+        # SlimMenusApplet.lua:569-570) and only puts its locally created Radio
+        # node into the home menu once such a child arrives
+        # (ui/HomeMenu.lua:567-580) — without these rows the client shows no
+        # Radio entry at all.  Perl registers them unconditionally per
+        # generated plugin (OPMLBased.pm:48-52); our directory structure is
+        # static (radiobrowser.ROOT_NODES), so the node and its children are
+        # always emitted together.
+        from lyrion.web import radiobrowser
+
+        items.extend(radiobrowser.home_menu_items())
 
         # myMusicMenu(1, $client) (Jive.pm:316) → BrowseLibrary nodes.
         # The Perl per-node conditions are mirrored by the flags: this port

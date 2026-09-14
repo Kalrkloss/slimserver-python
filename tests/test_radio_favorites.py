@@ -105,6 +105,23 @@ class _Favs:
                 return dict(row)
         return None
 
+    async def find_url(self, url):
+        """Perl ``findUrl`` — the first entry with that URL (None for folders)."""
+        url = (url or "").strip()
+        if not url:
+            return None
+        for row in self.rows:
+            if row.get("url") == url:
+                return row["id"]
+        return None
+
+    async def delete(self, fav_id):
+        for index, row in enumerate(self.rows):
+            if row["id"] == fav_id:
+                del self.rows[index]
+                return True
+        return False
+
     async def add(self, title, url=None, parent_id=None):
         title = (title or "").strip()
         if not title:
@@ -371,3 +388,83 @@ def test_presets_survive_a_dead_radio_browser(favs, monkeypatch):
     # the static tag index still lists its drill-downs (no API needed)
     music = rpc("music", "items", 0, 5, "menu:music")
     assert {i["type"] for i in music["item_loop"]} == {"link"}
+
+
+# ── the client's own request line, end to end ─────────────────────────────
+
+def test_client_built_add_chain_ends_in_the_favorites_list(favs, client):
+    """The whole chain with the tokens the *client* builds.
+
+    SqueezePlay turns an action's ``params`` into ``key:value`` tokens and
+    always appends ``useContextMenu:1``
+    (``share/jive/applets/SlimBrowser/SlimBrowserApplet.lua:735-762``); the
+    server side is Perl's ``_playlistControlContextMenu`` favourites row
+    (``XMLBrowser.pm:1875-1900``) → ``jiveFavoritesCommand``
+    (``Slim/Control/Jive.pm:2657-2687``) → ``cliAdd``
+    (``Slim/Plugin/Favorites/Plugin.pm:821-922``).  Step 1 is skipped for the
+    row's ``item_id`` (the sid lives in the feed), steps 2-4 are replayed
+    verbatim.
+    """
+    from lyrion.web.api import JSONRPCAPI as API
+
+    before = [r["title"] for r in favs.rows]
+
+    # 2. the row's action: ['jivefavorites','add'] + params → tokens
+    confirm = call(API()._jive_menu_query(
+        "jivefavorites", client, PLAYER,
+        ["add", f"url:{STATION_URL}", "title:Test FM", "type:audio",
+         f"icon:{FAVICON}", "isContextMenu:1", "useContextMenu:1"]))
+    assert confirm["count"] == 2
+
+    # 3. the confirmation row's own tokens (params + trailing useContextMenu)
+    go = confirm["item_loop"][1]["actions"]["go"]
+    request = [str(c) for c in go["cmd"]]
+    for key, value in go["params"].items():
+        if value is not None:              # the client skips json.null
+            request.append(f"{key}:{value}")
+    request.append("useContextMenu:1")
+    assert request[0] == "favorites" and request[1] == "add"
+    assert rpc(*request) == {"count": 1}
+
+    # 4. the favourites list grew by exactly this station — nothing was emptied
+    plain = rpc("favorites", "items", 0, 50)
+    names = [i["name"] for i in plain["loop_loop"]]
+    assert names[:len(before)] == before, names
+    assert names[-1] == "Test FM" and names.count("Test FM") == 1
+    menu = rpc("favorites", "items", 0, 50, "menu:favorites")
+    assert [i.get("text") for i in menu["item_loop"]][-1] == "Test FM"
+
+
+# ── favourites delete (Perl cliDelete) ────────────────────────────────────
+
+def test_favorites_delete_removes_by_url_and_keeps_the_rest(favs):
+    """``Slim/Plugin/Favorites/Plugin.pm:925-970`` — ``deleteUrl``.
+
+    The radio feeds' play-control row and the ``jivefavorites`` confirmation
+    both address the entry by URL (``XMLBrowser.pm:1884-1899``,
+    ``Jive.pm:2670-2690``); Perl's answer carries no result keys at all
+    (``setStatusDone``).
+    """
+    rpc("favorites", "add", f"url:{STATION_URL}", "title:Test FM")
+    before = [r["title"] for r in favs.rows]
+
+    assert rpc("favorites", "delete", f"url:{STATION_URL}",
+               "title:Test FM") == {}
+    assert [r["title"] for r in favs.rows] == before[:-1]
+    assert favs.rows[0]["title"] == "Chill"       # nothing else was touched
+
+
+def test_favorites_delete_by_index_deletes_exactly_that_entry(favs):
+    """The ``item_id`` form: a *valid* index wins over the URL (``:946-952``)."""
+    assert rpc("favorites", "delete", "url:http://old.example/stream",
+               "item_id:2") == {}
+    assert [r["title"] for r in favs.rows] == ["Chill"]
+
+
+def test_favorites_delete_without_url_or_valid_index_is_a_no_op(favs):
+    """Perl: no index and no URL → ``setStatusBadParams``; unknown URL → warn."""
+    before = [dict(r) for r in favs.rows]
+    assert rpc("favorites", "delete", "title:Test FM") == {}
+    assert rpc("favorites", "delete", "url:http://nowhere.invalid/x") == {}
+    assert rpc("favorites", "delete", "item_id:999") == {}
+    assert [r["title"] for r in favs.rows] == [r["title"] for r in before]

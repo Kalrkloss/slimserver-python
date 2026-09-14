@@ -808,6 +808,105 @@ def root_level(*, title_only: bool = False) -> list[dict[str, Any]]:
     return [dict(n) for n in ROOT_NODES]
 
 
+def home_menu_items() -> list[dict[str, Any]]:
+    """The radio sub-nodes as **home-menu** rows — Perl's ``@pluginMenus``.
+
+    Perl registers one dynamic OPMLBased plugin per directory item
+    (``Slim/Plugin/InternetRadio/Plugin.pm:150-153``::
+
+        $class->SUPER::initPlugin(
+            tag    => '$tag',
+            menu   => 'radios',
+            weight => $weight,
+            type   => '$type',
+        );
+
+    and ``initPlugin`` hands each plugin's jive menu to the controller
+    registry (``Slim/Plugin/OPMLBased.pm:48-52``)::
+
+        if ( my $menu = $class->initJive( %args ) ) {
+            ...
+            Slim::Control::Jive::registerPluginMenu($menu);
+        }
+
+    ``OPMLBased::initJive`` (:66-91) builds exactly one item per sub-node::
+
+        id             => 'opml' . $args{tag},
+        uuid           => $class->_pluginDataFor('id'),
+        node           => $args{node} || $args{menu} || 'plugins',
+        weight         => $class->weight,
+        displayWhenOff => 0,
+        window         => { 'icon-id' => $icon, titleStyle => 'album' },
+        actions        => { go => { player => 0, cmd => [ $args{tag}, 'items' ],
+                                    params => { menu => $args{tag} } } },
+
+    and, for ``type eq 'search'``, the ``input`` block (:93-106).  With
+    ``menu => 'radios'`` the item's ``node`` is therefore ``'radios'`` —
+    these rows are the **children of the Radio node**, not extra home rows.
+
+    Why they must be sent (measured against SqueezePlay's own Lua, read-only):
+
+    * the client creates the Radio entry *itself* —
+      ``share/jive/jive/JiveMain.lua:464``::
+
+          jiveMain:addNode( { id = 'radios', iconStyle = 'hm_radio',
+                              node = 'home', text = str("INTERNET_RADIO"),
+                              weight = 20 } )
+
+      and **drops** the server's identical node:
+      ``applets/SlimMenus/SlimMenusApplet.lua:569-570``
+      (``elseif item.id == "radios" then --ignore, shown locally``);
+    * ``share/jive/jive/ui/HomeMenu.lua:567-580`` (``addItem``) adds a node to
+      its parent menu only once it has a child::
+
+          local nodeEntry = self.nodeTable[item.node]
+          if nodeEntry and nodeEntry.item then
+              local hasEntry = pairs(nodeEntry.items)(nodeEntry.items)
+              if hasEntry then self:addItem(nodeEntry.item) end
+          end
+
+      so without a row whose ``node`` is ``'radios'`` the locally created
+      Radio node never reaches the home menu — the reported
+      "SqueezePlay hat keinen Radio-Eintrag im Home-Menü".
+
+    Perl's live ``menu 0 100 direct:1`` (192.168.1.90, read-only 2026-09-14)
+    carries these ten rows (indices 16-25 of 54): ``opmlpresets``,
+    ``opmllocal``, ``opmlmusic``, ``opmlnews``, ``opmlsports``, ``opmltalk``,
+    ``opmllocation``, ``opmllanguage``, ``opmlsearch``, ``opmlpodcast`` (plus
+    ``opmlsounds``, a My-Apps app item, and ``opmlmyapps`` — both outside the
+    Radio node and therefore not emitted here).
+    """
+    from lyrion.web.menus import _search_input
+
+    items: list[dict[str, Any]] = []
+    for node in ROOT_NODES:
+        tag = str(node["tag"])
+        icon = str(node["icon"] or "html/images/radio.png")
+        go_params: dict[str, Any] = {"menu": tag}
+        item: dict[str, Any] = {
+            "text": node["text"],
+            # OPMLBased.pm:69 ``'opml' . $args{tag}``
+            "id": f"opml{tag}",
+            # OPMLBased.pm:70 — a generated plugin has no manifest id: null.
+            "uuid": None,
+            # OPMLBased.pm:71 ``$args{node} || $args{menu}`` = 'radios'.
+            "node": "radios",
+            "weight": node["weight"],
+            "displayWhenOff": 0,                       # OPMLBased.pm:73
+            "window": {"icon-id": proxied_image(icon),  # :74-77
+                       "titleStyle": "album"},
+            "actions": {"go": {"player": 0,           # :78-85
+                               "cmd": [tag, "items"],
+                               "params": go_params}},
+        }
+        if node.get("type") == "search":
+            # OPMLBased.pm:93-106 (Bug 12336).
+            go_params["search"] = "__TAGGEDINPUT__"
+            item["input"] = _search_input(str(node["text"]))
+        items.append(item)
+    return items
+
+
 __all__ = [
     "CACHE_TTL",
     "DEFAULT_COUNTRY",
@@ -826,6 +925,7 @@ __all__ = [
     "countries",
     "country_name",
     "empty_placeholder",
+    "home_menu_items",
     "index_child",
     "index_rows",
     "languages",

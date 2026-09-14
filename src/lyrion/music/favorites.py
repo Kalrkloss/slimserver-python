@@ -183,6 +183,31 @@ class FavoritesManager:
             fav = await session.get(Favorite, fav_id)
             return self._fav_to_dict(fav) if fav else None
 
+    async def find_url(self, url: str) -> Optional[int]:
+        """DB id of the first favourite stream with this URL — Perl ``findUrl``.
+
+        ``Slim/Utils/Favorites.pm`` ``findUrl`` walks the OPML outline and
+        answers the entry whose ``URL`` matches; ``XMLBrowser`` uses it for the
+        add-vs-delete decision (``Slim/Control/XMLBrowser.pm:1886-1893``) and
+        ``Plugin.pm``'s ``cliDelete`` falls back to it when no index was sent
+        (``Slim/Plugin/Favorites/Plugin.pm:946-952``::
+
+            if (!defined $index || !defined $favs->entry($index)) {
+                if ($url) { $favs->deleteUrl($url); }
+
+        ).  Folders (``url`` is NULL) never match.
+        """
+        url = (url or "").strip()
+        if not url:
+            return None
+        async with self._db_session() as session:
+            result = await session.execute(
+                select(Favorite.id).where(Favorite.url == url)
+                .order_by(Favorite.id).limit(1)
+            )
+            found = result.scalar()
+        return int(found) if found is not None else None
+
     # ── mutations ──────────────────────────────────────────────────────
 
     async def _next_position(
