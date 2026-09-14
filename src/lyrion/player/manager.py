@@ -169,6 +169,62 @@ def _formats_for_model(model: str) -> set[str]:
     return _perl_model_formats(model) or set(_COMMON_FORMATS)
 
 
+def _hashable(value):
+    """A hashable, comparable view of a status field value.
+
+    ``PlayerState`` keeps a few dicts/lists (``playlist``,
+    ``remote_meta``, ``playerprefs``, ``sync_slaves``); they must take part
+    in the status signature without making it unhashable.
+    """
+    if isinstance(value, dict):
+        return tuple(sorted((str(k), _hashable(v)) for k, v in value.items()))
+    if isinstance(value, (list, tuple, set)):
+        return tuple(_hashable(v) for v in value)
+    return value
+
+
+def status_signature(player: PlayerState) -> tuple:
+    """The player state a pushed ``status`` is built from, minus the clock.
+
+    Every field here is one the status response reports (``Queries.pm:3996+``
+    ``statusQuery``).  Deliberately excluded are the fields the ~1/s STAT tick
+    moves without changing what the client displays — ``elapsed``,
+    ``signal_strength``, ``_stat``, ``_last_stmd*``, ``_track_started_at``,
+    ``last_activity``, ``strm_sent_*``, ``playing_track_id``: Perl's STAT
+    heartbeat is not an event (``Squeezebox2.pm:174-176`` ->
+    ``playerStatusHeartbeat`` -> ``_NoOp``/``_CheckSync``,
+    ``StreamingController.pm:238-244``) and must not produce a push.
+    """
+    return (
+        player.mode,
+        player.power,
+        player.volume,
+        player.mute,
+        player.name,
+        player.connected,
+        player.current_track_id,
+        player.current_title,
+        player.current_url,
+        _hashable(player.playlist),
+        player.playlist_position,
+        player.playlist_total,
+        player.playlist_timestamp,
+        player.playlist_mode,
+        player.shuffle,
+        player.repeat,
+        player.randomplay,
+        player.remote,
+        player.sleep_remaining,
+        player.sync_master,
+        _hashable(player.sync_slaves),
+        player.use_volume_control,
+        player.digital_volume_control,
+        player.stream_bitrate,
+        _hashable(player.remote_meta),
+        _hashable(player.playerprefs),
+    )
+
+
 class PlayerManager:
     """Singleton manager for all connected Squeezebox players.
 
@@ -193,6 +249,9 @@ class PlayerManager:
         self._protocol_handler = None
         # PROT-18 display wiring (lazily bound to _protocol_handler).
         self._display_wiring = None
+        # Last pushed status per player (the STAT heartbeat gate, see
+        # ``status_changed``): mac -> status_signature().
+        self._status_signatures: dict[str, tuple] = {}
         logger.info("PlayerManager initialized")
 
     def set_protocol_handler(self, handler) -> None:
@@ -246,6 +305,54 @@ class PlayerManager:
             await mgr.notify_display(player.mac, kind, block, duration)
         except Exception as exc:  # noqa: BLE001 — Anzeige darf nie stören
             logger.debug("display notify for %s failed: %s", player.mac, exc)
+
+    # ------------------------------------------------------------------
+    # Status-change gate (Perl's notification rule for a `status` sub)
+    # ------------------------------------------------------------------
+
+    def status_changed(self, player: PlayerState) -> bool:
+        """True when the player's status differs from the last pushed one.
+
+        Perl re-executes a ``status`` subscription only when the server
+        *notifies* a change — never once per STAT tick:
+
+        * ``Slim/Player/Squeezebox2.pm:138-178`` ``statHandler`` has a branch
+          for STMc/d/n/l/u/a/s/o and EoS only; **every other STAT code
+          (STMf, STMp, STMr, STMt, STMz …) is dispatched as
+          ``$client->controller->playerStatusHeartbeat($client)``
+          (:174-176)** — a heartbeat, not an event.
+        * ``Slim/Player/StreamingController.pm:238-244`` maps
+          ``StatusHeartbeat`` to ``_NoOp`` (STOPPED), ``_CheckSync``
+          (PLAYING — :485-490 returns at once unless more than one player
+          shares a sync group) and ``_CheckPaused`` (:424-452 acts only when
+          a remote stream's buffer is full).  None of them notifies.
+        * The subscription itself is registered as an auto-execute whose
+          filter decides relevance (``Queries.pm:4588-4597`` +
+          ``Request.pm:2065-2102``); a notification that does not concern the
+          player is filtered out (``statusQuery_filter``,
+          ``Queries.pm:3925-3993``).
+
+        Our port's only server-side clock is the STAT frame the player sends
+        ~1/s, so the faithful equivalent is: compare the status the client
+        would be sent and stay silent while it is unchanged.  The volatile
+        STAT fields (``elapsed``/``jiffies``/``bytes_received``/
+        ``buffer_fullness``/``output_buffer_fullness``/``signal_strength``/
+        ``_stat``) are deliberately NOT part of the signature: they move on
+        every tick while the displayed status does not — exactly the tick
+        Perl's heartbeat never turns into a notification.
+
+        Returns True (and records the new signature) when a push is due.
+        """
+        signature = status_signature(player)
+        key = player.mac
+        # getattr: some tests build the singleton with object.__new__.
+        store = getattr(self, "_status_signatures", None)
+        if store is None:
+            store = self._status_signatures = {}
+        if store.get(key) == signature:
+            return False
+        store[key] = signature
+        return True
 
     async def _display_update(self, player: PlayerState) -> list[str]:
         """Perl ``$client->update()`` — ``Player.pm:152`` -> ``Display.pm:141``.

@@ -169,6 +169,50 @@ def _is_glob(pattern: str) -> bool:
         or pattern.endswith("/*")
 
 
+def _client_player_form(player_id: str) -> str:
+    """The player id in the form the controllers name their channels with.
+
+    Perl's own client id is the upper-case colon MAC — it builds it from the
+    HELO frame with ``unpack("…H2H2H2H2H2H2…")`` + ``join(':')``
+    (``Slimproto.pm:964``/``:990``), which is exactly what ``PlayerState.mac``
+    holds.  Every controller names its channels with the LOWER-case form of
+    it (live log 2026-09-14 16:05:08: SqueezePlay registers
+    ``/14ff96e66d084eb6/slim/playerstatus/1c:87:2c:47:fc:36``; jive builds
+    that channel in ``jive/slim/Player.lua:993``).  Used only for the
+    glob fallback below: Perl never rebuilds a channel — the event goes out
+    on the channel string the client registered (``Cometd.pm:852``
+    ``$request->source("$response|$id|$priority|$clid|$ua")``, ``:942-944``
+    ``requestCallback`` splits that string back out, ``Manager.pm:230-243``
+    delivers on it).  A pure ``/<cid>/**`` registration produces no event at
+    all in Perl (``Cometd.pm:782-819``: a request-less subscription is only a
+    channel registration), so no channel form here is Perl-determined — we
+    use the client-visible spelling instead of the server-internal one.
+    """
+    if not isinstance(player_id, str) or ":" not in player_id:
+        return player_id
+    return player_id.lower()
+
+
+def event_frame(channel: str, data, msg_id: int = 0,
+                priority: str = "") -> dict:
+    """One pushed subscription event, shaped like Perl's.
+
+    Perl's ``requestCallback`` builds exactly
+    ``{channel, id, data, ext => {priority}}`` (``Cometd.pm:962-970``) —
+    ``data`` is the re-executed request's result
+    (``$request->getResults``, :955), ``id`` the request id (``$params->{id}
+    || 0``, :769) and ``ext.priority`` the client's ``data.priority`` or ''
+    (:772).  Our pushes carried the same channel/data/id but no ``ext`` —
+    an invented key set, one key short of Perl's.
+    """
+    return {
+        "channel": channel,
+        "id": msg_id,
+        "data": data,
+        "ext": {"priority": priority},
+    }
+
+
 def _channel_matches(pattern: str, channel: str) -> bool:
     """Bayeux channel matching, mirroring Perl
     Slim::Web::Cometd::Manager::add_channels:
@@ -446,6 +490,26 @@ def _default_request(subscription: str) -> list:
 def _set_manager(mgr: "CometdManager") -> None:
     global _manager
     _manager = mgr
+
+
+def keepalive_due(last: float | None, interval: float, now: float) -> bool:
+    """Is a ``subscribe:N`` auto-execute due? (Perl Request.pm:2176-2181)
+
+    Perl arms the timer when the subscription is registered::
+
+        if ($timeout > 0) {
+            Slim::Utils::Timers::setTimer($request,
+                Time::HiRes::time() + $timeout, \\&__autoexecute);
+        }
+
+    so the FIRST re-execution is ``N`` seconds away.  ``last is None`` means
+    "just armed", not "long overdue" — firing at once was an extra push Perl
+    never sends (the subscription's own result already went out with the
+    /slim/subscribe reply, Cometd.pm:454-475).
+    """
+    if last is None:
+        return False
+    return now - last >= interval
 
 
 def get_manager() -> Optional["CometdManager"]:
@@ -980,9 +1044,11 @@ class CometdManager:
         an event pushed on a channel we rebuilt with a different mac spelling
         is dropped as "not subscribed" and the Now-Playing screen freezes.
         SqueezePlay registers ``/<cid>/slim/playerstatus/1c:87:...`` (lower
-        case) while ``PlayerState.mac`` is upper case.  Returns ``player_id``
-        unchanged when the client registered no concrete channel naming that
-        player (a glob-only client cannot express a spelling of its own).
+        case) while ``PlayerState.mac`` is upper case.  A client that
+        registered no concrete channel naming that player (a glob-only
+        client) has no spelling of its own to express: the channel we build
+        for it then uses the client-visible form (:func:`_client_player_form`)
+        rather than the server-internal ``PlayerState.mac``.
         """
         for sub in list(client.subscriptions):
             if _is_glob(sub):
@@ -990,7 +1056,7 @@ class CometdManager:
             candidate = _channel_player(sub)
             if candidate and _same_player(candidate, player_id):
                 return candidate
-        return player_id
+        return _client_player_form(player_id)
 
     @staticmethod
     def _glob_concrete_channel(client: CometdClient, pattern: str,
@@ -1090,8 +1156,7 @@ class CometdManager:
                     request = [player_id, ["displaystatus", kind]]
                 try:
                     result = await self._dispatch(request)
-                    self.push(client.client_id,
-                              {"channel": channel, "data": result, "id": 0})
+                    self.push(client.client_id, event_frame(channel, result))
                 except Exception:  # noqa: BLE001
                     pass
 
@@ -1141,11 +1206,7 @@ class CometdManager:
                 try:
                     request = _stored_request(data) or ["", list(JIVE_SERVERSTATUS_REQUEST)]
                     result = await self._dispatch(request)
-                    self.push(client.client_id, {
-                        "channel": channel,
-                        "data": result,
-                        "id": 0,
-                    })
+                    self.push(client.client_id, event_frame(channel, result))
                 except Exception:  # noqa: BLE001
                     pass
 
@@ -1238,11 +1299,7 @@ class CometdManager:
                     else:
                         request = [player_id, list(JIVE_STATUS_REQUEST)]
                     result = await self._dispatch(request)
-                    self.push(client.client_id, {
-                        "channel": channel,
-                        "data": result,
-                        "id": 0,
-                    })
+                    self.push(client.client_id, event_frame(channel, result))
                 except Exception:  # noqa: BLE001
                     pass
 
@@ -1256,11 +1313,8 @@ class CometdManager:
             for sub in list(client.subscriptions.keys()):
                 if "favorites" not in sub:
                     continue
-                self.push(client.client_id, {
-                    "channel": sub,
-                    "data": ["favorites", ["changed"]],
-                    "id": 0,
-                })
+                self.push(client.client_id,
+                          event_frame(sub, ["favorites", ["changed"]]))
 
     # ------------------------------------------------------------------
     # subscribe:N keep-alive
@@ -1310,17 +1364,18 @@ class CometdManager:
                     if interval <= 0:
                         continue
                     key = (client.client_id, sub)
-                    if now - last.get(key, 0) < interval:
+                    last_fired = last.get(key)
+                    if not keepalive_due(last_fired, interval, now):
+                        # First sight of the subscription: Arm the timer
+                        # (Perl Request.pm:2176-2181) — do NOT fire now.
+                        if last_fired is None:
+                            last[key] = now
                         continue
                     last[key] = now
                     try:
                         result = await self._dispatch(
                             data.get("request") or ["", ["status", "-", "1"]])
-                        self.push(client.client_id, {
-                            "channel": sub,
-                            "data": result,
-                            "id": 0,
-                        })
+                        self.push(client.client_id, event_frame(sub, result))
                     except Exception:  # noqa: BLE001
                         pass
             # Drop bookkeeping for clients the idle reaper removed — a
@@ -1478,13 +1533,11 @@ class CometdManager:
                             seed = _default_request(sub)
                         if seed:
                             result = await self._dispatch(seed)
-                            self.deliver_result(cid, {
-                                "channel": sub,
-                                "data": result,
-                                # SqueezeClient's Message class requires id:
-                                # Int — a missing id breaks the array parse.
-                                "id": msg.get("id", ""),
-                            }, replies)
+                            # SqueezeClient's Message class requires id: Int —
+                            # a missing/empty id breaks its array parse, and
+                            # Perl defaults a missing one to 0 (:769).
+                            self.deliver_result(cid, event_frame(
+                                sub, result, msg.get("id") or 0), replies)
                 if not subscriptions:
                     reply.update({"successful": True, "error": None,
                                   "clientId": cid})
@@ -1555,12 +1608,9 @@ class CometdManager:
                     # (:772/:926-928). ``successful`` is deliberately absent —
                     # Perl only stamps it on the /slim/request ACK (:576), and
                     # libcometd's Message defaults it to true.
-                    self.deliver_result(cid, {
-                        "channel": response_channel,
-                        "id": msg.get("id") or 0,
-                        "data": result,
-                        "ext": {"priority": data.get("priority") or ""},
-                    }, replies)
+                    self.deliver_result(cid, event_frame(
+                        response_channel, result, msg.get("id") or 0,
+                        data.get("priority") or ""), replies)
                     continue
                 reply.update({"successful": False, "clientId": None})
 

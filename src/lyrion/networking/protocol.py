@@ -4041,18 +4041,42 @@ class SlimProtoClient:
                     except Exception:
                         pass
                     # Wake Cometd status/playerstatus subscribers (Android
-                    # controllers) with the fresh player status.
+                    # controllers) with the fresh player status — but ONLY
+                    # when this STAT actually changed the status.  Perl's
+                    # STAT heartbeat is not an event: every code without its
+                    # own branch in ``statHandler`` (STMf, STMp, STMr, STMt,
+                    # STMz …) goes to ``playerStatusHeartbeat``
+                    # (Squeezebox2.pm:174-176), whose state-table entries are
+                    # ``_NoOp`` (STOPPED) / ``_CheckSync`` (PLAYING — a no-op
+                    # for a single player, StreamingController.pm:485-490)
+                    # / ``_CheckPaused`` (:424-452) — none of them notifies,
+                    # so Perl's ``status`` subscription is NOT re-executed
+                    # (``statusQuery_filter``, Queries.pm:3925-3993).  A push
+                    # per STAT tick flooded the client with ~1 event/s
+                    # (measured: 15 pushes in 12 s against a stopped-idle
+                    # player while Perl sends one per change).
+                    # status-change gate (see above) — no push while unchanged
+                    _changed = True
                     try:
-                        from lyrion.web.cometd import get_manager
-                        _mgr = get_manager()
-                        if _mgr is not None:
-                            logger.debug("STAT %s → notify_player_status (%d cometd clients)",
-                                         mac_str, len(getattr(_mgr, "_clients", {})))
-                            asyncio.create_task(_mgr.notify_player_status(player.mac))
-                        else:
-                            logger.debug("STAT %s → no cometd manager", mac_str)
-                    except Exception as exc:
-                        logger.debug("notify_player_status dispatch failed: %s", exc)
+                        from lyrion.player.manager import PlayerManager
+                        _changed = PlayerManager().status_changed(player)
+                    except Exception as exc:  # noqa: BLE001
+                        logger.debug("status-change gate failed: %s", exc)
+                    if not _changed:
+                        logger.debug("STAT %s → status unchanged, no push",
+                                     mac_str)
+                    else:
+                        try:
+                            from lyrion.web.cometd import get_manager
+                            _mgr = get_manager()
+                            if _mgr is not None:
+                                logger.debug("STAT %s → notify_player_status (%d cometd clients)",
+                                             mac_str, len(getattr(_mgr, "_clients", {})))
+                                asyncio.create_task(_mgr.notify_player_status(player.mac))
+                            else:
+                                logger.debug("STAT %s → no cometd manager", mac_str)
+                        except Exception as exc:
+                            logger.debug("notify_player_status dispatch failed: %s", exc)
             except Exception:
                 pass
         except Exception as exc:

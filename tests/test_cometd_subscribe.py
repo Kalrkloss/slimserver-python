@@ -23,8 +23,13 @@ built from and on which channel it is delivered.
 """
 
 import asyncio
+import time
 
-from lyrion.web.cometd import CometdManager, _default_request
+from lyrion.web.cometd import (
+    CometdManager,
+    _default_request,
+    keepalive_due,
+)
 
 PLAYER = "1c:87:2c:47:fc:36"
 
@@ -740,3 +745,138 @@ def test_player_key_normalises_case_and_colons():
     assert not _same_player("", "1c:87:2c:47:fc:36")
     assert not _same_player("", "")
     assert not _same_player("aa:bb:cc:dd:ee:ff", "1c:87:2c:47:fc:36")
+
+
+def test_glob_only_client_uses_the_client_visible_channel_form():
+    """A glob-only client has no channel string of its own.
+
+    Perl never rebuilds a channel: the event goes out on the string the client
+    registered (``Cometd.pm:852`` ``$request->source("$response|…")``,
+    ``:942-944`` ``requestCallback``, ``Manager.pm:230-243``), and a pure
+    ``/<cid>/**`` registration produces no event at all (``Cometd.pm:782-819``
+    — a request-less subscription is only a channel registration).  The
+    Python-side concretisation for such a client must therefore not stamp the
+    SERVER-internal ``PlayerState.mac`` (upper case: Perl builds its own id
+    from the HELO frame with ``unpack("…H2H2H2H2H2H2…")`` +
+    ``join(':')``, ``Slimproto.pm:964``/``:990``) — every controller names its
+    channels with the lower-case form (live log 2026-09-14 16:05:08:
+    ``/14ff96e66d084eb6/slim/playerstatus/1c:87:2c:47:fc:36``).
+    """
+
+    async def run():
+        mgr, rec = _manager()
+        cid = await _handshake(mgr)
+        await mgr.handle_messages([{
+            "channel": "/meta/subscribe", "clientId": cid, "id": 2,
+            "subscription": f"/{cid}/**",
+        }])
+        rec.calls.clear()
+        await mgr.notify_player_status(UPPER_PLAYER)
+        return await mgr.wait_for_events(cid, timeout=0)
+
+    events = _run(run())
+    assert len(events) == 1, events
+    assert events[0]["channel"].endswith(f"/slim/playerstatus/{PLAYER}"), events
+    assert "1C:87:2C:47:FC:36" not in events[0]["channel"], events
+    assert events[0]["channel"].count(":") == 5, events
+
+
+def test_a_seeded_status_keeps_the_upper_case_id_of_a_client_that_used_it():
+    """The client's OWN spelling always wins — never normalised away."""
+
+    async def run():
+        mgr, rec = _manager()
+        cid = await _handshake(mgr)
+        channel = f"/{cid}/slim/playerstatus/{UPPER_PLAYER}"
+        await mgr.handle_messages([{
+            "channel": "/meta/subscribe", "clientId": cid, "id": 2,
+            "subscription": channel,
+        }])
+        await mgr.wait_for_events(cid, timeout=0)
+        rec.calls.clear()
+        await mgr.notify_player_status(PLAYER)
+        return channel, await mgr.wait_for_events(cid, timeout=0)
+
+    channel, events = _run(run())
+    assert [e["channel"] for e in events] == [channel], events
+
+
+def test_pushed_events_carry_perls_frame_shape():
+    """Perl's subscription event is ``{channel, id, data, ext:{priority}}``.
+
+    ``requestCallback`` (``Cometd.pm:962-970``) builds exactly those four keys
+    — ``data`` = the re-executed request's result (:955), ``id`` = the request
+    id (:769 ``$params->{id} || 0``) and ``ext.priority`` = the client's
+    ``data.priority`` or ``''`` (:772).  Our pushes were missing ``ext``.
+    """
+
+    async def run():
+        mgr, rec = _manager()
+        cid = await _handshake(mgr)
+        response = f"/{cid}/slim/playerstatus/{PLAYER}"
+        await mgr.handle_messages([{
+            "channel": "/slim/subscribe", "id": 2,
+            "data": {"request": [PLAYER, JIVE_STATUS_CMD], "response": response},
+        }])
+        events = await mgr.wait_for_events(cid, timeout=0)
+        return events
+
+    events = _run(run())
+    assert len(events) == 1, events
+    assert set(events[0]) == {"channel", "id", "data", "ext"}, events[0]
+    assert events[0]["ext"] == {"priority": ""}, events[0]
+    assert isinstance(events[0]["id"], int), events[0]
+
+
+# ---------------------------------------------------------------------------
+# subscribe:N keep-alive timing (Perl Request.pm:2176-2181)
+# ---------------------------------------------------------------------------
+
+
+def test_keepalive_is_armed_not_fired_immediately():
+    r"""Perl arms ``setTimer(now + $timeout, \&__autoexecute)`` at registration.
+
+    The first re-execution is N seconds away.  Firing at once (``last``
+    defaulting to 0 made every interval look overdue) pushed one extra status
+    per subscription right after the client subscribed — Perl's subscribe
+    reply already carried that result (Cometd.pm:454-475).
+    """
+    assert keepalive_due(None, 600, 1_000_000.0) is False   # just armed
+    assert keepalive_due(1_000_000.0, 600, 1_000_599.0) is False
+    assert keepalive_due(1_000_000.0, 600, 1_000_600.0) is True
+    assert keepalive_due(1_000_000.0, 1, 1_000_002.0) is True
+
+
+def test_keepalive_loop_waits_one_interval_before_the_first_push():
+    """End to end: ``subscribe:1`` -> no push inside the first second."""
+
+    async def run():
+        mgr, rec = _manager()
+        cid = await _handshake(mgr)
+        await mgr.handle_messages([{
+            "channel": "/slim/subscribe", "id": 2,
+            "data": {"request": [PLAYER, ["status", "-", "1", "subscribe:1"]],
+                     "response": f"/{cid}/slim/playerstatus/{PLAYER}"},
+        }])
+        await mgr.wait_for_events(cid, timeout=0)  # the seed of the subscribe
+        task = asyncio.create_task(mgr.keepalive_loop())
+        started = time.monotonic()
+        try:
+            # The loop ticks once per second; "just armed" is not "overdue",
+            # so the first push may only come one interval AFTER the arm.
+            events = await mgr.wait_for_events(cid, timeout=5.0)
+            delay = time.monotonic() - started
+        finally:
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001, S110
+                pass
+        return events, delay
+
+    events, delay = _run(run())
+    assert len(events) == 1, events
+    assert events[0]["channel"].endswith(f"/slim/playerstatus/{PLAYER}")
+    # Firing on the loop's first pass (delay ~1.0 s: the loop's own tick) was
+    # the bug; Perl's timer needs the arm PLUS the interval (>= ~2.0 s).
+    assert delay >= 1.5, f"first auto-execute after {delay:.2f}s — Perl arms it"
