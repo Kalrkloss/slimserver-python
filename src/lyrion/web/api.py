@@ -2678,7 +2678,19 @@ class JSONRPCAPI:
                 "version": __version__,
                 "uuid": server_uuid,
                 "name": server_name,
-                "httpport": http_port,
+                # Perl gibt hier seinen HTTP-Port aus (live: 9000). Wir nennen
+                # dagegen den NATIVEN Cometd-Port (9080), also genau den, den
+                # TLV- und JSON-Beacon ankündigen: Jive/SqueezePlay liest dieses
+                # Feld und wechselt darauf für seine weiteren Verbindungen
+                # (gemessen 2026-09-14: mit "httpport": 9000 hielt SqueezePlay
+                # zwei Sessions parallel — ASGI 9000 plus nativ 9080 — und
+                # flatterte; auf dem ASGI-Pfad endet der Streaming-Stream nach
+                # RETRY_DELAY (5 s) Stille, ohne Events in der Zeit => Abriss,
+                # Neu-Handshake, "Verbindung geht mal und mal nicht").
+                # Der native Port bedient Jive direkt und proxyt /jsonrpc.js an
+                # die Web-App (networking/cometd_stream.py:202-230), ist also
+                # für alle Clients die richtige Adresse.
+                "httpport": int(get_config().get("cometd_stream_port") or 9080),
                 "ip": local_ip,
                 "player count": len(players),
                 "other player count": 0,
