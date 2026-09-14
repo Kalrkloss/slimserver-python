@@ -366,6 +366,58 @@ def _notify_cometd_server_status() -> None:
     except Exception:  # noqa: BLE001
         pass
 
+
+async def _notify_metadata_display(mac: str) -> None:
+    """Perl's display push when an in-stream metadata title changes.
+
+    ``Slim/Music/Info.pm:513-553`` (``setCurrentTitle``) — Perl only acts when
+    the title really changed (:516) and then walks the whole sync group::
+
+        for my $everybuddy ( $client->syncGroupActiveMembers() ) {
+            $everybuddy->update();                              # :529-531
+        }
+
+    ``$client->update()`` (``Player.pm:152`` → ``Slim/Display/Display.pm:141``)
+    renders the display and — with ``notifyLevel == 2``, i.e. the controller
+    subscribed with something other than ``subscribe:showbriefly``
+    (``Queries.pm:1758-1763``) — fires ``$display->notify('update')``
+    (``Display.pm:214-217``), i.e. a ``displaynotify`` of type ``update``
+    (``Display.pm:905-913``).  ``displaystatusQuery`` answers it from the
+    display's own cache (``Queries.pm:1650-1651``) as
+    ``{text => $screen1->{'line'}, …}`` (:1693-1700) — the two now-playing
+    lines, exactly what ``PlayerManager._now_playing_lines`` renders here.
+
+    ``displaystatusQuery_filter`` only forwards the notification when the
+    screen content changed (``Queries.pm:1618``) — the changed title is what
+    changed it.  The sibling ``playlist newsong`` notification of
+    ``Info.pm:534`` belongs to the status subscriptions and is not a display
+    push; this port has no ``newsong`` dispatch yet.
+    """
+    try:
+        from lyrion.player.manager import PlayerManager
+        from lyrion.web.cometd import get_manager
+
+        pm = PlayerManager()
+        mgr = get_manager()
+        members = pm.get_sync_group(mac)          # Perl syncGroupActiveMembers
+        if not members:
+            player = pm.get_player(mac)
+            members = [player] if player else []
+        for member in members:
+            if member is None or not getattr(member, "connected", True):
+                continue
+            # ``$everybuddy->update()`` — render the screen (Player.pm:152 →
+            # Display.pm:141) …
+            await pm._display_update(member)
+            if mgr is None:
+                continue
+            # … and notify the displaystatus subscribers (Display.pm:214-217).
+            lines = await pm._now_playing_lines(member)
+            await mgr.notify_display(member.mac, "update", {"text": lines}, None)
+    except Exception as exc:  # noqa: BLE001 — a display push must never break a stream
+        logger.debug("metadata display notify for %s failed: %s", mac, exc)
+
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -3522,6 +3574,12 @@ class SlimProtoClient:
         ``StreamTitle`` itself and pushes it over STMu, so the server can show
         the actual song + artist in Now Playing without proxying the audio.
         The payload is ``StreamTitle='Artist - Title'`` (NUL-terminated).
+
+        Perl's arrival point for the same information is
+        ``Slim/Player/Protocols/HTTP.pm:271-357`` (``parseMetadata``, the ICY
+        ``StreamTitle``) which hands it to
+        ``Slim::Music::Info::setCurrentTitle`` — see
+        :meth:`_notify_metadata_display` for what that fires.
         """
         try:
             text = payload.split(b"\x00")[0].decode("utf-8", errors="replace").strip()
@@ -3547,15 +3605,55 @@ class SlimProtoClient:
             player = PlayerManager().get_player(mac_str)
             if player is None:
                 return
+            stream_title = m.group(1) if m else text.strip()
+            # ``Slim/Music/Info.pm:516``: everything below happens only when the
+            # title really changed (``if (getCurrentTitle($client, $url) ne
+            # ($title || ''))``).
+            changed = str(getattr(player, "current_title", "") or "") != stream_title
             player.remote_meta = {
                 "title": song.strip(),
                 "artist": artist.strip(),
-                "streamtitle": m.group(1) if m else text.strip(),
+                "streamtitle": stream_title,
                 "url": getattr(player, "current_url", ""),
             }
-            player.current_title = m.group(1) if m else text.strip()
+            player.current_title = stream_title
+            if changed:
+                self._notify_metadata_display(player)
         except Exception as exc:
             logger.warning("STMu parse failed for %s: %s", mac_str, exc)
+
+    @staticmethod
+    def _notify_metadata_display(player: object) -> None:
+        """Queue the display push of ``setCurrentTitle`` — ``Info.pm:513-553``.
+
+        Perl runs this chain when an in-stream metadata title changes::
+
+            $client->metaTitle( $title );                       # :527
+            for my $everybuddy ( $client->syncGroupActiveMembers() ) {
+                $everybuddy->update();                          # :529-531
+            }
+            Slim::Control::Request::notifyFromArray(            # :534
+                $client, [ 'playlist', 'newsong', $title ] );
+
+        ``$client->update()`` (``Player.pm:152`` → ``Display.pm:141``) renders
+        the screen and, with ``notifyLevel == 2`` — i.e. a controller that
+        subscribed to ``displaystatus`` with something other than
+        ``subscribe:showbriefly`` (``Queries.pm:1758-1763``) — fires
+        ``$display->notify('update')`` (``Display.pm:214-217``), which the
+        ``displaystatusQuery_filter`` forwards to those subscribers
+        (``Queries.pm:1610``) and ``displaystatusQuery`` answers with the
+        display's own lines (``:1650-1651`` + ``:1693-1700``).
+
+        The frame loop is synchronous, so the asynchronous part runs as a task.
+        """
+        mac = str(getattr(player, "mac", "") or "")
+        if not mac:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:                     # no loop (unit tests) — nothing to push
+            return
+        loop.create_task(_notify_metadata_display(mac))
 
     # STAT field offsets — Perl `unpack('a4CCCNNNNnNNNNnNNn')`
     # (Slim/Networking/Slimproto.pm:768) == SqueezePlay SlimProto.lua:167-195.
