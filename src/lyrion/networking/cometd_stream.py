@@ -96,7 +96,27 @@ async def _read_http_request(reader: asyncio.StreamReader) -> dict | None:
     return {"headers": headers, "body": body}
 
 
-async def _push_events(manager, cid: str, writer: asyncio.StreamWriter) -> None:
+async def _send(writer, data: bytes, lock: asyncio.Lock | None = None) -> None:
+    """Write ``data`` to ``writer`` and flush it.
+
+    ``lock`` serialises this write against the push task (``_push_events``)
+    and a proxied request that runs *while* the chunked connect response is
+    still open. Jive pipelines the artwork/icon GET onto the very socket
+    that carries the open streaming response, so the two writers share one
+    transport; without the lock a pushed event batch could be spliced into
+    the middle of a proxied response body (or vice versa).
+    """
+    if lock is None:
+        writer.write(data)
+        await writer.drain()
+        return
+    async with lock:
+        writer.write(data)
+        await writer.drain()
+
+
+async def _push_events(manager, cid: str, writer: asyncio.StreamWriter,
+                       lock: asyncio.Lock | None = None) -> None:
     """Push event batches into the open chunked stream as they arrive.
 
     Perl answers a /meta/connect after at most LONG_POLLING_TIMEOUT
@@ -119,14 +139,15 @@ async def _push_events(manager, cid: str, writer: asyncio.StreamWriter) -> None:
             if not events and manager.get(cid) is None:
                 break
             data = json.dumps(events).encode("utf-8")
-            writer.write(f"{len(data):x}\r\n".encode() + data + b"\r\n")
-            await writer.drain()
+            await _send(writer, f"{len(data):x}\r\n".encode() + data + b"\r\n",
+                        lock)
     except (ConnectionError, OSError, RuntimeError):
         pass
 
 
 async def _proxy_get(method: str, target: bytes, headers: dict,
-                     writer, port: int) -> None:
+                     writer, port: int,
+                     lock: asyncio.Lock | None = None) -> None:
     """Serve a non-Cometd request by proxying it to the web app (port 9000).
 
     Jive builds artwork/image/static URLs from the advertised (Cometd) port
@@ -134,6 +155,9 @@ async def _proxy_get(method: str, target: bytes, headers: dict,
     request, so the cover slots stayed empty. Forward the raw request and
     pipe the upstream response (status line, headers, body) back verbatim,
     then close the client connection.
+
+    ``lock`` is passed while a streaming /meta/connect response is open on
+    the same socket (see ``_send``).
     """
     try:
         reader, up = await asyncio.open_connection("127.0.0.1", port)
@@ -179,16 +203,14 @@ async def _proxy_get(method: str, target: bytes, headers: dict,
                 if b":" in ln and ln.split(b":", 1)[0].strip().lower()
                 not in (b"connection", b"keep-alive")]
         out = b"\r\n".join([status_line, *keep, b"", b""])
-        writer.write(out)
         if rest:
-            writer.write(rest)
-        await writer.drain()
+            out += rest
+        await _send(writer, out, lock)
         while True:
             chunk = await reader.read(65536)
             if not chunk:
                 break
-            writer.write(chunk)
-            await writer.drain()
+            await _send(writer, chunk, lock)
     except (ConnectionError, OSError, RuntimeError,
             asyncio.IncompleteReadError):
         pass
@@ -262,6 +284,13 @@ async def _handle_connection(manager, reader: asyncio.StreamReader,
     # ending — the normal case — must never erase the client.
     owner = object()
     conn_cids: set[str] = set()
+    # Serialises every write to this socket. While the streaming
+    # /meta/connect response is open the client keeps PIPELINING requests
+    # onto the same socket (Perl HTTP.pm:2065-2072: "Check for additional
+    # pipelined GET or HEAD requests we need to process / We also support
+    # pipelined cometd requets, even though this is against the HTTP RFC"),
+    # so the push task and the request loop write into one transport.
+    write_lock = asyncio.Lock()
     try:
         while True:
             request = await _read_http_request(reader)
@@ -378,12 +407,16 @@ async def _handle_connection(manager, reader: asyncio.StreamReader,
                     first.extend(events)
                     # Chunked transfer: the app's HttpResponseInputStream
                     # requires Transfer-Encoding: chunked (or Content-Length).
-                    writer.write(b"HTTP/1.1 200 OK\r\n"
-                                 b"Content-Type: application/json\r\n"
-                                 b"Transfer-Encoding: chunked\r\n\r\n")
+                    # Written in ONE locked section: the push task must not
+                    # splice a chunk into the response head.
                     chunk = json.dumps(first).encode("utf-8")
-                    writer.write(f"{len(chunk):x}\r\n".encode() + chunk + b"\r\n")
-                    await writer.drain()
+                    await _send(
+                        writer,
+                        b"HTTP/1.1 200 OK\r\n"
+                        b"Content-Type: application/json\r\n"
+                        b"Transfer-Encoding: chunked\r\n\r\n"
+                        + f"{len(chunk):x}\r\n".encode() + chunk + b"\r\n",
+                        write_lock)
                     # The stream stays open: mark the client as actively
                     # connected so the idle reaper (Perl LONG_POLLING_AUTOKILL)
                     # never drops a silently streaming client. The push task
@@ -391,14 +424,40 @@ async def _handle_connection(manager, reader: asyncio.StreamReader,
                     # below); the request loop keeps running.
                     manager.connection_open(cid)
                     push_task = asyncio.create_task(
-                        _push_events(manager, cid, writer))
+                        _push_events(manager, cid, writer, write_lock))
                     stream_cid = cid
                     try:
                         while True:
                             nxt = await _read_http_request(reader)
                             if nxt is None:
                                 break
-                            nb = nxt["body"]
+                            if nxt.get("method") in ("GET", "HEAD"):
+                                # Jive builds EVERY server URL from the
+                                # advertised (Cometd) port and pipelines the
+                                # artwork/menu-icon GET onto the very socket
+                                # that carries the open streaming response —
+                                # which Perl explicitly supports
+                                # (HTTP.pm:2065-2072, see write_lock above).
+                                # Reading ``nxt["body"]`` unconditionally
+                                # raised KeyError here; it escaped the except
+                                # tuple below, the handler died with its
+                                # socket and the ``finally`` removed the
+                                # client. SqueezePlay hits this as soon as
+                                # Albums or Favorites is opened (those screens
+                                # fetch the menu icons/artwork): live
+                                # 2026-09-14 09:46:05 logs
+                                # "redirecting /html/images/artists_40x40_m.png"
+                                # immediately followed by "Cometd connection
+                                # close -> removing client 14ff96e66d084eb6",
+                                # and the app reports "kann sich nicht mit dem
+                                # Server verbinden". Proxy it like the
+                                # non-streaming loop does and keep the stream.
+                                await _proxy_get(
+                                    nxt["method"], nxt["target"],
+                                    nxt["headers"], writer, web_port,
+                                    write_lock)
+                                continue
+                            nb = nxt.get("body") or b""
                             # Every POST on this client's socket counts as
                             # activity: Perl re-arms the autokill timer on
                             # each new poll (Cometd.pm:693). Without this a
@@ -440,9 +499,10 @@ async def _handle_connection(manager, reader: asyncio.StreamReader,
                                         # no connect ack, and the stream ends
                                         # so the client must handshake anew.
                                         nbad = json.dumps(nreplies).encode("utf-8")
-                                        writer.write(f"{len(nbad):x}\r\n".encode()
-                                                     + nbad + b"\r\n")
-                                        await writer.drain()
+                                        await _send(
+                                            writer,
+                                            f"{len(nbad):x}\r\n".encode()
+                                            + nbad + b"\r\n", write_lock)
                                         break
                                     new_cid = nc.get("clientId", stream_cid)
                                     if new_cid and new_cid != stream_cid:
@@ -465,9 +525,10 @@ async def _handle_connection(manager, reader: asyncio.StreamReader,
                                         "advice": connect_advice(
                                             nc.get("connectionType", ""))}]
                                     nchunk = json.dumps(payload).encode("utf-8")
-                                    writer.write(f"{len(nchunk):x}\r\n".encode()
-                                                 + nchunk + b"\r\n")
-                                    await writer.drain()
+                                    await _send(
+                                        writer,
+                                        f"{len(nchunk):x}\r\n".encode()
+                                        + nchunk + b"\r\n", write_lock)
                                 else:
                                     # Non-connect POSTs (slim/request
                                     # publishes): the acks go into the SAME
@@ -480,9 +541,10 @@ async def _handle_connection(manager, reader: asyncio.StreamReader,
                                     # and cannot tell where that fake response
                                     # ends. Result events flow via push_task.
                                     nack = json.dumps(nreplies).encode("utf-8")
-                                    writer.write(f"{len(nack):x}\r\n".encode()
-                                                 + nack + b"\r\n")
-                                    await writer.drain()
+                                    await _send(
+                                        writer,
+                                        f"{len(nack):x}\r\n".encode()
+                                        + nack + b"\r\n", write_lock)
                     finally:
                         push_task.cancel()
                         try:
