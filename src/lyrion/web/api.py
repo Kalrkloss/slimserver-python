@@ -3697,17 +3697,30 @@ class JSONRPCAPI:
                     return {"_displaytype": dt} if dt is not None else {}
                 return {"_uuid": getattr(client, "uuid", "") or None}
 
-        # rescanprogress  — rescanprogressQuery (Queries.pm:3231-3357),
+        # rescan [?]  — rescanQuery (Queries.pm:3214-3229) für ['rescan','?']
+        # (Dispatch Request.pm:606): addResult('_rescan',
+        # stillScanning() ? 1 : 0) (:3225). Der Kommando-Eintrag
+        # ['rescan','_mode','_target'] (:607) fügt kein Result hinzu und läuft
+        # über die Kommando-Verdrahtung (lyrion.control.rescan) — dieselbe wie
+        # am CLI-Port, wie Perls eine rescanCommand
+        # (Slim/Web/JSONRPC.pm:400-520). Live Perl 9.1.1, read-only,
+        # 2026-09-13: rescan ? → {"_rescan":0}.
+        if cmd == "rescan" and args and str(args[0]) == "?":
+            from lyrion.control import rescan as _scan
+
+            return {"_rescan": 1 if _scan.is_scanning() else 0}
+
+        # rescanprogress  — rescanprogressQuery (Queries.pm:3231-3360),
         # Dispatch Request.pm:608 (keine Parameter). Ohne Scan: addResult
-        # 'rescan' 0 (:3355-3357). Live Perl 9.1.1, 2026-09-13:
+        # 'rescan' 0 (:3355-3357); während des Scans rescan 1 + Schritt-Prozent
+        # + steps + totaltime (:3242-3285); im Idle mit zurückgebliebener
+        # failure-Zeile zusätzlich lastscanfailed (:3291-3296, _scanFailed
+        # :6247-6258). Live Perl 9.1.1, 2026-09-13:
         #   rescanprogress -> {"rescan":0}
         if cmd == "rescanprogress":
-            try:
-                from lyrion.media.scan_state import SCAN_STATE
-                scanning = 1 if SCAN_STATE.snapshot().get("scanning") else 0
-            except Exception:  # noqa: BLE001
-                scanning = 0
-            return {"rescan": scanning}
+            from lyrion.control import rescan as _scan
+
+            return dict(_scan.progress_results())
 
         # roles [<index> <quantity>] [tags:t]  — rolesQuery (Queries.pm:3302-3473),
         # Dispatch Request.pm:634. SQL :3393-3400 (ohne track_id):
@@ -5181,35 +5194,19 @@ class JSONRPCAPI:
         return items
 
     async def _rescan(self, mode: str = "full") -> Any:
-        """Direct rescan — triggers MusicImporter in background.
+        """Direct rescan — starts the library scan like the ``rescan`` command.
 
         ``mode`` mirrors the LMS rescan modes (Commands.pm rescanCommand):
         the default full rescan reconciles deletions; other modes are
-        additive refreshes that never delete.
+        additive refreshes that never delete.  Uses the very same wiring the
+        CLI command uses (:mod:`lyrion.control.rescan`), so a scan that is
+        already running queues this one instead of racing it
+        (Commands.pm:2712-2720) and a failure is logged with its traceback.
         """
-        import asyncio as _asyncio
-        from pathlib import Path as _Path
+        from lyrion.control import rescan as scan
 
-        mode = (str(mode) or "full").strip().lower() or "full"
-
-        async def _do():
-            from lyrion.config import get_config
-            from lyrion.media.importer import MusicImporter, ImportConfig
-            musicdir = get_config().get("musicdir", "") or ""
-            if not str(musicdir).strip():
-                from pathlib import Path as _P
-                fallback = _P.home() / "Music"
-                logger.warning(
-                    "Preference 'musicdir' is empty — falling back to %s "
-                    "(set it via serverpref)", fallback)
-                musicdir = str(fallback)
-            importer = MusicImporter(ImportConfig(source_path=_Path(musicdir),
-                                                  mode=mode))
-            stats = await importer.import_music()
-            return stats
-
-        _asyncio.create_task(_do())
-        return {"status": "rescan started", "mode": mode}
+        state = scan.request_scan(mode)
+        return {"status": f"rescan {state}", "mode": scan.normalise_mode(mode)}
 
     async def _abortscan(self) -> Any:
         """Direct abortscan — stops the running library scan (Perl parity)."""

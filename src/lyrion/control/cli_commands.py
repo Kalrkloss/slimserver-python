@@ -1081,7 +1081,7 @@ async def cmd_rescanprogress(
     ctx: CLIContext,
     args: list[str],
 ) -> list[str]:
-    """rescanprogress — ONE line: ``rescanprogress rescan:<0|1>``.
+    """rescanprogress — ONE line: ``rescanprogress rescan:<0|1> …``.
 
     ``rescanprogressQuery`` is registered as a *query* with ``[0,1,1]`` and no
     parameter (``Slim/Control/Request.pm:608``); it adds the result ``rescan``
@@ -1089,23 +1089,15 @@ async def cmd_rescanprogress(
     percentages/``steps``/``totaltime`` while a scan runs, else ``0``
     (:3355-3357).  Live Perl 9.1.1, read-only, 2026-09-12 (idle):
     ``rescanprogress`` → ``rescanprogress rescan%3A0``.
-    """
-    try:
-        from lyrion.media.scan_state import SCAN_STATE
 
-        st = SCAN_STATE.snapshot()
-        scanning = 1 if st.get("scanning") else 0
-        progress = int(st.get("progress", 0) or 0)
-        total = int(st.get("total", 0) or 0)
-    except Exception:  # noqa: BLE001
-        scanning, progress, total = 0, 0, 0
-    results: list[tuple[str, Any]] = [("rescan", scanning)]
-    if scanning:
-        results.append(("steps", "importer"))
-        results.append(("totaltime", "00:00:00"))
-        if total:
-            results.append(("importer", int(progress / total * 100)))
-    return _command_line(["rescanprogress"], [], [], results=results)
+    The shape lives in :mod:`lyrion.control.rescan` (shared with the JSON-RPC
+    branch in ``lyrion.web.api``), including Perl's ``lastscanfailed`` for a
+    leftover failure row (:3291-3296, ``_scanFailed`` :6247-6258).
+    """
+    from lyrion.control import rescan as scan
+
+    return _command_line(["rescanprogress"], [], [],
+                         results=scan.progress_results())
 
 
 @register_command("abortscan")
@@ -2922,56 +2914,33 @@ async def cmd_rescan(
     ctx: CLIContext,
     args: list[str],
 ) -> list[str]:
-    """rescan [<mode>] | rescan ? — ONE escaped line.
+    """rescan [<mode>] [<target>] | rescan ? — ONE escaped line.
 
     ``rescanQuery`` adds the bare result ``_rescan`` (``1`` while a scan runs,
     else ``0``; ``Slim/Control/Queries.pm:3214-3229``) and
     ``['rescan','_mode','_target']`` (:606) is the command entry, which adds no
     result → the request is echoed (Plugin/CLI/Plugin.pm:692-698).  Live Perl
     9.1.1, read-only, 2026-09-12: ``rescan ?`` → ``rescan 0``.
+
+    Perls ``rescanCommand`` (``Slim/Control/Commands.pm:2679-2830``) startet
+    den Scan: Modus ``full`` als Default (:2689), ``album``/``track`` ohne ID
+    = Fehler (:2693-2699), ein laufender Scan macht den Request zu einer
+    *queued* Scan-Aufgabe statt zu einem zweiten parallelen Scan (:2712-2720).
+    Die Verdrahtung selbst liegt in :mod:`lyrion.control.rescan`, damit CLI
+    und JSON-RPC denselben Weg gehen (Perl: dieselbe ``rescanCommand``,
+    ``Slim/Web/JSONRPC.pm:400-520``).
     """
+    from lyrion.control import rescan as scan
+
     if _is_query_echo(args):
-        scanning = 0
-        try:
-            from lyrion.media.scan_state import SCAN_STATE
+        return _command_line(["rescan"], [], [],
+                             results=[("_rescan", 1 if scan.is_scanning() else 0)])
 
-            scanning = 1 if SCAN_STATE.snapshot().get("scanning") else 0
-        except Exception:  # noqa: BLE001
-            pass
-        return _command_line(["rescan"], [], [], results=[("_rescan", scanning)])
-
-    mode = (args[0] if args and args[0] else "full").strip().lower()
-    if mode in ("1", "once"):
-        mode = "full"
-    try:
-        import asyncio
-
-        from lyrion.media.importer import ImportConfig, MusicImporter
-
-        async def _do() -> None:
-            try:
-                import logging as _logging
-                from pathlib import Path as _Path
-
-                from lyrion.config import get_config
-
-                musicdir = get_config().get("musicdir", "") or ""
-                if not str(musicdir).strip():
-                    fallback = _Path.home() / "Music"
-                    _logging.getLogger("lyrion").warning(
-                        "Preference 'musicdir' is empty — falling back to %s "
-                        "(set it via serverpref)", fallback)
-                    musicdir = str(fallback)
-                imp = MusicImporter(ImportConfig(source_path=_Path(musicdir),
-                                                 mode=mode))
-                await imp.import_music()
-            except Exception as exc:  # noqa: BLE001
-                import logging
-                logging.getLogger("lyrion").warning("Rescan failed: %s", exc)
-
-        asyncio.create_task(_do())
-    except Exception:  # noqa: BLE001
-        pass
+    mode = args[0] if args else scan.DEFAULT_MODE
+    target = args[1] if len(args) > 1 else None
+    # A failure is logged with its traceback (Perl: the scanner error plus the
+    # Progress 'failure' row, Queries.pm:3291-3296); it must never be silent.
+    scan.request_scan(mode, target)
     return _command_echo(["rescan"], args, ["_mode", "_target"])
 
 
