@@ -92,6 +92,18 @@ def apply_player_pref(player, key: str, value: Any) -> str:
         setattr(player, key, new)
         return "clamped" if raw != new else "applied"
 
+    if key == "mp3StreamingMethod":
+        # Perl Slim/Player/Protocols/HTTP.pm:433-439 (``canDirectStream``):
+        # "Allow user pref to select the method for streaming" — ``$method == 1``
+        # means proxied streaming, so the player must fetch /stream.mp3 from
+        # THIS server instead of being pointed at the remote URL. The value is
+        # read back by SlimProtoClient.send_remote_stream before it decides
+        # between a direct and a proxy strm frame.
+        new = _as_int(value, 0)
+        old = int(getattr(player, "mp3_streaming_method", 0) or 0)
+        player.mp3_streaming_method = new
+        return "applied" if new != old else "unchanged"
+
     # Font-Wahl im Stil von Jive.pm:1865 ('<font>_curr').
     if key.endswith("_curr"):
         return "stored"

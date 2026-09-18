@@ -254,6 +254,13 @@ REMOTE_BUFFER_SECS = 3
 # requestStatus() (= `stream 't'`), and a player that fails to answer for
 # 3 intervals is disconnected (:199-241).
 KEEPALIVE_SECONDS = 5.0
+# Number of missed polls before Perl declares the client dead:
+# `if ( $last_heard >= $check_all_clients_time * 3 ... ) { slimproto_close(
+# $client->tcpsock ) }` (Slimproto.pm:218-238). The missing half of the
+# check_all_clients contract — without it a client whose socket went away
+# without a FIN stays "connected" and every strm frame is written into a
+# black hole (no RESP, no STM, title frozen).
+KEEPALIVE_MISS_LIMIT = 3
 
 # strm `outputThreshold` per source format byte. Perl: stream_s in
 # Slim/Player/Squeezebox.pm — see output_threshold() for the line numbers.
@@ -937,6 +944,12 @@ class SlimProtoClient:
         # stop/play: "Cannot send command to disconnected player").
         self._player_connections: dict[str, int] = {}
 
+        # Perl's %heartbeat (Slim/Networking/Slimproto.pm:43/:1223): the last
+        # time we HEARD from a client. `_stat_handler` refreshes it for every
+        # inbound frame (:703-709) and `check_all_clients` (:199-241) closes
+        # the socket of a client that stayed silent for 3 poll intervals.
+        self._last_heard: dict[str, float] = {}
+
         # Forget tasks for disconnected players (Perl forget_disconnected_client):
         # MAC-key -> task that unregisters the player after the grace period.
         self._forget_tasks: dict[str, asyncio.Task] = {}
@@ -1430,6 +1443,12 @@ class SlimProtoClient:
                         logger.warning("Oversized frame from %s: op=%r len=%d", peer, opcode_raw, plen)
                         break
                     payload = await reader.readexactly(plen) if plen else b""
+                    # Perl's _stat_handler: any frame from the player proves it
+                    # is alive (`$heartbeat{$client->id} = $now`,
+                    # Slimproto.pm:703-709). check_all_clients closes a client
+                    # that stopped answering the `strm 't'` poll for 3
+                    # intervals (:218-238).
+                    self._heartbeats()[mac_key] = time.monotonic()
                     # Perl looks the opcode up in %message_handlers as the RAW
                     # 4-byte name (case sensitive, 'IR  ' space padded). Keep
                     # the raw form for that lookup; the lower-case form serves
@@ -1649,58 +1668,68 @@ class SlimProtoClient:
             if keepalive_task is not None:
                 keepalive_task.cancel()
             # Deregister writer + decrement connection count for this player.
-            # Squeezelite keeps TWO connections; only when the LAST one
-            # closes (and it was not a DSCO end-of-stream) the player is
-            # unregistered. Otherwise stop/play would break mid-stream
-            # ("Cannot send command to disconnected player").
+            # Perl keeps ONE live slimproto socket per client: a HELO for a
+            # known MAC closes the previous socket with the 'reconnect' flag
+            # (Slimproto.pm:1195) and that close runs NO disconnect block
+            # (:261-296) — the client is alive on the new socket. Only a
+            # socket that is still the registered one may mark the player
+            # offline / arm the forget timer.
             try:
                 if hello is not None:
                     mac_clean = ":".join(f"{b:02X}" for b in hello.mac)
                     key = mac_clean.replace(":", "").upper()
-                    count = self._player_connections.get(key, 1) - 1
-                    if count <= 0:
-                        self._player_connections.pop(key, None)
-                        if self._player_writers.get(key) is writer:
-                            self._player_writers.pop(key, None)
-                        # The player is gone: it cannot still hold a stream
-                        # we sent (R0.5-P1), so drop the guard as well.
-                        self._reset_strm_guard(key, "player disconnected")
-                        from lyrion.player.manager import PlayerManager, _formats_for_model
-                        if keep_registered:
-                            # DSCO end-of-stream: the player reconnects
-                            # immediately. Mark offline but KEEP the state
-                            # (playlist/volume) so the reconnect restores it.
-                            p = PlayerManager().get_player(mac_clean)
-                            if p is not None:
-                                p.connected = False
-                        else:
-                            # Perl forget_disconnected_client semantics: keep the
-                            # player's state (playlist/volume/position) across the
-                            # disconnect, mark it offline, and forget it after the
-                            # grace period unless it reconnects first.
-                            p = PlayerManager().get_player(mac_clean)
-                            if p is not None:
-                                p.connected = False
-                            # Perl Slimproto.pm:272 notifies 'client disconnect'
-                            # on the close (right before arming the forget
-                            # timer, :289-296) — a controller that only watches
-                            # the notification stream would otherwise still list
-                            # a player that is gone.
-                            try:
-                                from lyrion.control.notifications import (
-                                    notify_from_array,
-                                )
-
-                                notify_from_array(mac_clean, ["client", "disconnect"])
-                            except Exception as exc:  # noqa: BLE001
-                                logger.debug("client disconnect notify failed for %s: %s",
-                                             mac_clean, exc)
-                            self._schedule_forget(mac_clean)
-                            logger.info("Player disconnected (forget in %ds): %s",
-                                        FORGET_DISCONNECTED_TIME, mac_clean)
-                            _notify_cometd_server_status()
+                    registered = self._player_writers.get(key)
+                    if registered is not None and registered is not writer:
+                        logger.debug(
+                            "Superseded SlimProto socket for %s closed "
+                            "(reconnect — no disconnect, Slimproto.pm:1195)",
+                            mac_clean)
                     else:
-                        self._player_connections[key] = count
+                        count = self._player_connections.get(key, 1) - 1
+                        if count <= 0:
+                            self._player_connections.pop(key, None)
+                            if registered is writer:
+                                self._player_writers.pop(key, None)
+                            self._heartbeats().pop(key, None)
+                            # The player is gone: it cannot still hold a stream
+                            # we sent (R0.5-P1), so drop the guard as well.
+                            self._reset_strm_guard(key, "player disconnected")
+                            from lyrion.player.manager import PlayerManager
+                            if keep_registered:
+                                # DSCO end-of-stream: the player reconnects
+                                # immediately. Mark offline but KEEP the state
+                                # (playlist/volume) so the reconnect restores it.
+                                p = PlayerManager().get_player(mac_clean)
+                                if p is not None:
+                                    p.connected = False
+                            else:
+                                # Perl forget_disconnected_client semantics: keep the
+                                # player's state (playlist/volume/position) across the
+                                # disconnect, mark it offline, and forget it after the
+                                # grace period unless it reconnects first.
+                                p = PlayerManager().get_player(mac_clean)
+                                if p is not None:
+                                    p.connected = False
+                                # Perl Slimproto.pm:272 notifies 'client disconnect'
+                                # on the close (right before arming the forget
+                                # timer, :289-296) — a controller that only watches
+                                # the notification stream would otherwise still list
+                                # a player that is gone.
+                                try:
+                                    from lyrion.control.notifications import (
+                                        notify_from_array,
+                                    )
+
+                                    notify_from_array(mac_clean, ["client", "disconnect"])
+                                except Exception as exc:  # noqa: BLE001
+                                    logger.debug("client disconnect notify failed for %s: %s",
+                                                 mac_clean, exc)
+                                self._schedule_forget(mac_clean)
+                                logger.info("Player disconnected (forget in %ds): %s",
+                                            FORGET_DISCONNECTED_TIME, mac_clean)
+                                _notify_cometd_server_status()
+                        else:
+                            self._player_connections[key] = count
             except Exception:
                 pass
             writer.close()
@@ -1734,9 +1763,18 @@ class SlimProtoClient:
         self._forget_tasks[key] = asyncio.create_task(_forget())
 
     def _cancel_forget(self, mac_clean: str) -> None:
-        """Cancel a pending forget task (called when a player reconnects)."""
+        """Cancel a pending forget task (called when a player reconnects).
+
+        Perl does the same on every HELO of a known client:
+        ``Slim::Utils::Timers::killTimers($client, \\&forget_disconnected_client)``
+        (Slimproto.pm:1198) — a reconnecting client must never be forgotten,
+        even if its grace period has almost run out.
+        """
         key = mac_clean.replace(":", "").upper()
-        task = self._forget_tasks.pop(key, None)
+        tasks = getattr(self, "_forget_tasks", None)
+        if tasks is None:               # unit tests build clients via __new__
+            self._forget_tasks = tasks = {}
+        task = tasks.pop(key, None)
         if task is not None:
             task.cancel()
 
@@ -1774,12 +1812,45 @@ class SlimProtoClient:
         NOT a heartbeat in Perl: firmwareid 1 is `digitalOutputEncoding`
         (Squeezebox2.pm:916-919), i.e. we were pushing value 0 into a real
         player setting. A `strm 't'` frame cannot change any setting.
+
+        The second half of Perl's contract is the drop: ``Slimproto.pm:218-238``
+        closes the socket of a client whose ``$heartbeat`` value is
+        ``check_all_clients_time * 3`` seconds old::
+
+            my $last_heard = $now - $heartbeat{ $client->id };
+            if ( $last_heard >= $check_all_clients_time * 3 ... ) {
+                $log->info("Haven't heard from $client->id in $last_heard seconds, closing connection");
+                slimproto_close( $client->tcpsock );
+            }
+
+        Without it a socket that dies without a FIN (WiFi drop, killed player,
+        NAT timeout) keeps its register entry forever: ``players`` reports
+        ``connected=1``, every ``strm`` is written into a black hole (no RESP,
+        no STM, the client's title freezes) and the player never comes back
+        because the server still believes it holds the stream. Closing here
+        lets the normal close path in ``_handle_player`` run the disconnect
+        block (``disconnected(1)``, ``['client','disconnect']``, forget timer —
+        Slimproto.pm:265-296), exactly like Perl's ``slimproto_close`` call.
         """
+        key = mac_str.upper().replace(":", "")
         keepalive_frame = self._build_strm_control_frame("t")
         try:
             while True:
                 await asyncio.sleep(KEEPALIVE_SECONDS)
                 if writer.is_closing():
+                    break
+                # Perl re-reads $check_all_clients_time each pass; read the
+                # module globals per iteration so a shorter poll interval
+                # (tests) applies without restarting the loop.
+                last_heard = self._heartbeats().get(key)
+                if last_heard is not None and (
+                    time.monotonic() - last_heard
+                    >= KEEPALIVE_SECONDS * KEEPALIVE_MISS_LIMIT
+                ):
+                    logger.info(
+                        "Haven't heard from %s in %d seconds, closing connection",
+                        mac_str, int(time.monotonic() - last_heard))
+                    writer.close()
                     break
                 writer.write(keepalive_frame)
                 await writer.drain()
@@ -2114,8 +2185,27 @@ class SlimProtoClient:
         except Exception as exc:  # noqa: BLE001
             logger.debug("strm guard reset failed for %s: %s", mac, exc)
 
+    def _heartbeats(self) -> dict[str, float]:
+        """Perl's ``%heartbeat`` (Slimproto.pm:43) — lazy, because unit tests
+        build a SlimProtoClient via ``__new__`` without ``__init__``."""
+        hb = getattr(self, "_last_heard", None)
+        if hb is None:
+            hb = self._last_heard = {}
+        return hb
+
     def _register_player_writer(self, mac_key: str, writer) -> None:
         """Register (or replace) the SlimProto writer for ``mac_key``.
+
+        Perl keeps ONE ``tcpsock`` per client (Slim/Player/Client.pm ``tcpsock``):
+        when a HELO arrives for a client that still has a socket, the OLD socket
+        is closed with the ``reconnect`` flag — ``slimproto_close( $client->tcpsock,
+        'reconnect' )`` (Slimproto.pm:1195) — i.e. its close runs WITHOUT the
+        disconnect block (:261-296), and the pending forget timer is killed
+        (``Slim::Utils::Timers::killTimers($client, \\&forget_disconnected_client)``,
+        :1198). Leaking the old socket instead leaves ``_player_connections``
+        inflated, so a later close of the live socket no longer reaches 0 and the
+        register keeps pointing at a dead StreamWriter — the next strm frame then
+        goes to a socket nobody reads (no RESP, frozen title).
 
         A (re)connect means the player has no stream in progress: Perl
         disassociates the streaming socket on stop/play (Squeezebox.pm:
@@ -2123,10 +2213,29 @@ class SlimProtoClient:
         readyToStream(1). Clear any stale strm guard so the next play of the
         same track streams again instead of being skipped into silence.
         """
+        old = self._player_writers.get(mac_key)
+        if old is not None and old is not writer:
+            # Perl's reconnect-close: the previous socket is dropped here, so
+            # its own handler must not run the disconnect path (see the
+            # superseded check in _handle_player's cleanup).
+            self._player_connections.pop(mac_key, None)
+            self._player_writers.pop(mac_key, None)
+            self._heartbeats().pop(mac_key, None)
+            try:
+                old.close()
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("closing superseded socket for %s failed: %s",
+                             mac_key, exc)
+            logger.info("Closed previous SlimProto socket for %s (reconnect)",
+                        mac_key)
         self._player_writers[mac_key] = writer
-        self._player_connections[mac_key] = (
-            self._player_connections.get(mac_key, 0) + 1
-        )
+        # Perl has exactly one live slimproto socket per client (Slimproto.pm:
+        # :1195, :1215-1223) — reset the counter instead of incrementing it.
+        self._player_connections[mac_key] = 1
+        # Slimproto.pm:1223 — a fresh HELO (re)arms the heartbeat.
+        self._heartbeats()[mac_key] = time.monotonic()
+        # Slimproto.pm:1198 — a reconnecting client must not be forgotten.
+        self._cancel_forget(mac_key)
         self._reset_strm_guard(mac_key, "player (re)connected")
         # PROT-14: a (re)connect starts a fresh controller state (Perl builds
         # a new controller per client, StreamingController.pm:46-87).
@@ -2708,13 +2817,29 @@ class SlimProtoClient:
         playing when this server goes away — exactly like the real LMS.
 
         Falls back to the server-side proxy (/stream.mp3?player=MAC) when
-        the URL cannot be resolved to a direct connection.
+        the URL cannot be resolved to a direct connection or when the client's
+        ``mp3StreamingMethod`` pref asks for proxied streaming (HTTP.pm:433-439).
         """
         mac = mac.upper().replace(":", "")
         writer = self._player_writers.get(mac)
         if writer is None or writer.is_closing():
             logger.warning("No active connection for player %s", mac)
             return False
+
+        # Perl HTTP.pm:433-439 (``canDirectStream``): "Allow user pref to
+        # select the method for streaming" — ``$method == 1`` refuses the
+        # direct stream ("Not direct streaming because of mp3StreamingMethod
+        # pref", :436), so the player is pointed at OUR /stream.mp3 relay
+        # instead of at the remote URL.
+        try:
+            from lyrion.player.manager import PlayerManager as _PM
+            _pref_player = _PM().get_player(mac)
+        except Exception:  # noqa: BLE001
+            _pref_player = None
+        if int(getattr(_pref_player, "mp3_streaming_method", 0) or 0) == 1:
+            logger.info("Player %s mp3StreamingMethod=1 — proxying %s "
+                        "(HTTP.pm:433-439)", mac, url[:60])
+            return await self._send_proxy_stream(mac, url, codec)
 
         # Stop the player and close its previous /stream.mp3 response before
         # the new direct stream — Perl's _stopClient (stream('q') +
