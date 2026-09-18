@@ -660,3 +660,44 @@ def test_migration_cli_defaults_to_dry_run(tmp_path, capsys,
     assert rc == 0
     assert "Dry run" in out
     assert _dir_rows(db) == [], "CLI ohne --apply schreibt nichts"
+
+
+def test_bmf_drill_lists_a_child_without_a_track_row(tmp_path, monkeypatch,
+                                                     tracks_schema_sql):
+    """``mode:bmf`` lists ``readDirectory``'s children — also the row-less ones.
+
+    Perl's bmf feed is a wrapper around the ``musicfolder`` query
+    (``Slim/Menu/BrowseLibrary.pm:2044-2046`` ``_generic(…, 'musicfolder',
+    ['tags:cdus'…])`` → ``Queries.pm:2169-2507`` → ``Slim/Utils/Misc.pm:1150``
+    ``readDirectory`` → :973-1043), and that query creates a row for every
+    child it displays (``Queries.pm:2263-2268`` ``objectForUrl({url,
+    create => 1, playlist => isPlaylist($url)})``).  A list derived from the
+    ``tracks`` rows alone drops them: live 192.168.1.90 (read-only 2026-09-18)
+    ``folder_id:<Bollywood>`` → Perl 13 children, ours 12 — the
+    ``…-Songs Mar 18 [2008].m3u`` was missing.  Both paths must agree.
+    """
+    root = tmp_path / "Musik"
+    (root / "Bollywood").mkdir(parents=True)
+    (root / "Bollywood" / "Songs.m3u").write_text("#EXTM3U\n")
+    (root / "Bollywood" / "01.mp3").write_bytes(b"\0")
+    db = _db(tmp_path / "lyrion.db", tracks_schema_sql, [])
+    monkeypatch.setattr(folders, "_ro_connection",
+                        lambda db_path=None: sqlite3.connect(db))
+    monkeypatch.setattr(folders, "_rw_connection",
+                        lambda db_path=None: sqlite3.connect(db))
+    folders.reset_caches()
+    try:
+        top = _folders(db, monkeypatch, str(root),
+                       ["items", "0", "50", "menu:1", "mode:bmf"])
+        assert [i["text"] for i in top] == ["Bollywood"]
+        drill = _folders(db, monkeypatch, str(root),
+                         ["items", "0", "50", "menu:1", "mode:bmf",
+                          f"folder_id:{top[0]['id']}"])
+        assert {i["text"] for i in drill} == {"Songs.m3u", "01.mp3"}
+        # Der musicfolder-Loop (Perl: dieselbe Query) sieht dieselben Kinder.
+        mf = folders.musicfolder_result(0, 50, folder_id=top[0]["id"])
+        assert mf["count"] == len(drill) == 2
+        assert {i["filename"] for i in mf["folder_loop"]} == {
+            "Songs.m3u", "01.mp3"}
+    finally:
+        folders.reset_caches()

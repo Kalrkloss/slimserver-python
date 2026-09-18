@@ -917,29 +917,76 @@ def _bmf_index_dir(index_path: str, root: str) -> str | None:
 
 def _bmf_children(directory: str, start: int = 0,
                   count: int = 200) -> tuple[list, int]:
-    """Children of ``directory`` from the library rows.
+    """Children of ``directory`` — Perl's ``readDirectory`` listing.
 
     Returns ``(rows, total)``: ``type 'folder'`` subdirectories (``id`` =
     the directory's ``tracks`` row id, ``path`` = absolute directory, ``name``
-    = decoded folder name) followed by ``type 'audio'`` files directly in the
-    directory (``id`` = track id) — Perl's bmf lists files there too, and a
-    folder id is the id of its ``dir`` row (``Slim/Control/Queries.pm:2429``,
-    created by ``objectForUrl({url, create => 1})`` :2263-2268).
+    = decoded folder name) and ``type 'audio'`` files of the directory, in the
+    order Perl lists them (``sub 'order'`` = ``sortFilename``) — Perl's bmf
+    lists files there too, and a folder id is the id of its ``dir`` row
+    (``Slim/Control/Queries.pm:2429``, created by ``objectForUrl({url,
+    create => 1})`` :2263-2268).
 
-    The subdirectories come from **two** row sources, both from the index, so
-    the filesystem is never touched:
+    **The child set is Perl's ``folder_loop`` set** — the ``mode:bmf`` feed is
+    a thin wrapper around the ``musicfolder`` query
+    (``Slim/Menu/BrowseLibrary.pm:2044-2046`` ``_generic(…, 'musicfolder',
+    ['tags:cdus'…])`` → ``Queries.pm:2169-2507`` → ``Slim/Utils/Misc.pm:1150``
+    ``readDirectory`` → :973-1043).  Deriving the list from ``tracks`` rows
+    alone dropped every child that has no row: live 192.168.1.90 ``folder_id:
+    <Bollywood>`` → Perl 13 children, ours 12 — the ``…-Songs Mar 18
+    [2008].m3u`` playlist file was missing (Perl's first pass creates the row:
+    ``Queries.pm:2263-2268`` ``objectForUrl({create => 1, playlist =>
+    isPlaylist($url)})``), and the aggregated rows also re-listed files under
+    their 8.3 short names (``folder_id:<Ambient>``: Perl 353, ours 358).  So
+    the listing is the source and the rows only supply the ids.
 
-    * the ``content_type='dir'`` rows below ``directory`` — one level deep —
-      written by the scan or the migration.  They make a directory that holds
-      no track at all visible, exactly like Perl's ``readDirectory``
-      (``Slim/Utils/Misc.pm:973-1043``) lists it;
-    * the ancestor directories aggregated from the track URLs
-      (:func:`_bmf_subdir_paths`), which covers rows that do not exist yet
-      (a library scanned before the directory rows were introduced).
+    Only when the listing is empty — a share that is not mounted, or the
+    synthetic roots the tests use — the tree is aggregated from the rows
+    instead (the pre-``readDirectory`` behaviour): the scan's
+    ``content_type='dir'`` rows plus the ancestor directories of the track
+    URLs (:func:`_bmf_subdir_paths`).
     """
     prefix = _bmf_encoded_prefix(directory)
     like = prefix + "%"
     off = len(prefix) + 1          # 1-based index behind "<dir>/"
+    # IDs of this directory's *file* rows — one query for the whole listing
+    # (a file without a row keeps its file URL as ``id``, like
+    # ``media/folders._child_item``; Perl would have created the row).
+    file_ids: dict[str, int] = {}
+    try:
+        for r in _db_query(
+                "SELECT id, url FROM tracks WHERE url LIKE ?"
+                " AND instr(substr(url, ?), '/') = 0", (like, off)):
+            p = _bmf_path(str(r.get("url") or ""))
+            if p:
+                file_ids.setdefault(p, int(r["id"]))
+    except Exception:  # noqa: BLE001 - lean DB: ids stay the file URLs
+        file_ids = {}
+    from lyrion.media import folders
+
+    try:
+        listing = folders.list_directory_entries(directory)
+    except Exception:  # noqa: BLE001 - unreadable share → row fallback
+        listing = []
+    if listing:
+        fs_paths = [posixpath.join(directory, name) for name in listing]
+        fs_types = [folders.item_type(p) for p in fs_paths]
+        dir_ids = _bmf_dir_row_ids(
+            [p for p, t in zip(fs_paths, fs_types) if t == "folder"])
+        out: list[dict] = []
+        for p, name, kind in zip(fs_paths, listing, fs_types):
+            if kind == "folder":
+                out.append({"id": dir_ids.get(p, p), "path": p,
+                            "name": name, "title": name, "type": "folder"})
+            else:
+                # Perl's bmf feed shows a playlist child as 'audio'
+                # (``BrowseLibrary.pm:2125-2138``: ``type 'audio'``,
+                # ``playall = 1``); the musicfolder loop itself names it
+                # 'playlist' (``Queries.pm:2437-2440``).
+                out.append({"id": file_ids.get(p)
+                            or folders.file_url_from_path(p),
+                            "name": name, "title": name, "type": "audio"})
+        return out[start:start + count], len(out)
     paths: dict[str, str] = {}     # path → display name
     # (1) directory rows of the children (Perl stores every directory;
     #     their presence is also what makes an empty folder listable).
@@ -8428,20 +8475,38 @@ class JSONRPCAPI:
             elif kind == "folder" and r.get("type") == "audio":
                 # A file in the browsed folder (Perl bmf lists files too):
                 # an audio leaf carrying the track, not a drill target.
+                # ``id`` is normally the ``tracks.id`` — but a child Perl would
+                # have created a row for while listing (``Queries.pm:2263-2268``
+                # ``objectForUrl({create => 1, playlist => isPlaylist($url)})``),
+                # e.g. a playlist file the scan never touched, keeps its file
+                # URL (``media/folders._child_item`` does the same; Perl plays
+                # it through the ``tmp://`` volatile URL, ``BrowseLibrary.pm:
+                # 2125-2138``).  The numeric ``track_id`` fields must survive
+                # that token.
                 text = r["name"] or ""
                 item["type"] = "audio"
                 item["text"] = text
                 item["textkey"] = text[:1].upper()
-                item["commonParams"] = {"track_id": int(r["id"])}
+                try:
+                    ident: Any = int(r["id"])
+                except (TypeError, ValueError):
+                    ident = str(r["id"])
+                item["commonParams"] = {"track_id": ident}
                 item["actions"] = {
                     "play": {"player": 0, "cmd": ["playlistcontrol"],
                              "params": {"cmd": "load", "menu": 1,
-                                        "track_id": str(r["id"])},
+                                        "track_id": str(ident)},
                              "nextWindow": "nowPlaying"},
                     "add": {"player": 0, "cmd": ["playlistcontrol"],
                             "params": {"cmd": "add", "menu": 1,
-                                       "track_id": str(r["id"])}},
+                                       "track_id": str(ident)}},
                 }
+                if not isinstance(ident, int):
+                    # Perl's ``tmp://`` equivalent: the file URL the client can
+                    # hand back to play a playlist that has no library row.
+                    item["presetParams"] = {"favorites_type": "audio",
+                                            "favorites_title": text,
+                                            "favorites_url": ident}
             elif kind == "folder":
                 text = r["name"] or ""
                 ident = str(r["id"])

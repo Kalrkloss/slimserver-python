@@ -561,3 +561,59 @@ def test_urllib_quote_is_used_for_plus(tmp_path):
     url = folders.file_url_from_path("/m/AC+DC")
     assert urllib.parse.unquote(url) == "file:///m/AC+DC"
     assert "+" not in url
+
+
+# ---------------------------------------------------------------------------
+# Perl ``validTypeExtensions('list|audio')`` — the drill's child filter
+# ---------------------------------------------------------------------------
+
+#: Every suffix ``types.conf`` defines with slim-type ``list``/``audio`` — the
+#: set Perl's ``validTypeExtensions()`` (``Slim/Music/Info.pm:1345-1375``,
+#: ``next unless $type =~ /$findTypes/`` with ``$findTypes || 'list|audio'``)
+#: turns into the regex ``readDirectory``'s ``fileFilter`` uses
+#: (``Slim/Utils/Misc.pm:973-975`` → ``:900-903``).  ``lnk`` is excluded: Perl
+#: adds it only on Windows (``Info.pm:1371-1374``).
+PERL_LIST_AUDIO_SUFFIXES: frozenset[str] = frozenset({
+    "aac", "aif", "aiff", "ape", "asx", "cue", "dff", "dsf", "fla", "flac",
+    "flc", "l16", "l24", "lpcm", "m3u", "m3u8", "m4a", "m4b", "mp+", "mp2",
+    "mp3", "mp4", "mpc", "oga", "ogf", "ogg", "opus", "pcm", "pls", "wav",
+    "wave", "wax", "wma", "wpl", "wv", "xspf",
+})
+
+
+def test_every_perl_valid_type_extension_is_listable():
+    """The drill must not drop children Perl lists.
+
+    Regression (live 192.168.1.90, read-only 2026-09-18):
+    ``musicfolder 0 400 folder_id:<Video>`` → Perl 6 children (two of them
+    ``.mp4``), ours 4 — ``LISTABLE_EXTENSIONS`` was derived from
+    ``SUPPORTED_EXTENSIONS`` and missed the 14 suffixes Perl's
+    ``validTypeExtensions()`` adds (``types.conf:20/22/24/30/40/42/45/47/57/62``).
+    """
+    missing = PERL_LIST_AUDIO_SUFFIXES - folders.LISTABLE_EXTENSIONS
+    assert not missing, f"Perl lists these, we dropped them: {sorted(missing)}"
+
+
+def test_drill_lists_the_perl_type_set(monkeypatch, tmp_path, lib_db):
+    """``.mp4``/``.dsf``/``.mp2`` children appear and are ``type 'track'``.
+
+    Perl's ``folder_loop`` type comes from ``isSong`` — slim-type ``audio``
+    (``Slim/Control/Queries.pm:2483-2484``, ``Slim/Music/Info.pm:1262-1276``),
+    so an ``.mp4`` (``types.conf:40`` ``mp4 … audio``) is a ``track``, not
+    ``unknown``.
+    """
+    root = tmp_path / "lib"
+    (root / "Video").mkdir(parents=True)
+    for name in ("a.mp4", "b.dsf", "c.mp2", "d.flac"):
+        (root / "Video" / name).write_bytes(b"\0")
+    _prefs(monkeypatch, mediadirs=str(root))
+    _use_lib_db(monkeypatch, lib_db)
+
+    top = folders.musicfolder_result(0, 100)
+    folder_id = top["folder_loop"][0]["id"]
+    child = folders.musicfolder_result(0, 100, folder_id=folder_id)
+
+    assert child["count"] == 4
+    assert {i["filename"] for i in child["folder_loop"]} == {
+        "a.mp4", "b.dsf", "c.mp2", "d.flac"}
+    assert {i["type"] for i in child["folder_loop"]} == {"track"}

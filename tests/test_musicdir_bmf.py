@@ -1,7 +1,11 @@
 """R0.6-B (LIVE-07) — „Musikordner“ (mode:bmf) aus der Bibliothek aufbauen.
 
-Der Ordnerbaum wird NICHT per Dateisystem-Readwalk gebaut (SMB, 121k
-Dateien), sondern aus den ``file://``-Track-URLs der Bibliothek
+Der Ordnerbaum kommt aus **Perls ``readDirectory``**: jede Ebene wird wie bei
+Perl gelesen (``Slim/Utils/Misc.pm:973-1043``, der ``mode:bmf``-Feed ist ein
+Wrapper um die ``musicfolder``-Query, ``Slim/Menu/BrowseLibrary.pm:2044-2046``)
+— genau EIN Verzeichnis pro Anfrage, nie ein Walk über den SMB-Baum.  Die
+``file://``-Track-URLs der Bibliothek liefern nur noch die IDs; nur wenn die
+Liste leer ist (Share nicht gemountet), wird der Baum aus den Zeilen
 aggregiert.  Wurzel ist das Runtime-Pref ``musicdir``; ohne Pref die
 längste gemeinsame Verzeichnis-Wurzel der Track-URLs — und nur, wenn sie
 mehr als einen Track umfasst (drei Testdateien außerhalb der Bibliothek
@@ -32,13 +36,15 @@ Perl-Gegenprobe (read-only, 192.168.1.90:9000/jsonrpc.js, Player
                                "params": {"mode": "bmf",
                                           "menu": "browselibrary"}}, …}}
 
-Von den 303 Perl-Einträgen haben 253 einen indexierten Track (die
-restlichen 50 sind leere Ordner / Nicht-Audio-Dateien, die die
-URL-Aggregation bewusst nicht kennt).  Perl identifiziert Ordner mit den
+Perl identifiziert Ordner mit den
 ``tracks.id``-Werten seiner ``content_type='dir'``-Zeilen; der Port führt
 dieselben Zeilen (``lyrion.media.dir_rows``: Scan + Browse legen sie an) und
 gibt deren id aus — jeder Drill ``folder_id:<id>`` läuft wie bei Perl über
-diese Zeile.  Zusätzlich akzeptiert der Drill Pfade/``file://``-Tokens, damit
+diese Zeile.  Die Liste selbst ist Perls ``readDirectory``, also auch die
+Kinder, für die Perl erst beim Auflisten eine Zeile anlegt
+(``Slim/Control/Queries.pm:2263-2268``: Playlist-/Nicht-Scan-Dateien) —
+vorher fehlten sie, weil nur ``tracks``-Zeilen gezählt wurden.
+Zusätzlich akzeptiert der Drill Pfade/``file://``-Tokens, damit
 eine Bibliothek ohne geschriebene dir-Zeilen weiter browst.
 """
 
@@ -51,6 +57,7 @@ from pathlib import Path
 
 import pytest
 
+from lyrion.media import folders
 from lyrion.web import api as api_mod
 from lyrion.web.api import JSONRPCAPI
 
@@ -86,6 +93,11 @@ GVFS_URLS = [
     (2, "file:///run/user/1000/gvfs/smb-share%3Aserver%3Dmedia.local%2C"
         "share%3Dmedia/Musik/Ambient/Boards%20of%20Canada/02.flac"),
 ]
+
+#: The gvfs root shape as a *real* tree under ``tmp_path`` (the drill lists the
+#: directory, so the fixture needs the files on disk — see
+#: ``test_bmf_percent_encoded_gvfs_root``).
+GVFS_DIR_NAME = "smb-share:server=media.local,share=media"
 
 
 #: ``tracks`` DDL used for every DB in this module — set by the autouse
@@ -214,8 +226,28 @@ def test_bmf_top_level_items_are_perl_like(tmp_path, monkeypatch):
 
 
 def test_bmf_percent_encoded_gvfs_root(tmp_path, monkeypatch):
-    """Decoded Pref + percent-encoded Track-URLs (smb-share%3A…) matchen."""
-    _setup(tmp_path, monkeypatch, GVFS_URLS, GVFS_ROOT)
+    """Decoded Pref + percent-encoded Track-URLs (smb-share%3A…) matchen.
+
+    Der gvfs-Fall: der ``musicdir``-Pref ist der dekodierte Pfad
+    (``…/smb-share:server=…,share=…/Musik``), die ``file://``-URLs der
+    Bibliothek tragen die Prozentkodierung.  Der Lesepfad arbeitet auf dem
+    dekodierten Pfad (``readDirectory``, ``Slim/Utils/Misc.pm:973-1043``), die
+    Kinder müssen also trotz der Kodierung gefunden und die ``dir``-Zeilen
+    unter der kodierten URL angelegt werden.
+    """
+    root = tmp_path / GVFS_DIR_NAME / "Musik"
+    (root / "Metal" / "Accept").mkdir(parents=True)
+    (root / "Ambient" / "Boards of Canada").mkdir(parents=True)
+    (root / "Metal" / "Accept" / "01-hard_attack.mp3").write_bytes(b"\0")
+    (root / "Ambient" / "Boards of Canada" / "02-oktaf.flac").write_bytes(b"\0")
+    rows = [
+        (1, folders.file_url_from_path(
+            root / "Metal" / "Accept" / "01-hard_attack.mp3")),
+        (2, folders.file_url_from_path(
+            root / "Ambient" / "Boards of Canada" / "02-oktaf.flac")),
+    ]
+    assert "%3A" in rows[0][1], "the fixture must keep the URL encoding"
+    _setup(tmp_path, monkeypatch, rows, str(root))
     assert _texts(["items", "0", "50", "menu:1", "mode:bmf"]) == {
         "Ambient", "Metal"}
 

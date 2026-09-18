@@ -69,8 +69,43 @@ PLAYLIST_EXTENSIONS: frozenset[str] = frozenset({
     "m3u", "m3u8", "pls", "wpl", "asx", "xspf", "cue",
 })
 
-#: Perl ``validTypeExtensions`` — the audio + playlist set (Info.pm:1345).
-LISTABLE_EXTENSIONS: frozenset[str] = SUPPORTED_EXTENSIONS | PLAYLIST_EXTENSIONS
+#: Perl ``validTypeExtensions`` — the audio + playlist set (Info.pm:1345-1375).
+#:
+#: Perl's ``readDirectory`` calls ``fileFilter`` with the **default**
+#: ``$validRE = Slim::Music::Info::validTypeExtensions()``
+#: (``Slim/Utils/Misc.pm:973-975``), i.e. every suffix whose ``types.conf``
+#: slim-type matches ``list|audio`` (``Slim/Music/Info.pm:1345-1375``:
+#: ``next unless $type =~ /$findTypes/`` with ``$findTypes || 'list|audio'``,
+#: ``types.conf`` column 4).  Deriving the set from ``SUPPORTED_EXTENSIONS``
+#: alone was short by 14 of Perl's suffixes, so the drill silently lost the
+#: children that carry them: live 192.168.1.90 ``musicfolder 0 400
+#: folder_id:<Video>`` → 6 children, ours 4 — the two ``.mp4`` files were
+#: missing (``types.conf:40`` ``mp4  m4a,mp4,m4b  …  audio``).  Same for the
+#: ``.dsf``/``.dff``/``.wv``/``.mp2``/``.wave``/``.pcm`` rows (types.conf:20,
+#: :22, :62, :42, :57, :47).  ``lnk`` stays out: Perl adds it only on Windows
+#: (``Info.pm:1371-1374`` ``if (main::ISWINDOWS …)``).
+PERL_LISTABLE_SUFFIXES: frozenset[str] = frozenset({
+    "dff", "dsf", "fla", "flc", "l16", "l24", "lpcm", "mp2", "mp4",
+    "ogf", "pcm", "wave", "wax", "wv",
+})
+
+LISTABLE_EXTENSIONS: frozenset[str] = (
+    SUPPORTED_EXTENSIONS | PLAYLIST_EXTENSIONS | PERL_LISTABLE_SUFFIXES
+)
+
+#: ``types.conf`` suffixes whose slim-type is ``audio`` — Perl's ``isSong``
+#: (``Slim/Music/Info.pm:1262-1276``) is exactly
+#: ``$slimTypes{$type} eq 'audio'``, and that is what makes a ``folder_loop``
+#: item ``type 'track'`` (``Slim/Control/Queries.pm:2483-2484``).  A ``.mp4``
+#: is one of them (``types.conf:40`` ``mp4   m4a,mp4,m4b   …   audio``): live
+#: 192.168.1.90 ``musicfolder 0 4 folder_id:<Video>`` answers ``type: 'track'``
+#: for its ``.mp4`` files, deriving the set from ``SUPPORTED_EXTENSIONS`` alone
+#: answered ``unknown``.
+PERL_SONG_SUFFIXES: frozenset[str] = frozenset({
+    "aac", "aif", "aiff", "ape", "dff", "dsf", "fla", "flac", "flc",
+    "l16", "l24", "lpcm", "m4a", "m4b", "mp+", "mp2", "mp3", "mp4",
+    "mpc", "oga", "ogf", "ogg", "opus", "pcm", "wav", "wave", "wma", "wv",
+})
 
 #: Perl ``fileFilter`` always drops these (``Slim/Utils/OS.pm:268-274`` + Misc.pm:835-845).
 IGNORED_ITEMS: frozenset[str] = frozenset({"lost+found"})
@@ -663,15 +698,16 @@ def item_type(path: str) -> str:
     """The ``type`` Perl puts on a ``folder_loop`` item.
 
     ``Slim/Control/Queries.pm:2472-2485``: ``folder`` for a directory,
-    ``playlist`` for a playlist file, ``track`` for a song, ``unknown`` for
-    everything else.
+    ``playlist`` for a playlist file (``isPlaylist``, ``Info.pm:1313-1318``),
+    ``track`` for a song (``isSong`` ⇒ slim-type ``audio``,
+    ``Info.pm:1262-1276``), ``unknown`` for everything else.
     """
     if os.path.isdir(path):
         return "folder"
     suffix = path.rsplit(".", 1)[-1].lower() if "." in path else ""
     if suffix in PLAYLIST_EXTENSIONS:
         return "playlist"
-    if suffix in SUPPORTED_EXTENSIONS:
+    if suffix in PERL_SONG_SUFFIXES or suffix in SUPPORTED_EXTENSIONS:
         return "track"
     return "unknown"
 
