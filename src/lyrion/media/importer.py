@@ -313,12 +313,22 @@ class MusicImporter:
             batch = []
 
             # Phase 2: short-lived session, inserts only — the library
-            # grows incrementally while the walk continues.
+            # grows incrementally while the walk continues.  One commit per
+            # batch, never one giant transaction (Perl: "Commit for every
+            # chunk when using scanner.pl", Slim/Utils/Scanner/Local.pm:471;
+            # scanner.pl:293-295 leaves AutoCommit off and lets the scanner
+            # commit as it goes).
             async with db_session() as session:
                 await self._import_batch(session, extracted)
                 self.stats.imported_files += len(extracted)
                 await session.commit()
             self._emit_progress()
+            # Hand the scheduler a turn after every batch.  Perl services
+            # pending timers while scanning (``main::idleStreams()`` every
+            # third file, Slim/Utils/Scanner.pm:139-141); back-to-back batches
+            # without a yield are what starved the request path when the scan
+            # ran in the server process.
+            await asyncio.sleep(0)
             logger.info("Imported %d/%d+ files", self.stats.scanned_files,
                         total_seen)
 

@@ -660,6 +660,14 @@ class LyrionConfig:
         await prefs.init_preference("loglevel", default="info", category="server")
         await prefs.init_preference("maxwebcache", default=10000, type_name="int", category="server")
         await prefs.init_preference("browsecache", default=1, type_name="bool", category="server")
+        # Server Settings → Performance (Perl
+        # ``Slim/Web/Settings/Server/Performance.pm:26`` lists ``scannerPriority``
+        # next to ``serverPriority``).  Default ``0``
+        # (``Slim/Utils/Prefs.pm:220``), passed to the scan process as
+        # ``--priority`` (``Slim/Music/Import.pm:139-155`` →
+        # ``Slim/Utils/OS.pm:409-421`` ``setpriority``).
+        await prefs.init_preference(
+            "scannerPriority", default=0, type_name="int", category="server")
         await prefs.init_preference("uuid", default="", category="server")
         await prefs.init_preference("password", default="", category="server")
         await prefs.init_preference("username", default="", category="server")

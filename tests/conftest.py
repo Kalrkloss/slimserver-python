@@ -211,6 +211,61 @@ def _spawn_server(tmp_path_factory):
 
 
 @pytest.fixture(autouse=True)
+def _isolate_scan_channels(tmp_path_factory, monkeypatch):
+    """Keep every test out of the real scan state and off a real scan process.
+
+    ``lyrion.media.scan_state`` keeps the shared progress/abort file paths in
+    module state and ``lyrion.control.rescan`` keeps the running-scan flag and
+    starts the scan **process** (``lyrion.media.scan_process``).  Without this
+    isolation a test that merely dispatches ``rescan`` would
+
+    * write/delete the running server's progress and abort files in the real
+      cache dir, and
+    * start a scanner that imports the *developer's* library,
+
+    and a leaked running-scan flag would make the next test's ``rescan ?``
+    answer ``1``.  Tests that need a real child override the stub with the
+    function captured at import time (``tests/test_scan_process.py``).
+    """
+    # Outside the test's own tmp_path: a test may use that directory as a music
+    # folder and list it (test_musicfolder_primitive_lists_a_real_directory).
+    cache = tmp_path_factory.mktemp("scan-channels")
+    monkeypatch.setattr(
+        "lyrion.media.scan_state.scan_channel_paths",
+        lambda: (cache / "scan-progress.json", cache / "scan-abort"))
+
+    from lyrion.control import rescan
+    from lyrion.media import scan_process, scan_state
+    from lyrion.media.scan_state import SCAN_STATE
+
+    def _stub_spawn(source, mode, **kwargs):  # pragma: no cover - trivial
+        return FinishedScanProcess()
+
+    monkeypatch.setattr(scan_process, "spawn_scan_worker", _stub_spawn)
+
+    def _reset() -> None:
+        scan_state.clear_channels()
+        scan_state.reset_published_reap_flag()
+        SCAN_STATE.reset()
+        rescan.reset()
+
+    _reset()
+    yield
+    _reset()
+
+
+class FinishedScanProcess:
+    """A scan process stand-in that is already done (tests, no real child)."""
+
+    def __init__(self, pid: int = 4242, returncode: int = 0) -> None:
+        self.pid = pid
+        self.returncode: int | None = returncode
+
+    def poll(self):
+        return self.returncode
+
+
+@pytest.fixture(autouse=True)
 def _isolate_streaming_controllers():
     """Give every test the controller state of a fresh player.
 

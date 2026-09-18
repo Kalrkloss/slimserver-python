@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import threading
 from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
@@ -45,6 +46,29 @@ _init_lock = threading.Lock()
 
 #: Default database path
 DEFAULT_DB_PATH: Path | None = None
+
+#: Busy timeout for every pooled connection ("database is locked" → wait).
+#: Matches the previous aiosqlite default (``timeout=30.0``).
+BUSY_TIMEOUT_S: float = 30.0
+BUSY_TIMEOUT_MS: int = int(BUSY_TIMEOUT_S * 1000)
+
+#: WAL checkpoint threshold in pages (Perl ``Slim/Utils/SQLiteHelper.pm:104``).
+#: ``200`` for the server, ``10000`` while a scan runs: a checkpoint blocks
+#: readers, which is exactly the "server goes deaf during the scan" symptom.
+DEFAULT_WAL_AUTOCHECKPOINT = 200
+SCANNER_WAL_AUTOCHECKPOINT = 10000
+
+
+def wal_autocheckpoint() -> int:
+    """``200``, or ``10000`` inside the scan process (Perl ``:104``).
+
+    The scan worker sets ``LYRION_SCANNER=1`` for itself
+    (:mod:`lyrion.media.scan_worker`), the port's counterpart of Perl's
+    compile-time ``main::SCANNER`` constant (``scanner.pl:23``).
+    """
+    if os.environ.get("LYRION_SCANNER") == "1":
+        return SCANNER_WAL_AUTOCHECKPOINT
+    return DEFAULT_WAL_AUTOCHECKPOINT
 
 
 def _default_db_path() -> Path:
@@ -102,10 +126,15 @@ async def init_db(
         # SQLite-specific options
         connect_args={
             "check_same_thread": False,
-            # Busy timeout: the background library scan holds long write
-            # transactions; other writers (playlist save, radio add) must
-            # wait for the next scan commit instead of failing immediately.
-            "timeout": 30.0,
+            # Busy timeout in seconds (sqlite3 → ``sqlite3_busy_timeout``): a
+            # writer must wait for the running scan's short transaction instead
+            # of failing with "database is locked".  Perl leaves this to
+            # DBD::SQLite and only guarantees short transactions + WAL
+            # (``Slim/Utils/Scanner/Local.pm:471`` "Commit for every chunk when
+            # using scanner.pl", ``Slim/Utils/SQLiteHelper.pm:98-111``); the
+            # explicit PRAGMA below makes the setting visible on every pooled
+            # connection.
+            "timeout": BUSY_TIMEOUT_S,
         },
         # Use StaticPool for SQLite (avoids connection pool issues)
         poolclass=AsyncAdaptedQueuePool,
@@ -120,6 +149,12 @@ async def init_db(
     def _set_sqlite_pragma(dbapi_connection, connection_record):  # noqa: ARG001
         cursor = dbapi_connection.cursor()
         cursor.execute("PRAGMA foreign_keys = ON")
+        # Reader latency while a scan writes: WAL lets readers proceed, but a
+        # *checkpoint* still blocks them, so the scan process raises
+        # ``wal_autocheckpoint`` (Perl: ``PRAGMA wal_autocheckpoint = 200``,
+        # and ``10000`` for the scanner, ``Slim/Utils/SQLiteHelper.pm:104``).
+        cursor.execute(f"PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}")
+        cursor.execute(f"PRAGMA wal_autocheckpoint = {wal_autocheckpoint()}")
         cursor.close()
 
     _session_factory = async_sessionmaker(

@@ -1,15 +1,15 @@
-"""``rescan`` wiring: the command reaches the importer (Perl rescanCommand).
+"""``rescan`` wiring: the command reaches the scan process (Perl rescanCommand).
 
 Regression (2026-09-18): ``rescan`` answered its Perl echo on both ports while
 the library never changed — the importer call was there, but every failure
 inside it was swallowed (``logger.warning("Rescan failed: %s", exc)`` in
 ``cli_commands.cmd_rescan`` and a fire-and-forget task in
 ``JSONRPCAPI._rescan``), so a failed scan looked exactly like "nothing
-happened".  These tests pin the wiring itself with a fake importer — no scan
-of a real library, no DB write:
+happened".  These tests pin the wiring itself with a fake importer and a fake
+scan process — no scan of a real library, no DB write:
 
-* ``rescan``  → the importer runs (Perl ``rescanCommand``,
-  ``Slim/Control/Commands.pm:2679-2830``);
+* ``rescan``  → the scan runs (Perl ``rescanCommand``,
+  ``Slim/Control/Commands.pm:2679-2830`` → ``launchScan``, :2746);
 * ``rescan ?`` → ``_rescan`` 1/0 (Perl ``rescanQuery``,
   ``Slim/Control/Queries.pm:3214-3229``; Dispatch ``Request.pm:606``);
 * a second ``rescan`` while a scan runs is *queued*, not run in parallel
@@ -18,12 +18,19 @@ of a real library, no DB write:
 * ``rescanprogress`` reports the scan and its percentage
   (``Queries.pm:3231-3285``) and a leftover failure as ``lastscanfailed``
   (:3291-3296, ``_scanFailed`` :6247-6258).
+
+The scan itself runs in its own process (Perl's ``scanner.pl``,
+``Slim/Music/Import.pm:106-240``); here the spawner is simulated in-process so
+the wiring can be asserted deterministically.  The real child process — its own
+DB handle, the progress publication, the abort marker and the request latency
+during a scan — is covered by ``tests/test_scan_process.py``.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -44,6 +51,25 @@ def _clean_scan_state():
     SCAN_STATE.reset()
 
 
+@pytest.fixture(autouse=True)
+def _temp_scan_channels(tmp_path, monkeypatch):
+    """Keep the cross-process scan files inside the test's tmp dir.
+
+    Without this the shared progress/abort files would resolve to the real
+    server's cache dir (``config.cache_dir``) — a test would then delete a
+    running scan's progress file.
+    """
+    cache = tmp_path / "Cache"
+    cache.mkdir(parents=True, exist_ok=True)
+    progress = cache / "scan-progress.json"
+    abort = cache / "scan-abort"
+    monkeypatch.setattr("lyrion.media.scan_state.scan_channel_paths",
+                        lambda: (progress, abort))
+    monkeypatch.setattr("lyrion.control.rescan._child_paths",
+                        lambda: (tmp_path / "lyrion.db", tmp_path))
+    yield
+
+
 class FakeImporter:
     """Stand-in for ``MusicImporter`` — records calls, never touches a disk."""
 
@@ -51,6 +77,7 @@ class FakeImporter:
     finished = 0
     hold: asyncio.Event | None = None
     fail_with: BaseException | None = None
+    processes: list = []
 
     def __init__(self, config) -> None:
         self.config = config
@@ -67,6 +94,21 @@ class FakeImporter:
                                deleted_files=0)
 
 
+class FakeScanProcess:
+    """The scan child, simulated: ``poll()`` is what the watcher reads."""
+
+    source: Path | None = None
+    mode: str = ""
+    priority: int = 0
+
+    def __init__(self, pid: int = 4242) -> None:
+        self.pid = pid
+        self.returncode: int | None = None
+
+    def poll(self):
+        return self.returncode
+
+
 @pytest.fixture
 def fake_importer(monkeypatch):
     FakeImporter.instances = []
@@ -77,6 +119,31 @@ def fake_importer(monkeypatch):
     music = Path("/tmp/lyrion-test-music")
     monkeypatch.setattr("lyrion.media.music_dir.resolve_music_dir",
                         lambda: music)
+
+    started: list[FakeScanProcess] = []
+
+    def _spawn(source, mode, *, db_path=None, serverdata=None, priority=0,
+               parent_pid=None):
+        """The seam: behave like ``spawn_scan_worker``, run the fake importer."""
+        from lyrion.media.importer import ImportConfig
+
+        proc = FakeScanProcess()
+        started.append(proc)
+        proc.source, proc.mode, proc.priority = source, mode, priority
+
+        async def _child():
+            importer = FakeImporter(ImportConfig(source_path=source, mode=mode))
+            try:
+                await importer.import_music()
+                proc.returncode = 0
+            except BaseException:  # the real worker exits 1 on a failure
+                proc.returncode = 1
+
+        asyncio.get_running_loop().create_task(_child())
+        return proc
+
+    monkeypatch.setattr("lyrion.media.scan_process.spawn_scan_worker", _spawn)
+    FakeImporter.processes = started
     yield FakeImporter
     FakeImporter.hold = None
     FakeImporter.fail_with = None
@@ -90,6 +157,13 @@ async def _settle(rounds: int = 6) -> None:
     """Let the background scan task and its callbacks run."""
     for _ in range(rounds):
         await asyncio.sleep(0)
+
+
+async def _wait_idle(timeout: float = 5.0) -> None:
+    """Wait until the watcher has reaped the scan process (Perl: stillScanning)."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline and rescan.is_scanning():
+        await asyncio.sleep(0.02)
 
 
 # ---------------------------------------------------------------------------
@@ -129,7 +203,7 @@ def test_rescan_query_reports_the_running_scan(fake_importer):
         await _settle()
         running = await _cli("rescan", ["?"])
         held.set()
-        await _settle(20)
+        await _wait_idle()
         idle = await _cli("rescan", ["?"])
         return running, idle
 
@@ -153,7 +227,7 @@ def test_second_rescan_while_scanning_is_queued_not_parallel(fake_importer):
         await _settle()
         queued = len(fake_importer.instances)
         held.set()
-        await _settle(30)
+        await _wait_idle()
         return queued
 
     queued = asyncio.run(body())
@@ -190,22 +264,29 @@ def test_rescan_singledir_scans_only_that_folder_without_deleting(fake_importer)
 
 
 def test_failed_scan_is_logged_with_traceback_and_reported(fake_importer, caplog):
-    """A failure must not be silent (Perl logs it and stores a failure row)."""
+    """A failure must not be silent (Perl logs it and stores a failure row).
+
+    The traceback now belongs to the scan *process* (Perl writes it to
+    ``scanner.log``, ``Slim/Music/Import.pm:203-212``); what the server must do
+    is notice the dead scanner, log it (``Slim/Music/Import.pm:772-786``) and
+    leave a failure for ``rescanprogress``.
+    """
     fake_importer.fail_with = AttributeError("boom")
 
     async def body():
         await _cli("rescan", ["full"])
-        await _settle(10)
+        await _settle()
+        await _wait_idle()
         progress = await _cli("rescanprogress", [])
         return progress
 
     with caplog.at_level(logging.ERROR, logger="lyrion.control.rescan"):
         progress = asyncio.run(body())
 
-    assert "Library scan failed" in caplog.text
-    assert "Traceback" in caplog.text or "boom" in caplog.text
+    assert "External scanner exited without completing the scan" in caplog.text
     assert progress == ["rescanprogress rescan%3A0 "
-                        "lastscanfailed%3AAttributeError%3A%20boom"]
+                        "lastscanfailed%3Ascan%20process%20exited%20with%20code%201"]
+
 
 
 def test_rescan_without_a_usable_folder_skips_the_scan(fake_importer, monkeypatch, caplog):
@@ -280,7 +361,7 @@ def test_jsonrpc_rescan_query_matches_rescanquery(fake_importer):
         await _settle()
         running = await _jsonrpc_async(["rescan", "?"], api)
         held.set()
-        await _settle(20)
+        await _wait_idle()
         return running
 
     assert asyncio.run(body()) == {"_rescan": 1}
@@ -313,7 +394,7 @@ def test_jsonrpc_rescan_method_queues_like_perl(fake_importer):
         await _settle()
         second = await api._rescan("full")
         held.set()
-        await _settle(30)
+        await _wait_idle()
         return first, second
 
     first, second = asyncio.run(body())

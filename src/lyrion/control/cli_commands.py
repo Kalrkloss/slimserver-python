@@ -1114,11 +1114,15 @@ async def cmd_abortscan(
     result, so ``renderAsArray`` prints just the request verb
     (Plugin/CLI/Plugin.pm:692-698).  Live Perl 2026-09-12: ``abortscan`` →
     ``abortscan``.
+
+    The flag has to reach the scan *process* (``Slim/Control/Commands.pm:46-49``
+    → ``Slim/Music/Import.pm:257-270``), so it goes through
+    :func:`lyrion.control.rescan.request_abort`.
     """
     try:
-        from lyrion.media.scan_state import SCAN_STATE
+        from lyrion.control.rescan import request_abort
 
-        SCAN_STATE.request_abort()
+        request_abort()
     except Exception:  # noqa: BLE001
         pass
     return _echo("abortscan", args)

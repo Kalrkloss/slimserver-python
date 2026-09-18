@@ -22,8 +22,17 @@ Perl's behaviour, as cited below:
 * ``Slim/Music/Import.pm:760-791`` ``stillScanning`` reads the
   ``metainformation`` row ``isScanning`` and cleans up progress + notifies
   ``rescan done`` when a crashed scanner left the flag set.
+* ``Slim/Music/Import.pm:106-240`` ``launchScan`` is the *normal* full-scan
+  path: the scan runs in its own process (``scanner.pl``) with its own DB
+  handle and its own priority, and the server keeps serving requests.  This
+  port now does the same — :mod:`lyrion.media.scan_worker` +
+  :mod:`lyrion.media.scan_process`, progress published via
+  :mod:`lyrion.media.scan_state` exactly as Perl publishes it through the
+  ``progress`` table and the progress JSON (``Slim/Utils/Progress.pm:298-341``).
 * ``Slim/Media/MediaFolderScan.pm:43-79`` ``startScan`` is the in-process
-  directory scan itself (``scanName => 'directory'``, ``progress => 1``).
+  directory scan (``scanName => 'directory'``, ``progress => 1``) that Perl
+  only uses for the quick single-object (``album``/``track``) modes
+  (``Slim/Control/Commands.pm:2749-2786``).
   LMS 9.1.1 has **no** ``Slim/Plugin/Scanner/Plugin.pm``; the plugin named
   after the scan is ``Slim/Plugin/Rescan/Plugin.pm``, a *scheduler* that
   simply executes the plain ``rescan``/``wipecache``/``rescan playlists``
@@ -38,6 +47,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from collections import deque
 from pathlib import Path
@@ -79,6 +89,14 @@ _STARTED_AT: Optional[float] = None
 #: Watchdog task for a queue that has to wait for a scan this module did not
 #: start (Perl's ``nextScanTask`` runs from the scanner's own end handler).
 _WATCHER: Optional[asyncio.Task] = None
+
+#: Handle of the running scan process (Perl's ``scanningProcess``,
+#: ``Slim/Music/Import.pm:228-231`` + ``:772-786``).
+_PROC: Optional[Any] = None
+
+#: How often the scan process is polled for its exit (Perl polls the scanner
+#: with a timer, ``Slim/Music/Import.pm:242-258`` ``_watchScanner``).
+_POLL_INTERVAL = 0.05
 
 
 # ---------------------------------------------------------------------------
@@ -228,7 +246,8 @@ def _source_path(mode: str, target: Optional[str]) -> Optional[Path]:
 def request_scan(mode: Any = DEFAULT_MODE, target: Optional[str] = None) -> str:
     """Perl's ``rescanCommand`` wiring — returns ``started``/``queued``/``error``.
 
-    ``started``  the in-process scan was launched (Commands.pm:2786-2830);
+    ``started``  the scan process was launched (Commands.pm:2746
+                 ``launchScan`` / Import.pm:106-240);
     ``queued``   a scan is already running, so the request became a scan task
                  for the running one (Commands.pm:2712-2720);
     ``error``    ``album``/``track`` without an id (Commands.pm:2693-2699);
@@ -256,25 +275,61 @@ def request_scan(mode: Any = DEFAULT_MODE, target: Optional[str] = None) -> str:
     return "started"
 
 
-def _launch(mode: str, target: Optional[str]) -> None:
-    """Start the background import (Perl launches the scan, then answers).
+def request_abort() -> None:
+    """Stop the running scan — Perl's ``abortScanCommand`` (Commands.pm:46-49).
 
-    ``_RUNNING`` is set *before* the task runs: Perl's ``isScanning``
-    metainformation is set when the scan is started, not when it reaches its
-    first file — that is what makes a second ``rescan`` arriving right behind
-    the first one a queued task instead of a concurrent scan
-    (Commands.pm:2712-2720).
+    ``Slim::Music::Import->abortScan`` (Import.pm:257-270) sets ``$ABORT``; the
+    scanner learns about it from the server's answer to its own progress notify
+    (``Slim/Utils/SQLiteHelper.pm:429-444``) and shuts down.  For a scan that
+    runs in a child process the flag has to travel through the shared abort
+    marker, so the channels are armed first when a scan is under way.
     """
-    global _RUNNING, _STARTED_AT
+    from lyrion.media.scan_state import SCAN_STATE
 
-    _RUNNING = mode
-    _STARTED_AT = time.monotonic()
-    asyncio.create_task(_run(mode, target))
+    if is_scanning():
+        try:
+            from lyrion.media.scan_state import scan_channel_paths, set_channels
+
+            set_channels(*scan_channel_paths())
+        except Exception as exc:  # noqa: BLE001 - abort must never raise
+            logger.warning("Scan-Kanäle nicht verfügbar: %s", exc)
+    SCAN_STATE.request_abort()
 
 
-async def _run(mode: str, target: Optional[str]) -> None:
-    """One scan: import the media dirs, then start the next queued task."""
-    global _RUNNING, _STARTED_AT
+def _child_paths() -> tuple[Optional[Path], Optional[Path]]:
+    """``(db_path, serverdata)`` the scan process must use.
+
+    Perl hands the scanner its own ``prefsdir``/``logdir`` explicitly
+    (``Slim/Music/Import.pm:120-137``) so it opens the *same* database; the
+    port passes the resolved library DB path and the server data root.
+    """
+    db_path: Optional[Path] = None
+    serverdata: Optional[Path] = None
+    try:
+        from lyrion.config import get_config
+
+        db_path = Path(get_config().db_path)
+    except Exception as exc:  # noqa: BLE001 - resolved again in the child
+        logger.warning("Bibliotheks-DB-Pfad nicht ermittelbar: %s", exc)
+    try:
+        from lyrion.platform import paths as platform_paths
+
+        serverdata = platform_paths.resolve_serverdata_dir()[0]
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Serverdata-Verzeichnis nicht ermittelbar: %s", exc)
+    return db_path, serverdata
+
+
+def _launch(mode: str, target: Optional[str]) -> None:
+    """Start the scan **in its own process** — Perl's ``launchScan``.
+
+    ``_RUNNING`` and the published scan state are set *before* the child runs:
+    Perl's ``isScanning`` metainformation is written when the scan is started
+    (``Slim/Music/Import.pm:206-207``), not when it reaches its first file —
+    that is what makes a second ``rescan`` arriving right behind the first one
+    a queued task instead of a concurrent scan (Commands.pm:2712-2720).
+    """
+    global _RUNNING, _STARTED_AT, _PROC
 
     # A partial walk (one folder / one album) must never reconcile deletions:
     # this port's importer drops every track it did not see when the mode is a
@@ -286,37 +341,103 @@ async def _run(mode: str, target: Optional[str]) -> None:
 
     clear_failure()
 
+    source = _source_path(mode, target)
+    if source is None:
+        # Perl: no folder defined → no scan (Slim/Media/MediaFolderScan.pm:
+        # 47-52); resolve_music_dir() already logged *why* it is unusable.
+        logger.error("Skipping media folder scan - no folders defined.")
+        return
+
+    from lyrion.media import scan_process, scan_state
+
+    # Arm the cross-process progress/abort channel before the child starts
+    # (Perl: the scanner and the server share the progress rows +
+    # metainformation.isScanning, Slim/Utils/Progress.pm:298-341).
     try:
-        source = _source_path(mode, target)
-        if source is None:
-            # Perl: no folder defined → no scan (Slim/Media/MediaFolderScan.pm:
-            # 47-52); resolve_music_dir() already logged *why* it is unusable.
-            logger.error("Skipping media folder scan - no folders defined.")
-            return
-        from lyrion.media.importer import ImportConfig, MusicImporter
+        scan_state.prepare_channels()
+    except Exception as exc:  # noqa: BLE001 - a scan without progress beats none
+        logger.warning("Scan-Kanäle nicht verfügbar (%s) — Scan startet trotzdem",
+                       exc)
 
-        importer = MusicImporter(ImportConfig(source_path=source,
-                                             mode=importer_mode))
-        logger.info("Starting %s scan of %s", mode, source)
-        stats = await importer.import_music()
-        logger.info("Scan finished (%s): imported=%d updated=%d skipped=%d "
-                    "errors=%d deleted=%d", mode, stats.imported_files,
-                    stats.updated_files, stats.skipped_files,
-                    stats.error_files, stats.deleted_files)
-        from lyrion.media.scan_state import SCAN_STATE
+    _RUNNING = mode
+    _STARTED_AT = time.monotonic()
 
-        if SCAN_STATE.abort_requested:
-            # Perl stores SCAN_ABORTED as the failure info (Queries.pm:6250-6252).
-            note_failure("SCAN_ABORTED")
-    except Exception as exc:  # noqa: BLE001 - reported, never swallowed
-        note_failure(f"{type(exc).__name__}: {exc}")
-        # Perl's scanner failure is a logged error plus a Progress 'failure'
-        # row; the traceback is what made the last silent failure invisible.
-        logger.exception("Library scan failed (%s): %s", mode, exc)
-    finally:
+    db_path, serverdata = _child_paths()
+    if db_path is None:
+        # Without the DB path the child could resolve the wrong library
+        # (a legacy DB of another installation); that is not a scan we start.
+        note_failure("scan process not started: library DB path unknown")
         _RUNNING = None
         _STARTED_AT = None
-        _start_next_queued()
+        logger.error("Scan-Prozess nicht gestartet: Bibliotheks-DB-Pfad unbekannt")
+        return
+
+    priority = scan_process.scanner_priority()
+    try:
+        _PROC = scan_process.spawn_scan_worker(
+            source, importer_mode, db_path=db_path, serverdata=serverdata,
+            priority=priority, parent_pid=os.getpid())
+    except OSError as exc:
+        # Perl: a scanner that dies right away is detected by stillScanning
+        # and logged as "External scanner exited without completing the scan."
+        # (Slim/Music/Import.pm:772-786).
+        _PROC = None
+        note_failure(f"scan process not started: {exc}")
+        _RUNNING = None
+        _STARTED_AT = None
+        logger.error("Scan-Prozess nicht startbar (nice=%d): %s", priority, exc)
+        return
+
+    logger.info("Starting %s scan of %s in process %d (nice=%d)",
+                mode, source, _PROC.pid, priority)
+    try:
+        asyncio.create_task(_watch_scan_process(_PROC, mode))
+    except RuntimeError as exc:
+        # No running event loop: the scan itself is fine, its supervision is
+        # not (Perl's _watchScanner runs off the server's timer queue,
+        # Slim/Music/Import.pm:242-258).  The published state stays readable.
+        logger.warning("Scan-Prozess nicht überwachbar (%s)", exc)
+
+
+async def _watch_scan_process(proc: Any, mode: str) -> None:
+    """Wait for the scan process, then clean up and run the queue.
+
+    Perl polls its scanner while a scan runs and treats a process that is gone
+    with ``isScanning`` still set as a crash
+    (``Slim/Music/Import.pm:242-258`` ``_watchScanner``, ``:760-791``
+    ``stillScanning``).
+    """
+    global _RUNNING, _STARTED_AT, _PROC
+
+    try:
+        while proc.poll() is None:
+            await asyncio.sleep(_POLL_INTERVAL)
+        code = proc.returncode
+    except Exception as exc:  # noqa: BLE001 - a watcher must never crash
+        logger.warning("Scan-Prozess-Überwachung gestoppt: %s", exc)
+        code = None
+
+    from lyrion.media.scan_state import live_published_state
+
+    if code:
+        note_failure(f"scan process exited with code {code}")
+        logger.error(
+            "External scanner exited without completing the scan (exit=%s). "
+            "Perl: Slim/Music/Import.pm:772-786", code)
+    elif live_published_state(max_age=0) is None:  # forced fresh read
+        logger.debug("Scan-Prozess %s beendet", getattr(proc, "pid", "?"))
+
+    _PROC = None
+    _RUNNING = None
+    _STARTED_AT = None
+    # Detach from the shared progress/abort files (Perl clears the progress and
+    # drops the scanning flag when the scanner is gone, scanner.pl:436-461
+    # ``cleanup``).  A queued scan re-arms them in ``_launch``.
+    from lyrion.media.scan_state import clear_channels
+
+    clear_channels()
+    _start_next_queued()
+
 
 
 def _start_next_queued() -> None:
@@ -352,9 +473,18 @@ async def _watch_queue() -> None:
 
 def reset() -> None:
     """Drop queue/failure bookkeeping (tests, and Perl's ``Progress->clear``)."""
-    global _RUNNING, _STARTED_AT, _LAST_FAILURE, _WATCHER
+    global _RUNNING, _STARTED_AT, _LAST_FAILURE, _WATCHER, _PROC
     _QUEUE.clear()
     _RUNNING = None
     _STARTED_AT = None
     _LAST_FAILURE = None
     _WATCHER = None
+    _PROC = None
+    # Detach from the shared progress/abort files: a leftover path would make a
+    # later scan read a foreign (or deleted) marker as its own state.
+    try:
+        from lyrion.media.scan_state import clear_channels
+
+        clear_channels()
+    except Exception:  # noqa: BLE001 - reset must never raise
+        pass
