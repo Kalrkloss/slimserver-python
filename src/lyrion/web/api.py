@@ -6714,16 +6714,24 @@ class JSONRPCAPI:
         """``button <code>`` → ``Slim::Hardware::IR::executeButton``.
 
         ``buttonCommand`` (``Slim/Control/Commands.pm:263-291``) passes the
-        ``_buttoncode`` straight to ``Slim::Hardware::IR::executeButton``; the
-        Jive/SqueezeBox preset keys dispatch ``playPreset_<n>``
-        (``Slim/Buttons/Common.pm:908``), so that is the button code handled
-        here (``playPreset``, Common.pm:825-877):
-
-        every other button code is not wired in our port (no IR/Lua button
-        table) and stays a no-op.
+        ``_buttoncode`` straight to ``Slim::Hardware::IR::executeButton`` with
+        ``_orFunction`` defaulting to 1 (:288); the Jive/SqueezeBox preset keys
+        dispatch ``playPreset_<n>`` (``Slim/Buttons/Common.pm:908``) and are
+        handled below (``playPreset``, Common.pm:825-877), every other code
+        goes through the shared map/function table
+        (:func:`lyrion.player.buttons.execute_named_button`). That is what the
+        controllers actually send: SqueezeJS' next/prev buttons post
+        ``['button','jump_fwd']`` / ``['button','jump_rew']``
+        (``HTML/EN/html/SqueezeJS/UI.js:297``, ``:260``), i.e. the FUNCTION
+        name, which ``IR.pm:1061-1064`` keeps as-is when the map has no entry
+        and ``Common::getFunction`` splits into ``jump`` + ``fwd``/``rew``
+        (Common.pm:1338-1360).
         """
         code = str(args[0]) if args else ""
         if not code.lower().startswith("playpreset"):
+            from lyrion.player.buttons import execute_named_button
+
+            await execute_named_button(code, pid, manager=pm)
             return
         digits = "".join(ch for ch in code if ch.isdigit())
         digit = int(digits) if digits else 0
@@ -7066,12 +7074,20 @@ class JSONRPCAPI:
                         player.playlist_total = len(playlist)
                         player.last_activity = time.time()
                         return
-            elif sub == "index" and rest:
-                idx = rest[0]
+            elif sub in ("index", "jump") and rest:
+                # Perl serves BOTH verbs from playlistJumpCommand
+                # (Commands.pm:925) and takes an absolute index as well as a
+                # relative '+n'/'-n' offset (:970-1014). The old port only
+                # accepted a plain digit here, so SqueezeJS' HTTP-client form
+                # ``playlist index +1`` (UI.js:306) and every ``playlist jump``
+                # were silently swallowed.
+                from lyrion.player.manager import jump_target
+
                 player = pm.get_player(pid)
-                if player is not None and str(idx).isdigit():
-                    player.playlist_position = int(idx)
-                    await self._play_playlist_item(pm, player, int(idx))
+                if player is not None:
+                    target = jump_target(player, rest[0])
+                    if target is not None:
+                        await self._play_playlist_item(pm, player, target)
             elif sub == "play":
                 # LMS-compatible 'playlist play [<index>|track_id:<n>|item_id:<n>|album_id:<n>|artist_id:<n>|<url>]'
                 player = pm.get_player(pid)

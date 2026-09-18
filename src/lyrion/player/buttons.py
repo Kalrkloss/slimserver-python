@@ -1282,23 +1282,38 @@ async def _act_stop(pm, player, button, arg) -> None:
 
 
 async def _act_fwd(pm, player, button, arg) -> None:
-    """Common.pm:268-275 'fwd' + :327-331 jump 'fwd' -> playlist jump +1."""
-    await pm.playlist_next(player.mac)
+    """Common.pm:268-275 'fwd' -> ``playlist jump +1`` (which is ``skip``)."""
+    await pm.playlist_jump(player.mac, "+1")
 
 
 async def _act_rew(pm, player, button, arg) -> None:
-    """Common.pm:277-294 'rew' + :310-325 jump 'rew' -> jump -1 (or restart)."""
-    await pm.playlist_prev(player.mac)
+    """Common.pm:277-294 'rew': less than a second since the last IR press steps
+    back one track, otherwise the current track restarts."""
+    await pm.playlist_jump(player.mac, "-1")
 
 
 async def _act_jump(pm, player, button, arg) -> None:
-    """Common.pm:296-337 'jump' with arg 'rew'|'fwd'|else (restart +0)."""
-    if arg == "fwd":
-        await pm.playlist_next(player.mac)
-    elif arg == "rew":
-        await pm.playlist_prev(player.mac)
-    elif player.current_track_id is not None:
-        await pm.play_track(player.mac, player.current_track_id)   # :335
+    """Common.pm:296-337 'jump' with arg 'rew'|'fwd'|else (restart +0).
+
+    Perl does not move indices itself here — every branch executes a
+    ``playlist jump`` command and lets ``playlistJumpCommand``
+    (Commands.pm:921-1036) do the arithmetic:
+
+    * ``rew`` (:310-325): a song time below five seconds OR a stopped player
+      steps back one (``-1``), anything else restarts the current track (``+0``)
+    * ``fwd`` (:327-331): ``+1``
+    * anything else (:332-336): ``+0``
+    """
+    if arg == "rew":
+        if float(getattr(player, "elapsed", 0.0) or 0.0) < 5 \
+                or getattr(player, "mode", "stop") == "stop":
+            await pm.playlist_jump(player.mac, "-1")
+        else:
+            await pm.playlist_jump(player.mac, "+0")
+    elif arg == "fwd":
+        await pm.playlist_jump(player.mac, "+1")
+    else:
+        await pm.playlist_jump(player.mac, "+0")
 
 
 async def _act_play(pm, player, button, arg) -> None:
@@ -1443,8 +1458,22 @@ async def _execute(mac: str, code: str, kind: str, hold: bool,
     if function is None:
         res.action = "no-op"
         return res
+    await _run_function(res, function, button, manager)
+    return res
+
+
+async def _run_function(res: ButtonAction, function: str, button: str,
+                        manager) -> ButtonAction:
+    """``Common::getFunction`` + call (``Common.pm:1338-1360``, IR.pm:1084-1104).
+
+    ``getFunction`` returns the exact sub for a function name, else splits
+    ``X_Y`` into the sub ``X`` with argument ``Y`` (:1349-1354 for the mode's
+    functions, :1356-1358 for the shared ``%functions``). The FUNCTION name —
+    not the button name — is what the sub receives as its second argument
+    (IR.pm:1084, :1104).
+    """
     sub, arg = split_function(function)
-    res.sub, res.arg = sub, arg
+    res.function, res.sub, res.arg = function, sub, arg
     handler = ACTIONS.get(sub)
     if handler is None:
         # IR.pm:1106-1112 — Perl only warns here, the socket stays open.
@@ -1455,15 +1484,34 @@ async def _execute(mac: str, code: str, kind: str, hold: bool,
     if manager is None:
         from lyrion.player.manager import PlayerManager
         manager = PlayerManager()
-    player = manager.get_player(mac)
+    player = manager.get_player(res.mac) if res.mac else None
     if player is None:
         res.action = "no-op"
         return res
-    # executeButton passes the FUNCTION name (not the button name) as the
-    # second argument (IR.pm:1084, :1104) — actions that need the direction
-    # or the slot read it from `arg`/`button`.
     await handler(manager, player, button, arg)
     res.action = "executed"
+    return res
+
+
+async def execute_named_button(button: str, mac: str | None = None, *,
+                               manager=None, mode: str | None = None,
+                               hold: bool = False) -> ButtonAction:
+    """``button <code>`` -> ``IR::executeButton`` — Commands.pm:263-291.
+
+    The wire paths (``IR  ``/``BUTN``/``KNOB``) carry a hex code that is first
+    resolved to a button NAME (:func:`handle_button`); a ``button`` command
+    (CLI, JSON-RPC, cometd) already carries the name and Perl hands it straight
+    to ``executeButton`` (``Commands.pm:288``) with ``_orFunction`` defaulting
+    to 1. That flag makes a name the function when the map has no entry for it
+    (``IR.pm:1061-1064``) — which is why ``button jump_fwd`` from the
+    controllers runs ``%functions{'jump'}`` with the argument ``fwd``
+    (``Common.pm:296-337``) and not a map entry for a ``jump_fwd`` button.
+    """
+    res = ButtonAction(mac=mac or "", code=button, kind="command")
+    function = lookup_function(button, mode=mode, hold=hold)
+    if function is None:
+        function = button                            # IR.pm:1061-1064
+    await _run_function(res, function, button, manager)
     return res
 
 

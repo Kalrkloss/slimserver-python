@@ -1619,12 +1619,16 @@ async def cmd_button(
 ) -> list[str]:
     """button <name> — simulate a front-panel button press; ONE line.
 
-    ``addDispatch(['button','_buttoncode','_time','_orFunction'],
-    [1,0,0,buttonCommand])`` (``Slim/Control/Request.pm:483``);
+    ``addDispatch(['button','_buttoncode','_time','_orFunction'],``
+    ``[1,0,0,buttonCommand])`` (``Slim/Control/Request.pm:483``);
     ``buttonCommand`` adds no result (Commands.pm), so the request is echoed —
     with the client id (needsClient=1) and the declared ``_time``/
     ``_orFunction`` slots rendered empty when unset (Request.pm:1026-1028).
-    We still perform the mapped transport action.
+    The button name is executed through the shared map/function table
+    (``Commands.pm:288`` → ``IR::executeButton(..., _orFunction=1)``), the same
+    path the JSON/cometd ``button`` command uses — ``button jump_fwd`` (what
+    the controllers post) is the function ``jump`` with argument ``fwd``
+    (``Common.pm:1338-1360``, :296-337).
     """
     if not args:
         return _echo("button", args, clientid=ctx.player_id)
@@ -1634,26 +1638,9 @@ async def cmd_button(
     name = str(args[0]).lower()
     try:
         from lyrion.player import PlayerManager
+        from lyrion.player.buttons import execute_named_button
 
-        pm = PlayerManager()
-        if name == "play":
-            player = pm.get_player(ctx.player_id)
-            if player is not None and player.mode != "play":
-                await pm.pause_player(ctx.player_id, False)
-        elif name == "pause":
-            player = pm.get_player(ctx.player_id)
-            if player is not None:
-                await pm.pause_player(ctx.player_id, player.mode != "pause")
-        elif name == "power":
-            player = pm.get_player(ctx.player_id)
-            if player is not None:
-                pm.set_power(ctx.player_id, not player.power)
-        elif name == "stop":
-            await pm.stop_player(ctx.player_id)
-        elif name == "prev":
-            await pm.playlist_prev(ctx.player_id)
-        elif name == "next":
-            await pm.playlist_next(ctx.player_id)
+        await execute_named_button(name, ctx.player_id, manager=PlayerManager())
     except Exception:  # noqa: BLE001
         pass
     return _command_echo(["button"], args,
@@ -2416,23 +2403,24 @@ async def cmd_playlist(
             return _command_echo(["playlist", "url"], rest, ["_item"],
                                  clientid=ctx.player_id)
         if sub in ("index", "jump"):
-            # playlist index <n> — jump to a playlist index (no restart of
-            # an identical index; LMS 'index' only plays when changed).
+            # playlist index <n> / playlist jump [+n|-n|<n>] — Perl serves both
+            # verbs from playlistJumpCommand (Commands.pm:925) and accepts
+            # relative offsets ('+1'/'+0'/'-1', :970-1014); the arithmetic
+            # lives in lyrion.player.manager.jump_target.
             player3 = pm.get_player(ctx.player_id)
             cur = getattr(player3, "playlist_position", 0) if player3 else 0
             if not rest or str(rest[0]) == "?":
                 return _command_line(["playlist", sub], [], [],
                                      clientid=ctx.player_id,
                                      results=[(f"_{sub}", cur)])
-            if not str(rest[0]).lstrip("-").isdigit():
+            if player3 is None:
                 return _command_echo(["playlist", sub], rest, ["_index"],
                                      clientid=ctx.player_id)
-            idx = int(rest[0])
-            if sub == "index" and idx == cur and player3 is not None \
-                    and player3.mode == "play":
-                pass
-            else:
-                await pm.playlist_play(ctx.player_id, idx)
+            from lyrion.player.manager import jump_target
+
+            target = jump_target(player3, rest[0])
+            if target is not None:
+                await pm.playlist_play(ctx.player_id, target)
             return _command_echo(["playlist", sub], rest, ["_index"],
                                  clientid=ctx.player_id)
         if sub in ("shuffle", "repeat"):

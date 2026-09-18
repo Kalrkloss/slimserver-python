@@ -169,6 +169,50 @@ def _formats_for_model(model: str) -> set[str]:
     return _perl_model_formats(model) or set(_COMMON_FORMATS)
 
 
+def jump_target(player: PlayerState, index) -> int | None:
+    """``playlistJumpCommand`` target index — ``Slim/Control/Commands.pm:937-1014``.
+
+    Perl's handler serves BOTH ``playlist jump`` and ``playlist index``
+    (``Commands.pm:925``) and accepts an absolute index as well as a relative
+    ``+n``/``-n`` offset (``Commands.pm:970``):
+
+    * no playlist at all -> the command returns immediately (``:937``)
+    * playing and ``+0`` — or playing with a single-song playlist and ``-1`` —
+      restarts the CURRENT track (``:974-979``, ``jumpToTime(0)``); the index
+      does not move
+    * playing and ``+1`` skips to the next song (``:980-986``): the controller's
+      ``nextsong`` wraps at the end and REPLAYS the current song while
+      ``playlist repeat == 1`` (``StreamingController.pm:848-899``)
+    * everything else is ``playingSongIndex + offset`` / the absolute index,
+      wrapped into the playlist (``:990``, ``:1010-1013``)
+
+    Returns ``None`` when there is nothing to jump to (empty playlist, or a
+    non-numeric absolute index).
+    """
+    playlist = list(getattr(player, "playlist", None) or [])
+    count = len(playlist)
+    if not count:
+        return None                                     # :937 (|| return)
+    text = str(index)
+    cur = int(getattr(player, "playlist_position", 0) or 0)
+    if cur < 0 or cur >= count:
+        cur = 0
+    if "+" in text or "-" in text:                      # :970 relative
+        stopped = getattr(player, "mode", "stop") == "stop"   # StreamCtrl:1681
+        if not stopped:
+            if text == "+0" or (count == 1 and text == "-1"):
+                return cur                              # :974-979 restart
+            if text == "+1":                            # :980-986 skip()
+                if int(getattr(player, "repeat", 0) or 0) == 1:
+                    return cur             # StreamingController.pm:876-878
+                return (cur + 1) % count
+        return (cur + int(text)) % count                # :990, :1010-1013
+    stripped = text.lstrip("+")
+    if not stripped.isdigit():
+        return None
+    return int(stripped) % count                        # :1005, :1010-1013
+
+
 def _hashable(value):
     """A hashable, comparable view of a status field value.
 
@@ -1459,7 +1503,15 @@ class PlayerManager:
         return bool(sent)
 
     async def playlist_play(self, player_id: str, index: int) -> bool:
-        """Play the track at a playlist index (0-based)."""
+        """Play the track at a playlist index (0-based).
+
+        A playlist entry is either a DB track id (``int``) or a remote stream
+        URL (``str``, radio/favorites); Perl streams both through one path — a
+        ``Song`` whose ``url`` is local or remote (``Slim/Player/Song.pm``, the
+        remote scan ``Slim/Utils/Scanner/Remote.pm``). The stream branch mirrors
+        the web API's ``_play_playlist_item`` so ``playlist jump``/``next`` work
+        on a queue of radio streams too.
+        """
         player = self.get_player(player_id)
         if player is None:
             return False
@@ -1468,12 +1520,48 @@ class PlayerManager:
         if index < 0 or index >= len(player.playlist):
             return False
         player.playlist_position = index
-        track_id = player.playlist[index]
-        ok = await self.play_track(player_id, track_id)
+        item = player.playlist[index]
+        if not isinstance(item, int):
+            # Stream URL entry — send the strm frame for the remote source.
+            handler = self._protocol_handler
+            if handler is None:
+                return False
+            from lyrion.networking.protocol import SlimProtoClient
+
+            url = str(item)
+            codec = SlimProtoClient._guess_codec_from_url(url)
+            ok = await handler.send_remote_stream(player.mac, url, codec)
+            if not ok:
+                return False
+            await self.power_on_for_playback(player)
+            player.playlist_position = index
+            player.playlist_total = len(player.playlist)
+            player.mode = "play"
+            player.remote = 1
+            player.current_track_id = None
+            player.current_url = url
+            player.elapsed = 0.0
+            player.last_activity = time.time()
+            return True
+        ok = await self.play_track(player_id, item)
         if ok:
             player.playlist_position = index
             player.playlist_total = len(player.playlist)
         return ok
+
+    async def playlist_jump(self, player_id: str, index) -> bool:
+        """``playlist jump|index`` — ``Slim/Control/Commands.pm:921-1036``.
+
+        Absolute index or relative ``+n``/``-n`` offset; the target index comes
+        from :func:`jump_target` and is then played (``:1016-1021``).
+        """
+        player = self.get_player(player_id)
+        if player is None:
+            return False
+        target = jump_target(player, index)
+        if target is None:
+            return False
+        return await self.playlist_play(player_id, target)
 
     async def seek_to(self, player_id: str, seconds: int) -> bool:
         """Seek within the current stream.
@@ -1505,20 +1593,18 @@ class PlayerManager:
         )
 
     async def playlist_next(self, player_id: str) -> bool:
-        """Skip to the next track in the playlist (wraps to start)."""
-        player = self.get_player(player_id)
-        if player is None or not player.playlist:
-            return False
-        nxt = (player.playlist_position + 1) % len(player.playlist)
-        return await self.playlist_play(player_id, nxt)
+        """Skip to the next track in the playlist (wraps to start).
+
+        Perl's ``skip`` is what ``playlist jump +1`` runs
+        (``Commands.pm:980-986``) — routed through :func:`jump_target` so the
+        wrap and the ``repeat == 1`` (repeat-song) rule match
+        (``StreamingController.pm:848-899``).
+        """
+        return await self.playlist_jump(player_id, "+1")
 
     async def playlist_prev(self, player_id: str) -> bool:
         """Go back to the previous track in the playlist (wraps to end)."""
-        player = self.get_player(player_id)
-        if player is None or not player.playlist:
-            return False
-        prev = (player.playlist_position - 1) % len(player.playlist)
-        return await self.playlist_play(player_id, prev)
+        return await self.playlist_jump(player_id, "-1")
 
     async def save_playlist(self, player_id: str, name: str) -> bool:
         """Persist the player's current playlist to the DB under a name."""

@@ -85,11 +85,15 @@ class FakeManager:
         return True
 
     async def playlist_next(self, mac):
-        self.calls.append(("next",))
+        self.calls.append(("playlist_jump", "+1"))
         return True
 
     async def playlist_prev(self, mac):
-        self.calls.append(("prev",))
+        self.calls.append(("playlist_jump", "-1"))
+        return True
+
+    async def playlist_jump(self, mac, index):
+        self.calls.append(("playlist_jump", str(index)))
         return True
 
     async def play_track(self, mac, track_id):
@@ -280,14 +284,57 @@ def test_pause_button_toggles_and_never_sends_a_toggle():
 
 def test_fwd_and_rew_map_through_jump():
     # Default.map fwd.single = jump_fwd -> Common.pm:327-331 jump +1
-    player = _player()
+    # rew.single = jump_rew -> Common.pm:310-325 jump -1 (songTime < 5)
+    player = _player(mode="stop")
     pm = FakeManager(player)
     res = _run(B.handle_button(MAC, CODE_FWD, manager=pm))
     assert (res.function, res.sub, res.arg) == ("jump_fwd", "jump", "fwd")
-    assert pm.calls[-1] == ("next",)
+    assert pm.calls[-1] == ("playlist_jump", "+1")
     res = _run(B.handle_button(MAC, CODE_REW, manager=pm))
     assert (res.function, res.sub, res.arg) == ("jump_rew", "jump", "rew")
-    assert pm.calls[-1] == ("prev",)
+    assert pm.calls[-1] == ("playlist_jump", "-1")
+
+
+def test_jump_rew_restarts_a_running_track_after_five_seconds():
+    # Common.pm:310-325: songTime >= 5 AND playing -> jump '+0' (restart)
+    player = _player(mode="play", elapsed=42.0)
+    pm = FakeManager(player)
+    _run(B.handle_button(MAC, CODE_REW, manager=pm))
+    assert pm.calls[-1] == ("playlist_jump", "+0")
+
+
+def test_execute_named_button_runs_the_function_table():
+    # Commands.pm:263-291 -> IR.pm:1061-1064 -> Common.pm:1338-1360
+    player = _player(mode="play", playlist=[11, 22], playlist_position=0)
+    pm = FakeManager(player)
+    res = _run(B.execute_named_button("jump_fwd", MAC, manager=pm))
+    assert (res.kind, res.function, res.sub, res.arg) == (
+        "command", "jump_fwd", "jump", "fwd")
+    assert res.action == "executed"
+    assert pm.calls[-1] == ("playlist_jump", "+1")
+
+    res = _run(B.execute_named_button("jump_rew", MAC, manager=pm))
+    assert (res.function, res.sub, res.arg) == ("jump_rew", "jump", "rew")
+    assert pm.calls[-1] == ("playlist_jump", "-1")
+
+
+def test_button_fwd_name_is_looked_up_in_the_map_first():
+    # 'fwd'/'rew' are BUTTON names: the map turns them into jump_fwd/jump_rew
+    # (Default.map [common] fwd.single, IR.pm:491-527)
+    player = _player(mode="play", elapsed=42.0)
+    pm = FakeManager(player)
+    res = _run(B.execute_named_button("fwd", MAC, manager=pm))
+    assert (res.function, res.sub, res.arg) == ("jump_fwd", "jump", "fwd")
+    assert pm.calls[-1] == ("playlist_jump", "+1")
+
+
+def test_execute_named_button_unknown_function_is_logged_not_executed():
+    # IR.pm:1106-1112 — Perl only warns; the socket stays open
+    player = _player(mode="play")
+    pm = FakeManager(player)
+    res = _run(B.execute_named_button("next", MAC, manager=pm))
+    assert res.action == "not-implemented"
+    assert pm.calls == []
 
 
 def test_power_button_uses_the_toggle_branch():
