@@ -572,20 +572,28 @@ async def _push_events(manager, cid: str, writer: asyncio.StreamWriter,
     Perl writes into a streaming /meta/connect response the MOMENT an event
     exists (``Manager::deliver_events``, Manager.pm:247-263 -> sendResponse
     Cometd.pm:661) and writes NOTHING while the client has no events: the
-    streaming branch arms no timer at all (Cometd.pm:288-297).  A quiet
-    streaming socket is therefore only ended by the HTTP keep-alive timeout
+    streaming branch arms no timer at all (Cometd.pm:288-297).  A client that
+    wants a heartbeat therefore ASKS for one: a ``subscribe:<n>`` token in its
+    status/serverstatus request makes Perl re-execute that request every n
+    seconds (``Queries.pm:4593-4597``/:3869-3875 -> ``registerAutoExecute``
+    Request.pm:2176-2181) and push the fresh result into this very stream —
+    that is the traffic a Squeeze Client/Squeezer session lives on, and it is
+    what ``CometdManager``'s keepalive/auto-execute sweep reproduces.  A client
+    that asked for no such timeout is silent from Perl's point of view; its
+    stream is then only ended by the HTTP keep-alive timeout
     (``KEEPALIVETIMEOUT => 75``, HTTP.pm:70/:2091-2099), after which the client
     re-polls (advice interval RETRY_DELAY 5000 ms, Cometd.pm:278) and so
-    notices a dropped registration.  Measured on live 9.1.1: ack chunk at once,
-    then no byte, EOF at 74.94 s.
+    notices a dropped registration.  Measured on live 9.1.1: ack chunk at
+    once, then no byte, EOF at 74.94 s.
 
     Python used to write an EMPTY batch (``[]``) every LONG_POLLING_TIMEOUT
-    instead — a rate no Perl client ever sees — and left the socket open
-    forever, so a client whose registration had been reaped (grace expired /
-    autokill) kept a silent, open stream and never re-polled: the UI froze on
-    the last title it had received, with no error and no reconnect.  Both are
-    gone: silence is silence, and the socket is closed after Perl's
-    KEEPALIVETIMEOUT.
+    instead — a rate no Perl client ever sees — which also papered over the
+    missing ``subscribe:<n>`` re-execution: without it a client that had asked
+    for a 60 s keep-alive went silent, its own connect timeout
+    (``advice.timeout`` = 60 s, Cometd.pm:251) expired and the app abandoned
+    the session (live 2026-09-18: new clientId every ~60-240 s, no status in
+    the UI).  Both are gone: silence is silence, and the timers a client asked
+    for with ``subscribe:<n>`` fire on schedule.
 
     Every way out of this task is logged with the client id — a stream that
     ends must never do so silently.

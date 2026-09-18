@@ -148,6 +148,14 @@ class CometdClient:
     """One connected Jive controller."""
     client_id: str
     subscriptions: dict[str, dict] = field(default_factory=dict)
+    # Perl's ``%subscribers{$cnxid}{$name}{$clientid}`` table for requests that
+    # asked to be re-executed (``subscribe:<n>`` in their command array,
+    # registerAutoExecute Request.pm:2113-2183).  Keyed by
+    # ``(response channel, command)``; the entry holds the request, the
+    # message id and the interval in seconds.  Only requests that arrived as
+    # ``/slim/request`` (a one-shot) land here — a ``/slim/subscribe`` stores
+    # its request in ``subscriptions`` and is served by the same loop.
+    autoexecute: dict[tuple[str, str], dict] = field(default_factory=dict)
     events: list[dict] = field(default_factory=list)
     notify: asyncio.Event = field(default_factory=asyncio.Event)
     # Wall-clock of the client's last message / connection activity. Used by
@@ -495,6 +503,50 @@ def _stored_request(data) -> list | None:
         request = data.get("request")
         if isinstance(request, list) and request:
             return request
+    return None
+
+
+def subscribe_timeout(request) -> int | None:
+    """Perl's ``$request->getParam('subscribe')`` of a request's command args.
+
+    A controller asks for a repeating re-execution by putting a
+    ``subscribe:<n>`` token into its command array (SqueezePlay's
+    ``['status','-',10,'menu:menu','useContextMenu:1','subscribe:600']``,
+    Squeeze Client's ``['serverstatus','0','2147483647','subscribe:60',…]``).
+    Perl reads it in the QUERY ITSELF — ``Queries.pm:4593-4597`` (status):
+
+        if (defined(my $timeout = $request->getParam('subscribe'))) {
+            # register ourselves to be automatically re-executed on timeout
+            $request->registerAutoExecute($timeout, \\&statusQuery_filter);
+        }
+
+    and ``Queries.pm:3869-3875`` (serverstatus) — for EVERY cometd message
+    that carries such a request, ``/slim/request`` included (Cometd.pm:545-558
+    dispatches it through the same ``handleRequest`` → ``Request::execute``;
+    the modern WebSocket transport says it out loud:
+    "lets Slim::Control::Request re-invoke us for subscribe:<n> style
+    requests", ``Slim/Plugin/WebSocket/Plugin.pm:282-283``).
+
+    Returns ``None`` when the command array has no token (Perl: nothing is
+    registered), ``-1`` for the literal ``subscribe:-`` (Perl: "do not store
+    the subscription", Request.pm:2167 ``if ($timeout ne '-')``) and the
+    parsed seconds otherwise — ``0`` means "remember it, arm no timer"
+    (Request.pm:2176 ``if ($timeout > 0)``).
+    """
+    if not isinstance(request, list):
+        return None
+    for item in request:
+        tokens = item if isinstance(item, list) else [item]
+        for token in tokens:
+            if isinstance(token, str) and token.startswith("subscribe:"):
+                value = token[len("subscribe:"):].strip()
+                if value == "-":
+                    return -1
+                try:
+                    return max(0, int(value))
+                except ValueError:
+                    # Perl compares non-numeric values numerically: 0.
+                    return 0
     return None
 
 
@@ -1257,6 +1309,65 @@ class CometdManager:
         client.events.append(event)
         client.notify.set()
 
+    def arm_autoexecute(self, client_id: str, channel: str, msg_id,
+                        request: list | None, timeout: int | None) -> bool:
+        """Register/kill a request for Perl's periodic re-execution.
+
+        ``registerAutoExecute`` (``Slim/Control/Request.pm:2113-2183``) is how
+        Perl implements the ``subscribe:<n>`` token of a status/serverstatus
+        request (``Queries.pm:4593-4597``/:3869-3875) — for EVERY cometd
+        message that carries one, ``/slim/request`` included: the request is
+        re-executed every ``n`` seconds and its fresh result pushed to the
+        response channel (``__autoexecute`` :2467-2495 →
+        ``requestCallback`` Cometd.pm:939-981 → ``deliver_events``).
+
+        The three Perl cases (Request.pm:2167/:2176):
+
+        * ``subscribe:-`` → the request is *not* stored (and any timer for the
+          same connection/request is killed, :2143-2161);
+        * ``subscribe:0`` → stored, no timer;
+        * ``subscribe:N`` (N > 0) → stored and armed for ``now + N`` (:2179-2181
+          ``setTimer($request, Time::HiRes::time() + $timeout, \\&__autoexecute)``),
+          so the FIRST re-execution is N seconds away — the client's initial
+          status is the one its own reply carried (Cometd.pm:454-475/:922-929).
+
+        Returns True when a timer entry is now registered.  Without this, a
+        ``/slim/request … subscribe:60`` (which is exactly what Squeeze Client
+        sends for its serverstatus) stayed a ONE-SHOT: the streaming connect
+        then went quiet, the client's own connect timeout (``advice.timeout``
+        = 60 s, Cometd.pm:251) expired, and the app abandoned the session and
+        re-handshaked under a NEW clientId — the UI lost status/push binding.
+        """
+        client = self._clients.get(client_id)
+        if client is None or not channel or not isinstance(request, list) \
+                or not request:
+            return False
+        key = (channel, _request_command(request))
+        # Perl kills the previous subscription for this connection/request
+        # before storing the new one (:2143-2161).
+        client.autoexecute.pop(key, None)
+        if timeout is None or timeout < 0:
+            return False
+        client.autoexecute[key] = {
+            "channel": channel,
+            "id": msg_id,
+            "request": request,
+            "interval": float(timeout),
+            "last": self._clock(),
+        }
+        logger.debug("Cometd subscribe:%s armed for %s on %s "
+                     "(Perl registerAutoExecute Request.pm:2176)",
+                     timeout, client_id, channel)
+        return timeout > 0
+
+    def drop_autoexecute(self, client_id: str, channel: str) -> None:
+        """Forget the repeating requests of a channel (Perl's unsubscribe)."""
+        client = self._clients.get(client_id)
+        if client is None:
+            return
+        for key in [k for k in client.autoexecute if k[0] == channel]:
+            del client.autoexecute[key]
+
     async def notify_server_status(self) -> None:
         """Push a fresh serverstatus to all serverstatus subscribers.
 
@@ -1444,12 +1555,22 @@ class CometdManager:
     async def keepalive_loop(self) -> None:
         """Push fresh status to subscribe:N subscriptions on schedule.
 
+        Two sources feed this, exactly like Perl's one
+        ``registerAutoExecute`` rule (``Queries.pm:4593-4597`` /
+        ``:3869-3875`` → ``Request.pm:2176-2181``):
+
+        * ``client.subscriptions`` — a ``/slim/subscribe`` (or
+          ``/meta/subscribe``) that stored a request with ``subscribe:<n>``;
+        * ``client.autoexecute`` — a ``/slim/request`` (one-shot by nature)
+          that carried ``subscribe:<n>``, i.e. what Squeeze Client sends for
+          its serverstatus.
+
         Runs for the lifetime of the server (started from the app/CLI
         entrypoints). Without it the controller apps never get status
         updates while a player is idle (mode=stop → no STAT events) and
         treat the silent stream as dead, reconnecting every ~75 s.
         """
-        last: dict[tuple[str, str], float] = {}
+        last: dict[tuple, float] = {}
         while True:
             await asyncio.sleep(1)
             now = time.time()
@@ -1458,7 +1579,7 @@ class CometdManager:
                     interval = self._subscribe_interval(data)
                     if interval <= 0:
                         continue
-                    key = (client.client_id, sub)
+                    key = ("sub", client.client_id, sub)
                     last_fired = last.get(key)
                     if not keepalive_due(last_fired, interval, now):
                         # First sight of the subscription: Arm the timer
@@ -1474,10 +1595,33 @@ class CometdManager:
                             sub, result, _subscription_msg_id(data)))
                     except Exception:  # noqa: BLE001
                         pass
+                for entry_key, entry in list(client.autoexecute.items()):
+                    interval = entry.get("interval") or 0
+                    if interval <= 0:
+                        # ``subscribe:0``: Perl stores the request but arms no
+                        # timer (Request.pm:2176 ``if ($timeout > 0)``).
+                        continue
+                    key = ("auto", client.client_id, entry_key)
+                    last_fired = last.get(key)
+                    if not keepalive_due(last_fired, interval, now):
+                        if last_fired is None:
+                            last[key] = now
+                        continue
+                    last[key] = now
+                    try:
+                        result = await self._dispatch(entry["request"])
+                        # Perl's __autoexecute runs the request again and hands
+                        # the fresh result to requestCallback, which pushes it
+                        # on the original response channel with the original
+                        # message id (Cometd.pm:939-970).
+                        self.push(client.client_id, event_frame(
+                            entry["channel"], result, entry["id"]))
+                    except Exception:  # noqa: BLE001
+                        pass
             # Drop bookkeeping for clients the idle reaper removed — a
             # per-(client, channel) key would otherwise grow forever.
             live = {c.client_id for c in self._clients.values()}
-            for key in [k for k in last if k[0] not in live]:
+            for key in [k for k in last if k[1] not in live]:
                 del last[key]
 
     # ------------------------------------------------------------------
@@ -1667,6 +1811,11 @@ class CometdManager:
                 if client is not None:
                     for sub in subscriptions:
                         client.subscriptions.pop(sub, None)
+                        # Perl removes the repeating re-execution together with
+                        # the channel it belonged to (requestCallback's
+                        # ``%toUnsubscribe`` check, Cometd.pm:947-953 /
+                        # unregisterAutoExecute Request.pm:894-911).
+                        self.drop_autoexecute(cid, sub)
                 # Perl Cometd.pm:382-387 / :519-525: every unsubscribe ack
                 # carries clientId and the subscription; /slim/unsubscribe
                 # echoes data back.
@@ -1712,6 +1861,19 @@ class CometdManager:
                     self.deliver_result(cid, event_frame(
                         response_channel, result, msg.get("id") or 0,
                         data.get("priority") or ""), replies)
+                    # A ``subscribe:<n>`` in the command array makes this a
+                    # REPEATING request in Perl (Queries.pm:4593-4597 ->
+                    # registerAutoExecute Request.pm:2176-2181): the result is
+                    # re-executed and pushed every n seconds.  Squeeze Client
+                    # asks for its serverstatus that way (``/slim/request``,
+                    # not ``/slim/subscribe``); treating it as a one-shot left
+                    # the client's stream silent until its own connect timeout
+                    # (60 s) expired — the app then re-handshaked under a new
+                    # clientId and lost its status binding.
+                    self.arm_autoexecute(
+                        cid, response_channel, msg.get("id") or 0,
+                        data.get("request") or None,
+                        subscribe_timeout(data.get("request") or []))
                     continue
                 reply.update({"successful": False, "clientId": None})
 

@@ -346,3 +346,115 @@ def test_closing_the_stream_keeps_the_client_until_the_grace_expires():
             await web.wait_closed()
 
     _run(run())
+
+
+def test_squeeze_client_sequence_gets_its_status_and_a_keep_alive():
+    """Live regression after b0e2b70b6: the apps were left without status.
+
+    Squeeze Client / Squeezer run exactly this sequence (live log
+    2026-09-18 20:00:50 for client ``lyrion-12``): handshake, a streaming
+    /meta/connect, channel subscriptions via /meta/subscribe, a
+    /slim/subscribe for the player status — and their serverstatus as a
+    **/slim/request** carrying ``subscribe:60``:
+
+        {'request': ['', ['serverstatus','0','2147483647','subscribe:60',…]],
+         'response': '/<cid>/slim/serverstatus'}
+
+    Perl re-executes such a request every 60 s (``Queries.pm:4593-4597`` /
+    ``:3869-3875`` → ``Request.pm:2176-2181``); because we treated it as a
+    one-shot, the streaming connect went silent, the client's own connect
+    timeout (``advice.timeout`` = 60 s, Cometd.pm:251) expired and the app
+    dropped the session and re-handshaked under a new clientId (logcat:
+    ``Disconnected from event stream`` + ``Connected … with client ID
+    lyrion-4/-7/-8/-12``), leaving the UI without play symbol, times and
+    metadata.  Measured live: the first give-up came 66 s after the connect.
+
+    This test drives the real frontend and asserts BOTH halves of the fix:
+    the subscribing client gets its initial status immediately (its own reply
+    carries it, Cometd.pm:922-929) and the armed ``subscribe:1`` keeps
+    writing fresh results onto the open stream instead of leaving it silent.
+    """
+    async def run():
+        web = await asyncio.start_server(_start_web_app(), "127.0.0.1", 0)
+        web_port = web.sockets[0].getsockname()[1]
+        mgr = CometdManager(_StubRPC())
+        server = await start_cometd_server(mgr, "127.0.0.1", 0, web_port)
+        loop_task = asyncio.create_task(mgr.keepalive_loop())
+        try:
+            port = server.sockets[0].getsockname()[1]
+            a_r, a_w = await asyncio.open_connection("127.0.0.1", port)
+            b_r, b_w = await asyncio.open_connection("127.0.0.1", port)
+            try:
+                cid = await _handshake(b_r, b_w)
+                # the app's channel registrations (globs + concrete channels)
+                for i, sub in enumerate((f"/{cid}/**",
+                                         f"/{cid}/slim/request/*",
+                                         f"/{cid}/slim/serverstatus"), start=2):
+                    b_w.write(_post_bytes([{"channel": "/meta/subscribe",
+                                            "id": i, "clientId": cid,
+                                            "subscription": sub}]))
+                    await b_w.drain()
+                    await _read_response(b_r)
+
+                # the streaming connect, alone in its POST (as live)
+                a_w.write(_post_bytes([{"channel": "/meta/connect", "id": 8,
+                                        "clientId": cid,
+                                        "connectionType": "streaming"}]))
+                await a_w.drain()
+                head = await _read_headers(a_r)
+                assert b"chunked" in head.lower(), head
+                await _read_chunk(a_r)                    # the connect ack
+
+                # its serverstatus, asked for as a /slim/request + subscribe:1
+                b_w.write(_post_bytes([{
+                    "channel": "/slim/request", "id": 9, "clientId": cid,
+                    "data": {"request": ["", ["serverstatus", "0", "50",
+                                              "subscribe:1"]],
+                             "response": f"/{cid}/slim/serverstatus"}}]))
+                await b_w.drain()
+                _, body = await _read_response(b_r)
+                reply = json.loads(body)
+                chans = [m.get("channel") for m in reply]
+                assert "/slim/request" in chans, reply      # the ack rides here
+                # A streaming client reads its result off the connect channel —
+                # Perl routes a finished request through deliver_events
+                # (Cometd.pm:584-589), so the reply above carries the ack only.
+                assert f"/{cid}/slim/serverstatus" not in chans, chans
+
+                started = asyncio.get_running_loop().time()
+                events = json.loads(await _read_chunk(a_r))
+                assert events[0]["channel"] == f"/{cid}/slim/serverstatus", events
+                assert events[0]["id"] == 9, events          # the initial status
+
+                # ~1 s later the armed request must push again — the stream
+                # stays alive instead of going silent until the client's own
+                # connect timeout drops the session.
+                again = json.loads(await _read_chunk(a_r))
+                gap = asyncio.get_running_loop().time() - started
+                assert again and again[0]["id"] == 9, again
+                assert again[0]["channel"] == f"/{cid}/slim/serverstatus", again
+                assert again[0]["data"]["command"] == "serverstatus", again
+                assert gap >= 1.0, f"the repeat came after only {gap:.2f}s"
+
+                # the session survives: the client is still registered and the
+                # stream socket is still owned by it
+                client = mgr.get(cid)
+                assert client is not None and client.autoexecute, \
+                    "the repeating request was never registered"
+                assert mgr.has_live_connection(cid), \
+                    "the streaming connection is no longer registered"
+            finally:
+                a_w.close()
+                b_w.close()
+        finally:
+            loop_task.cancel()
+            try:
+                await loop_task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001, S110
+                pass
+            server.close()
+            await server.wait_closed()
+            web.close()
+            await web.wait_closed()
+
+    _run(run())

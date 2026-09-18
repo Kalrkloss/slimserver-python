@@ -24,7 +24,13 @@ playing.  Three Perl facts fix that, each pinned here:
    advice interval (5000 ms) and discovers a reaped registration instead of
    holding a silently dead stream.  We used to write an empty ``[]`` batch every
    60 s and never end the socket, so a client whose registration had been reaped
-   kept a silent, open stream forever.
+   kept a silent, open stream forever.  What Perl DOES write on such a stream is
+   the result of every request the client registered with ``subscribe:<n>``
+   (``Queries.pm:4593-4597``/:3869-3875 → ``registerAutoExecute``
+   Request.pm:2176-2181) — a client that wants a heartbeat asks for one, and
+   that is the traffic a Squeeze Client/Squeezer session lives on (pinned by
+   ``tests/test_cometd_request_autoexecute.py`` and
+   ``test_cometd_stream_native.py::test_squeeze_client_sequence_gets_its_status_and_a_keep_alive``).
 
 3. A long-polling connect answers with Content-Length after the client's
    timeout (Perl Cometd.pm:298-328, chunked is streaming only, :288-292) and
