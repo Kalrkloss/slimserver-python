@@ -328,6 +328,117 @@ def test_gvfs_mount_states_with_a_mount_point(monkeypatch, tmp_path):
     assert platform_paths.gvfs_mount_state(str(child)) == "not-mounted"
 
 
+def test_gvfs_share_with_entries_is_mounted_without_a_mount_entry(monkeypatch, tmp_path):
+    """Regression: a readable gvfs share must never be "not-mounted".
+
+    Measured on the live session this test models: the share directory
+    ``/run/user/1000/gvfs/smb-share:server=media.local,share=media`` holds 20
+    entries (305 in the ``Musik`` folder below it) while
+    ``os.path.ismount(share)`` is ``False`` and ``/proc/self/mounts`` lists only
+    the single ``gvfsd-fuse /run/user/1000/gvfs`` mount — gvfs shares are plain
+    sub-directories of it.  The old check demanded a mount point and therefore
+    answered ``not-mounted`` for a perfectly readable folder.
+    """
+    share = tmp_path / "smb-share:server=media.local,share=media"
+    (share / "Musik" / "Album").mkdir(parents=True)
+    (share / "Musik" / "Album" / "a.flac").write_bytes(b"x")
+    monkeypatch.setattr(platform_paths, "gvfs_mount_root", lambda p: share)
+    # Exactly what the real share reports: not a mount point of its own.
+    monkeypatch.setattr(platform_paths, "_is_mount_point", lambda p: False)
+    monkeypatch.setattr(platform_paths, "_proc_mount_points", lambda: set())
+
+    music = str(share / "Musik")
+    assert platform_paths.gvfs_mount_state(music) == "mounted"
+    assert platform_paths.explain_missing_path(music) == (platform_paths.OK, "")
+    assert platform_paths.warn_about_media_dirs([music]) == []
+    assert platform_paths.is_usable_dir(music)
+
+
+def test_gvfs_three_cases_stay_distinguishable(monkeypatch, tmp_path, caplog):
+    """Detached share vs. attached-but-empty vs. item does not exist."""
+    share = tmp_path / "smb-share:server=h,share=s"
+    music = share / "Musik"
+    monkeypatch.setattr(platform_paths, "gvfs_mount_root", lambda p: share)
+    # The tmp tree only *models* the gvfs layout; the URL-less path needs the
+    # predicate stubbed too so explain_missing_path takes the gvfs branch.
+    monkeypatch.setattr(platform_paths, "is_gvfs_path", lambda p: True)
+
+    # 1. The share is not attached at all: its directory is gone.
+    assert platform_paths.gvfs_mount_state(str(music)) == "not-mounted"
+    code, message = platform_paths.explain_missing_path(music)
+    assert code == platform_paths.MOUNT_NOT_MOUNTED
+    assert "not mounted" in message
+
+    # 2. Attached, but the share lists nothing: empty, not not-mounted.
+    monkeypatch.setattr(platform_paths, "_is_mount_point", lambda p: True)
+    share.mkdir(parents=True)
+    assert platform_paths.gvfs_mount_state(str(music)) == "empty"
+    code, message = platform_paths.explain_missing_path(music)
+    assert code == platform_paths.EMPTY
+    assert "lists nothing" in message
+
+    with caplog.at_level(logging.WARNING, logger="lyrion.platform.paths"):
+        problems = platform_paths.warn_about_media_dirs([str(music)])
+    assert problems[0][1] == platform_paths.EMPTY
+    assert "Music folder is empty" in caplog.text
+
+    # 3. Attached and readable, but the item is not in it → plain missing.
+    (share / "Anderes").mkdir()
+    (share / "Anderes" / "b.flac").write_bytes(b"x")
+    assert platform_paths.gvfs_mount_state(str(music)) == "mounted"
+    code, message = platform_paths.explain_missing_path(music)
+    assert code == platform_paths.MISSING
+    assert "not mounted" not in message
+    assert not platform_paths.warn_about_media_dirs([str(share / "Anderes")])
+
+
+def test_is_usable_dir_ignores_a_failing_stat(monkeypatch, tmp_path):
+    """The scan guard lists the folder; it does not trust ``Path.is_dir()``.
+
+    ``pathlib`` turns any ``OSError`` into ``False``, which is how a readable
+    gvfs share became "Music directory unusable" while ``ls`` showed 305
+    entries (Perl only needs ``-d``, ``Slim/Utils/Prefs.pm:707``).
+    """
+    music = tmp_path / "Musik"
+    music.mkdir()
+    (music / "a.flac").write_bytes(b"x")
+    empty = tmp_path / "leer"
+    empty.mkdir()
+
+    assert platform_paths.is_usable_dir(music)
+    assert platform_paths.is_usable_dir(empty), "an empty folder is still a folder"
+    assert not platform_paths.is_usable_dir(tmp_path / "weg")
+    assert not platform_paths.is_usable_dir(music / "a.flac"), "a file is no folder"
+
+    monkeypatch.setattr(Path, "is_dir", lambda self: False)
+    assert platform_paths.is_usable_dir(music), "listing wins over a failed stat"
+
+
+def test_resolve_music_dir_trusts_the_listing(monkeypatch, tmp_path):
+    """A readable configured folder is usable even when ``stat`` lies.
+
+    Measured bug: the live gvfs music folder (305 entries) was refused with
+    "Music directory unusable (mount-not-mounted)" — the guard asked
+    ``Path.is_dir()``, which turns a transient FUSE ``OSError`` into ``False``.
+    The guard now lists the folder; Perl needs no more than ``-d``
+    (``Slim/Utils/Prefs.pm:707``).
+    """
+    from lyrion.media import music_dir
+
+    music = tmp_path / "Musik"
+    music.mkdir()
+    (music / "a.flac").write_bytes(b"x")
+
+    class FakeConfig:
+        def get(self, name, default=None):
+            return str(music) if name == "musicdir" else ""
+
+    monkeypatch.setattr("lyrion.config.get_config", lambda: FakeConfig())
+    monkeypatch.setattr(Path, "is_dir", lambda self: False)
+
+    assert music_dir.resolve_music_dir() == music
+
+
 def test_missing_file_inside_a_mounted_folder_is_plainly_missing(tmp_path):
     """"file missing" must not be confused with "mount not mounted"."""
     code, message = platform_paths.explain_missing_path(tmp_path / "nope.mp3")

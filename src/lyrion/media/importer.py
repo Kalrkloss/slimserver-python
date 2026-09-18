@@ -170,18 +170,26 @@ class MusicImporter:
         from lyrion.media.scan_state import SCAN_STATE
 
         source = self.config.source_path
-        if source is None or not source.is_dir():
-            # Distinguish "folder is gone" from "the share is not mounted"
-            # (gvfs/FUSE) — different operator action, same silent library.
-            from lyrion.platform import paths as platform_paths
+        if source is None:
+            logger.error(
+                "No music folder configured — set 'mediadirs' (Perl "
+                "defaultMediaDirs, Slim/Utils/Prefs.pm:687-712)")
+            self.stats.end_time = datetime.now()
+            SCAN_STATE.finish()
+            return self.stats
 
-            if source is None:
-                logger.error(
-                    "No music folder configured — set 'mediadirs' (Perl "
-                    "defaultMediaDirs, Slim/Utils/Prefs.pm:687-712)")
-            else:
-                code, message = platform_paths.explain_missing_path(source)
-                logger.error("Music directory unusable (%s): %s", code, message)
+        # Distinguish "folder is gone" from "the share is not mounted"
+        # (gvfs/FUSE) — different operator action, same silent library.  The
+        # test is a real listing, not ``Path.is_dir()`` (which swallows the
+        # OSError of a FUSE share and rejected a readable 305-entry folder) and
+        # not a mount-table probe (a gvfs share is a plain sub-directory of the
+        # one gvfsd-fuse mount, Perl only needs ``-d``,
+        # Slim/Utils/Prefs.pm:707).
+        from lyrion.platform import paths as platform_paths
+
+        if not platform_paths.is_usable_dir(source):
+            code, message = platform_paths.explain_missing_path(source)
+            logger.error("Music directory unusable (%s): %s", code, message)
             self.stats.end_time = datetime.now()
             SCAN_STATE.finish()
             return self.stats

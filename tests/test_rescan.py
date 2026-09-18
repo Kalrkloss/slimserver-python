@@ -8,6 +8,7 @@ additive, and abortscan stops the running scan.
 """
 
 import asyncio
+import logging
 import sqlite3
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
@@ -124,6 +125,27 @@ def test_full_rescan_reconciles_deletions(tmp_path, lib_db):
     asyncio.run(run())
     assert _count_where(lib_db, "tracks", "content_type != 'dir'") == 1
     assert _count(lib_db, "albums") == 1, "orphaned album must be cleaned up"
+
+
+def test_readable_source_dir_is_scanned(tmp_path, lib_db, caplog):
+    """The scan guard accepts a readable folder (no "unusable" diagnosis).
+
+    Together with ``test_resolve_music_dir_trusts_the_listing`` this pins the
+    guard that refused the live gvfs folder: the decision is a real listing,
+    not a mount-table probe and not ``Path.is_dir()``.
+    """
+    music = tmp_path / "music"
+    _make_lib(music)
+
+    async def run():
+        with caplog.at_level(logging.ERROR, logger="lyrion.media.importer"):
+            stats = await MusicImporter(
+                ImportConfig(source_path=music, mode="full")).import_music()
+        return stats
+
+    stats = asyncio.run(run())
+    assert stats.imported_files == 2, "both files must be imported"
+    assert "Music directory unusable" not in caplog.text
 
 
 def test_additive_mode_keeps_missing_tracks(tmp_path, lib_db):

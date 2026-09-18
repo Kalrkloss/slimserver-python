@@ -677,11 +677,21 @@ def _proc_mount_points() -> set[str]:
 
 
 def _is_mount_point(path: Path) -> bool:
-    """True when ``path`` is a mount point.
+    """True when ``path`` *itself* is a mount point.
 
     ``os.path.ismount`` covers FUSE/gvfs on Linux and drive letters/UNC roots
     on Windows; ``/proc/self/mounts`` is consulted as a second, independent
     source on Linux (both read-only, no shelling out to ``gio``/``mount``).
+
+    ``False`` for a gvfs *share* directory, and that is not a defect: measured
+    on a live GNOME session, ``/proc/self/mounts`` holds exactly one gvfs line —
+    ``gvfsd-fuse /run/user/1000/gvfs fuse.gvfsd-fuse …`` — while the share
+    ``/run/user/1000/gvfs/smb-share:server=media.local,share=media`` is a plain
+    sub-directory of that single FUSE mount (``os.path.ismount`` → ``False``,
+    no ``/proc/self/mounts`` entry).  Never use this function alone to decide
+    whether a share is attached; :func:`_gvfs_mount_attached` asks about the
+    gvfs base as well, and :func:`gvfs_mount_state` decides from the directory
+    contents first.
     """
     try:
         if os.path.ismount(str(path)):
@@ -691,17 +701,44 @@ def _is_mount_point(path: Path) -> bool:
     return str(path) in _proc_mount_points()
 
 
+def _gvfs_mount_attached(root: Path) -> bool:
+    """True when the gvfs tree around ``root`` is really FUSE-mounted.
+
+    ``gvfsd-fuse`` mounts one FUSE filesystem at ``$XDG_RUNTIME_DIR/gvfs`` and
+    materialises every share as a sub-directory of it, so the *base* is the
+    actual mount point.  Checking the base as well keeps an attached but empty
+    share distinguishable from a leftover plain directory, without ever
+    assuming a per-share mount entry exists.
+    """
+    if _is_mount_point(root):
+        return True
+    base = root.parent
+    if _GVFS_ROOT_RE.match(str(base) + "/"):
+        return _is_mount_point(base)
+    return False
+
+
 def gvfs_mount_state(path: str | os.PathLike[str]) -> str:
     """Classify a gvfs path: ``mounted``, ``not-mounted``, ``empty`` or ``not-gvfs``.
 
-    ``GVfs`` (the FUSE daemon behind ``/run/user/<uid>/gvfs``) **removes** the
-    mount directory when the share is unmounted, so the interesting cases are
-    distinguishable without any system change:
+    The decision comes from the directory, never from the mount table — Perl
+    has no mount test at all: ``Slim/Utils/Prefs.pm:707`` accepts a media
+    folder with ``if ($path && -d $path)`` and the scan walk simply reads it
+    (``Slim/Utils/Scanner/Local/AIO.pm:70`` ``aio_readdirx``).  Perl's single
+    ``/proc/mounts`` reader is a *change detector*
+    (``Slim/Utils/AutoRescan/Linux.pm:45-54`` — nfs/smb mountpoints switch to
+    stat-based monitoring), it never rejects a folder.
 
-    * ``not-mounted`` — the mount directory is gone, or it exists as a plain
-      (empty, non-FUSE) directory: the share is not attached.
-    * ``empty`` — the mount point exists and is a real mount, but lists nothing.
-    * ``mounted`` — mount point exists, is FUSE-mounted and has entries.
+    * ``mounted`` — the mount directory lists entries: the share is attached.
+      Checked **first**, and deliberately not gated on a mount-point probe: a
+      gvfs share is only a sub-directory of the one ``gvfsd-fuse`` mount, so
+      requiring ``os.path.ismount``/``/proc/self/mounts`` answered
+      ``not-mounted`` for a readable share holding 305 entries.
+    * ``empty`` — the mount directory exists and sits on a real FUSE mount, but
+      lists nothing (an attached, empty share).
+    * ``not-mounted`` — the mount directory is gone (gvfs removes it when the
+      share is detached) or it is a plain leftover directory that is not a FUSE
+      mount at all.
 
     This is what makes "file missing" distinguishable from "mount not
     mounted" (:func:`explain_missing_path`), and it never mounts anything.
@@ -711,13 +748,17 @@ def gvfs_mount_state(path: str | os.PathLike[str]) -> str:
         return "not-gvfs"
     if not root.exists():
         return "not-mounted"
-    if not _is_mount_point(root):
-        return "not-mounted"
     try:
         with os.scandir(root) as it:
-            return "mounted" if any(True for _ in it) else "empty"
-    except OSError:
-        return "not-mounted"
+            has_entries = any(True for _ in it)
+    except OSError as exc:
+        # Present but not listable: only a real FUSE mount counts as attached,
+        # so the caller reports "not readable" instead of "mount is gone".
+        logger.debug("gvfs mount %s is not listable (%s)", root, exc)
+        return "mounted" if _gvfs_mount_attached(root) else "not-mounted"
+    if has_entries:
+        return "mounted"
+    return "empty" if _gvfs_mount_attached(root) else "not-mounted"
 
 
 # ---------------------------------------------------------------------------
@@ -732,34 +773,26 @@ NOT_READABLE = "not-readable"
 EMPTY = "empty"
 
 
-def explain_missing_path(path: str | os.PathLike[str]) -> tuple[str, str]:
-    """Why ``path`` cannot be used — ``(code, message)``.
+def _unreachable(text: str, exc: OSError | None) -> tuple[str, str]:
+    """Diagnose a path whose directory listing failed.
 
-    Distinguishes the two situations that look identical from the outside:
-
-    * ``missing`` — the directory is there, the item simply is not in it.
-    * ``mount-not-mounted`` — a gvfs/FUSE share is not attached, so the whole
-      tree (folder *and* its files) is unreachable.  This is the "mount gone →
-      metadata yes, sound no" case; the server never auto-mounts
-      (``references/cross-platform.md``).
-
-    Also reports ``not-readable`` (exists, but ``stat``/listing is denied) and
-    ``empty`` (usable directory without entries).  ``ok`` means "fine".
+    ``exc`` is the listing error, or ``None`` when the caller only knows that
+    the path is not a listable directory.  A gvfs path is classified further
+    first (detached share / attached but empty), then ``os.stat`` separates
+    "nothing there" from "there, but denied".
     """
-    target = Path(path)
-    text = str(target)
-
     if is_gvfs_path(text):
         state = gvfs_mount_state(text)
         root = gvfs_mount_root(text)
-        if state in ("not-mounted",):
+        if state == "not-mounted":
             return MOUNT_NOT_MOUNTED, (
                 f"gvfs mount is not mounted: {root} — {text} is unreachable "
                 f"(the server does not mount shares by itself)"
             )
-        if state == "empty" and not target.exists():
-            return MOUNT_NOT_MOUNTED, (
-                f"gvfs mount {root} is attached but empty — {text} is unreachable"
+        if state == "empty":
+            return EMPTY, (
+                f"gvfs mount {root} is attached but lists nothing — "
+                f"{text} is unreachable"
             )
 
     try:
@@ -768,19 +801,65 @@ def explain_missing_path(path: str | os.PathLike[str]) -> tuple[str, str]:
         return MISSING, f"missing: {text} (the parent folder exists and is mounted)"
     except PermissionError:
         return NOT_READABLE, f"not readable (permissions): {text}"
-    except OSError as exc:
-        return MISSING, f"missing: {text} ({exc})"
+    except OSError as stat_exc:
+        return MISSING, f"missing: {text} ({stat_exc})"
 
     if stat.S_ISDIR(st.st_mode):
-        try:
-            with os.scandir(text) as it:
-                if not any(True for _ in it):
-                    return EMPTY, f"exists but is empty: {text}"
-        except PermissionError:
-            return NOT_READABLE, f"not readable (permissions): {text}"
-        except OSError as exc:
-            return NOT_READABLE, f"not readable: {text} ({exc})"
+        return NOT_READABLE, f"not readable: {text} ({exc})"
     return OK, ""
+
+
+def explain_missing_path(path: str | os.PathLike[str]) -> tuple[str, str]:
+    """Why ``path`` cannot be used — ``(code, message)``.
+
+    The decisive test is the directory listing, exactly like Perl:
+    ``Slim/Utils/Prefs.pm:707`` accepts a media folder by ``if ($path && -d
+    $path)`` and the scan walk just reads it
+    (``Slim/Utils/Scanner/Local/AIO.pm:70`` ``aio_readdirx``).  Only when that
+    fails is the situation named — ``missing`` (the directory is there, the
+    item is not in it), ``mount-not-mounted`` (a gvfs/FUSE share is detached,
+    so the whole tree is unreachable: the "mount gone → metadata yes, sound no"
+    case; the server never mounts a share by itself), ``empty`` (usable
+    directory without entries) or ``not-readable``.  ``ok`` means "fine".
+
+    Because listing comes first, a readable directory with entries can never be
+    reported as ``mount-not-mounted`` — the mount-point probes below are a hint
+    for the message, not the decision (a gvfs share is a plain sub-directory of
+    the single ``gvfsd-fuse`` mount, see :func:`_is_mount_point`).
+    """
+    target = Path(path)
+    text = str(target)
+
+    try:
+        with os.scandir(text) as it:
+            has_entries = any(True for _ in it)
+    except NotADirectoryError:
+        # An existing regular/special file is a perfectly usable item.
+        return (OK, "") if os.path.exists(text) else _unreachable(text, None)
+    except OSError as exc:
+        return _unreachable(text, exc)
+
+    if has_entries:
+        return OK, ""
+    return EMPTY, f"exists but is empty: {text}"
+
+
+def is_usable_dir(path: str | os.PathLike[str]) -> bool:
+    """True when ``path`` is a directory the server can list.
+
+    Deliberately **not** ``Path.is_dir()``: ``pathlib`` swallows ``OSError``
+    and answers ``False`` for a gvfs/FUSE share whose ``stat`` fails for a
+    moment while the directory itself lists fine — that is how a readable
+    305-entry share became "Music directory unusable".  Listing is what the
+    scanner does anyway (Perl ``Slim/Utils/Scanner/Local/AIO.pm:70``
+    ``aio_readdirx``), so it is the test that matches the work.
+    """
+    try:
+        with os.scandir(str(path)) as it:
+            next(it, None)
+    except (OSError, TypeError, ValueError):
+        return False
+    return True
 
 
 def media_dir_problems(

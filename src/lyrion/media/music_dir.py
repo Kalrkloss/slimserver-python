@@ -53,7 +53,10 @@ def resolve_music_dir() -> Path | None:
         musicdir = str(fallback)
 
     p = Path(musicdir)
-    if not p.is_dir():
+    # ``is_usable_dir`` instead of ``Path.is_dir()``: pathlib swallows the
+    # OSError of a gvfs/FUSE share and reported a readable 305-entry folder as
+    # unusable.  Perl only needs ``-d`` (Slim/Utils/Prefs.pm:707).
+    if not platform_paths.is_usable_dir(p):
         code, message = platform_paths.explain_missing_path(p)
         logger.error("Music directory unusable (%s): %s", code, message)
         return None
