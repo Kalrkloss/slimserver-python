@@ -228,6 +228,16 @@ def _after_strm_sent(mac: str, song: Any = None) -> None:
         player.strm_sent_at = time.time()
         if song is not None:
             player.strm_sent_track = song
+        # A new strm frame is a new stream: Perl clears the client's metadata
+        # title the moment the new stream is opened (``Song::open``,
+        # ``Slim/Player/Song.pm:700-702 $client->metaTitle(undef)``) and files
+        # in-stream metadata under the URL of the song that IS streaming
+        # (``HTTP.pm:274-276``, ``%currentTitles{$url}`` Info.pm:552). Without
+        # this the old sender's ``remoteMeta``/title stayed in the status while
+        # the new station played (LIVE 2026-09-18: switch Hirschmilch →
+        # "Absolut relax" left remoteMeta = {title: 'Sea Surfaces', artist:
+        # 'Martin Nonstatic', url: hirschmilch.de…}).
+        player.forget_metadata()
     try:
         from lyrion.player import streaming
         streaming.note_strm_sent(mac, song)
@@ -3810,13 +3820,30 @@ class SlimProtoClient:
             m = re.search(r"(?im)^icy-metaint:\s*(\d+)\s*$", text)
             metaint = int(m.group(1)) if m else 0
             mac_key = mac_str.upper().replace(":", "")
+            # The player just announced the source connection of the stream it
+            # is on NOW — from here on an incoming STMu/meta frame can belong to
+            # this stream (Perl routes `directMetadata` through the stream's own
+            # SongStreamController, Squeezebox2.pm:819-823). State bookkeeping
+            # first: it must not depend on the 'cont' frame being sent.
+            try:
+                from lyrion.player.manager import PlayerManager
+                _p = PlayerManager().get_player(mac_str)
+                if _p is not None:
+                    _p.note_source_ready()
+            except Exception:  # noqa: BLE001
+                pass
             fut = self._resp_waiters.get(mac_key)
             if fut is not None and not fut.done():
                 fut.set_result(metaint)
             else:
                 # No waiter (e.g. server restarted between strm and RESP) —
                 # send cont directly so the decoder still starts.
-                asyncio.create_task(self._send_cont(mac_str, metaint))
+                try:
+                    asyncio.get_running_loop()
+                except RuntimeError:
+                    pass          # no loop (unit test) — nothing to send
+                else:
+                    asyncio.create_task(self._send_cont(mac_str, metaint))
             logger.info("RESP from %s: metaint=%d", mac_str, metaint)
         except Exception as exc:
             logger.warning("RESP parse failed for %s: %s", mac_str, exc)
@@ -3870,11 +3897,74 @@ class SlimProtoClient:
             if player is None:
                 return
             stream_title = m.group(1) if m else text.strip()
+            stream_url = str(getattr(player, "current_url", "") or "")
+            epoch = int(getattr(player, "stream_epoch", 0) or 0)
+            # ── Perl's stream association: a frame only counts for the stream
+            # that is open NOW (``$client->controller()->songStreamController()
+            # || return``, ``Squeezebox2.pm:819-823``, reached from the META
+            # frame handler ``Slimproto.pm:908-919`` → ``StreamingController.pm:
+            # 2348-2361``). No stream → nothing to attribute the frame to.
+            if not stream_url:
+                logger.info(
+                    "STMu from %s dropped: no stream open (%r) — Perl "
+                    "Squeezebox2.pm:819-823 `songStreamController() || return`",
+                    mac_str, stream_title)
+                return
+            # A frame that arrives within the strm start window while the player
+            # has NOT yet announced the source connection of THIS stream cannot
+            # come from it: Perl only installs the new stream after the player
+            # could close the old one (``SongStreamController::close``,
+            # ``SongStreamController.pm:55-65``; ``StreamingController.pm:1340-
+            # 1342`` "Bug 15477") — such a frame is the leftover of the stream we
+            # just replaced and must not overwrite the new station's title.
+            _sent_at = float(getattr(player, "strm_sent_at", 0.0) or 0.0)
+            _since_strm = (time.time() - _sent_at) if _sent_at else None
+            if (_since_strm is not None
+                    and _since_strm <= self.STRM_START_HANDSHAKE_WINDOW_S
+                    and not bool(getattr(player, "stream_source_ready", False))):
+                logger.info(
+                    "STMu from %s: %r belongs to the previous stream (stream "
+                    "epoch %d, strm %.1fs ago, no source connection yet) — "
+                    "discarded", mac_str, stream_title, epoch, _since_strm)
+                return
+            if not stream_title:
+                # Perl stores the empty title (``$currentTitles{$url} = $title``,
+                # Info.pm:552) but ``getCurrentTitle`` only ever returns a
+                # TRUTHY cache entry and otherwise falls back to
+                # ``standardTitle($client, $url)`` (:572-582): an empty
+                # in-stream title means "no metadata title for this stream" —
+                # the station's own name is what the status shows, not an empty
+                # title (live: SUNSHINE LIVE sends ``StreamTitle='';``).
+                player.remote_meta = {}
+                player.stream_meta_epoch = 0
+                player.stream_meta_url = ""
+                player.current_title = (
+                    player.stream_baseline_title or stream_url
+                )
+                logger.info(
+                    "STMu from %s: empty StreamTitle — no metadata title for "
+                    "this stream, baseline %r (Perl Info.pm:572-582)",
+                    mac_str, player.current_title)
+                return
             # ``Slim/Music/Info.pm:516``: everything below happens only when the
             # title really changed (``if (getCurrentTitle($client, $url) ne
-            # ($title || ''))``).
-            changed = str(getattr(player, "current_title", "") or "") != stream_title
-            stream_url = str(getattr(player, "current_url", "") or "")
+            # ($title || ''))``) — and ``getCurrentTitle($client, $url)`` is the
+            # title cached FOR THIS URL (``%currentTitles{$url}``, :552/:572-574;
+            # ``standardTitle`` otherwise). A title of the stream we replaced is
+            # never the baseline of the new stream.
+            _same_stream = (
+                int(getattr(player, "stream_meta_epoch", 0) or 0) == epoch
+                and str(getattr(player, "stream_meta_url", "") or "") == stream_url
+            )
+            prev_title = ""
+            if _same_stream:
+                prev_title = str(
+                    (getattr(player, "remote_meta", {}) or {}).get("streamtitle")
+                    or ""
+                )
+            if not prev_title:
+                prev_title = str(getattr(player, "current_title", "") or "")
+            changed = prev_title != stream_title
             player.remote_meta = {
                 "title": song.strip(),
                 "artist": artist.strip(),
@@ -3882,6 +3972,11 @@ class SlimProtoClient:
                 "url": stream_url,
             }
             player.current_title = stream_title
+            # Bind the metadata to the stream it came from (Perl's per-URL
+            # cache key, Info.pm:552) — a later switch bumps ``stream_epoch``
+            # and this metadata is no longer the current stream's.
+            player.stream_meta_epoch = epoch
+            player.stream_meta_url = stream_url
             if changed:
                 # ``setCurrentTitle($url, $title, $client)`` — the client form,
                 # which is the ONLY one that fires the ``playlist newsong``

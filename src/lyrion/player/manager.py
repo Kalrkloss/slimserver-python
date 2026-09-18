@@ -1130,9 +1130,12 @@ class PlayerManager:
             player.remote = 0  # local track: never a "live stream" flag
             player.elapsed = 0.0
             # A local track must not inherit the radio's StreamTitle/meta
-            # (else now-playing shows the old station name over the track).
+            # (else now-playing shows the old station name over the track):
+            # Perl clears the client's metadata title when the new song opens
+            # (``Song.pm:700-702``) — here together with the stream epoch, so a
+            # late STMu of the radio stream cannot attach to the local track.
+            player.forget_metadata()
             player.current_title = ""
-            player.remote_meta = {}
             # Track duration for status 'duration'/'time' queries — the
             # real LMS serves it from the DB as soon as the track loads.
             try:
@@ -1224,7 +1227,28 @@ class PlayerManager:
         if ok:
             # Playing implies power-on (Perl enables the audio outputs then).
             await self.power_on_for_playback(player)
-            player.current_title = title or url
+            # New stream, new metadata — Perl's ``Song::open`` drops the
+            # client's metadata title on EVERY stream start
+            # (``$client->metaTitle(undef)``, ``Slim/Player/Song.pm:700-702``)
+            # and the metadata is filed under the URL of the song that IS
+            # streaming (``%currentTitles{$url}``, Info.pm:552). The replaced
+            # sender's ``remoteMeta``/title must not survive the switch (LIVE
+            # 2026-09-18: switching onto a proxied station left remoteMeta =
+            # {title:'Sea Surfaces', artist:'Martin Nonstatic',
+            #  url:'http://hirschmilch.de:7000/chillout.mp3'}). The strm tail
+            # did the same a moment ago (``_after_strm_sent``); here the station
+            # name becomes the baseline the status shows until the stream
+            # reports its own ``StreamTitle`` (Perl ``standardTitle``,
+            # Info.pm:556-583) — unless a frame of THIS stream already arrived.
+            if int(getattr(player, "stream_meta_epoch", 0) or 0) != int(
+                    getattr(player, "stream_epoch", 0) or 0):
+                player.forget_metadata()
+                player.current_title = title or url
+            # Perl's ``standardTitle($client, $url)`` baseline for THIS stream
+            # (Info.pm:556-583): what ``getCurrentTitle`` answers while no
+            # (truthy) in-stream title is cached — e.g. after an empty
+            # ``StreamTitle``.
+            player.stream_baseline_title = title or url
             player.current_url = url
             player.current_track_id = None
             player.remote = 1  # radio stream: never "track end"

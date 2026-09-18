@@ -88,6 +88,44 @@ class PlayerState:
     duration: float = 0.0         # duration of the current track in seconds
     current_title: str = ""       # station name / override title
     current_url: Optional[str] = None  # currently streaming URL
+    # ── Stream identity / per-stream metadata association ────────────────
+    # Perl binds a stream AND its in-stream metadata to ONE object per
+    # stream: ``Slim::Player::SongStreamController`` is created when the
+    # stream's socket is opened (``Slim/Player/Song.pm:690``, ``sub open``),
+    # becomes the controller's current stream only AFTER the previous one was
+    # closed (``Slim/Player/StreamingController.pm:1340-1342`` — "Bug 15477:
+    # Delayed to here so that $player->play() has the opportunity to close any
+    # old stream before the new one becomes available") and is dropped in
+    # ``_Stop`` (:465-468) / ``SongStreamController::close``
+    # (``SongStreamController.pm:55-65``). Two consequences Perl relies on:
+    #   * ``Song::open`` clears the client's metadata title the moment a NEW
+    #     stream is opened: ``$client->metaTitle(undef)`` (Song.pm:700-702) —
+    #     the previous sender's title never survives the switch;
+    #   * a metadata frame with no open stream is dropped, and a frame is
+    #     filed under the URL of the streaming song, never of the one before
+    #     (``directMetadata`` → ``songStreamController() || return``,
+    #     ``Squeezebox2.pm:819-823``; ``HTTP.pm:274-276``; the per-URL title
+    #     cache ``%currentTitles{$url}``, ``Info.pm:516``/:552).
+    # ``stream_epoch`` is that association for us: every new stream bumps it
+    # (``forget_metadata``), and ``stream_meta_epoch``/``stream_meta_url``
+    # record which stream the stored metadata belongs to.
+    stream_epoch: int = 0          # bumped whenever a new stream starts
+    stream_meta_epoch: int = 0     # epoch the stored metadata belongs to (0 = none)
+    stream_meta_url: str = ""      # URL that metadata belongs to
+    # True once the player announced the source connection of the CURRENT
+    # stream (its RESP frame, ``Slimproto.pm:549-556`` / the port's
+    # ``_handle_resp_frame``). Only then can a metadata frame come from this
+    # stream — the frames of the stream we just replaced belong to the window
+    # before it (see PlayerState.forget_metadata).
+    stream_source_ready: bool = False
+    # Perl's title fallback for a stream WITHOUT a (truthy) in-stream title:
+    # ``getCurrentTitle($client, $url)`` returns ``$currentTitles{$url}`` only
+    # while that cache entry is truthy (``if (!$meta &&
+    # $currentTitles{$url})``, Info.pm:572-574) and otherwise falls back to
+    # ``standardTitle($client, $url)`` (:556-583) — the station name. An empty
+    # ``StreamTitle`` therefore means "no metadata title", never an empty
+    # display title (live: SUNSHINE LIVE sends ``StreamTitle='';``).
+    stream_baseline_title: str = ""
     shuffle: int = 0              # playlist shuffle mode (0/1/2)
     repeat: int = 0               # playlist repeat mode (0/1/2)
     playlist_position: int = 0
@@ -189,6 +227,54 @@ class PlayerState:
         """
         self.strm_sent_track = None
         self.playing_track_id = None
+
+    def forget_metadata(self) -> int:
+        """Drop the stream metadata of the stream that is being replaced.
+
+        Perl does exactly this the moment a NEW stream opens: right after
+        ``$self->setStatus(STATUS_STREAMING)`` comes
+        ``$client->metaTitle(undef)`` (``Slim/Player/Song.pm:700-702``) — the
+        previous sender's title/artist never survives a station switch, and
+        ``getCurrentTitle`` falls back to the standard title for the new URL
+        because ``%currentTitles{$newUrl}`` is empty (``Info.pm:556-583``).
+
+        Bumps the stream epoch, so metadata stored earlier belongs to a stream
+        that is no longer current (``stream_meta_epoch``) and cannot be used
+        as the "previous title" of the new one. Returns the new epoch.
+        """
+        self.stream_epoch += 1
+        self.stream_meta_epoch = 0
+        self.stream_meta_url = ""
+        self.stream_source_ready = False
+        self.stream_baseline_title = ""
+        self.remote_meta = {}
+        return self.stream_epoch
+
+    def begin_stream(self, url: Optional[str] = None, title: str = "") -> int:
+        """Start a new stream: forget the old stream's metadata (Perl
+        ``Song::open``, Song.pm:700-702) and adopt the new stream's URL/title.
+
+        ``title`` is Perl's ``standardTitle($client, $url)`` baseline — the
+        name the status shows until the stream reports its own ``StreamTitle``
+        (``Info.pm:572-582``). ``url=None`` leaves ``current_url`` untouched
+        (the local ``/stream.mp3`` path has no remote URL).
+        """
+        epoch = self.forget_metadata()
+        if url is not None:
+            self.current_url = str(url)
+        self.current_title = title or str(self.current_url or "")
+        self.stream_baseline_title = self.current_title
+        return epoch
+
+    def note_source_ready(self) -> None:
+        """The player announced the source connection of the CURRENT stream.
+
+        Its RESP frame carries the source's headers (``_handle_resp_frame``,
+        ``Slim/Proto`` RESP → ``Squeezebox2.pm:398-430``); from that moment the
+        stream can deliver in-stream metadata. Cleared by every stream start
+        (``forget_metadata``).
+        """
+        self.stream_source_ready = True
 
     def to_dict(self) -> dict:
         """Return a plain dict representation."""
