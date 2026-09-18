@@ -698,7 +698,14 @@ BMF_ROWS = [
 
 @pytest.fixture()
 def bmf_library(tmp_path, monkeypatch, tracks_schema_sql):
-    """Temp library DB + ``musicdir`` pref (pattern: test_musicdir_bmf)."""
+    """Temp library DB + ``musicdir`` pref (pattern: test_musicdir_bmf).
+
+    The folder layer's read *and* write handle point at the same DB, so a
+    folder id is the row the browse stores (Perl ``create => 1``,
+    ``Slim/Control/Queries.pm:2263-2268``).
+    """
+    from lyrion.media import folders as folders_mod
+
     db = tmp_path / "lyrion.db"
     con = sqlite3.connect(db)
     con.executescript(tracks_schema_sql)
@@ -711,7 +718,13 @@ def bmf_library(tmp_path, monkeypatch, tracks_schema_sql):
     con.close()
     monkeypatch.setattr(api_mod, "_library_db_path", lambda: str(db))
     monkeypatch.setattr(api_mod, "_bmf_musicdir_pref", lambda: BMF_ROOT)
+    monkeypatch.setattr(folders_mod, "_ro_connection",
+                        lambda db_path=None: sqlite3.connect(db))
+    monkeypatch.setattr(folders_mod, "_rw_connection",
+                        lambda db_path=None: sqlite3.connect(db))
+    folders_mod.reset_caches()
     yield db
+    folders_mod.reset_caches()
 
 
 def _bmf(args: list) -> dict:
@@ -725,6 +738,17 @@ def _musicfolder(args: list) -> dict:
     async def run():
         return await JSONRPCAPI()._json_musicfolder([str(a) for a in args])
     return asyncio.run(run())
+
+
+def _dir_rows(db) -> list[tuple]:
+    """``(id, url, content_type)`` of every ``dir`` row — a fresh read."""
+    con = sqlite3.connect(str(db))
+    try:
+        return con.execute(
+            "SELECT id, url, content_type FROM tracks"
+            " WHERE content_type = 'dir' ORDER BY id").fetchall()
+    finally:
+        con.close()
 
 
 def test_bmf_folder_rows_carry_a_numeric_id(bmf_library):
@@ -829,9 +853,30 @@ def test_musicfolder_rows_are_numeric_like_perl(bmf_library, monkeypatch):
     assert [sorted(r) for r in top] == [["filename", "id", "type"]]
     assert top[0]["filename"] == "Metal" and top[0]["type"] == "folder"
     assert isinstance(top[0]["id"], int) and top[0]["id"] > 0
+    # Die Zeile entsteht beim **Auflisten** — Perl paged die Liste und ruft
+    # dabei ``objectForUrl({url, create => 1})`` je angezeigtem Kind
+    # (``Slim/Control/Queries.pm:2263-2268``; der erste Durchgang
+    # ``:2249-2257`` prüft nur die Existenz).  Also liegt sie danach in der DB
+    # und ``id`` ist deren ``tracks.id`` (:2429).
+    assert _dir_rows(bmf_library) == [
+        (top[0]["id"], "file:///srv/music/Metal", "dir")]
+    # Zweiter Aufruf → dieselbe id (der Client cached sie) und keine neue
+    # Zeile: die Auflistung findet die Zeile vor, statt sie zu ersetzen.
+    again = _musicfolder(["0", "3"])["folder_loop"]
+    assert [r["id"] for r in again] == [top[0]["id"]]
+    assert _dir_rows(bmf_library) == [
+        (top[0]["id"], "file:///srv/music/Metal", "dir")]
     # the numeric id is only the *folder* id: a real tracks row keeps its own
     assert api_mod._folder_row_numeric_id(
         {"id": 123456, "type": "track"}) is None
+    # Der Lese-Nachschlag selbst schreibt nicht (Perl löst ``folder_id`` über
+    # ``Slim::Schema->find('Track', $id)`` auf, ``Queries.pm:2311-2316``).
+    before = _dir_rows(bmf_library)
+    assert folders_mod.resolve_folder_id(str(top[0]["id"])) == \
+        f"{BMF_ROOT}/Metal"
+    assert api_mod._folder_row_numeric_id(
+        {"id": "file:///srv/music/Metal", "type": "folder"}) == top[0]["id"]
+    assert _dir_rows(bmf_library) == before
     # the drill with the numeric id must reach the directory
     drilled = _musicfolder(["0", "3", f"folder_id:{top[0]['id']}"])
     assert [r["filename"] for r in drilled["folder_loop"]] == ["Accept"]

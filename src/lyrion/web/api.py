@@ -784,11 +784,14 @@ def _folder_numeric_id(directory: str) -> int | None:
 
 
 def _folder_row_numeric_id(row: dict) -> int | None:
-    """Folder id for a directory row of a browse loop, ``None`` = keep ``id``.
+    """Stored folder id for a directory row of a browse loop, ``None`` = keep.
 
-    Only rows of ``type 'folder'`` whose ``id`` is not already numeric are
-    rewritten: a *file* row carries a real ``tracks.id`` (Perl's own value,
-    ``media/folders.py`` ``_child_item``) and must keep it.
+    Only rows of ``type 'folder'`` are considered: a *file* row carries a real
+    ``tracks.id`` (Perl's own value, ``media/folders.py`` ``_child_item``) and
+    must keep it.  The lookup is **read-only** — ``media/folders`` and the bmf
+    browse already store the row while listing (Perl ``create => 1``); this
+    only upgrades a folder row that still carries a URL (lean/stubbed input)
+    when a row happens to exist, and never writes during a read request.
     """
     if str(row.get("type") or "") != "folder":
         return None
@@ -798,7 +801,7 @@ def _folder_row_numeric_id(row: dict) -> int | None:
     path = _bmf_path(str(row.get("url") or rid or ""))
     if not path or path == "/":
         return None
-    return _folder_numeric_id(path)
+    return dir_rows.lookup_dir_id(path, db_path=_library_db_path())
 
 
 def _bmf_subdir_paths(directory: str) -> list[str]:

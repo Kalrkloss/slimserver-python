@@ -676,6 +676,19 @@ def item_type(path: str) -> str:
     return "unknown"
 
 
+def _is_dir_entry(path: str) -> bool:
+    """Is this listing entry a directory (Perl ``isDir``)?
+
+    ``Slim/Music/Info.pm:1278-1281`` ``sub isDir`` → ``_isType($pathOrObj,
+    'dir')``, which comes out of ``typeFromPath``'s ``# sanity check for
+    folders`` block (``if ($filepath && -d $filepath) { $type = 'dir' }``,
+    ``Slim/Music/Info.pm:1482-1484``).  That is exactly
+    :func:`item_type`, so the id decision and the ``type`` decision of a
+    ``folder_loop`` item use the same test.
+    """
+    return item_type(path) == "folder"
+
+
 def _folder_item(folder: str, *, volatile: bool = False, tags: str = "",
                  dir_ids: dict[str, int] | None = None) -> dict:
     """One ``folder_loop`` entry for a directory, Perl shaped.
@@ -774,7 +787,13 @@ def mediafolder_result(
         target = all_dirs[0]
 
     if listing_roots:
-        dir_paths = [d for d in all_dirs if os.path.isdir(d)]
+        # One directory test for id *and* ``type``: ``item_type`` is the port's
+        # ``Slim::Music::Info::typeFromPath``/``isDir`` (``Slim/Music/Info.pm:
+        # 1278-1281`` ``sub isDir``, ``:1482-1484`` ``$type = 'dir'`` for
+        # ``-d $filepath``).  ``os.path.isdir`` here would bypass it and hand
+        # out a ``type 'folder'`` item without the ``tracks`` row Perl creates
+        # for it (:2263-2268).
+        dir_paths = [d for d in all_dirs if _is_dir_entry(d)]
         dir_ids = _dir_ids_for(dir_paths)
         items = [
             _folder_item(d, volatile=(d in volatile_dirs), tags=tags,
@@ -787,10 +806,12 @@ def mediafolder_result(
         # Perl writes a ``dir`` row for every directory it lists (the browse
         # creates them, ``Slim/Control/Queries.pm:2263-2268`` /
         # ``Slim/Utils/Misc.pm:1082-1090``); one batch for the whole listing.
+        # Same directory test as ``_child_item`` (Perl ``isDir``).
         dir_ids: dict[str, int] = {}
         if target and names:
-            dir_ids = _dir_ids_for([os.path.join(target, n) for n in names
-                                    if os.path.isdir(os.path.join(target, n))])
+            dir_ids = _dir_ids_for(
+                [os.path.join(target, n) for n in names
+                 if _is_dir_entry(os.path.join(target, n))])
         items = ([_child_item(target, name, tags=tags, dir_ids=dir_ids)
                   for name in names] if target else [])
 
@@ -812,12 +833,17 @@ def _child_item(directory: str, name: str, *, tags: str = "",
     """
     full = os.path.join(directory, name)
     url = file_url_from_path(full)
-    is_dir = os.path.isdir(full)
+    # One decision for "is a directory" — ``item_type`` is Perl's
+    # ``isDir``/``isSong`` branch (``Slim/Control/Queries.pm:2472-2485``); a
+    # *folder* row gets the id of its ``tracks`` row, a file keeps its own
+    # ``tracks.id`` (``_track_id_by_url``).
+    kind = item_type(full)
+    is_dir = _is_dir_entry(full)
     entry: dict = {
         "id": (_folder_id(full, url, dir_ids) if is_dir
                else (_track_id_by_url(url) or url)),
         "filename": name,
-        "type": item_type(full),
+        "type": kind,
     }
     if "s" in tags:
         entry["textkey"] = name[:1].upper()

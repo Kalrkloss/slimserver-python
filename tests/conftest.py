@@ -70,22 +70,39 @@ def library_db(tmp_path, tracks_schema_sql) -> str:
 
 
 @pytest.fixture(autouse=True)
-def _no_library_db_writes(monkeypatch):
-    """Never let an unstubbed code path write into the real library DB.
+def _no_library_db_writes(monkeypatch, tmp_path):
+    """Point every unstubbed library-DB accessor at an empty throwaway DB.
 
     Folder browsing creates Perl's ``content_type='dir'`` rows on demand
     (``lyrion.media.dir_rows``), so a test that calls a browse function
     without pointing the library DB at a temp file would otherwise insert
-    directory rows into ``~/.lyrion/Lyrion/Prefs/lyrion.db``.  With the
-    *configured* path and the folder layer's write handle returning ``None``
-    the code takes its documented no-DB path; a test that wants directory rows
-    stubs one of them explicitly (its own ``monkeypatch.setattr`` runs after
-    this fixture and wins).  An explicitly passed ``db_path`` is untouched —
-    that is how the tests that do exercise the rows point at their temp DB.
+    directory rows into ``~/.lyrion/Lyrion/Prefs/lyrion.db`` — and a test that
+    merely *reads* a count would silently measure the developer's real
+    library.  The throwaway DB carries the port's ``tracks`` schema and is
+    created on first use, so tests that stub nothing see an empty library; a
+    test that wants directory rows stubs the accessor itself (its own
+    ``monkeypatch.setattr`` runs after this fixture and wins).  An explicitly
+    passed ``db_path`` is untouched — that is how the tests that do exercise
+    the rows point at their temp DB.
     """
     from lyrion.media import dir_rows, folders
 
-    monkeypatch.setattr(dir_rows, "config_db_path", lambda: None)
+    db = tmp_path / "no-library.db"
+    state = {"created": False}
+
+    def _path(explicit: str | None = None) -> str:
+        if explicit:
+            return str(explicit)
+        if not state["created"]:
+            con = sqlite3.connect(db)
+            con.executescript(TRACKS_SCHEMA_SQL)
+            con.commit()
+            con.close()
+            state["created"] = True
+        return str(db)
+
+    monkeypatch.setattr(dir_rows, "config_db_path", lambda: _path())
+    monkeypatch.setattr("lyrion.web.api._library_db_path", lambda: _path())
     monkeypatch.setattr(folders, "_rw_connection", lambda db_path=None: None)
     yield
 
