@@ -67,6 +67,36 @@ RETRY_DELAY_MS = 5000
 # /meta/disconnect. Python implements it as an idle sweep instead of a timer.
 LONG_POLLING_AUTOKILL = 180.0
 
+# Perl Slim/Web/HTTP.pm:70 ``use constant KEEPALIVETIMEOUT => 75;`` — a
+# keep-alive socket is closed by ``closeHTTPSocket`` when it has not been
+# written to for this long (armed when the request is accepted, HTTP.pm:457-465,
+# and re-armed after every completed send, HTTP.pm:2091-2099).  This timer is
+# the ONLY thing that ever ends a quiet streaming /meta/connect in Perl:
+# Cometd.pm has no heartbeat at all (the streaming branch :288-297 arms no
+# timer and writes nothing while the client has no events), so a streaming
+# socket that stays silent for 75 s is CLOSED and the client re-polls after its
+# ``advice.interval`` (RETRY_DELAY, Cometd.pm:278) — which is how a client
+# discovers a dropped registration.  Measured against live LMS 9.1.1
+# (192.168.1.90): a streaming connect received its ack chunk immediately, then
+# no further byte, and EOF at 74.94 s.
+KEEPALIVE_TIMEOUT = 75.0
+
+# Perl Cometd.pm:264 ``elsif ( $obj->{channel} =~ qr{^/meta/(?:re)?connect$} )``
+# — /meta/reconnect is handled EXACTLY like /meta/connect: it gets the
+# first_event ack with ``advice.interval`` (:269-280), kills the pending
+# disconnectClient timer (:283) and registers the connection with the manager
+# (:286).  Live 9.1.1 answers a ``/meta/reconnect`` on a streaming client with
+# ``Transfer-Encoding: chunked`` and the ack leading the batch; treating it as
+# an unknown channel (successful: true, no stream, no registration) left the
+# client believing it was connected while the server had no connection for it:
+# no events, no error, no close — the app kept showing the old title.
+CONNECT_CHANNELS = ("/meta/connect", "/meta/reconnect")
+
+
+def is_connect_channel(channel) -> bool:
+    """True for /meta/connect and /meta/reconnect (Perl Cometd.pm:264)."""
+    return channel in CONNECT_CHANNELS
+
 # Hold window of an ASGI streaming /meta/connect: NONE. Perl holds a streaming
 # response open for as long as the socket lives — it has no timer for that
 # branch at all (Cometd.pm:288-297 only sets ``Transfer-Encoding: chunked``
@@ -604,7 +634,7 @@ def connect_ack(msg: dict, client_id: str) -> dict:
     (``[connect_ack(...)] + acks``), never after the batch acks.
     """
     return {
-        "channel": "/meta/connect",
+        "channel": msg.get("channel") or "/meta/connect",
         "successful": True,
         "clientId": client_id,
         "id": msg.get("id", ""),
@@ -836,7 +866,34 @@ class CometdManager:
         if client is None or client.owner is not owner:
             return False
         client.owner = None
+        # Perl logs every lost connection through webCloseHandler
+        # (Cometd.pm:991-994 "Lost connection from $peer, clid: $clid,
+        # transport: $transport") — a connection must never end without a line
+        # naming the client, so a silent client loss stays diagnosable.
+        logger.info("Cometd connection lost -> client %s (transport %s, grace %.0fs)",
+                    client_id, client.transport or "none", DISCONNECT_GRACE)
         self.arm_disconnect(client_id)
+        return True
+
+    def unregister_connection(self, client_id: str, owner: object) -> bool:
+        """Drop the registration of a FINISHED poll without arming the grace.
+
+        Perl removes the connection from the manager the moment a long-polling
+        response is written (``sendHTTPResponse``, Cometd.pm:682-696:
+        ``$manager->remove_connection( $httpClient->clid )``) and re-arms
+        LONG_POLLING_AUTOKILL instead (:691-695).  It is the *transport* that
+        then depends on the client's next poll, not on webCloseHandler: the
+        socket stays open and the client is NOT in the 10 s
+        ``disconnectClient`` window.  Keeping such a client registered as
+        "having a live connection" made a long-polling client's request results
+        go to a "connection" that no longer polls (Cometd.pm:584-589 routes
+        them into the poll response for a long-polling transport).
+        """
+        client = self._clients.get(client_id)
+        if client is None or client.owner is not owner:
+            return False
+        client.owner = None
+        client.last_seen = self._clock()
         return True
 
     def remove_if_owner(self, client_id: str, owner: object) -> bool:
@@ -1674,14 +1731,24 @@ class CometdManager:
                 logger.info("Cometd disconnect -> client %s", cid)
 
             elif channel == "/meta/ping":
-                reply.update({"successful": True})
+                # Perl Cometd.pm:609-620 answers any other channel with
+                # ``successful: true`` — /meta/ping has no branch of its own —
+                # but only AFTER the clientId check at :200-211, which rejects
+                # a message packet without a clientId with
+                # ``error => 'No clientId found'`` and discards the rest of it
+                # (live 9.1.1: ``[{"channel":"/meta/ping","id":10,
+                # "successful":false,"error":"No clientId found"}]``).
+                reply.update({"successful": bool(cid)})
+                if not cid:
+                    reply["error"] = "No clientId found"
 
-            elif channel == "/meta/connect":
+            elif is_connect_channel(channel):
                 # A (re)connect is activity: Perl cancels the autokill timer
-                # here (Cometd.pm:289 killTimers) so a client that keeps
-                # polling is never reaped while it is live.
+                # here (Cometd.pm:283 killTimers) so a client that keeps
+                # polling is never reaped while it is live.  /meta/reconnect
+                # takes this branch too (:264).
                 self.touch(cid)
-                # Deliberately NOT replied to here: /meta/connect long-polls,
+                # Deliberately NOT replied to here: /meta/(re)connect long-polls,
                 # and the transport (cometd_stream.py / web/app.py) writes
                 # the one and only connect ack itself. Replying here as well
                 # sent two /meta/connect answers per connect, and jive calls

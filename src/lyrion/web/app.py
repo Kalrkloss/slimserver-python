@@ -9,18 +9,21 @@ from __future__ import annotations
 from pathlib import Path
 
 import logging
+import time as _time
 from typing import Callable, Optional
 
 import uvicorn
 
 from .api import JSONRPCAPI, WebAPIHandler
 from .cometd import (
+    KEEPALIVE_TIMEOUT,
     LONG_POLL_TIMEOUT,
     CometdManager,
     _client_id_from_channel,
     connect_ack,
     connect_timeout,
     has_invalid_client_advice,
+    is_connect_channel,
 )
 
 logger = logging.getLogger(__name__)
@@ -231,8 +234,17 @@ async def _handle_streaming_connect(
             # 100% CPU and freeze the whole server.
             if cometd.get(cid) is None:
                 break
+            # Perl has NO heartbeat on a streaming connect (Cometd.pm:288-297
+            # arms no timer and writes nothing while the client has no events);
+            # a silent stream is ended by the HTTP keep-alive timeout
+            # (KEEPALIVETIMEOUT => 75, HTTP.pm:70/:2091-2099). Asking for
+            # exactly that window and ending the response when it passes is
+            # that timeout — the client then re-polls (advice interval
+            # RETRY_DELAY, Cometd.pm:278) and learns that a reaped
+            # registration is gone instead of holding a silently dead stream.
+            _started = _time.monotonic()
             events_task = _asyncio.ensure_future(
-                cometd.wait_for_events(cid, timeout=None))
+                cometd.wait_for_events(cid, timeout=KEEPALIVE_TIMEOUT))
             try:
                 done, _pending = await _asyncio.wait(
                     {events_task, gone},
@@ -252,13 +264,25 @@ async def _handle_streaming_connect(
             if not events:
                 # A spurious wake (a removal that raced the existence check
                 # above): keep holding, exactly as Perl keeps the response
-                # open and silent.
+                # open and silent. A wait that burned the whole keep-alive
+                # window ends the stream instead.
+                if events_task in done and \
+                        _time.monotonic() - _started >= KEEPALIVE_TIMEOUT:
+                    logger.info(
+                        "Cometd streaming connect idle %.0fs -> ending stream "
+                        "for %s (Perl HTTP.pm:70 KEEPALIVETIMEOUT)",
+                        KEEPALIVE_TIMEOUT, cid)
+                    break
                 continue
             await send({"type": "http.response.body",
                         "body": _json.dumps(events).encode("utf-8"),
                         "more_body": True})
-    except Exception:
-        pass
+    except Exception as exc:  # noqa: BLE001
+        # The peer vanished or the send failed. Never a silent end: name the
+        # client and the reason, like Perl's webCloseHandler debug line
+        # ("Lost connection from $peer, clid: $clid, transport: $transport",
+        # Cometd.pm:991-994).
+        logger.info("Cometd stream for %s ended: %r", cid, exc)
     finally:
         # ``gone.cancel()`` first: the watcher is parked in ``receive()`` and
         # would otherwise keep the task alive after this handler returns.
@@ -332,7 +356,7 @@ async def _handle_cometd(cometd: CometdManager, path: str, receive, send) -> Non
         logger.warning("Cometd handle_messages failed: %s", exc)
 
     connect_msgs = [m for m in messages if isinstance(m, dict)
-                    and m.get("channel") == "/meta/connect"]
+                    and is_connect_channel(m.get("channel"))]
     # cid -> owner of every /meta/connect this POST holds. ONLY these clients
     # may be dropped when the response cannot be delivered: a handshake/
     # subscribe/request POST that aborts must not erase a client whose connect

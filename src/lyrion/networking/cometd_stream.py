@@ -36,14 +36,19 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 
 from lyrion.web.cometd import (
+    KEEPALIVE_TIMEOUT,
     LONG_POLL_TIMEOUT,
+    RETRY_DELAY_MS,
     _client_id_from_channel,
     _http_timestamp,
     connect_ack,
     connect_advice,
+    connect_timeout,
     has_invalid_client_advice,
+    is_connect_channel,
 )
 
 
@@ -243,11 +248,17 @@ class _Emitter:
     delayed for minutes — so those fall back to per-chunk locking.
     """
 
-    def __init__(self, writer, lock, atomic: bool) -> None:
+    def __init__(self, writer, lock, atomic: bool,
+                 activity: list | None = None) -> None:
         self.writer = writer
         self.lock = lock
         self.atomic = atomic
         self._held = False
+        # ``activity`` is the streaming connection's "last byte written" clock
+        # (``[monotonic]``). A relayed response counts as wire activity for the
+        # stream that shares this socket, exactly like Perl re-arms its
+        # keep-alive timer after every completed send (HTTP.pm:2091-2099).
+        self.activity = activity
 
     async def __aenter__(self) -> "_Emitter":
         if self.atomic and self.lock is not None:
@@ -268,6 +279,8 @@ class _Emitter:
             await self.writer.drain()
         else:
             await _send(self.writer, data, self.lock)
+        if self.activity is not None:
+            self.activity[0] = time.monotonic()
 
 
 # ---------------------------------------------------------------------------
@@ -392,6 +405,7 @@ async def _relay_request(method: str, target: bytes, version: str, headers: dict
                          client_reader: asyncio.StreamReader | None, writer,
                          port: int, *, body_prefix: bytes = b"",
                          body_remaining: int = 0, lock=None,
+                         activity: list | None = None,
                          self_delimit: bool = False,
                          atomic: bool = False) -> bool:
     """Relay one non-Bayeux request to the internal web app (uvicorn).
@@ -432,7 +446,8 @@ async def _relay_request(method: str, target: bytes, version: str, headers: dict
                             b"Content-Length: 0\r\n\r\n", lock)
         return True
     body_len = len(body_prefix) + body_remaining
-    async with _Emitter(writer, lock, atomic and not body_remaining) as emit:
+    async with _Emitter(writer, lock, atomic and not body_remaining,
+                        activity) as emit:
         try:
             up.write(_upstream_head(method, target, headers, port, body_len))
             await _copy_request_body(up, client_reader, body_prefix,
@@ -550,17 +565,30 @@ async def _proxy_get(method: str, target: bytes, headers: dict, writer,
 # ---------------------------------------------------------------------------
 
 async def _push_events(manager, cid: str, writer: asyncio.StreamWriter,
-                       lock: asyncio.Lock | None = None) -> None:
+                       lock: asyncio.Lock | None = None,
+                       activity: list | None = None) -> None:
     """Push event batches into the open chunked stream as they arrive.
 
-    Perl answers a /meta/connect after at most LONG_POLLING_TIMEOUT
-    (Cometd.pm:48 = 60 s, Cometd.pm:318-322 "Waiting N seconds on
-    long-poll connection"). We mirror that: with nothing to send we emit an
-    empty batch so the poll completes and the client re-polls, which also
-    refreshes its autokill timer (Cometd.pm:693). Waiting forever left the
-    client's request unanswered — its session was reaped after
-    LONG_POLLING_AUTOKILL while the socket stayed open, and Now-Playing
-    stopped updating (live 2026-09-12).
+    Perl writes into a streaming /meta/connect response the MOMENT an event
+    exists (``Manager::deliver_events``, Manager.pm:247-263 -> sendResponse
+    Cometd.pm:661) and writes NOTHING while the client has no events: the
+    streaming branch arms no timer at all (Cometd.pm:288-297).  A quiet
+    streaming socket is therefore only ended by the HTTP keep-alive timeout
+    (``KEEPALIVETIMEOUT => 75``, HTTP.pm:70/:2091-2099), after which the client
+    re-polls (advice interval RETRY_DELAY 5000 ms, Cometd.pm:278) and so
+    notices a dropped registration.  Measured on live 9.1.1: ack chunk at once,
+    then no byte, EOF at 74.94 s.
+
+    Python used to write an EMPTY batch (``[]``) every LONG_POLLING_TIMEOUT
+    instead — a rate no Perl client ever sees — and left the socket open
+    forever, so a client whose registration had been reaped (grace expired /
+    autokill) kept a silent, open stream and never re-polled: the UI froze on
+    the last title it had received, with no error and no reconnect.  Both are
+    gone: silence is silence, and the socket is closed after Perl's
+    KEEPALIVETIMEOUT.
+
+    Every way out of this task is logged with the client id — a stream that
+    ends must never do so silently.
     """
     try:
         while True:
@@ -568,15 +596,56 @@ async def _push_events(manager, cid: str, writer: asyncio.StreamWriter,
             # return [] immediately — without the existence check this
             # loop would spin at 100% CPU and freeze the whole server.
             if manager.get(cid) is None:
-                break
-            events = await manager.wait_for_events(cid, timeout=LONG_POLL_TIMEOUT)
-            if not events and manager.get(cid) is None:
-                break
+                logger.debug("Cometd push for %s: client dropped, stream ends",
+                             cid)
+                return
+            started = time.monotonic()
+            events = await manager.wait_for_events(cid,
+                                                   timeout=KEEPALIVE_TIMEOUT)
+            if manager.get(cid) is None:
+                logger.debug("Cometd push for %s: client dropped, stream ends",
+                             cid)
+                return
+            if not events:
+                # No event within KEEPALIVETIMEOUT. If the socket was written
+                # to in the meantime (a relayed artwork/JSON-RPC response
+                # shares it) the keep-alive clock restarted, exactly like
+                # Perl's timer re-arm after every send (:2091-2099).
+                if activity is not None and activity[0] > started:
+                    continue
+                logger.info(
+                    "Cometd streaming connect idle %.0fs -> closing stream for "
+                    "%s (Perl HTTP.pm:70 KEEPALIVETIMEOUT=%d; client re-polls "
+                    "after advice interval %d ms)",
+                    KEEPALIVE_TIMEOUT, cid, int(KEEPALIVE_TIMEOUT),
+                    RETRY_DELAY_MS)
+                try:
+                    writer.close()
+                except Exception:  # noqa: BLE001
+                    pass
+                return
             data = json.dumps(events).encode("utf-8")
             await _send(writer, f"{len(data):x}\r\n".encode() + data + b"\r\n",
                         lock)
-    except (ConnectionError, OSError, RuntimeError):
-        pass
+            if activity is not None:
+                activity[0] = time.monotonic()
+    except (ConnectionError, OSError, RuntimeError) as exc:
+        # The peer is gone (or the transport is broken): the stream ends here,
+        # and the manager only hears about it from the connection's finally —
+        # so log the reason instead of vanishing in silence.
+        logger.warning("Cometd push to %s failed (%r) — stream ends", cid, exc)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        # A bug in the push path must not leave a silently dead-but-open
+        # stream: say what happened and let the response end so the client
+        # re-polls (Perl closes the socket and the client reconnects).
+        logger.warning("Cometd push to %s aborted: %r — stream ends",
+                       cid, exc, exc_info=True)
+        try:
+            writer.close()
+        except Exception:  # noqa: BLE001
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -603,10 +672,21 @@ async def _handle_connection(manager, reader: asyncio.StreamReader,
     # pipelined cometd requets, even though this is against the HTTP RFC"),
     # so the push task and the request loop write into one transport.
     write_lock = asyncio.Lock()
+    # "Last byte written to this socket" clock (monotonic). Every write path —
+    # the connect ack, a pushed batch and a relayed response — refreshes it, so
+    # the streaming keep-alive close (Perl HTTP.pm:70/:2091-2099) only fires
+    # after 75 s without ANY traffic on the socket.
+    activity = [time.monotonic()]
     try:
         while True:
             request = await _read_http_head(reader)
             if request is None:
+                # EOF (the client closed) or an unparsable request line (logged
+                # in _read_http_head). Never a silent end: say which side ended
+                # it and which clients this socket carried.
+                logger.debug("NativeCometd connection end: peer closed / EOF "
+                             "(%d client(s) on this socket: %s)",
+                             len(conn_cids), ",".join(sorted(conn_cids)) or "-")
                 break
             method = request["method"]
             target = request["target"]
@@ -635,9 +715,13 @@ async def _handle_connection(manager, reader: asyncio.StreamReader,
                     method, target, version, headers, reader, writer,
                     internal_port, body_prefix=prefix,
                     body_remaining=remaining,
+                    activity=activity,
                     self_delimit=method not in ("GET", "HEAD")
                     and version != "HTTP/1.1")
                 if not reusable:
+                    logger.info("NativeCometd relay says connection close "
+                                "(%s %s) — closing socket",
+                                method, target[:40])
                     break
                 continue
 
@@ -689,7 +773,7 @@ async def _handle_connection(manager, reader: asyncio.StreamReader,
             for c in conn_cids:
                 manager.touch(c)
             connect_msgs = [m for m in messages if isinstance(m, dict)
-                            and m.get("channel") == "/meta/connect"]
+                            and is_connect_channel(m.get("channel"))]
 
             if connect_msgs:
                 msg = connect_msgs[0]
@@ -725,8 +809,17 @@ async def _handle_connection(manager, reader: asyncio.StreamReader,
                 if cid:
                     conn_cids.add(cid)
                     manager.register_connection(cid, owner)
-                logger.info("NativeCometd connect: cid=%s (POST hatte %d Nachrichten: %s)",
-                            cid, len(messages),
+                # Perl Cometd.pm:267 decides the transport of THIS connect —
+                # ``connectionType eq 'streaming'`` — and stores it on the
+                # connection (:295 streaming, :300 long-polling).  Everything
+                # but the literal 'streaming' is long-polling (that ternary).
+                streaming = msg.get("connectionType") == "streaming"
+                manager.set_transport(cid, "streaming" if streaming
+                                      else "long-polling")
+                logger.info("NativeCometd connect: cid=%s type=%s (POST hatte "
+                            "%d Nachrichten: %s)", cid,
+                            "streaming" if streaming else "long-polling",
+                            len(messages),
                             ",".join(m.get("channel", "?") for m in messages))
                 connect_reply = connect_ack(msg, cid)
                 # Per Cometd.pm:269-271 the /meta/(re)connect ack is stored in
@@ -744,6 +837,34 @@ async def _handle_connection(manager, reader: asyncio.StreamReader,
                 # handle_messages() deliberately does NOT answer
                 # /meta/connect, so this is the one and only connect ack.
                 first = [connect_reply] + list(replies)
+                if not streaming:
+                    # Perl Cometd.pm:298-328 — the long-polling branch. The
+                    # transport is recorded (:300), the hold time is
+                    # LONG_POLLING_TIMEOUT unless the client overrides it
+                    # (:302-307) and a poll with events already pending answers
+                    # at once (:309-313). The reply is a plain Content-Length
+                    # response — ``Transfer-Encoding: chunked`` is set for
+                    # STREAMING only (:288-292) — and the socket stays reusable
+                    # for the client's next pipelined poll; the connection is
+                    # unregistered from the manager right after the response
+                    # (sendHTTPResponse, :682-696), which re-arms Perl's
+                    # LONG_POLLING_AUTOKILL window (:691-695) instead of the
+                    # 10 s disconnectClient grace.
+                    events = await manager.wait_for_events(
+                        cid, timeout=connect_timeout(msg))
+                    manager.touch(cid)
+                    first.extend(events)
+                    payload = json.dumps(first).encode("utf-8")
+                    await _send(
+                        writer,
+                        b"HTTP/1.1 200 OK\r\n"
+                        b"Content-Type: application/json\r\n"
+                        b"Cache-Control: no-cache\r\n"
+                        + f"Content-Length: {len(payload)}\r\n\r\n".encode()
+                        + payload,
+                        write_lock)
+                    manager.unregister_connection(cid, owner)
+                    continue
                 events = await manager.wait_for_events(cid, timeout=0)
                 first.extend(events)
                 # Chunked transfer: the app's HttpResponseInputStream
@@ -765,12 +886,15 @@ async def _handle_connection(manager, reader: asyncio.StreamReader,
                 # below); the request loop keeps running.
                 manager.connection_open(cid)
                 push_task = asyncio.create_task(
-                    _push_events(manager, cid, writer, write_lock))
+                    _push_events(manager, cid, writer, write_lock, activity))
                 stream_cid = cid
                 try:
                     while True:
                         nxt = await _read_http_head(reader)
                         if nxt is None:
+                            logger.debug(
+                                "NativeCometd streaming loop end for %s: peer "
+                                "closed / EOF", stream_cid or "-")
                             break
                         nmethod = nxt["method"]
                         ntarget = nxt["target"]
@@ -813,8 +937,13 @@ async def _handle_connection(manager, reader: asyncio.StreamReader,
                                 nmethod, ntarget, nversion, nheaders, reader,
                                 writer, internal_port, body_prefix=prefix,
                                 body_remaining=remaining, lock=write_lock,
+                                activity=activity,
                                 self_delimit=True, atomic=True)
                             if not reusable:
+                                logger.info("NativeCometd relay wants the "
+                                            "socket closed (%s %s) — ending "
+                                            "stream of %s",
+                                            nmethod, ntarget[:40], stream_cid)
                                 break
                             continue
                         nb = prefix + await _read_rest(reader, remaining)
@@ -839,7 +968,7 @@ async def _handle_connection(manager, reader: asyncio.StreamReader,
                         nreplies = await manager.handle_messages(nmsgs)
                         nconnect = [m for m in nmsgs
                                     if isinstance(m, dict)
-                                    and m.get("channel") == "/meta/connect"]
+                                    and is_connect_channel(m.get("channel"))]
                         if nconnect:
                             # New connect while streaming — answer as
                             # a proper CHUNK (the connection body is
@@ -977,9 +1106,19 @@ async def _handle_connection(manager, reader: asyncio.StreamReader,
                              + f"Content-Length: {len(payload)}\r\n\r\n".encode()
                              + payload)
                 await writer.drain()
-    except (ConnectionError, OSError, RuntimeError, asyncio.CancelledError,
-            asyncio.IncompleteReadError, EOFError):
-        pass
+    except asyncio.CancelledError:
+        # Server shutdown / task cancel — not an error, but never silent.
+        logger.info("NativeCometd connection cancelled by the server "
+                    "(clients on this socket: %s)",
+                    ",".join(sorted(conn_cids)) or "-")
+        raise
+    except (ConnectionError, OSError, RuntimeError,
+            asyncio.IncompleteReadError, EOFError) as exc:
+        # The socket died under us (reset, truncated body, ...). This used to
+        # be swallowed silently — a client loss must always leave a trace that
+        # names it, so a frozen UI can be correlated with the transport end.
+        logger.info("NativeCometd connection lost: %r (clients on this "
+                    "socket: %s)", exc, ",".join(sorted(conn_cids)) or "-")
     finally:
         # The socket is gone. ``conn_cids`` holds every client this connection
         # touched, but only a client this connection CONNECTED still has it as
