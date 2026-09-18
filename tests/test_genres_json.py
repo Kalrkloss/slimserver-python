@@ -295,8 +295,10 @@ def test_tags_cc_suppresses_the_loop(tmp_path, monkeypatch):
 
 # ---------------------------------------------------------------------------
 # Was Perl nicht liefert, unsere Clients aber lesen (BrowseLibrary.pm:1305-1313
-# setzt name/type und drillt mit genre_id:<id>, :1318; die alten JSON-Clients
-# lesen text/type/loop_loop/item_loop — siehe _browse_response-Docstring).
+# setzt name/type und drillt mit genre_id:<id>, :1318). Der Loop-Name ist
+# Perls ``genres_loop`` (Queries.pm:1945) — genau EINER: die früheren
+# ``loop_loop``/``item_loop``-Zwillinge verdreifachten jede Antwort und
+# liessen Squeeze Client beim Alben-Browse in einen OOM laufen (2026-09-18).
 # ---------------------------------------------------------------------------
 
 def test_compat_fields_are_additive_and_after_perls_keys(tmp_path, monkeypatch):
@@ -310,9 +312,9 @@ def test_compat_fields_are_additive_and_after_perls_keys(tmp_path, monkeypatch):
     assert item["hasitems"] == 1
     assert item["actions"]["go"]["params"]["genre_id"] == 1876   # :1318
     assert item["actions"]["go"]["cmd"] == ["artists"]
-    # Loop-Aliase der alten JSON-RPC-Clients bleiben identisch
-    assert res["loop_loop"] is res["genres_loop"]
-    assert res["item_loop"] is res["genres_loop"]
+    # Genau ein Loop, unter Perls Namen — keine Aliase mehr.
+    assert res["genres_loop"]
+    assert "loop_loop" not in res and "item_loop" not in res
 
 
 # ---------------------------------------------------------------------------

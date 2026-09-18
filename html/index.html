@@ -1571,8 +1571,11 @@ async function loadBrowseData() {
       } catch(e) { return []; }
     };
 
-    // Server responses come as a JSON dict {count, item_loop, loop_loop}
-    // (the same format the Android controllers use). Older/fallback
+    // Server responses come as a JSON dict {count, <loop>} in Perl's shape:
+    // the menuMode feed names its loop ``item_loop``, the flat feed
+    // ``loop_loop`` (XMLBrowser.pm:582/846) and the library queries use
+    // their category loop (``albums_loop``, ``artists_loop``, ``titles_loop``,
+    // ``genres_loop`` — Queries.pm:746/1021/4908/1945). Older/fallback
     // paths return CLI lines ("id:1","title:X") — keep the line parser
     // for those.
     const parse = (lines) => {
@@ -1598,7 +1601,12 @@ async function loadBrowseData() {
 
     const fromResponse = (r) => {
       if (r && typeof r === 'object' && !Array.isArray(r)) {
-        const items = r.item_loop || r.loop_loop || [];
+        let items = r.item_loop || r.loop_loop;
+        if (!items) {
+          // Perl's category loop, whatever the mode named it.
+          const cat = Object.keys(r).find(k => k.endsWith('_loop') && Array.isArray(r[k]));
+          items = cat ? r[cat] : [];
+        }
         return { items, total: typeof r.count === 'number' ? r.count : items.length };
       }
       return { items: parse(Array.isArray(r) ? r : []), total: 0 };

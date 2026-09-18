@@ -778,10 +778,12 @@ def test_bmf_folder_id_drills_into_the_children(bmf_library):
     accept = next(r for r in children["item_loop"] if r["text"] == "Accept")
     assert accept["commonParams"]["folder_id"] == str(accept["id"])
     assert accept["commonParams"]["url"] == f"{BMF_ROOT}/Metal/Accept"
-    # … and one level deeper again (no loop, no empty answer)
+    # … and one level deeper again (no loop, no empty answer). The flat
+    # (non-menu) feed answers ``loop_loop`` — XMLBrowser.pm:582/846, live Perl
+    # ``browselibrary items … mode:bmf`` → ``{"count":…, "loop_loop":[…]}``.
     tracks = _bmf(["items", "0", "512", "mode:bmf",
                    f"folder_id:{accept['id']}"])
-    assert [r["text"] for r in tracks["item_loop"]] == ["01-hard_attack.mp3"]
+    assert [r["text"] for r in tracks["loop_loop"]] == ["01-hard_attack.mp3"]
 
 
 def test_bmf_drill_without_menu_also_carries_the_numeric_id(bmf_library):
@@ -791,12 +793,12 @@ def test_bmf_drill_without_menu_also_carries_the_numeric_id(bmf_library):
     the id the row handed out, otherwise a client that echoes that action
     lands on a different directory.
     """
-    metal = next(r for r in _bmf(["items", "0", "512", "mode:bmf"])["item_loop"]
+    metal = next(r for r in _bmf(["items", "0", "512", "mode:bmf"])["loop_loop"]
                  if r["text"] == "Metal")
     children = _bmf(["items", "0", "512", "mode:bmf",
                      f"folder_id:{metal['id']}"])
-    assert all(str(r["id"]).isdigit() for r in children["item_loop"])
-    for row in children["item_loop"]:
+    assert all(str(r["id"]).isdigit() for r in children["loop_loop"])
+    for row in children["loop_loop"]:
         go = row["actions"]["go"]["params"]
         assert go["folder_id"] == str(row["id"])
         assert go["search"] == str(row["id"])
@@ -812,10 +814,11 @@ def test_bmf_legacy_tokens_and_unknown_ids(bmf_library):
     """
     for token in (f"{BMF_ROOT}/Metal", f"file://{BMF_ROOT}/Metal", "Metal"):
         res = _bmf(["items", "0", "512", "mode:bmf", f"folder_id:{token}"])
-        assert [r["text"] for r in res["item_loop"]] == ["Accept", "Iron Maiden"]
+        # flat feed → Perl's ``loop_loop`` (XMLBrowser.pm:582/846)
+        assert [r["text"] for r in res["loop_loop"]] == ["Accept", "Iron Maiden"]
     unknown = _bmf(["items", "0", "512", "mode:bmf", "folder_id:99999999"])
     assert unknown["count"] == 0
-    assert not (unknown.get("item_loop") or [])
+    assert not (unknown.get("loop_loop") or [])
     # ``1`` ist im Fixture die Track-Zeile von Accept/01-hard_attack.mp3 —
     # keine ``dir``-Zeile, also leer (Perl-Probe oben).
     track_id = _bmf(["items", "0", "512", "mode:bmf", "folder_id:1"])

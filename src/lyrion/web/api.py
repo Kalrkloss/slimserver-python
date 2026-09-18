@@ -6550,20 +6550,58 @@ class JSONRPCAPI:
         finally:
             db.close()
 
+    #: Die Loop-Namen, die Perls ``*Query``-Handler tatsächlich ausgeben
+    #: (``Queries.pm``: ``albums_loop`` :746, ``artists_loop`` :1021,
+    #: ``genres_loop`` :1945, ``titles_loop`` :4908, ``years_loop`` :4996).
+    #: Ein Aufrufer, der ``plural`` nicht setzt, beschreibt damit die
+    #: generische Browse-Form (Perls ``loop_loop`` aus der XMLBrowser-Feed-
+    #: Schicht, ``XMLBrowser.pm:582/846``).
+    _PERL_PLURAL_LOOPS = frozenset({
+        "albums_loop", "artists_loop", "genres_loop", "titles_loop",
+        "years_loop", "folder_loop", "playlists_loop", "radioss_loop",
+        "search_loop", "contributors_loop", "works_loop",
+    })
+
     @staticmethod
     def _browse_response(loop: list, total: int | None = None,
                          plural: str | None = None) -> dict:
-        """Browse/menu response — Jive expects 'item_loop', the older
-        JSON-RPC clients 'loop_loop' and the controllers read the
-        category-specific name ('artists_loop' etc., LMS reference);
-        deliver all (identical). count = the total number of matches
-        (not the page length).
+        """Browse/menu response in **Perl's** shape: ``count`` plus exactly
+        ONE loop.
 
-        Each item is normalized so the Android controllers (SqueezeClient /
-        Squeezer) can render it: they read 'text' for the display title and
-        'type' for the row kind. The raw LMS fields (album/artist/title/name)
-        are kept for the Real-LMS reference shape; unknown keys are ignored
-        by the kotlinx deserializers, so adding text/type/icon is safe."""
+        Perl's library queries each answer a single, category-specific loop
+        and nothing else — live 192.168.1.90::
+
+            albums  0 3            → {"albums_loop": […], "count": 7189}
+            artists 0 3            → {"artists_loop": […], "count": 11170}
+            titles  0 3            → {"titles_loop": […], "count": 80218}
+            genres  0 3            → {"genres_loop": […], "count": 762}
+            years   0 3            → {"years_loop": […], "count": …}
+
+        Queries.pm:746 ``my $loopname = 'albums_loop';`` / :1021 artists /
+        :1939 genres / :4908 titles — ``Request.pm:2264-2281`` unrolls that
+        one loop; there is no ``item_loop``/``loop_loop`` twin. The
+        ``loop_loop``/``item_loop`` pair only exists in the XMLBrowser feed
+        layer (``XMLBrowser.pm:582/846``: ``$menuMode ? 'item_loop' :
+        'loop_loop'``), which is why ``browselibrary items … menu:1`` answers
+        ``item_loop`` alone and the flat form answers ``loop_loop`` alone.
+
+        The port used to publish the SAME list under all three names. That
+        triples the bytes for every page, and for the un-paged probe Squeeze
+        Client issues when opening *Eigene Musik → Alben*
+        (``albums 0 2147483647 … tags:yE``, measured live 2026-09-18) it was
+        22.07 MB versus Perl's 1.01 MB — the app died with
+        ``java.lang.OutOfMemoryError`` (192 MB heap, reproduced in Waydroid).
+        One loop per answer, as in Perl, removes the aliases.
+
+        Items keep the compatibility fields ``text``/``type``/``hasitems``
+        that the Android controllers read for the display line and the row
+        kind (unknown keys are ignored by their deserializers); whatever
+        native fields the caller built — including the Jive ``actions`` tree
+        of the library queries — are left untouched. (Perl's XMLBrowser feed
+        lets ``Slim/Menu/BrowseLibrary.pm`` attach actions in the
+        ``item_loop`` form; the JSON catalog queries carry none, which is a
+        documented leftover divergence here.) ``count`` stays the total
+        number of matches, not the page length."""
         for it in loop:
             if not isinstance(it, dict):
                 continue
@@ -6585,10 +6623,14 @@ class JSONRPCAPI:
                 it["icon"] = f"/music/{it['coverid']}/cover.jpg"
                 it["icon-id"] = it["coverid"]
         resp: dict = {"count": len(loop) if total is None else total,
-                      "offset": 0,
-                      "loop_loop": loop, "item_loop": loop}
-        if plural:
-            resp[plural] = loop
+                      "offset": 0}
+        # Exactly ONE loop, named as Perl names it. A caller that passes a
+        # plural asks for a library query answer (albums/artists/…); a caller
+        # without one wants the generic browse feed, whose Perl name is
+        # `loop_loop` (XMLBrowser.pm:582/846, non-menuMode).
+        loop_name = plural if plural in JSONRPCAPI._PERL_PLURAL_LOOPS \
+            else "loop_loop"
+        resp[loop_name] = loop
         return resp
 
     async def _load_tracks(self, track_ids: list[int]) -> dict:
@@ -8206,8 +8248,14 @@ class JSONRPCAPI:
                          "params": play_params},
             }
             loop.append(item)
-        return {"count": total, "loop_loop": loop,
-                "item_loop": loop, plural: loop}
+        # ONE loop, Perl's flat XMLBrowser name: ``$menuMode ? 'item_loop' :
+        # 'loop_loop'`` (XMLBrowser.pm:846) — the non-menu feed answers
+        # ``loop_loop`` alone. Live Perl: ``browselibrary items 0 3
+        # mode:albums`` → ``{"count":…, "loop_loop":[…]}``; the old triple
+        # (loop_loop+item_loop+<plural>) tripled every page for nothing and
+        # was the same defect that made the Squeeze-Client album probe
+        # 22 MB instead of Perl's 1 MB.
+        return {"count": total, "loop_loop": loop}
 
     @staticmethod
     def _browselibrary_menu_items(kind: str, rows: list, mode: str,

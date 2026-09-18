@@ -241,14 +241,24 @@ def _ours_sid(res: dict) -> str:
 SID_RE = re.compile(r"^[a-f0-9]{8}$")
 
 
+def _loop(res: dict) -> list:
+    """The response's single loop under its Perl name.
+
+    Perl: ``$menuMode ? 'item_loop' : 'loop_loop'`` (XMLBrowser.pm:582/846) —
+    the non-menu feed (e.g. the plain ``favorites items`` listing) answers
+    ``loop_loop``, the menu feed ``item_loop``.
+    """
+    return res.get("item_loop") or res.get("loop_loop") or []
+
+
 def _folder_item(res: dict, idx: int = 0) -> dict:
-    it = res["item_loop"][idx]
+    it = _loop(res)[idx]
     assert "actions" in it, f"item {idx} is not a folder item: {sorted(it)}"
     return it
 
 
 def _audio_item(res: dict) -> dict:
-    for it in res["item_loop"]:
+    for it in _loop(res):
         if it.get("goAction") == "play":
             return it
     raise AssertionError("no touch-to-play item in the response")
@@ -299,11 +309,18 @@ def test_window_is_home_menu(favs):
 
 
 def test_plain_listing_keeps_classic_shape(favs):
-    """Without ``menu:`` Perl answers the classic loop (no base/window)."""
+    """Without ``menu:`` Perl answers the classic loop (no base/window).
+
+    Perl sends exactly ONE loop and names it ``loop_loop`` in the
+    non-menuMode feed (``XMLBrowser.pm:582/846``: ``$menuMode ? 'item_loop' :
+    'loop_loop'``) — live 192.168.1.90 ``favorites items 0 3`` →
+    ``{"count":…, "loop_loop":[…], "title":"Favorites"}``. The port used to
+    add an ``item_loop`` twin; that tripling is what made the Squeeze-Client
+    album probe 22 MB instead of Perl's 1 MB (OOM, 2026-09-18)."""
     ours = _items(PLAIN_ARGS)
     assert set(_perl_result(PLAIN_FIXTURE)) == {"count", "loop_loop", "title"}
     assert "base" not in ours and "window" not in ours
-    assert "loop_loop" in ours and "item_loop" in ours
+    assert "loop_loop" in ours and "item_loop" not in ours
     folder = _folder_item(ours, 0)
     for key in ("id", "name", "isaudio", "hasitems"):
         assert key in folder, f"classic shape lost '{key}'"
