@@ -37,12 +37,14 @@ Deviation, stated honestly
 --------------------------
 Perl gives every browsed folder a numeric id by *creating* a ``Track`` row of
 content type ``dir`` (``findAndScanDirectoryTree`` → ``objectForUrl(create=>1)``,
-``Slim/Utils/Misc.pm:1082-1087``).  Browsing must stay read-only here, so our
-``tracks`` table holds no ``dir`` rows (verified against the live DB: content
-types are only audio/video).  ``folder_loop`` items therefore carry the
-folder's **file URL** as ``id`` — the same token our browse layer already
-accepts back as ``folder_id``/``url`` (``web/api.py`` ``_json_browselibrary``).
-When a directory *does* have a ``tracks`` row the numeric id is used, like Perl.
+``Slim/Utils/Misc.pm:1082-1087``).  This port stores those rows too — the scan
+writes one per walked directory (``media/dir_rows.py``) and the browse creates
+the row of every listed folder on demand, like Perl's ``Queries.pm:2263-2268``
+— so ``folder_loop`` items carry the row's ``tracks.id``.  When the library DB
+is not writable (or a lean/foreign schema has no ``content_type`` column) the
+row cannot be established and the folder's **file URL** is emitted instead:
+the drill (``folder_id``/``url``) accepts that token as well, so browsing keeps
+working, and ``media/dir_rows.py`` logs the reason.
 """
 
 from __future__ import annotations
@@ -56,6 +58,7 @@ import urllib.parse
 from pathlib import Path
 from typing import Any, Iterable
 
+from lyrion.media import dir_rows
 from lyrion.media.scanner import SUPPORTED_EXTENSIONS
 
 logger = logging.getLogger(__name__)
@@ -536,6 +539,65 @@ def _ro_connection(db_path: str | os.PathLike[str] | None = None) -> sqlite3.Con
     return con
 
 
+def _rw_connection(db_path: str | os.PathLike[str] | None = None
+                   ) -> sqlite3.Connection | None:
+    """A **writable** connection to the library DB (Perl's ``commit => 1``).
+
+    ``objectForUrl({create => 1, commit => 1})`` writes the directory row
+    (``Slim/Utils/Misc.pm:1082-1090``), so the folder-id path needs a writable
+    handle — unlike :func:`_ro_connection`, which the browse reads with.
+    ``None`` when no library DB is reachable; the caller then keeps its
+    non-Perlish URL token.
+    """
+    path = str(db_path) if db_path is not None else None
+    if path is None:
+        try:
+            from lyrion.config import get_config
+
+            path = str(get_config().db_path)
+        except Exception:  # pragma: no cover - defensive, config is always there
+            return None
+    if not path or not os.path.exists(path):
+        return None
+    try:
+        con = sqlite3.connect(path, timeout=30)
+        con.execute("PRAGMA busy_timeout=30000")
+    except sqlite3.Error:
+        return None
+    return con
+
+
+def _folder_id(path: str, fallback: str,
+               dir_ids: dict[str, int] | None = None) -> Any:
+    """Perl folder id of a directory: its ``tracks`` row id.
+
+    ``Slim/Control/Queries.pm:2429`` adds ``id => $item->id()`` for an item
+    built with ``objectForUrl({url, create => 1})`` (:2263-2268) — the row is
+    created while browsing.  ``dir_ids`` is the batch of rows written for one
+    listing by :func:`_dir_ids_for`; without a row the pre-D4 URL token is
+    kept (see the module docstring).
+    """
+    if dir_ids:
+        hit = dir_ids.get(os.path.normpath(path))
+        if hit is not None:
+            return hit
+    return fallback
+
+
+def _dir_ids_for(directories: Iterable[str]) -> dict[str, int]:
+    """Write/look up the directory rows of one listing (Perl ``create => 1``)."""
+    con = _rw_connection()
+    if con is None:
+        return {}
+    try:
+        return dir_rows.ensure_dir_ids(directories, conn=con)
+    finally:
+        try:
+            con.close()
+        except sqlite3.Error:  # pragma: no cover - defensive
+            pass
+
+
 def reset_caches() -> None:
     """Drop the cached read-only connection (tests / after a rescan)."""
     global _RO_CONN, _RO_CONN_PATH
@@ -614,20 +676,21 @@ def item_type(path: str) -> str:
     return "unknown"
 
 
-def _folder_item(folder: str, *, volatile: bool = False, tags: str = "") -> dict:
+def _folder_item(folder: str, *, volatile: bool = False, tags: str = "",
+                 dir_ids: dict[str, int] | None = None) -> dict:
     """One ``folder_loop`` entry for a directory, Perl shaped.
 
     Perl: ``id`` (:2429), ``filename`` (:2430), ``type`` (:2472-2487) and the
     optional tag fields ``coverid``/``duration``/``textkey``/``url``/``title``
-    (:2489-2497).  ``filename`` is the *basename* (``Info::fileName``), and a
-    not-yet-scanned ("volatile") folder in the browse root is shown bracketed
-    (:2423-2427).
+    (:2489-2497) plus ``ct`` for the ``o`` tag (:2494-2496).  ``filename`` is
+    the *basename* (``Info::fileName``), and a not-yet-scanned ("volatile")
+    folder in the browse root is shown bracketed (:2423-2427).
     """
     url = file_url_from_path(folder)
     name = os.path.basename(folder.rstrip("/")) or folder
     display = f"[{name}]" if volatile else name
     entry: dict = {
-        "id": _track_id_by_url(url) or url,
+        "id": _folder_id(folder, url, dir_ids),
         "filename": display,
         "type": "folder",
     }
@@ -637,6 +700,9 @@ def _folder_item(folder: str, *, volatile: bool = False, tags: str = "") -> dict
         entry["url"] = url
     if "t" in tags:
         entry["title"] = display
+    if "o" in tags:
+        # Perl ``$item->content_type`` — 'dir' for a directory (Info.pm:1482-1484).
+        entry["ct"] = dir_rows.DIR_CONTENT_TYPE
     return entry
 
 
@@ -708,15 +774,25 @@ def mediafolder_result(
         target = all_dirs[0]
 
     if listing_roots:
+        dir_paths = [d for d in all_dirs if os.path.isdir(d)]
+        dir_ids = _dir_ids_for(dir_paths)
         items = [
-            _folder_item(d, volatile=(d in volatile_dirs), tags=tags)
-            for d in all_dirs
-            if os.path.isdir(d)
+            _folder_item(d, volatile=(d in volatile_dirs), tags=tags,
+                         dir_ids=dir_ids)
+            for d in dir_paths
         ]
     else:
-        items = [_child_item(target, name, tags=tags)
-                 for name in list_directory_entries(target, recursive=recursive)] \
-            if target else []
+        names = (list_directory_entries(target, recursive=recursive)
+                 if target else [])
+        # Perl writes a ``dir`` row for every directory it lists (the browse
+        # creates them, ``Slim/Control/Queries.pm:2263-2268`` /
+        # ``Slim/Utils/Misc.pm:1082-1090``); one batch for the whole listing.
+        dir_ids: dict[str, int] = {}
+        if target and names:
+            dir_ids = _dir_ids_for([os.path.join(target, n) for n in names
+                                    if os.path.isdir(os.path.join(target, n))])
+        items = ([_child_item(target, name, tags=tags, dir_ids=dir_ids)
+                  for name in names] if target else [])
 
     count = len(items)
     valid, start, end = normalize(index, quantity, count)
@@ -726,12 +802,20 @@ def mediafolder_result(
     return result
 
 
-def _child_item(directory: str, name: str, *, tags: str = "") -> dict:
-    """One ``folder_loop`` entry for a child of ``directory`` (Perl :2429-2487)."""
+def _child_item(directory: str, name: str, *, tags: str = "",
+                dir_ids: dict[str, int] | None = None) -> dict:
+    """One ``folder_loop`` entry for a child of ``directory`` (Perl :2429-2487).
+
+    A child directory gets its ``tracks`` row id (Perl creates the ``dir`` row
+    while browsing, :2263-2268); a file keeps its own ``tracks.id``
+    (``media/folders.py`` ``_track_id_by_url``).
+    """
     full = os.path.join(directory, name)
     url = file_url_from_path(full)
+    is_dir = os.path.isdir(full)
     entry: dict = {
-        "id": _track_id_by_url(url) or url,
+        "id": (_folder_id(full, url, dir_ids) if is_dir
+               else (_track_id_by_url(url) or url)),
         "filename": name,
         "type": item_type(full),
     }
@@ -741,7 +825,22 @@ def _child_item(directory: str, name: str, *, tags: str = "") -> dict:
         entry["url"] = url
     if "t" in tags:
         entry["title"] = name
+    if "o" in tags:
+        # Perl ``$item->content_type`` for the ``o`` tag (:2494-2496): 'dir'
+        # for a directory, otherwise the type derived from the file suffix
+        # (``Slim/Music/Info.pm:1445-1453`` ``typeFromSuffix``).
+        entry["ct"] = _content_type_for(full) if not is_dir else "dir"
     return entry
+
+
+def _content_type_for(path: str) -> str:
+    """Perl 3-letter content type of a file (``typeFromSuffix``, Info.pm:1445)."""
+    try:
+        from lyrion.formats.lms_types import type_from_suffix
+
+        return type_from_suffix(path) or ""
+    except Exception:  # noqa: BLE001 - type table optional here
+        return ""
 
 
 #: ``musicfolderQuery`` is a thin alias of ``mediafolderQuery``

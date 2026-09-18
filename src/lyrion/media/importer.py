@@ -210,6 +210,12 @@ class MusicImporter:
         # reconciliation after a FULL scan (additive scans skip this).
         found_urls: set[str] | None = (set() if self.config.delete_missing
                                        else None)
+        # Absolute paths of every directory the walk visits — the scan writes
+        # one ``content_type='dir'`` row per entry (Perl records them in
+        # ``scanned_files`` with size 0, Slim/Utils/Scanner/Local/AIO.pm:62-67).
+        # Collected on every scan mode; only a FULL rescan also prunes the
+        # directory rows of directories that disappeared (see below).
+        found_dirs: set[str] = set()
         # Set by the consumer when abortscan arrived; the producer polls it
         # so a long gvfs walk stops quickly instead of draining fully.
         abort_ev = _threading.Event()
@@ -220,6 +226,13 @@ class MusicImporter:
                     if abort_ev.is_set():
                         logger.info("Scan walk aborted — stopping walker")
                         break
+                    if p.is_dir():
+                        # Perl records every walked directory (filesize 0) while
+                        # scanning (Slim/Utils/Scanner/Local/AIO.pm:62-67,
+                        # :135-142); we turn each of them into a ``dir`` row
+                        # below so a folder id is a real ``tracks.id``.
+                        found_dirs.add(str(p))
+                        continue
                     if p.is_file() and p.suffix.lower().lstrip(".") in SUPPORTED_EXTENSIONS:
                         name = p.name.lower()
                         if name.startswith(".") or name in ("desktop.ini", "thumbs.db"):
@@ -304,6 +317,14 @@ class MusicImporter:
         walker.join(timeout=10)
         self.stats.end_time = datetime.now()
 
+        # Directory rows: one ``content_type='dir'`` row per walked directory,
+        # so a folder id is the row's ``tracks.id`` (Perl: the scan records the
+        # dirs — Slim/Utils/Scanner/Local/AIO.pm:62-67/:135-142 — and the
+        # browse creates the rows, Slim/Schema.pm:764-856).  Never on an
+        # aborted scan (a half-walked tree would prune live folders).
+        if not aborted and found_dirs:
+            await self._sync_dir_rows(found_dirs)
+
         # Deletion reconciliation: a full scan removes tracks whose files
         # are no longer on disk (plus orphaned albums/contributors). Never
         # run on an aborted scan, and never when the walk found nothing
@@ -323,6 +344,44 @@ class MusicImporter:
         )
         return self.stats
 
+    async def _sync_dir_rows(self, found_dirs: set[str]) -> tuple[int, int]:
+        """Store a ``dir`` row per walked directory (Perl's folder ids).
+
+        The rows are written on the importer's own session, so they land in
+        exactly the DB this scan writes to.  ``prune`` is only set for a FULL
+        scan whose walk actually found audio (same guard as the track
+        reconciliation): rows of directories that no longer exist are removed
+        — Perl drops them all with a full wipe (``Slim/Schema.pm:2346-2357``
+        ``wipeAllData``) and keeps stale ones through a normal rescan, because
+        its deleted/changed sets are filtered with ``content_type != 'dir'``
+        (``Slim/Utils/Scanner/Local.pm:186``).
+        """
+        from lyrion.database.sqlite_helper import db_session
+        from lyrion.media import dir_rows
+
+        prune = bool(self.config.delete_missing)
+        created = pruned = 0
+        # ``rglob('*')`` never yields the root itself; Perl stores it too
+        # (Slim/Utils/Scanner/Local/AIO.pm:62-68 "Add the root directory to
+        # the database", filesize 0) — and browsing the root creates its
+        # ``tracks`` row anyway (Slim/Utils/Misc.pm:1082-1090).
+        directories = set(found_dirs)
+        if self.config.source_path is not None:
+            directories.add(str(self.config.source_path))
+        try:
+            async with db_session() as session:
+                created, pruned = await dir_rows.sync_dir_rows(
+                    session, directories,
+                    root=self.config.source_path, prune=prune)
+                await session.commit()
+        except Exception as exc:  # noqa: BLE001 - a scan must not fail on this
+            logger.warning("Directory rows could not be synced: %s", exc)
+            return (0, 0)
+        if created or pruned:
+            logger.info("Directory rows: %d created, %d orphaned removed",
+                        created, pruned)
+        return (created, pruned)
+
     async def _reconcile_deletions(self, found_urls: set[str]) -> int:
         """Remove tracks whose files disappeared since the last full scan.
 
@@ -332,6 +391,7 @@ class MusicImporter:
         Returns the number of deleted tracks.
         """
         from lyrion.database.sqlite_helper import db_session
+        from lyrion.media import dir_rows
         from sqlalchemy import text
 
         if not found_urls:
@@ -340,7 +400,14 @@ class MusicImporter:
             return 0
 
         async with db_session() as session:
-            rows = await session.execute(text("SELECT url FROM tracks"))
+            # ``content_type != 'dir'``: Perl's deleted-set is built with the
+            # same filter (Slim/Utils/Scanner/Local.pm:186 ``$ctFilter``), so a
+            # directory row is never treated as a vanished audio file — its
+            # cleanup is the orphan prune of ``_sync_dir_rows`` (and Perl's
+            # full wipe, Slim/Schema.pm:2346-2357).
+            rows = await session.execute(text(
+                "SELECT url FROM tracks WHERE "
+                f"{dir_rows.not_dir_clause()}"))
             db_urls = {row[0] for row in rows}
             missing = sorted(db_urls - found_urls)
             if not missing:

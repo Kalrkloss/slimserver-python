@@ -167,7 +167,7 @@ def _lib_db(tmp_path, monkeypatch) -> str:
         CREATE TABLE tracks (
             id INTEGER PRIMARY KEY, titlesort TEXT, title TEXT, url TEXT,
             duration REAL, year INTEGER, genre TEXT, content_type TEXT,
-            remote INTEGER
+            remote INTEGER, audio INTEGER DEFAULT 1
         );
         CREATE TABLE contributors (id INTEGER PRIMARY KEY, name TEXT);
         CREATE TABLE tracks_contributors (track INTEGER, contributor INTEGER,
@@ -175,14 +175,14 @@ def _lib_db(tmp_path, monkeypatch) -> str:
         CREATE TABLE albums (id INTEGER PRIMARY KEY, title TEXT, artwork TEXT);
         CREATE TABLE tracks_albums (track INTEGER, album INTEGER);
         INSERT INTO tracks (id, titlesort, title, url, duration, year, genre,
-                            content_type, remote)
+                            content_type, remote, audio)
         VALUES
             (1, 'creep', 'Creep', 'file:///m/1.flac', 100.5, 1993, 'Rock',
-             'flac', 0),
+             'flac', 0, 1),
             (2, 'airbag', 'Airbag', 'file:///m/2.flac', 200.0, 1997, 'Rock',
-             'flac', 0),
+             'flac', 0, 1),
             (3, 'lucky', 'Lucky', 'file:///m/3.flac', 150.0, 0, '',
-             'flac', 0);
+             'flac', 0, 1);
         INSERT INTO contributors (id, name) VALUES (1, 'Radiohead'),
                                                    (2, 'Nigel Godrich');
         INSERT INTO tracks_contributors (track, contributor, role)

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 import socket
+import sqlite3
 import struct
 import subprocess
 import sys
@@ -19,6 +20,74 @@ from pathlib import Path
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+
+#: Real-shaped ``tracks`` DDL for tests that need a library DB.  It mirrors
+#: ``lyrion.database.schema.Track`` (NOT NULL columns included — the folder
+#: layer's INSERT must satisfy them) without pulling SQLAlchemy into the test.
+TRACKS_SCHEMA_SQL = """
+CREATE TABLE tracks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    titlesort VARCHAR(255) NOT NULL,
+    title VARCHAR(255) NOT NULL,
+    url VARCHAR(1000) NOT NULL UNIQUE,
+    content_type VARCHAR(50),
+    modtime BIGINT,
+    filesize BIGINT,
+    duration FLOAT NOT NULL DEFAULT 0,
+    playcount INTEGER NOT NULL DEFAULT 0,
+    lastplayed DATETIME,
+    lastscanned DATETIME,
+    year INTEGER,
+    remote INTEGER NOT NULL DEFAULT 0,
+    audio INTEGER NOT NULL DEFAULT 1,
+    video INTEGER NOT NULL DEFAULT 0,
+    disabled INTEGER NOT NULL DEFAULT 0,
+    genre VARCHAR(255),
+    type VARCHAR(100),
+    tracknum INTEGER,
+    disc INTEGER,
+    compilation INTEGER NOT NULL DEFAULT 0,
+    artflow_flag INTEGER NOT NULL DEFAULT 0
+);
+"""
+
+
+@pytest.fixture
+def tracks_schema_sql() -> str:
+    """The ``tracks`` DDL above (fixture so tests can request it by name)."""
+    return TRACKS_SCHEMA_SQL
+
+
+@pytest.fixture
+def library_db(tmp_path, tracks_schema_sql) -> str:
+    """A writable temp library DB with the port's ``tracks`` schema."""
+    db = tmp_path / "lyrion.db"
+    con = sqlite3.connect(db)
+    con.executescript(tracks_schema_sql)
+    con.commit()
+    con.close()
+    return str(db)
+
+
+@pytest.fixture(autouse=True)
+def _no_library_db_writes(monkeypatch):
+    """Never let an unstubbed code path write into the real library DB.
+
+    Folder browsing creates Perl's ``content_type='dir'`` rows on demand
+    (``lyrion.media.dir_rows``), so a test that calls a browse function
+    without pointing the library DB at a temp file would otherwise insert
+    directory rows into ``~/.lyrion/Lyrion/Prefs/lyrion.db``.  With the
+    *configured* path and the folder layer's write handle returning ``None``
+    the code takes its documented no-DB path; a test that wants directory rows
+    stubs one of them explicitly (its own ``monkeypatch.setattr`` runs after
+    this fixture and wins).  An explicitly passed ``db_path`` is untouched —
+    that is how the tests that do exercise the rows point at their temp DB.
+    """
+    from lyrion.media import dir_rows, folders
+
+    monkeypatch.setattr(dir_rows, "config_db_path", lambda: None)
+    monkeypatch.setattr(folders, "_rw_connection", lambda db_path=None: None)
+    yield
 
 TEST_WEB_PORT = 9002
 TEST_CLI_PORT = 9091

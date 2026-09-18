@@ -66,7 +66,8 @@ def _db(tmp_path):
             year INTEGER, tracknum INTEGER, bitrate INTEGER, samplerate INTEGER,
             bitspersample INTEGER, genre TEXT, cover TEXT, remote INTEGER,
             disc INTEGER, filesize INTEGER, comment TEXT, lyrics TEXT,
-            content_type TEXT, replay_gain REAL, replay_peak REAL
+            content_type TEXT, replay_gain REAL, replay_peak REAL,
+            audio INTEGER DEFAULT 1
         );
         CREATE TABLE contributors (id INTEGER PRIMARY KEY, name TEXT);
         CREATE TABLE tracks_contributors (track INTEGER, contributor INTEGER, role INTEGER);

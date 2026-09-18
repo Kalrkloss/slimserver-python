@@ -10,8 +10,13 @@ import posixpath
 import re
 import time
 import urllib.parse
-import zlib
 from typing import Any, Callable, Optional
+
+#: Perl's directory rows (``content_type = 'dir'``) — the folder-id model the
+#: browse and the songs/titles filters use.  Imported at module level: it is
+#: dependency-free (stdlib + ``lyrion.platform.paths``, which is loaded
+#: lazily inside its functions), so there is no import cycle.
+from lyrion.media import dir_rows
 
 #: The CLI tags Perl's TuneIn importer registers as radio sub-feeds: one
 #: dynamic OPMLBased plugin per TuneIn directory item
@@ -586,7 +591,14 @@ def _expand_track_ids(tagged: dict) -> list[int]:
     if tagged.get("folder_id"):
         # „Musikordner“ (mode:bmf): every track below that directory —
         # Perl's folderId expansion in playlistControl.
+        #
+        # ``content_type != 'dir'``: the directory rows of the *sub*folders
+        # carry URLs below this prefix too, and Perl never loads a directory
+        # as a song (its deleted/changed sets and the songs query are filtered
+        # the same way, ``Slim/Utils/Scanner/Local.pm:186`` /
+        # ``Slim/Control/Queries.pm:4843``).
         where.append("t.url LIKE ?")
+        where.append("(t.content_type IS NULL OR t.content_type != 'dir')")
         params.append(_bmf_encoded_prefix(tagged["folder_id"]) + "%")
     if not where:
         return []
@@ -648,9 +660,15 @@ def _bmf_encoded_prefix(directory: str) -> str:
 
 
 def _bmf_count_under(root: str) -> int:
-    """Tracks whose URL lives below ``root`` (0 on any error)."""
+    """Tracks whose URL lives below ``root`` (0 on any error).
+
+    Directory rows are not tracks (Perl's ``content_type != 'dir'``,
+    ``Slim/Utils/Scanner/Local.pm:186``), so they never satisfy the
+    "more than one track" rule below.
+    """
     try:
-        rows = _db_query("SELECT COUNT(*) AS n FROM tracks WHERE url LIKE ?",
+        rows = _db_query("SELECT COUNT(*) AS n FROM tracks WHERE url LIKE ?"
+                         " AND (content_type IS NULL OR content_type != 'dir')",
                          (_bmf_encoded_prefix(root) + "%",))
         return int(list(rows[0].values())[0]) if rows else 0
     except Exception:  # noqa: BLE001
@@ -697,21 +715,25 @@ def _bmf_music_root() -> str:
     return root if _bmf_count_under(root) > 1 else ""
 
 
-def _bmf_resolve_dir(token: str, root: str) -> str:
+def _bmf_resolve_dir(token: str, root: str) -> str | None:
     """Directory a ``mode:bmf`` drill token (folder_id/search/url) points at.
 
     Accepts an absolute path below ``root``, a ``file://`` URI or a path
-    relative to ``root``; a purely numeric token is one of our virtual
-    folder ids (:func:`_folder_numeric_id`) and is inverted over the folder
-    tree.  Anything else falls back to ``root`` (browse the top level
-    instead of leaking a foreign directory).
+    relative to ``root``; a purely numeric token is a folder id and is resolved
+    through the directory's ``tracks`` row, exactly like Perl
+    (``Slim/Control/Queries.pm:2311-2316`` → ``findAndScanDirectoryTree``,
+    ``Slim/Utils/Misc.pm:1067-1074``; see :func:`_folder_dir_by_id`).
+
+    ``None`` means "browse nothing" for a numeric token that has no directory
+    row or whose row is not a directory — live Perl 9.1.1 answers
+    ``{"count": 0}`` for both (``musicfolder 0 5 folder_id:99999999`` and
+    ``… folder_id:1``, checked read-only).  A path/``file://`` token outside
+    ``root`` still falls back to ``root`` (browse the top level instead of
+    leaking a foreign directory — a documented deviation, Perl would list it).
     """
     raw = str(token or "").strip()
     if raw and raw.lstrip("-").isdigit():
-        hit = _folder_dir_by_id(raw, root)
-        if hit:
-            return hit
-        return root
+        return _folder_dir_by_id(raw, root)
     p = _bmf_path(token)
     if not p or p == "/":
         return root
@@ -727,49 +749,42 @@ def _bmf_resolve_dir(token: str, root: str) -> str:
 # Folder ids
 #
 # Perl stores every directory it has browsed as a row in ``tracks``
-# (``content_type = 'dir'``) and hands out that row's ``id``: live Perl
-# ``musicfolder 0 3`` → ``{"id": 204573, "filename": "Accept", "type":
-# "folder"}`` (``Slim/Control/Queries.pm:2429-2430`` id/filename,
-# ``:2472-2487`` type, ``:2311-2316`` ``findAndTrackDirectoryTree`` resolves
-# a ``folder_id`` back through such a row).  Our port never creates ``dir``
-# rows, so a directory id was its ``file://`` URL — a value the controllers
-# cannot use: Squeeze Client shows the subdirectories but a tap sends no
-# drill request at all (cometd log 2026-09-13 19:25/19:27: only
-# ``browselibrary items 0 1|512 mode:bmf useContextMenu:1 menu:1``, never a
-# ``folder_id:`` follow-up).
+# (``content_type = 'dir'``) and hands out that row's ``id``: live Perl 9.1.1
+# ``musicfolder 0 5 tags:stuo`` → ``{"id": 204572, "filename": "Accept",
+# "type": "folder", "url": "file:///mnt/media/Musik/Accept", "ct": "dir"}``
+# (``Slim/Control/Queries.pm:2429-2430`` id/filename, ``:2472-2487`` type,
+# ``:2494-2496`` ct).  ``Slim/Utils/Misc.pm:1060-1104``
+# ``findAndScanDirectoryTree`` creates the browsed directory's own row
+# (``objectForUrl({url, create => 1, readTags => 1, commit => 1})``) and
+# ``Queries.pm:2263-2268`` creates the row of every child it *displays* — the
+# first pass only checks existence (:2249-2257 "don't create the dir objects in
+# the first pass - we can create them later when paging through the list").
+# A ``folder_id`` comes back in through that row (``:2311-2316`` →
+# ``Slim::Schema->find('Track', $params->{'id'})``).
 #
-# We hand out the same *shape* instead: a positive integer, derived from the
-# path so that it is stable across restarts and identical for every spelling
-# of one directory.  It is NOT Perl's ``tracks.id`` (there is no directory
-# row to borrow one from); the server resolves it back through
-# :func:`_folder_dir_by_id` over the same tree the browse is built from.
+# Our port stores the same rows (``lyrion.media.dir_rows``): the scan writes
+# one per walked directory and the browse creates a missing row on demand, so
+# a folder id is a real ``tracks.id`` and not a path-derived stand-in.  Only
+# when the library DB cannot hold the row (unwritable DB, foreign schema
+# without ``content_type``) does the item keep the pre-D4 ``file://`` URL —
+# the drill accepts that token too, so nothing becomes unbrowsable.
 # ---------------------------------------------------------------------------
 
-#: int32 mask — Perl's ``tracks.id`` is a 32-bit AUTOINCREMENT, so a folder id
-#: is a positive integer; ``crc32`` is already unsigned, the mask just keeps
-#: the value inside the range a client parses without sign trouble.
-_FOLDER_ID_MASK = 0x7FFFFFFF
 
-#: ``root → {numeric folder id: directory}`` — see :func:`_bmf_dir_index`.
-_DIR_INDEX: dict[str, dict[int, str]] = {}
+def _folder_numeric_id(directory: str) -> int | None:
+    """Perl folder id: the ``tracks.id`` of the directory's ``dir`` row.
 
-#: Cap on the directories one index build walks: a folder tap must never
-#: turn into a full-library tree walk (the SMB library holds 100k+ files).
-_DIR_INDEX_LIMIT = 20000
-
-
-def _folder_numeric_id(directory: str) -> int:
-    """Stable positive integer id for a directory path.
-
-    ``crc32`` of the decoded path — a pure function of the directory, so
-    ``/mnt/Musik``, ``file:///mnt/Musik`` and a percent-encoded spelling all
-    yield the same id, and it survives restarts (the client caches it).
+    Creates the row when it is missing — Perl's browse does exactly that
+    (``Slim/Control/Queries.pm:2263-2268``, ``Slim/Utils/Misc.pm:1082-1090``).
+    ``None`` when the row could not be established.
     """
-    return zlib.crc32(_bmf_path(directory).encode("utf-8")) & _FOLDER_ID_MASK
+    from lyrion.media import dir_rows
+
+    return dir_rows.ensure_dir_row(directory, db_path=_library_db_path())
 
 
 def _folder_row_numeric_id(row: dict) -> int | None:
-    """Virtual id for a directory row of a browse loop, ``None`` = keep ``id``.
+    """Folder id for a directory row of a browse loop, ``None`` = keep ``id``.
 
     Only rows of ``type 'folder'`` whose ``id`` is not already numeric are
     rewritten: a *file* row carries a real ``tracks.id`` (Perl's own value,
@@ -817,51 +832,42 @@ def _bmf_subdir_paths(directory: str) -> list[str]:
     return out
 
 
-def _bmf_dir_index(root: str) -> dict[int, str]:
-    """``{numeric folder id: directory}`` for the tree below ``root``.
+def _bmf_dir_row_ids(directories: list[str]) -> dict[str, int]:
+    """``{absolute directory: tracks.id}`` for one listing (Perl ``create=>1``)."""
+    from lyrion.media import dir_rows
 
-    Built from **one** prefix query over ``tracks.url`` (every URL's ancestor
-    directories, all levels) and cached per root — inverting ``crc32`` needs
-    the candidate paths, and a folder tap must not turn into a per-directory
-    query storm on a 100k-file library.
-    """
-    cached = _DIR_INDEX.get(root)
-    if cached is not None:
-        return cached
-    cached = {}
-    _DIR_INDEX[root] = cached
-    try:
-        rows = _db_query("SELECT DISTINCT url FROM tracks WHERE url LIKE ?",
-                         (_bmf_encoded_prefix(root) + "%",))
-    except Exception:  # noqa: BLE001
-        return cached
-    dirs: set[str] = set()
-    for r in rows:
-        d = posixpath.dirname(_bmf_path(str(r.get("url") or "")))
-        while d and d.startswith(root + "/") and len(dirs) < _DIR_INDEX_LIMIT:
-            dirs.add(d)
-            d = posixpath.dirname(d)
-    for d in dirs:
-        cached[_folder_numeric_id(d)] = d
-    return cached
+    return dir_rows.ensure_dir_ids(directories, db_path=_library_db_path())
 
 
 def _folder_dir_by_id(value: object, root: str) -> str | None:
-    """Directory a numeric (virtual) folder id points at, or ``None``.
+    """Directory a numeric ``folder_id`` points at, or ``None``.
 
-    Perl resolves a ``folder_id`` through the directory's ``tracks`` row
-    (``Queries.pm:2311-2316``); we invert :func:`_folder_numeric_id` over the
-    tree below ``root``.  A directory that holds no track at all (empty
-    branch, no rows to aggregate from) has no entry — the caller then falls
-    back to the browse root, exactly like an unresolvable id in Perl.
+    Perl resolves it through the directory's ``tracks`` row
+    (``Slim/Control/Queries.pm:2311-2316`` → ``Slim::Schema->find('Track',
+    $id)`` → ``$topLevelObj->path``, ``Slim/Utils/Misc.pm:1067-1074``): the row
+    is looked up by id, whatever its content type, and its URL is the
+    directory.  The path must sit below the browse root — the same containment
+    rule :func:`_bmf_resolve_dir` applies to path tokens, so a foreign id
+    cannot make the browse leave the configured tree.
     """
-    try:
-        wanted = int(str(value).strip())
-    except (TypeError, ValueError):
+    from lyrion.media import dir_rows
+
+    row = dir_rows.dir_row_by_id(value, db_path=_library_db_path())
+    if not row or not root:
         return None
-    if wanted < 0:
+    path = str(row["path"])
+    if not (path == root or path.startswith(root + "/")):
         return None
-    return _bmf_dir_index(root).get(wanted)
+    if str(row.get("content_type") or "") != dir_rows.DIR_CONTENT_TYPE \
+            and not os.path.isdir(path):
+        # The id belongs to a *file* row (or any other non-directory row):
+        # Perl's ``readDirectory`` on that path lists nothing and live Perl
+        # answers ``{"count": 0}`` (probe of ``folder_id:1``, a track id,
+        # read-only 2026-09-18).  A ``dir`` row is accepted without touching
+        # the filesystem — a library whose SMB mount is away still browses
+        # (the port derives the tree from ``tracks.url``, never from a walk).
+        return None
+    return path
 
 
 def _bmf_index_dir(index_path: str, root: str) -> str | None:
@@ -908,33 +914,67 @@ def _bmf_index_dir(index_path: str, root: str) -> str | None:
 
 def _bmf_children(directory: str, start: int = 0,
                   count: int = 200) -> tuple[list, int]:
-    """Children of ``directory``, aggregated from the track URLs.
+    """Children of ``directory`` from the library rows.
 
     Returns ``(rows, total)``: ``type 'folder'`` subdirectories (``id`` =
-    virtual folder id :func:`_folder_numeric_id`, ``path`` = absolute
-    directory, ``name`` = decoded folder name) followed by ``type 'audio'``
-    files directly in the directory (``id`` = track id) — Perl's bmf lists
-    files there too.  Everything comes from one prefix ``LIKE`` over
-    ``tracks.url`` (``DISTINCT``/``GROUP BY`` on the path segment); the
-    filesystem is never touched.
+    the directory's ``tracks`` row id, ``path`` = absolute directory, ``name``
+    = decoded folder name) followed by ``type 'audio'`` files directly in the
+    directory (``id`` = track id) — Perl's bmf lists files there too, and a
+    folder id is the id of its ``dir`` row (``Slim/Control/Queries.pm:2429``,
+    created by ``objectForUrl({url, create => 1})`` :2263-2268).
+
+    The subdirectories come from **two** row sources, both from the index, so
+    the filesystem is never touched:
+
+    * the ``content_type='dir'`` rows below ``directory`` — one level deep —
+      written by the scan or the migration.  They make a directory that holds
+      no track at all visible, exactly like Perl's ``readDirectory``
+      (``Slim/Utils/Misc.pm:973-1043``) lists it;
+    * the ancestor directories aggregated from the track URLs
+      (:func:`_bmf_subdir_paths`), which covers rows that do not exist yet
+      (a library scanned before the directory rows were introduced).
     """
     prefix = _bmf_encoded_prefix(directory)
     like = prefix + "%"
     off = len(prefix) + 1          # 1-based index behind "<dir>/"
-    folders = [(posixpath.basename(p), p) for p in _bmf_subdir_paths(directory)]
-    folders.sort(key=lambda t: t[0].casefold())
+    paths: dict[str, str] = {}     # path → display name
+    # (1) directory rows of the children (Perl stores every directory;
+    #     their presence is also what makes an empty folder listable).
     try:
-        cnt = _db_query("SELECT COUNT(*) AS n FROM tracks WHERE url LIKE ?"
-                        " AND instr(substr(url, ?), '/') = 0", (like, off))
+        drow = _db_query(
+            "SELECT url FROM tracks WHERE content_type = 'dir'"
+            " AND url LIKE ? AND instr(substr(url, ?), '/') = 0",
+            (like, off))
+    except Exception:  # noqa: BLE001 - lean DB without content_type
+        drow = []
+    for r in drow:
+        path = _bmf_path(str(r.get("url") or ""))
+        if path and path != directory and path.startswith(directory + "/"):
+            paths[path] = posixpath.basename(path)
+    # (2) directories aggregated from the track URLs (their rows may be
+    #     missing in a library that was scanned before this change).
+    for p in _bmf_subdir_paths(directory):
+        paths.setdefault(p, posixpath.basename(p))
+    folders = sorted(paths.items(), key=lambda t: t[1].casefold())
+    dir_ids = _bmf_dir_row_ids([p for p, _ in folders])
+    try:
+        cnt = _db_query(
+            "SELECT COUNT(*) AS n FROM tracks WHERE url LIKE ?"
+            " AND instr(substr(url, ?), '/') = 0"
+            " AND (content_type IS NULL OR content_type != 'dir')", (like, off))
         loose_total = int(list(cnt[0].values())[0]) if cnt else 0
     except Exception:  # noqa: BLE001
         loose_total = 0
     total = len(folders) + loose_total
     # Folders first, then the loose files of this directory (Perl returns
-    # both in one list).
-    out: list[dict] = [{"id": _folder_numeric_id(path), "path": path,
-                        "name": name, "title": name, "type": "folder"}
-                       for name, path in folders[start:start + count]]
+    # both in one list).  A directory row is never a loose *file*: it is
+    # listed as a folder above.  Without a stored row the item keeps the
+    # absolute path as its id — the drill accepts paths as well, so a browse
+    # over a library without directory rows stays usable.
+    out: list[dict] = [{"id": dir_ids.get(path, path),
+                        "path": path, "name": name, "title": name,
+                        "type": "folder"}
+                       for path, name in folders[start:start + count]]
     left = count - len(out)
     if left > 0:
         t_off = 0 if start < len(folders) else start - len(folders)
@@ -943,6 +983,7 @@ def _bmf_children(directory: str, start: int = 0,
             trows = _db_query(
                 "SELECT t.id, t.url FROM tracks t WHERE t.url LIKE ?"
                 " AND instr(substr(t.url, ?), '/') = 0"
+                " AND (t.content_type IS NULL OR t.content_type != 'dir')"
                 " ORDER BY t.url COLLATE NOCASE, t.id LIMIT ? OFFSET ?",
                 (like, off, left, t_off))
         except Exception:  # noqa: BLE001
@@ -3408,11 +3449,19 @@ class JSONRPCAPI:
             except Exception:
                 pass
             try:
+                # Perl's serverstatus totals are ``Slim::Schema->totals`` (the
+                # *titles* query, Queries.pm:4843) and ``totalTime`` over
+                # ``tracks.audio = 1`` (Schema.pm:2186-2190) — directory rows
+                # count as neither.
                 r = _db_query(
-                    "SELECT COUNT(*) AS n, COALESCE(SUM(duration),0) AS d FROM tracks"
-                )
+                    "SELECT COUNT(*) AS n FROM tracks WHERE "
+                    f"{dir_rows.songs_clause('tracks')}")
                 if r:
                     result["info total songs"] = r[0]["n"]
+                r = _db_query(
+                    "SELECT COALESCE(SUM(duration),0) AS d FROM tracks WHERE "
+                    f"{dir_rows.duration_clause('tracks')}")
+                if r:
                     result["info total duration"] = int(r[0]["d"])
                 r = _db_query(
                     "SELECT COUNT(DISTINCT c.id) AS n FROM contributors c "
@@ -7777,9 +7826,11 @@ class JSONRPCAPI:
         loop = res.get("folder_loop")
         if loop is not None:
             # Perl's ``id`` is the ``tracks`` row of the directory (:2429) —
-            # a positive integer.  Our port has no ``dir`` rows, so a folder
-            # item's id was its ``file://`` URL; hand out the virtual numeric
-            # id instead (same shape the bmf items and the drill use).
+            # a positive integer, created on demand (:2263-2268).  The
+            # primitive hands it out already (``media/folders._folder_id``);
+            # this loop is the safety net for a folder row that still carries
+            # a URL (unwritable library DB) — it tries the row once more and
+            # keeps the token when that is impossible.
             for row in loop:
                 num = _folder_row_numeric_id(row)
                 if num is not None:
@@ -8590,6 +8641,11 @@ class JSONRPCAPI:
         if mode == "tracks" or mode in ("songs", "titles"):
             # Album/artist/year drill → the track list (Perl mode:tracks).
             where, params = [], []
+            # Perl's songs/titles WHERE: ``tracks.audio = 1 AND
+            # tracks.content_type NOT IN ("cpl", "src", "ssp", "dir")``
+            # (``Slim/Control/Queries.pm:4843``) — a directory row is not a
+            # song.
+            where.append(dir_rows.songs_clause("t"))
             if f_album:
                 where.append("t.id IN (SELECT track FROM tracks_albums "
                              "WHERE album = ?)")
@@ -8727,14 +8783,19 @@ class JSONRPCAPI:
                              "WHERE year > 0")
             return rows, total, "years_loop", "years"
         if mode in ("bmf", "musicfolder"):
-            # „Musikordner“: the tree is aggregated from the track URLs
-            # below the musicdir root. Without a root (no pref, no
+            # „Musikordner“: the tree comes from the library rows — the
+            # directory rows the scan/migration wrote plus the ancestor
+            # directories of the track URLs. Without a root (no pref, no
             # multi-track library) the folder stays empty instead of
             # showing the first URL component ("home"/"run" bug).
             root = _bmf_music_root()
             if not root:
                 return [], 0, "musicfolder_loop", "folder"
             directory = _bmf_resolve_dir(search, root) if search else root
+            if not directory:
+                # Unresolvable numeric folder id: Perl answers {"count": 0}
+                # (live probe, see _bmf_resolve_dir).
+                return [], 0, "musicfolder_loop", "folder"
             rows, total = _bmf_children(directory, start, count)
             return rows, total, "musicfolder_loop", "folder"
         if mode == "search":
@@ -8743,12 +8804,13 @@ class JSONRPCAPI:
             if not search:
                 return [], 0, "search_loop", "search"
             like = f"%{search}%"
+            # Same songs filter as everywhere else (Queries.pm:4843).
+            _sw = f"WHERE t.title LIKE ? AND {dir_rows.songs_clause('t')}"
             rows = q("SELECT DISTINCT t.id, t.title FROM tracks t "
-                     "WHERE t.title LIKE ? ORDER BY t.title COLLATE NOCASE "
+                     + _sw + " ORDER BY t.title COLLATE NOCASE "
                      "LIMIT ? OFFSET ?", like, count, start)
             total = total_of(
-                "SELECT COUNT(DISTINCT t.id) FROM tracks t WHERE t.title LIKE ?",
-                like)
+                "SELECT COUNT(DISTINCT t.id) FROM tracks t " + _sw, like)
             rows = [{"id": r["id"], "name": r["title"] or ""} for r in rows]
             return rows, total, "search_loop", "search"
         # fallback: albums
@@ -8798,12 +8860,21 @@ class JSONRPCAPI:
             return {}
         value: Any = 0
         try:
+            # Perl's ``totals`` are the counts of the *titles* query
+            # (``Slim/Schema.pm:3305-3320`` → ``Queries.pm:2036-2049``), whose
+            # base WHERE is ``tracks.audio = 1 AND tracks.content_type NOT IN
+            # ("cpl", "src", "ssp", "dir")`` (``Queries.pm:4843``), and
+            # ``totalTime`` sums ``secs`` over ``tracks.audio = 1``
+            # (``Slim/Schema.pm:2186-2190``) — a directory row is in neither.
             if entity == "songs":
-                rows = _db_query("SELECT COUNT(*) AS n FROM tracks")
+                rows = _db_query(
+                    "SELECT COUNT(*) AS n FROM tracks WHERE "
+                    f"{dir_rows.songs_clause('tracks')}")
                 value = int(rows[0]["n"]) if rows else 0
             elif entity == "duration":
                 rows = _db_query(
-                    "SELECT COALESCE(SUM(duration),0) AS n FROM tracks")
+                    "SELECT COALESCE(SUM(duration),0) AS n FROM tracks WHERE "
+                    f"{dir_rows.duration_clause('tracks')}")
                 value = rows[0]["n"] if rows else 0
             elif entity == "albums":
                 rows = _db_query("SELECT COUNT(*) AS n FROM albums")
@@ -8990,6 +9061,9 @@ class JSONRPCAPI:
                 # which made the album drill return count 0 / no tracks).
                 _w: list[str] = []
                 _p: list = []
+                # Perl's titles/songs WHERE (Queries.pm:4843) — a directory
+                # row is not a song.
+                _w.append(dir_rows.songs_clause("t"))
                 if filters.get("search"):
                     _w.append("t.title LIKE ?"); _p.append(f"%{filters['search']}%")
                 joins = ""

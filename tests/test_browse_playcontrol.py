@@ -95,7 +95,8 @@ def _db(tmp_path) -> str:
     con.executescript(
         """
         CREATE TABLE tracks (id INTEGER PRIMARY KEY, title TEXT, genre TEXT,
-                             year INTEGER, url TEXT, tracknum INTEGER);
+                             year INTEGER, url TEXT, tracknum INTEGER,
+                             audio INTEGER DEFAULT 1, content_type TEXT);
         CREATE TABLE albums (id INTEGER PRIMARY KEY, title TEXT, year INTEGER,
                              artwork TEXT);
         CREATE TABLE contributors (id INTEGER PRIMARY KEY, name TEXT);
@@ -131,7 +132,8 @@ def _db_without_track_url(tmp_path) -> str:
     con.executescript(
         """
         CREATE TABLE tracks (id INTEGER PRIMARY KEY, title TEXT, genre TEXT,
-                             year INTEGER, tracknum INTEGER);
+                             year INTEGER, tracknum INTEGER,
+                             audio INTEGER DEFAULT 1, content_type TEXT);
         CREATE TABLE albums (id INTEGER PRIMARY KEY, title TEXT, year INTEGER,
                              artwork TEXT);
         CREATE TABLE contributors (id INTEGER PRIMARY KEY, name TEXT);

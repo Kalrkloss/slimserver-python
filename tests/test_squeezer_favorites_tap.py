@@ -676,12 +676,12 @@ def test_folder_and_stream_rows_differ_in_exactly_the_tap_fields(favs):
 # ``findAndTrackDirectoryTree``).  Our port created no ``dir`` rows, so the
 # id was the directory's ``file://`` URL.
 #
-# The port now hands out ``crc32(path) & 0x7fffffff`` — the same *shape*
-# (positive integer, stable across restarts, identical for every spelling of
-# a path), documented as NOT Perl's ``tracks.id`` — and inverts it over the
-# same tree the browse is built from (``api._folder_dir_by_id``).  Both
-# request paths are covered: the app's ``browselibrary … mode:bmf`` and the
-# plain ``musicfolder`` query.
+# The port hands out the id of the directory's ``tracks`` row: the scan writes
+# one per walked directory and the browse creates a missing one on demand
+# (``objectForUrl({url, create => 1})``, ``Slim/Utils/Misc.pm:1082-1090`` /
+# ``Queries.pm:2263-2268``) — a positive integer, stable across restarts, the
+# same value Perl stores in ``tracks.id``.  Both request paths are covered:
+# the app's ``browselibrary … mode:bmf`` and the plain ``musicfolder`` query.
 
 import sqlite3                                    # noqa: E402
 from pathlib import Path                          # noqa: E402
@@ -697,21 +697,21 @@ BMF_ROWS = [
 
 
 @pytest.fixture()
-def bmf_library(tmp_path, monkeypatch):
+def bmf_library(tmp_path, monkeypatch, tracks_schema_sql):
     """Temp library DB + ``musicdir`` pref (pattern: test_musicdir_bmf)."""
     db = tmp_path / "lyrion.db"
     con = sqlite3.connect(db)
-    con.executescript("CREATE TABLE tracks (id INTEGER PRIMARY KEY, url TEXT,"
-                      " title TEXT);")
-    con.executemany("INSERT INTO tracks (id, url, title) VALUES (?, ?, ?)",
-                    [(i, u, u.rsplit("/", 1)[-1]) for i, u in BMF_ROWS])
+    con.executescript(tracks_schema_sql)
+    con.executemany(
+        "INSERT INTO tracks (id, url, title, titlesort, audio, video, remote,"
+        " disabled, compilation, artflow_flag, duration, playcount)"
+        " VALUES (?, ?, ?, '', 1, 0, 0, 0, 0, 0, 0, 0)",
+        [(i, u, u.rsplit("/", 1)[-1]) for i, u in BMF_ROWS])
     con.commit()
     con.close()
     monkeypatch.setattr(api_mod, "_library_db_path", lambda: str(db))
     monkeypatch.setattr(api_mod, "_bmf_musicdir_pref", lambda: BMF_ROOT)
-    api_mod._DIR_INDEX.clear()
     yield db
-    api_mod._DIR_INDEX.clear()
 
 
 def _bmf(args: list) -> dict:
@@ -779,13 +779,23 @@ def test_bmf_drill_without_menu_also_carries_the_numeric_id(bmf_library):
 
 
 def test_bmf_legacy_tokens_and_unknown_ids(bmf_library):
-    """Paths keep working; an unknown numeric id falls back to the root."""
+    """Pfad-Tokens drillen weiter; eine unbekannte numerische id nicht.
+
+    Live Perl 9.1.1 (read-only 2026-09-18): ``folder_id:99999999`` →
+    ``{"count":0}`` und ``folder_id:1`` (eine Track-Zeile, kein Verzeichnis) →
+    ebenfalls ``{"count":0}`` — ``findAndTrackDirectoryTree`` findet keine
+    ``dir``-Zeile und ``readDirectory`` listet nichts.
+    """
     for token in (f"{BMF_ROOT}/Metal", f"file://{BMF_ROOT}/Metal", "Metal"):
         res = _bmf(["items", "0", "512", "mode:bmf", f"folder_id:{token}"])
         assert [r["text"] for r in res["item_loop"]] == ["Accept", "Iron Maiden"]
-    fallback = _bmf(["items", "0", "512", "mode:bmf", "folder_id:1"])
-    assert [r["text"] for r in fallback["item_loop"]] == ["Ambient", "Metal"]
-    assert fallback["count"] == 2
+    unknown = _bmf(["items", "0", "512", "mode:bmf", "folder_id:99999999"])
+    assert unknown["count"] == 0
+    assert not (unknown.get("item_loop") or [])
+    # ``1`` ist im Fixture die Track-Zeile von Accept/01-hard_attack.mp3 —
+    # keine ``dir``-Zeile, also leer (Perl-Probe oben).
+    track_id = _bmf(["items", "0", "512", "mode:bmf", "folder_id:1"])
+    assert track_id["count"] == 0
 
 
 def test_folder_id_is_stable_and_path_based(bmf_library):

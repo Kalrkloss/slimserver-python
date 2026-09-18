@@ -19,7 +19,8 @@ def _db(tmp_path):
         """
         CREATE TABLE albums (id INTEGER PRIMARY KEY, title TEXT, year INTEGER, artwork TEXT);
         CREATE TABLE contributors (id INTEGER PRIMARY KEY, name TEXT);
-        CREATE TABLE tracks (id INTEGER PRIMARY KEY, title TEXT);
+        CREATE TABLE tracks (id INTEGER PRIMARY KEY, title TEXT,
+                             audio INTEGER DEFAULT 1, content_type TEXT);
         CREATE TABLE tracks_albums (track INTEGER, album INTEGER);
         CREATE TABLE tracks_contributors (track INTEGER, contributor INTEGER, role INTEGER);
         INSERT INTO albums (id, title) VALUES (10, 'Artist One Album'), (20, 'Artist Two Album');
@@ -39,7 +40,8 @@ def test_browselibrary_bmf_returns_child_folder_names(tmp_path, monkeypatch):
     con = sqlite3.connect(db)
     con.executescript(
         """
-        CREATE TABLE tracks (id INTEGER PRIMARY KEY, url TEXT);
+        CREATE TABLE tracks (id INTEGER PRIMARY KEY, url TEXT,
+                             audio INTEGER DEFAULT 1, content_type TEXT);
         INSERT INTO tracks (id, url) VALUES
             (1, 'file:///music/Rock/a.mp3'), (2, 'file:///music/Jazz/b.mp3');
         """

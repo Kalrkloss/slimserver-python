@@ -34,9 +34,12 @@ Perl-Gegenprobe (read-only, 192.168.1.90:9000/jsonrpc.js, Player
 
 Von den 303 Perl-Einträgen haben 253 einen indexierten Track (die
 restlichen 50 sind leere Ordner / Nicht-Audio-Dateien, die die
-URL-Aggregation bewusst nicht kennt).  Perl identifiziert Ordner mit
-numerischen ``folder_id``s; hier ist die ``folder_id`` der absolute
-Verzeichnispfad, damit ``mode:bmf&folder_id:<pfad>`` direkt drillt.
+URL-Aggregation bewusst nicht kennt).  Perl identifiziert Ordner mit den
+``tracks.id``-Werten seiner ``content_type='dir'``-Zeilen; der Port führt
+dieselben Zeilen (``lyrion.media.dir_rows``: Scan + Browse legen sie an) und
+gibt deren id aus — jeder Drill ``folder_id:<id>`` läuft wie bei Perl über
+diese Zeile.  Zusätzlich akzeptiert der Drill Pfade/``file://``-Tokens, damit
+eine Bibliothek ohne geschriebene dir-Zeilen weiter browst.
 """
 
 from __future__ import annotations
@@ -85,9 +88,39 @@ GVFS_URLS = [
 ]
 
 
-def _make_db(path: Path, rows, with_title: bool = True) -> str:
+#: ``tracks`` DDL used for every DB in this module — set by the autouse
+#: fixture below from the shared conftest schema, so the folder layer writes
+#: real Perl ``content_type='dir'`` rows into the test library.
+_TEST_SCHEMA: str | None = None
+
+
+@pytest.fixture(autouse=True)
+def _use_the_port_schema(tracks_schema_sql):
+    global _TEST_SCHEMA
+    _TEST_SCHEMA = tracks_schema_sql
+    yield
+    _TEST_SCHEMA = None
+
+
+def _make_db(path: Path, rows, with_title: bool = True,
+             schema: str | None = None) -> str:
+    """Temp library DB.
+
+    ``schema`` is the port's real ``tracks`` DDL (conftest fixture) — the
+    folder layer writes Perl's ``content_type='dir'`` rows into it, so a
+    hand-trimmed table would not exercise the id path.
+    """
     con = sqlite3.connect(path)
-    if with_title:
+    if schema is not None:
+        con.executescript(schema)
+        if rows:
+            con.executemany(
+                "INSERT INTO tracks (id, url, title, titlesort, audio, video, "
+                "remote, disabled, compilation, artflow_flag, duration, playcount)"
+                " VALUES (?, ?, ?, ?, 1, 0, 0, 0, 0, 0, 0, 0)",
+                [(i, u, urllib.parse.unquote(
+                    Path(u.rsplit("/", 1)[-1]).stem), "") for i, u in rows])
+    elif with_title:
         con.executescript(
             "CREATE TABLE tracks (id INTEGER PRIMARY KEY, url TEXT, "
             "title TEXT, tracknum INTEGER);")
@@ -103,13 +136,15 @@ def _make_db(path: Path, rows, with_title: bool = True) -> str:
     return str(path)
 
 
-def _db(tmp_path: Path, rows, with_title: bool = True) -> str:
-    return _make_db(tmp_path / "lyrion.db", rows, with_title)
+def _db(tmp_path: Path, rows, with_title: bool = True, schema: str | None = None) -> str:
+    return _make_db(tmp_path / "lyrion.db", rows, with_title,
+                    _TEST_SCHEMA if schema is None else schema)
 
 
-def _setup(tmp_path, monkeypatch, rows, pref: str, with_title: bool = True):
+def _setup(tmp_path, monkeypatch, rows, pref: str, with_title: bool = True,
+           schema: str | None = None):
     """Temp library DB + monkeypatched musicdir runtime pref."""
-    db = _db(tmp_path, rows, with_title)
+    db = _db(tmp_path, rows, with_title, schema)
     monkeypatch.setattr(api_mod, "_library_db_path", lambda: db)
     monkeypatch.setattr(api_mod, "_bmf_musicdir_pref", lambda: pref)
     return db
@@ -150,14 +185,14 @@ def test_bmf_top_level_uses_musicdir_root(tmp_path, monkeypatch):
 
 
 def test_bmf_top_level_items_are_perl_like(tmp_path, monkeypatch):
-    """Ordner-Items: type playlist, id/folder_id = virtuelle numerische ID,
-    textkey, go/play/add-Aktionen (Perl-BrowseLibrary-Form).
+    """Ordner-Items: type playlist, id/folder_id = die ``tracks``-Zeile des
+    Verzeichnisses, textkey, go/play/add-Aktionen (Perl-BrowseLibrary-Form).
 
-    Perl liefert hier seine ``tracks.id`` (Verzeichnisse liegen bei Perl als
-    ``content_type='dir'`` in ``tracks``); unser Port legt keine dir-Zeilen an
-    und gibt deshalb ``crc32(pfad) & 0x7fffffff`` aus — stabil, numerisch, aber
-    bewusst nicht identisch mit Perls ID. Der Client parst die ID numerisch,
-    deshalb darf hier keine URL/kein Pfad stehen."""
+    Perl liefert seine ``tracks.id`` (Verzeichnisse liegen als
+    ``content_type='dir'`` in ``tracks``, ``Slim/Control/Queries.pm:2429``);
+    der Port legt diese Zeile beim Browsen an (:2263-2268) und gibt ihre id
+    aus. Der Client parst die ID numerisch, deshalb darf hier keine URL/kein
+    Pfad stehen."""
     _setup(tmp_path, monkeypatch, LIB_URLS, ROOT)
     items = _items(["items", "0", "50", "menu:1", "mode:bmf"])
     metal = next(it for it in items if it["text"] == "Metal")
@@ -382,8 +417,13 @@ def test_bmf_loose_track_display_uses_filename_not_tag(tmp_path, monkeypatch):
     assert [it["text"] for it in items] == ["aa first.mp3", "zz second.mp3"]
     assert {it["type"] for it in items} == {"audio"}
 
-    # minimal DB without a title column behaves the same
-    db = _make_db(tmp_path / "minimal.db", [], with_title=False)
+    # minimal DB without a title column behaves the same (``content_type`` is
+    # required: it is what marks a directory row, so a folder whose row cannot
+    # be stored keeps the path token and the *files* must still be listed)
+    db = _make_db(
+        tmp_path / "minimal.db", [], schema=(
+            "CREATE TABLE tracks (id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "url TEXT, content_type TEXT);"))
     con = sqlite3.connect(db)
     con.executemany("INSERT INTO tracks (id, url) VALUES (?, ?)", rows)
     con.commit()

@@ -18,7 +18,8 @@ def _db(tmp_path):
     con = sqlite3.connect(db)
     con.executescript(
         """
-        CREATE TABLE tracks (id INTEGER PRIMARY KEY, title TEXT, genre TEXT, year INTEGER, url TEXT);
+        CREATE TABLE tracks (id INTEGER PRIMARY KEY, title TEXT, genre TEXT, year INTEGER, url TEXT,
+                             audio INTEGER DEFAULT 1, content_type TEXT);
         CREATE TABLE contributors (id INTEGER PRIMARY KEY, name TEXT);
         CREATE TABLE tracks_contributors (track INTEGER, contributor INTEGER, role INTEGER);
         INSERT INTO tracks (id, title, genre, year) VALUES
@@ -86,7 +87,8 @@ def test_browselibrary_search_drills_into_the_target_feed(tmp_path, monkeypatch)
     con = sqlite3.connect(db)
     con.executescript(
         """
-        CREATE TABLE tracks (id INTEGER PRIMARY KEY, title TEXT, year INTEGER);
+        CREATE TABLE tracks (id INTEGER PRIMARY KEY, title TEXT, year INTEGER,
+                             audio INTEGER DEFAULT 1, content_type TEXT);
         INSERT INTO tracks (id, title) VALUES (1, 'Sunset Orion'), (2, 'Other Song');
         """
     )
@@ -192,7 +194,8 @@ def _lib_db(tmp_path):
     con = sqlite3.connect(db)
     con.executescript(
         """
-        CREATE TABLE tracks (id INTEGER PRIMARY KEY, title TEXT, genre TEXT, year INTEGER, url TEXT, tracknum INTEGER);
+        CREATE TABLE tracks (id INTEGER PRIMARY KEY, title TEXT, genre TEXT, year INTEGER, url TEXT, tracknum INTEGER,
+                             audio INTEGER DEFAULT 1, content_type TEXT);
         CREATE TABLE albums (id INTEGER PRIMARY KEY, title TEXT, year INTEGER, artwork TEXT);
         CREATE TABLE contributors (id INTEGER PRIMARY KEY, name TEXT);
         CREATE TABLE tracks_contributors (track INTEGER, contributor INTEGER, role INTEGER);

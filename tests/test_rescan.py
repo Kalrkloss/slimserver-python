@@ -95,6 +95,17 @@ def test_abort_flag_lifecycle():
     assert not SCAN_STATE.abort_requested
 
 
+def _count_where(db_path, table, where="") -> int:
+    sql = f"SELECT COUNT(*) FROM {table}"
+    if where:
+        sql += f" WHERE {where}"
+    con = sqlite3.connect(db_path)
+    try:
+        return con.execute(sql).fetchone()[0]
+    finally:
+        con.close()
+
+
 def test_full_rescan_reconciles_deletions(tmp_path, lib_db):
     music = tmp_path / "music"
     one, two = _make_lib(music)
@@ -103,12 +114,15 @@ def test_full_rescan_reconciles_deletions(tmp_path, lib_db):
         imp = MusicImporter(ImportConfig(source_path=music))
         st1 = await imp.import_music()
         assert st1.imported_files == 2, "initial scan imports both files"
+        # the scan also stores a ``dir`` row per walked directory (Perl does
+        # the same while scanning, Slim/Utils/Scanner/Local/AIO.pm:62-67)
+        assert _count_where(lib_db, "tracks", "content_type = 'dir'") == 3
         two.unlink()
         st2 = await imp.import_music()
         assert st2.deleted_files == 1, "full rescan must remove the vanished file"
 
     asyncio.run(run())
-    assert _count(lib_db, "tracks") == 1
+    assert _count_where(lib_db, "tracks", "content_type != 'dir'") == 1
     assert _count(lib_db, "albums") == 1, "orphaned album must be cleaned up"
 
 
@@ -119,13 +133,15 @@ def test_additive_mode_keeps_missing_tracks(tmp_path, lib_db):
     async def run():
         imp = MusicImporter(ImportConfig(source_path=music))
         await imp.import_music()
-        assert _count(lib_db, "tracks") == 2
+        assert _count_where(lib_db, "tracks", "content_type != 'dir'") == 2
         two.unlink()
         # mode != full → additive refresh, deletions NOT reconciled
         imp2 = MusicImporter(ImportConfig(source_path=music, mode="playlists"))
         st2 = await imp2.import_music()
         assert st2.deleted_files == 0
-        assert _count(lib_db, "tracks") == 2, "additive scan must not delete"
+        assert _count_where(lib_db, "tracks",
+                            "content_type != 'dir'") == 2, \
+            "additive scan must not delete"
 
     asyncio.run(run())
 

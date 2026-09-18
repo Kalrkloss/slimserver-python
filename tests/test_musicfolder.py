@@ -23,11 +23,40 @@ import pytest
 from lyrion.media import folders
 
 
+#: ``tracks`` schema the port creates — shared fixture (``conftest``), so the
+#: folder layer's INSERT has to satisfy the same NOT NULL columns as in
+#: production.
+@pytest.fixture
+def lib_db(library_db):
+    """A temp library DB with the port's ``tracks`` schema (writable)."""
+    return Path(library_db)
+
+
+def _use_lib_db(monkeypatch, db):
+    """Point the folder layer's read *and* write handle at ``db``."""
+    monkeypatch.setattr(folders, "_ro_connection",
+                        lambda db_path=None: sqlite3.connect(db))
+    monkeypatch.setattr(folders, "_rw_connection",
+                        lambda db_path=None: sqlite3.connect(db))
+    folders.reset_caches()
+
+
+def _dir_rows(db) -> list[tuple[int, str]]:
+    con = sqlite3.connect(db)
+    try:
+        return con.execute(
+            "SELECT id, url FROM tracks WHERE content_type = 'dir'"
+        ).fetchall()
+    finally:
+        con.close()
+
+
 @pytest.fixture(autouse=True)
 def _hermetic(monkeypatch):
     """No live prefs, no live DB connection."""
     monkeypatch.setattr(folders, "_pref", lambda name, default="": default)
     monkeypatch.setattr(folders, "_ro_connection", lambda db_path=None: None)
+    monkeypatch.setattr(folders, "_rw_connection", lambda db_path=None: None)
     folders.reset_caches()
     yield
     folders.reset_caches()
@@ -259,24 +288,69 @@ def test_normalize_paging():
 # ---------------------------------------------------------------------------
 
 
-def test_musicfolder_lists_children_of_configured_media_dir(monkeypatch, tmp_path):
-    """``mediadirs`` set → the folder's children in Perl loop shape."""
+def test_musicfolder_lists_children_of_configured_media_dir(monkeypatch, tmp_path,
+                                                            lib_db):
+    """``mediadirs`` set → the folder's children in Perl loop shape.
+
+    Perl hands out each directory's ``tracks`` row id (``Queries.pm:2429``,
+    row created by the browse :2263-2268, ``Slim/Utils/Misc.pm:1082-1090``).
+    """
     root = _library(tmp_path)
     _prefs(monkeypatch, mediadirs=str(root))
+    _use_lib_db(monkeypatch, lib_db)
 
     result = folders.musicfolder_result(0, 100)
 
     assert result["count"] == 2                       # AC+DC, Accept
     by_name = {i["filename"]: i for i in result["folder_loop"]}
     assert set(by_name) == {"AC+DC", "Accept"}
-    assert by_name["AC+DC"] == {
-        "id": folders.file_url_from_path(root / "AC+DC"),
-        "filename": "AC+DC",
-        "type": "folder",
-    }
-    assert by_name["Accept"]["id"] == folders.file_url_from_path(root / "Accept")
+    rows = _dir_rows(lib_db)
+    assert len(rows) == 2                             # one dir row per folder
+    ids = {url: rid for rid, url in rows}
+    for name in ("AC+DC", "Accept"):
+        expected = ids[folders.file_url_from_path(root / name)]
+        assert isinstance(by_name[name]["id"], int)
+        assert by_name[name]["id"] == expected, by_name[name]
+    assert by_name["AC+DC"]["id"] != by_name["Accept"]["id"]
     # Perl sends exactly these three keys with no tags requested (:2429-2487).
     assert all(set(i) == {"id", "filename", "type"} for i in by_name.values())
+
+
+def test_musicfolder_folder_rows_are_real_dir_rows(monkeypatch, tmp_path,
+                                                   lib_db):
+    """The row is Perl's: ``content_type='dir'``, ``filesize`` 0, not audio.
+
+    ``Slim/Schema.pm:1774`` (``$ct eq 'dir'`` → simple create path) and
+    ``Slim/Utils/Scanner/Local/AIO.pm:67`` ("size, 0 for dirs").
+    """
+    root = _library(tmp_path)
+    _prefs(monkeypatch, mediadirs=str(root))
+    _use_lib_db(monkeypatch, lib_db)
+
+    folders.musicfolder_result(0, 100)
+
+    con = sqlite3.connect(lib_db)
+    try:
+        rows = con.execute(
+            "SELECT url, content_type, audio, filesize, title FROM tracks "
+            "WHERE content_type = 'dir' ORDER BY url").fetchall()
+    finally:
+        con.close()
+    assert len(rows) == 2
+    assert all(r[1] == "dir" and r[2] == 0 and r[3] == 0 for r in rows)
+    # ``title`` stays empty: Perl shows ``filename`` (fileName of the URL),
+    # never ``tracks.title``, for a folder (Queries.pm:2429-2430).
+    assert all(r[4] == "" for r in rows)
+
+
+def test_musicfolder_without_writable_db_keeps_the_url_id(monkeypatch, tmp_path):
+    """No writable library DB → documented fallback, browse stays usable."""
+    root = _library(tmp_path)
+    _prefs(monkeypatch, mediadirs=str(root))
+
+    result = folders.musicfolder_result(0, 100)
+    assert result["count"] == 2
+    assert all(i["id"].startswith("file://") for i in result["folder_loop"])
 
 
 def test_musicfolder_empty_mediadirs_uses_library_root(monkeypatch, tmp_path):
@@ -291,9 +365,12 @@ def test_musicfolder_empty_mediadirs_uses_library_root(monkeypatch, tmp_path):
 
     assert result["count"] == 2
     assert {i["filename"] for i in result["folder_loop"]} == {"AC+DC", "Accept"}
-    assert all(i["id"].startswith("file://") for i in result["folder_loop"])
-    # None of the entries is a bare path component like „run“.
+    # None of the entries is a bare path component like „run“ (the old bug),
+    # and without a writable DB the id stays the folder's file URL.
     assert "file:///run" not in {i["id"] for i in result["folder_loop"]}
+    assert {i["id"] for i in result["folder_loop"]} == {
+        folders.file_url_from_path(root / "AC+DC"),
+        folders.file_url_from_path(root / "Accept")}
 
 
 def test_musicfolder_empty_mediadirs_and_no_root_is_empty(monkeypatch):
@@ -382,11 +459,12 @@ def test_resolve_folder_id_accepts_numeric_track_id(tmp_path, monkeypatch):
     assert folders.resolve_folder_id("999999") is None
 
 
-def test_musicfolder_drills_into_folder_id(monkeypatch, tmp_path):
+def test_musicfolder_drills_into_folder_id(monkeypatch, tmp_path, lib_db):
     root = tmp_path / "lib"
     (root / "Album").mkdir(parents=True)
     (root / "Album" / "song.mp3").write_bytes(b"\0")
     _prefs(monkeypatch, mediadirs=str(root))
+    _use_lib_db(monkeypatch, lib_db)
 
     top = folders.musicfolder_result(0, 100)
     assert [i["filename"] for i in top["folder_loop"]] == ["Album"]
@@ -396,23 +474,36 @@ def test_musicfolder_drills_into_folder_id(monkeypatch, tmp_path):
     assert child["folder_loop"][0]["type"] == "track"
 
 
-def test_musicfolder_uses_numeric_id_when_a_track_row_exists(tmp_path, monkeypatch):
-    """Perl ids are ``tracks.id``; we match that whenever a row exists."""
+def test_musicfolder_uses_the_dir_row_id_of_an_existing_row(tmp_path, monkeypatch,
+                                                            lib_db):
+    """The id is ``tracks.id`` — the row that already exists is used as is."""
     root = tmp_path / "lib"
     (root / "Album").mkdir(parents=True)
-    db = tmp_path / "lyrion.db"
-    con = sqlite3.connect(db)
-    con.executescript("CREATE TABLE tracks (id INTEGER PRIMARY KEY, url TEXT);")
-    con.execute("INSERT INTO tracks (id, url) VALUES (?, ?)",
-                (7, folders.file_url_from_path(root / "Album")))
+    con = sqlite3.connect(lib_db)
+    con.execute(
+        "INSERT INTO tracks (id, url, title, titlesort, content_type, audio)"
+        " VALUES (?, ?, ?, ?, 'dir', 0)",
+        (7, folders.file_url_from_path(root / "Album"), "", ""))
     con.commit()
     con.close()
 
-    monkeypatch.setattr(folders, "_ro_connection",
-                        lambda db_path=None: sqlite3.connect(db))
+    _use_lib_db(monkeypatch, lib_db)
     _prefs(monkeypatch, mediadirs=str(root))
     result = folders.musicfolder_result(0, 100)
     assert result["folder_loop"][0]["id"] == 7
+    # …and no second row was created for the same directory
+    assert len(_dir_rows(lib_db)) == 1
+
+
+def test_musicfolder_ct_tag_reports_the_perl_content_type(monkeypatch, tmp_path,
+                                                          lib_db):
+    """``tags:o`` adds ``ct`` (Queries.pm:2494-2496); live Perl sends
+    ``"ct":"dir"`` for a folder."""
+    root = _library(tmp_path)
+    _prefs(monkeypatch, mediadirs=str(root))
+    _use_lib_db(monkeypatch, lib_db)
+    item = folders.musicfolder_result(0, 100, tags="sto")["folder_loop"][0]
+    assert item["ct"] == "dir"
 
 
 def test_tags_add_the_perl_optional_fields(monkeypatch, tmp_path):
