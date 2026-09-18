@@ -2833,6 +2833,18 @@ async def cmd_search(
     older ``search <type> <query>`` form is our own and answers in the same
     Perl shape (``<type>s_count``/``<type>s_loop``/``count``).
     """
+    if args and str(args[0]).lower() == "items":
+        # ``search items …`` belongs to the Radio plugin's dynamic search feed,
+        # not to this library query: Perl walks the dispatch tree token by token
+        # (``Slim/Control/Request.pm:1010-1014``) and therefore finds the
+        # ``['search','items','_index','_quantity']`` leaf the radio search
+        # plugin registered (``Slim/Plugin/OPMLBased.pm:117-120``) *before*
+        # ``items`` could be consumed as the ``_index`` of the library entry
+        # (``Queries.pm:610``).  Live Perl 9.1.1, read-only 2026-09-18:
+        # ``search items 0 20`` → ``<mac> search items 0 20 count%3A0`` (with the
+        # client prefix of the radio dispatch), ``search 0 3 term:rock`` → the
+        # library answer (``contributors_count``/``albums_count``).
+        return await _radio_feed_answer("search", ctx, args)
     if _is_query_echo(args):
         return _echo("search", args)
     if not args:
@@ -4196,6 +4208,272 @@ async def cmd_radio_play(
                    ("url", getattr(station, "url", "") or "")]
     return _command_line(["radio", "play"], args, [], has_tags=True,
                          results=results)
+
+
+# ---------------------------------------------------------------------------
+# Radio directory sub-feeds (Perl's dynamically registered OPMLBased plugins)
+# ---------------------------------------------------------------------------
+# Perl's InternetRadio plugin creates ONE *dynamic* OPMLBased plugin per TuneIn
+# directory item (``Slim/Plugin/InternetRadio/Plugin.pm:78-205``, tag =>
+# lc(subclass)); every one of them registers the same CLI dispatch pair
+# (``Slim/Plugin/OPMLBased.pm:108-133``):
+#
+#     [ $args{tag}, 'items', '_index', '_quantity' ]   [1, 1, 1, $cliQuery]
+#     [ $args{tag}, 'playlist', '_method' ]            [1, 1, 1, $cliQuery]
+#
+# plus ``[ $args{menu}, '_index', '_quantity' ]`` for the ``radios`` menu
+# itself (``:129-132``, handler ``cliRadiosQuery`` :181-280).  Both point at
+# ``Slim::Control::XMLBrowser::cliQuery`` (``:111-114``) — the SAME handler the
+# JSON transports use (``Jive.pm:1359-1385``) — so the CLI answer differs from
+# the JSON answer only in its *serialization* (``Request.pm:2226-2296``).
+# This port therefore renders the result dict the JSON-RPC path builds
+# (``JSONRPCAPI._slim_request``, exactly the pattern :func:`cmd_menu` uses)
+# through the CLI renderer instead of re-implementing the feed walk.
+#
+# Client prefix (Perl ``Slim/Plugin/CLI/Plugin.pm:581-585``): the ``items`` /
+# ``playlist`` dispatches are ``needsClient``, so a line without a player token
+# makes the CLI allocate ``Slim::Player::Client::clientRandom()``
+# (``Slim/Player/Client.pm:411-415`` = ``(clients())[0]``) and prefix that id
+# (``Plugin.pm:694`` → ``Stdio.pm:131``); with no client at all the prefix is
+# omitted.  ``radios`` is registered with ``needsClient = 0`` and therefore
+# never gets one.  Live Perl 9.1.1, read-only 2026-09-18::
+#
+#     radios 0 20                         → radios 0 20 sort%3Aweight count%3A10 …
+#                                           (no prefix)
+#     local items 0 20                    → 24:0a:c4:29:77:90 local items 0 20 …
+#                                           (the only client's MAC, clientRandom)
+#     local items 0 20 menu:local         → <mac> local items 0 20 menu%3Alocal
+#                                           offset%3A0 title%3A… base%3AHASH(0x…)
+#                                           … count%3A2 window%3AHASH(0x…)
+#     local items 0 20                    → <mac> local items 0 20
+#                                           title%3ALokale%20Sender id%3A<sid>.0
+#                                           name%3ASender isaudio%3A0 hasitems%3A1 …
+#                                           count%3A2
+#     local playlist play menu:local item_id:<sid>.0.0
+#                                         → <mac> local playlist play menu%3Alocal
+#                                           item_id%3A<sid>.0.0   (echo, no results)
+#     local 0 3                           → local 0 3   (nothing dispatches a
+#                                           bare tag → status 104 echo)
+#     search items 0 20                   → <mac> search items 0 20 count%3A0
+#     doctor items 0 20                   → doctor items 0 20  (no such plugin)
+
+#: CLI tags of the radio sub-feeds this module registers.  Identical to
+#: :data:`lyrion.web.radiobrowser.RADIO_FEEDS` (Perl's TuneIn ``MENUS`` table
+#: plus the ``Sounds`` app feed) minus ``search``, which this module already
+#: registers as the library search — Perl's radio search plugin owns a
+#: ``['search','items',…]`` leaf that wins over the library entry
+#: (``Request.pm:1010-1014``), so that case is branched inside
+#: :func:`cmd_search`.  ``tests/test_cli_radio_feeds.py`` asserts the identity.
+_RADIO_FEED_TAGS: tuple[str, ...] = (
+    "presets", "local", "music", "sports", "news", "talk", "location",
+    "language", "podcast", "sounds",
+)
+
+
+def _radio_feed_clientid(ctx: CLIContext, *, needs_client: bool = True) -> Optional[str]:
+    """``$request->clientid`` of a radio request (``Plugin/CLI/Plugin.pm:581-585``).
+
+    ``ctx.request_clientid`` is the player token the request line started with
+    (``Stdio.pm:96-116``); ``ctx.player_id`` is this port's ``clientRandom``
+    (the first connected client, ``RequestDispatcher.get_default_player`` —
+    see ``tests/test_cli_default_player.py``).  ``needs_client=False``
+    (the ``radios`` dispatch, flags ``[0, 1, 1, …]``) never allocates one.
+    """
+    if ctx.request_clientid:
+        return ctx.request_clientid
+    return ctx.player_id if needs_client else None
+
+
+def _as_dict(value: Any) -> dict[str, Any]:
+    """``value`` when it is a dict, else an empty one (item-row plumbing)."""
+    return value if isinstance(value, dict) else {}
+
+
+def _flat_row(item: dict[str, Any]) -> Optional[dict[str, Any]]:
+    """One ``<feed> items`` row in XMLBrowser's *non-menu* shape.
+
+    Without a ``menu:`` token Perl renders the flat OPML rows
+    (``Slim/Control/XMLBrowser.pm:1378-1413``, a ``Tie::IxHash`` in this exact
+    field order): ``id`` (:1382, set unconditionally), ``name`` (:1383),
+    ``type`` (:1384), ``title`` (:1385), ``image`` (:1386-1387 — the *proxied*
+    OPML image/icon), ``isaudio`` (:1394 ``defined(hasAudio($item)) + 0``) and
+    ``hasitems`` (:1396-1410: ``1`` for every type that is not
+    ``text``/``audio``).  Live Perl 9.1.1, read-only 2026-09-18::
+
+        local items 0 4 item_id:<sid>.0   →  title%3ASender id%3A<sid>.0.0
+        name%3A… type%3Aaudio image%3A%2Fimageproxy%2F… isaudio%3A1 hasitems%3A0 …
+
+    ``None`` means "Perl would not print this row": the ``EMPTY`` placeholder
+    is built in the *menu* branch only (:841-846 — the flat answer of an empty
+    feed is ``count%3A0`` alone, live ``search items 0 20``).
+    """
+    actions = _as_dict(item.get("actions"))
+    go = _as_dict(actions.get("go"))
+    params = _as_dict(item.get("params"))
+    item_id = params.get("item_id")
+    if item_id is None:
+        item_id = _as_dict(go.get("params")).get("item_id")
+    if item_id is None and str(item.get("type") or "") == "text":
+        return None
+    kind = item.get("type")
+    row: dict[str, Any] = {"id": item_id if item_id is not None else ""}
+    if item.get("text") is not None:
+        row["name"] = item["text"]
+    if kind is not None:
+        row["type"] = kind
+    if item.get("title") is not None:
+        row["title"] = item["title"]
+    image = item.get("icon") or item.get("icon-id")
+    if image:
+        row["image"] = image
+    row["isaudio"] = 1 if kind == "audio" else 0
+    row["hasitems"] = 0 if kind in ("text", "audio") else 1
+    return row
+
+
+async def _radio_feed_answer(
+    tag: str,
+    ctx: CLIContext,
+    args: list[str],
+) -> list[str]:
+    """``<tag> items …`` / ``<tag> playlist …`` — one radio sub-feed answer.
+
+    See the module section above for the Perl dispatch this mirrors.  The
+    result dict comes from the shared request pipeline
+    (``JSONRPCAPI._slim_request``), so every protocol answers the same data;
+    the CLI shape rules are ``Request.pm:2264-2291`` (loops unrolled inline,
+    refs interpolated as ``HASH(0x…)``, tokens percent-escaped).
+    """
+    sub = str(args[0]).lower() if args else ""
+    if sub not in ("items", "playlist"):
+        # Penalty for a request no Perl dispatch matches: status 104, echoed
+        # verbatim, without an allocated client (Plugin/CLI/Plugin.pm:657-663;
+        # live `local 0 3` → `local 0 3`).  A line that *did* start with a
+        # player token keeps its prefix (Stdio.pm:111-116 + :131).
+        return _echo(tag, args, clientid=ctx.request_clientid)
+
+    rest = [str(a) for a in args[1:]]
+    clientid = _radio_feed_clientid(ctx)
+
+    from lyrion.web.api import JSONRPCAPI
+
+    res = await JSONRPCAPI()._slim_request(clientid or "", [tag, sub, *rest])
+
+    if sub == "playlist":
+        # cliQuery marks that request (``XMLBrowser.pm:291-293``), walks the
+        # row's item path and hands its URL to the player (:778-790), then
+        # answers ``setStatusDone()`` without a result body (:1512).  Live
+        # Perl: `local playlist play menu:local item_id:<sid>.0.0` →
+        # `<mac> local playlist play menu%3Alocal item_id%3A<sid>.0.0`.
+        return _command_line([tag, "playlist"], rest, ["_method"],
+                             clientid=clientid, has_tags=True)
+
+    if not isinstance(res, dict):  # pragma: no cover - _slim_request answers dicts
+        return _echo(tag, args, clientid=ctx.request_clientid)
+
+    menu_mode = any(a.startswith("menu:") for a in rest)
+    results: list[tuple[str, Any]] = []
+    if menu_mode:
+        # The jive/menu envelope (``XMLBrowser.pm:1420-1452``) as the CLI
+        # prints it: ``offset``/``title`` first, then ``base``/``window`` as
+        # *references* (Perl interpolates the hash refs, :2291 — the live
+        # answers carry exactly those addresses), the unrolled ``item_loop``
+        # and ``count`` (``$totalCount``, :1420).
+        if res.get("offset") is not None:
+            results.append(("offset", res["offset"]))
+        if res.get("title"):
+            results.append(("title", res["title"]))
+        if "base" in res:
+            results.append(("base", res["base"]))
+        results.append(("item_loop", res.get("item_loop") or []))
+        if res.get("count") is not None:
+            results.append(("count", res["count"]))
+        if "window" in res:
+            results.append(("window", res["window"]))
+    else:
+        # Flat form: ``title`` first, one row per item, ``count`` last — also
+        # for a feed without rows (``XMLBrowser.pm:1420`` adds ``count`` to
+        # every answer; the loop simply stays empty).
+        if res.get("title"):
+            results.append(("title", res["title"]))
+        raw = res.get("item_loop") or []
+        rows = [r for r in (_flat_row(i) for i in raw) if r is not None]
+        if rows:
+            results.append(("item_loop", rows))
+            results.append(("count", res.get("count") if res.get("count") is not None
+                            else len(rows)))
+        else:
+            # The only rows were the menu-only ``Leer`` placeholder, so Perl's
+            # flat answer is the empty feed: ``count:0`` and no row at all
+            # (live ``search items 0 20`` → ``count%3A0``).
+            results.append(("count", 0))
+
+    return _command_line([tag, "items"], rest, ["_index", "_quantity"],
+                         clientid=clientid, has_tags=True, results=results)
+
+
+@register_command("radios")
+async def cmd_radios(
+    handler: CLIHandler,
+    ctx: CLIContext,
+    args: list[str],
+) -> list[str]:
+    """radios [<start> <count>] [menu:…] — ONE line, the loop unrolled.
+
+    Perl: ``OPMLBased.pm:129-132`` (``cliRadiosQuery`` :181-280) over
+    ``dynamicAutoQuery``, whose loop is ``$query . 's_loop'`` →
+    ``radioss_loop`` in the plain form and ``item_loop`` with a ``menu:``
+    token (``Queries.pm:5403``), ``sort:weight`` as a request *parameter*
+    (``OPMLBased.pm:193``) and ``count`` last (:5443).  ``[0, 1, 1, …]`` means
+    needsClient = 0 → no client prefix (live ``radios 0 20`` → ``radios 0 20
+    sort%3Aweight count%3A10 …``, 2026-09-18).
+    """
+    clientid = _radio_feed_clientid(ctx, needs_client=False)
+
+    from lyrion.web.api import JSONRPCAPI
+
+    res = await JSONRPCAPI()._slim_request(
+        clientid or "", ["radios", *[str(a) for a in args]])
+    if not isinstance(res, dict):  # pragma: no cover - _slim_request answers dicts
+        return _echo("radios", args, clientid=clientid)
+
+    menu_mode = any(str(a).startswith("menu:") for a in args)
+    loop_key = "item_loop" if menu_mode else "radioss_loop"
+    results: list[tuple[str, Any]] = [("sort", "weight")]
+    if res.get("count") is not None:
+        results.append(("count", res["count"]))
+    rows = res.get(loop_key)
+    if rows:
+        results.append((loop_key, rows))
+    return _command_line(["radios"], args, [], clientid=clientid,
+                         has_tags=True, results=results)
+
+
+def _register_radio_feed(tag: str) -> None:
+    """Register one ``<tag> items …`` dispatch (``OPMLBased.pm:117-120``)."""
+
+    async def _handler(
+        handler: CLIHandler,
+        ctx: CLIContext,
+        args: list[str],
+    ) -> list[str]:
+        return await _radio_feed_answer(tag, ctx, args)
+
+    _handler.__name__ = f"cmd_radio_feed_{tag}"
+    _handler.__doc__ = (
+        f"``{tag} items <start> <count> [params…]`` — Perl's ``{tag}`` "
+        "OPMLBased sub-feed (``Slim/Plugin/OPMLBased.pm:108-133``)."
+    )
+    register_command(tag)(_handler)
+
+
+def _register_radio_feeds() -> None:
+    """Register every radio sub-feed tag (``OPMLBased.pm:117-120``)."""
+    for tag in _RADIO_FEED_TAGS:
+        _register_radio_feed(tag)
+
+
+_register_radio_feeds()
 
 
 # ---------------------------------------------------------------------------

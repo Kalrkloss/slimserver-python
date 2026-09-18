@@ -332,14 +332,44 @@ def escape(value: Any) -> str:
     return quote(str(value), safe=_UNRESERVED)
 
 
+def perl_scalar(value: Any, *, in_loop: bool = False) -> Any:
+    """One result value as Perl *interpolates* it (``Request.pm:2269-2291``).
+
+    Perl builds every token by string concatenation / interpolation
+    (``$key . ':' . $val``), so a nested reference never renders its contents
+    but its address: a hash prints ``HASH(0x5598e6bd90d8)``.  Live Perl 9.1.1,
+    read-only 2026-09-18 (``local items 0 20 menu:local``)::
+
+        … offset%3A0 title%3ALokale%20Sender base%3AHASH(0x5598e6aa4548)
+        addAction%3Ago actions%3AHASH(0x5598eb4e4ac0) … window%3AHASH(0x5598e62fc260)
+
+    An ``ARRAY`` ref interpolates the same way (``ARRAY(0x…)``) inside a loop
+    item, while a top-level one is joined with ',' before the interpolation
+    (:2284-2286).  This is the port's analogue: the object identity takes the
+    place of Perl's memory address (both are meaningless to a client, and one
+    address can never be compared to the other).
+    """
+    if isinstance(value, dict):
+        return f"HASH(0x{id(value):x})"
+    if isinstance(value, (list, tuple)):
+        if in_loop:
+            return f"ARRAY(0x{id(value):x})"
+        return ",".join(
+            "" if v is None else str(perl_scalar(v, in_loop=True)) for v in value
+        )
+    return value
+
+
 def result_tokens(key: str, value: Any) -> list[Any]:
     """Return the CLI tokens one ``(key, value)`` result contributes.
 
     Perl: ``Slim/Control/Request.pm:2258-2293`` — ``__*`` keys are not output
-    (:2261), a key ending in ``_loop`` is unrolled item by item (:2264-2281),
-    a plain array is joined with ',' (:2284-2286), a ``_``-prefixed key
-    outputs its value alone (:2288-2290), everything else ``key:value``
-    (:2291) — without a space, unlike our old ``key: value`` lines.
+    (:2261), a key ending in ``_loop`` is unrolled item by item (:2264-2281;
+    inside an item the same ``key:value`` rule applies, nested refs print as
+    ``HASH(0x…)/ARRAY(0x…)``), a plain array is joined with ',' (:2284-2286, a
+    hash ref is interpolated, :2291), a ``_``-prefixed key outputs its value
+    alone (:2288-2290), everything else ``key:value`` (:2291) — without a
+    space, unlike our old ``key: value`` lines.
     """
     if key.startswith("__"):
         return []
@@ -348,14 +378,23 @@ def result_tokens(key: str, value: Any) -> list[Any]:
         tokens: list[Any] = []
         for item in value or ():
             if isinstance(item, dict):
+                # Perl's inner loop (:2269-2277) has no special case for a
+                # nested ``_loop`` key: it interpolates the value (i.e. prints
+                # the ref), so a nested loop is NOT unrolled here.
                 for sub_key, sub_value in item.items():
-                    tokens.extend(result_tokens(sub_key, sub_value))
+                    if sub_key.startswith("__"):
+                        continue
+                    scalar = perl_scalar(sub_value, in_loop=True)
+                    if sub_key.startswith("_"):
+                        tokens.append(scalar)
+                    else:
+                        tokens.append(f"{sub_key}:{scalar}")
             else:
                 tokens.append(item)
         return tokens
 
-    if isinstance(value, (list, tuple)):
-        value = ",".join("" if v is None else str(v) for v in value)
+    if isinstance(value, (list, tuple, dict)):
+        value = perl_scalar(value)
 
     if value is None:
         value = ""
