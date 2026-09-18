@@ -540,6 +540,12 @@ class PlayerManager:
             name_source = "setd"
 
         rank = {"device": 0, "display": 1, "setd": 2}
+        # Perl's client lifecycle verb for this HELO: a MAC Perl does not know
+        # yet creates a client (Client.pm:313-315 notifies 'client new'), a MAC
+        # it already has takes the reconnect branch (Slimproto.pm:1203-1213
+        # "$client->disconnected(0); notifyFromArray($client,
+        # ['client','reconnect'])"). Both are fired below.
+        lifecycle = "new"
 
         if mac in self.players:
             player = self.players[mac]
@@ -562,6 +568,7 @@ class PlayerManager:
                 player.supported_formats = _formats_for_model(player.model)
             player.connected = True
             player.update_activity()
+            lifecycle = "reconnect"
             logger.info("Player reconnected: %s (%s) src=%s", player.name, mac, player.name_source)
         else:
             player = PlayerState(
@@ -583,6 +590,22 @@ class PlayerManager:
 
         # Persist (INSERT OR IGNORE — keep any user-assigned name)
         self._save_player(player)
+
+        # Perl's client lifecycle notification, fired where Perl fires it:
+        #   * a new client:       Client.pm:313-315  ['client', 'new']
+        #   * a known client's HELO: Slimproto.pm:1211-1213 ['client','reconnect']
+        # Subscribers are Perl's CLI listeners (``listen 1``, Plugin/CLI/
+        # Plugin.pm:969-1017 — a controller only learns about a player that
+        # appeared from this line) and the controller auto-execute
+        # (Request.pm:2055-2102). Without it the client list never changed for
+        # any listener, even though ``players``/``serverstatus`` were right.
+        try:
+            from lyrion.control.notifications import notify_from_array
+
+            notify_from_array(mac, ["client", lifecycle])
+        except Exception as exc:  # noqa: BLE001 — a notification must not
+            logger.debug("client %s notification failed for %s: %s",  # kill a HELO
+                         lifecycle, mac, exc)
 
         return player
 

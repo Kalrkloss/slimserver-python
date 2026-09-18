@@ -1411,6 +1411,14 @@ class SlimProtoClient:
                 # NOTE: this differs from the server → player framing (2-byte length
                 # including opcode). The protocol is asymmetric.
                 while True:
+                    # Perl decides on the close that just happened, not on an
+                    # earlier frame: a socket close is a disconnect unless it
+                    # was an explicit reconnect-close (Slimproto.pm:255-296).
+                    # Without this reset a player that once sent DSCO/BYE!/IR
+                    # before vanishing kept the stale flag and was never
+                    # forgotten (its forget timer is only armed on the
+                    # disconnect path below, Slimproto.pm:289-296).
+                    keep_registered = False
                     try:
                         header = await reader.readexactly(8)
                     except asyncio.IncompleteReadError:
@@ -1673,6 +1681,20 @@ class SlimProtoClient:
                             p = PlayerManager().get_player(mac_clean)
                             if p is not None:
                                 p.connected = False
+                            # Perl Slimproto.pm:272 notifies 'client disconnect'
+                            # on the close (right before arming the forget
+                            # timer, :289-296) — a controller that only watches
+                            # the notification stream would otherwise still list
+                            # a player that is gone.
+                            try:
+                                from lyrion.control.notifications import (
+                                    notify_from_array,
+                                )
+
+                                notify_from_array(mac_clean, ["client", "disconnect"])
+                            except Exception as exc:  # noqa: BLE001
+                                logger.debug("client disconnect notify failed for %s: %s",
+                                             mac_clean, exc)
                             self._schedule_forget(mac_clean)
                             logger.info("Player disconnected (forget in %ds): %s",
                                         FORGET_DISCONNECTED_TIME, mac_clean)
