@@ -46,6 +46,24 @@ class PlayerState:
     # status ``time`` reports THIS while paused and resume continues here.
     # A zero STAT (or a flush) must never overwrite it.
     pause_time: float = 0.0
+    # ── Perl's client prefs for the (re)connect case ──────────────────────
+    # ``playingAtPowerOff`` — "was really playing when it went away": set on
+    # power-off (``Slim/Player/Player.pm:230-231``) and on every close of the
+    # live socket (``Slim/Networking/Slimproto.pm:313``). ``positionAtDisconnect``
+    # — the elapsed seconds at that moment (Slimproto.pm:315-319, read back at
+    # Player.pm:318; 0 when the song cannot seek, e.g. a radio stream).
+    # ``Slim::Player::Player::resumeOnPower`` (Player.pm:301-332) uses BOTH to
+    # continue the same track at the same position when a player (re)connects.
+    # Our port keeps them in memory (Perl persists them as client prefs).
+    playing_at_power_off: bool = False
+    position_at_disconnect: float = 0.0
+    # Seconds the CURRENT stream was started at, i.e. Perl's ``$song->
+    # startOffset`` (``Slim/Player/Protocols/File.pm:196-223``,
+    # ``HTTP.pm:976-979``): a resumed stream begins at that offset, so the
+    # status position is ``stream_start_offset + the player's STAT elapsed``
+    # (Perl does the same with ``remoteStreamStartTime(now - timeOffset)``,
+    # HTTP.pm:979). 0 for every normal play.
+    stream_start_offset: float = 0.0
     current_track_id: Optional[int] = None
     # Track id of the last strm frame actually written to the player (used
     # by the send-idempotency guard; NOT current_track_id, which the caller

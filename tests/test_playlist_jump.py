@@ -53,7 +53,7 @@ class _FakeHandler:
         self.strm: list = []
         self.remote: list = []
 
-    async def send_strm_to_player(self, mac, track_id):
+    async def send_strm_to_player(self, mac, track_id, start_seconds=0.0):
         self.strm.append((mac, track_id))
         return True
 

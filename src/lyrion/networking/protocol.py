@@ -198,6 +198,51 @@ def _reported_playmode(mac: str) -> Optional[str]:
         return None
 
 
+def stream_request_bytes(mac: str, *, transcode: bool = False,
+                         range_offset: int = 0) -> bytes:
+    """The HTTP request the player must send to ``/stream.mp3``.
+
+    LMS format (``Slim/Player/Squeezebox.pm stream_s``): the request is exactly
+    ``GET /stream.mp3?player=<MAC> HTTP/1.0`` + CRLF + CRLF — no track id in
+    the URL, no Host header; the /stream endpoint resolves the current track
+    from the player's playlist via the ``player=`` param.
+
+    Resuming at a position adds Perl's ``Range`` header
+    (``Slim/Player/Protocols/HTTP.pm:963-971``: "Always add Range to exclude
+    trailing metadata or garbage (aif/mp4...)" — ``$request .= $CRLF .
+    'Range: bytes=' . ($first || 0) . '-'``). Squeezelite sends this block
+    verbatim (``stream_sock`` stores the server-provided header and
+    ``SEND_HEADERS`` writes it out, stream.c), so our own relay starts the
+    response at that byte (HTTP 206, ``Slim/Web/HTTP.pm``).
+    """
+    if transcode:
+        # Format fallback: ask the /stream endpoint to run ffmpeg and emit
+        # raw PCM instead of the source file.
+        request = f"GET /stream.mp3?player={mac}&transcode=1 HTTP/1.0\r\n"
+    else:
+        request = f"GET /stream.mp3?player={mac} HTTP/1.0\r\n"
+    if range_offset > 0:
+        request += f"Range: bytes={range_offset}-\r\n"
+    return (request + "\r\n").encode("ascii")
+
+
+def resume_byte_offset(position: float, duration: float, size: int) -> int:
+    """Byte offset of ``position`` seconds into a ``size``-byte source.
+
+    Perl starts a resumed source at the offset of the saved position
+    (``$song->startOffset($seekdata->{timeOffset})`` — File.pm:196-223,
+    HTTP.pm:976-979) and obtains it per format class (``_timeToOffset``,
+    File.pm:130-133/:379; frame scanning ``findFrameBoundaries``). Where only
+    the length is known, Perl estimates proportionally — see HTTP.pm:790-793
+    ("Setting startOffset based on Content-Range to duration *
+    (startOffset/length)"). We do the same from filesize/duration.
+    Returns 0 when the position, duration or size is unusable.
+    """
+    if position <= 0 or duration <= 0 or size <= 0:
+        return 0
+    return int(size * min(1.0, position / duration))
+
+
 def _after_strm_sent(mac: str, song: Any = None) -> None:
     """Perl's bookkeeping after a ``strm 's'`` frame went out.
 
@@ -1247,6 +1292,16 @@ class SlimProtoClient:
                 mac_raw = fixed[offset:offset + 6]; offset += 6
                 uuid_raw = fixed[offset:offset + 16] if has_uuid else b""; offset += 16 if has_uuid else 0
                 wlan = int.from_bytes(fixed[offset:offset + 2], "big"); offset += 2
+                # Perl unpacks the wlan_channellist as two flag bits + the
+                # channel list (Slimproto.pm:972-974): ``$bitmapped =
+                # $wlan_channellist & 0x8000``, ``$reconnect =
+                # $wlan_channellist & 0x4000``, then ``& 0x3fff``.
+                # The reconnect bit means "the control connection went down
+                # but the player did NOT reboot" (Squeezebox.pm:70-77): it
+                # decides WHICH Perl resume path runs below.
+                bitmapped = bool(wlan & 0x8000)
+                reconnect = bool(wlan & 0x4000)
+                wlan &= 0x3FFF
                 br_h = int.from_bytes(fixed[offset:offset + 4], "big"); offset += 4
                 br_l = int.from_bytes(fixed[offset:offset + 4], "big"); offset += 4
                 lang_raw = fixed[offset:offset + 2].decode("ascii", errors="replace"); offset += 2
@@ -1286,8 +1341,10 @@ class SlimProtoClient:
                         can_https = True
 
                 logger.info(
-                    "HELO from %s: model=%s display=%s mac=%s len=%d caps=%s",
-                    peer, model, display_name, mac_str, length_be, cap_text[:80]
+                    "HELO from %s: model=%s display=%s mac=%s len=%d "
+                    "bitmapped=%s reconnect=%s caps=%s",
+                    peer, model, display_name, mac_str, length_be,
+                    bitmapped, reconnect, cap_text[:80]
                 )
                 # Full capability string at debug level: the codec list the
                 # player declares lives here (Perl parses it)
@@ -1352,11 +1409,23 @@ class SlimProtoClient:
                     uuid_str = uuid_raw.hex().lower()
 
                 # Register with PlayerManager
+                was_online = False
                 try:
                     from lyrion.player.manager import (
                         PlayerManager,
                         formats_from_capabilities,
                     )
+                    pm = PlayerManager()
+                    # Perl's resume gate is the state BEFORE this HELO: a
+                    # client that was already connected still holds its stream
+                    # (its previous socket was closed with the 'reconnect' flag
+                    # only — Slimproto.pm:1193-1195), so ``controller->
+                    # isPlaying()`` is true and ``resumeOnPower`` returns
+                    # immediately (Player.pm:304). A client that comes back
+                    # after being gone does not.
+                    prev_player = pm.get_player(mac_str)
+                    was_online = bool(prev_player is not None
+                                      and prev_player.connected)
                     peer_ip = peer[0] if peer else "unknown"
                     reg_name = display_name or model
                     # A ModelName that merely repeats the device type
@@ -1427,6 +1496,29 @@ class SlimProtoClient:
                     await _DisplayPM().display_on_connect(mac_str)
                 except Exception as exc:
                     logger.debug("display on connect failed for %s: %s", mac_str, exc)
+
+                # ── Resume playback on (re)connect (Perl Squeezebox.pm:79-98) ──
+                # Perl continues the song of a player that was playing when it
+                # vanished: a client connected WITHOUT the HELO reconnect bit
+                # (a restarted player) goes through ``$client->resumeOnPower(1)``
+                # (:89) — "Reconnection of a forgotten client, need to take
+                # resume position from the preferences" (:83-84) — which
+                # re-streams the track and starts it at ``positionAtDisconnect``
+                # (Player.pm:316-319). The reconnect bit means the control
+                # connection dropped but the player did not reboot (:93-98):
+                # then ``resumeOnPower()`` just resumes a paused player
+                # in place (Player.pm:321).
+                try:
+                    from lyrion.player.manager import PlayerManager as _ResumePM
+                    resumed = await _ResumePM().resume_on_power(
+                        mac_str, connect=not reconnect, was_online=was_online)
+                    if resumed:
+                        logger.info(
+                            "Player %s continued playback on (re)connect "
+                            "(reconnect=%s)", mac_str, reconnect)
+                except Exception as exc:
+                    logger.warning("resume on connect failed for %s: %s",
+                                   mac_str, exc)
 
                 # ── Read loop: binary slimproto frames from player ──
                 # Player → server framing (from LMS Slim/Networking/Slimproto.pm
@@ -1605,9 +1697,19 @@ class SlimProtoClient:
             model_name = hello.device_id.strip() or "squeezebox"
             player_ip = peer[0] if peer else "unknown"
             player_port = peer[1] if peer else 0
+            was_online = False
             try:
                 from lyrion.player.manager import PlayerManager, _formats_for_model
-                PlayerManager().register_player(
+                pm = PlayerManager()
+                # Perl's ``$reconnect`` flag lives in the wlan_channellist of
+                # the HELO (Slimproto.pm:973). This HELO layout has no such
+                # field (SB1-era frame), so a client arriving here is treated
+                # as a fresh connection — Perl's ``!defined $reconnect`` path
+                # (Squeezebox.pm:81) with the saved resume position.
+                prev_player = pm.get_player(mac_formatted)
+                was_online = bool(prev_player is not None
+                                  and prev_player.connected)
+                pm.register_player(
                     mac=mac_formatted,
                     name=model_name,
                     ip=player_ip,
@@ -1651,6 +1753,20 @@ class SlimProtoClient:
                 await _DisplayPM().display_on_connect(mac_formatted)
             except Exception as exc:
                 logger.debug("display on connect failed for %s: %s", mac_formatted, exc)
+
+            # ── Resume playback on (re)connect (Perl Squeezebox.pm:79-98) ──
+            # Same as the first HELO path: a client that comes back after the
+            # socket was gone continues its song (Player.pm:301-332).
+            try:
+                from lyrion.player.manager import PlayerManager as _ResumePM
+                resumed = await _ResumePM().resume_on_power(
+                    mac_formatted, connect=True, was_online=was_online)
+                if resumed:
+                    logger.info("Player %s continued playback on (re)connect",
+                                mac_formatted)
+            except Exception as exc:
+                logger.warning("resume on connect failed for %s: %s",
+                               mac_formatted, exc)
 
             # Read loop for this player
             while True:
@@ -1705,6 +1821,19 @@ class SlimProtoClient:
                             # we sent (R0.5-P1), so drop the guard as well.
                             self._reset_strm_guard(key, "player disconnected")
                             from lyrion.player.manager import PlayerManager
+                            # Perl saves the playback state on EVERY close of
+                            # the live socket (:283-286) — as if the player had
+                            # been switched off while still playing (:305-321) —
+                            # so that a later HELO can continue the same track
+                            # (Player.pm:312-330). It must happen NOW, before
+                            # anything else can act on stale data (:283-285).
+                            try:
+                                await PlayerManager().persist_playback_state_for_power_off(
+                                    mac_clean)
+                            except Exception as exc:  # noqa: BLE001
+                                logger.debug(
+                                    "persist playback state failed for %s: %s",
+                                    mac_clean, exc)
                             if keep_registered:
                                 # DSCO end-of-stream: the player reconnects
                                 # immediately. Mark offline but KEEP the state
@@ -2366,9 +2495,20 @@ class SlimProtoClient:
             logger.debug("cancel_active_stream failed for %s: %s", mac, exc)
             return False
 
-    async def send_strm_to_player(self, mac: str, track_id: int) -> bool:
+    async def send_strm_to_player(self, mac: str, track_id: int,
+                                  start_seconds: float = 0.0) -> bool:
         """Send a 'strm' (stream) frame to a player so it fetches the track
         over HTTP from this server's /stream.mp3 endpoint.
+
+        ``start_seconds`` is Perl's ``timeOffset`` of ``$seekdata``: when the
+        song resumes at a position (``Player.pm:316-319``), Perl starts the
+        SOURCE at that offset — the request to the source carries a byte range
+        (``HTTP.pm:963-971`` "Always add Range", ``File.pm:196-223``
+        ``_timeToOffset``) and the player's clock counts from there
+        (``startOffset`` / ``remoteStreamStartTime``, HTTP.pm:976-979).
+        Squeezelite forwards the request string we embed here verbatim
+        (``stream_sock`` → ``SEND_HEADERS``, stream.c), so the same Range
+        header makes our own /stream.mp3 response begin at that position.
 
         Squeezelite opens its own TCP connection to the server (ip from the
         slimproto connection when server_ip=0) and issues the HTTP request
@@ -2457,12 +2597,14 @@ class SlimProtoClient:
             existing.stream_in_flight = track_id
 
         try:
-            return await self._stream_track_to_player(mac, track_id, writer)
+            return await self._stream_track_to_player(
+                mac, track_id, writer, start_seconds)
         finally:
             if existing is not None and existing.stream_in_flight == track_id:
                 existing.stream_in_flight = None
 
-    async def _stream_track_to_player(self, mac: str, track_id: int, writer) -> bool:
+    async def _stream_track_to_player(self, mac: str, track_id: int, writer,
+                                      start_seconds: float = 0.0) -> bool:
         """Do the flush + ``strm 's'`` send for ``track_id``.
 
         Split out of :meth:`send_strm_to_player` so that the in-flight claim
@@ -2475,6 +2617,7 @@ class SlimProtoClient:
         mime = None
         track_path = None
         track_url = ""
+        duration_seconds = 0.0
         try:
             from sqlalchemy import select
             from lyrion.database.schema import Track
@@ -2485,6 +2628,7 @@ class SlimProtoClient:
                 )).scalar_one_or_none()
                 if track is not None:
                     mime = track.content_type
+                    duration_seconds = float(getattr(track, "duration", 0) or 0)
                     if track.url:
                         track_url = track.url
                         from lyrion.web.stream import _track_path_from_url
@@ -2630,18 +2774,48 @@ class SlimProtoClient:
         # exactly "GET /stream.mp3?player=<MAC> HTTP/1.0\r\n\r\n" — no track
         # id in the URL, no Host header. The /stream endpoint resolves the
         # current track from the player's playlist via the player= param.
-        if transcode_requested:
-            # Format fallback: ask the /stream endpoint to run ffmpeg and
-            # emit raw PCM instead of the source file.
-            request = (
-                f"GET /stream.mp3?player={mac}&transcode=1 HTTP/1.0\r\n"
-                f"\r\n"
-            ).encode("ascii")
-        else:
-            request = (
-                f"GET /stream.mp3?player={mac} HTTP/1.0\r\n"
-                f"\r\n"
-            ).encode("ascii")
+        #
+        # Resume at a position (Perl ``timeOffset``): Perl starts the source
+        # at that offset and always adds a byte range to the source request
+        # (``HTTP.pm:963-971`` "Always add Range to exclude trailing metadata
+        # or garbage"; the offset itself from ``_timeToOffset`` /
+        # ``findFrameBoundaries``, File.pm:130-133, :379). Our relay serves
+        # range responses (206) from that byte, so the resumed stream starts
+        # where the player stopped. The byte offset is proportional
+        # (``filesize * position / duration``) like Perl's own HTTP estimate
+        # from Content-Range (``HTTP.pm:790-793``: "Setting startOffset based
+        # on Content-Range to duration * (startOffset/length)").
+        range_offset = 0
+        source_bytes = 0
+        if start_seconds and start_seconds > 0 and not transcode_requested \
+                and track_path is not None and track_path.is_file() \
+                and duration_seconds > 0:
+            try:
+                source_bytes = track_path.stat().st_size
+            except OSError:
+                source_bytes = 0
+            range_offset = resume_byte_offset(start_seconds, duration_seconds,
+                                              source_bytes)
+
+        request = stream_request_bytes(mac, transcode=transcode_requested,
+                                       range_offset=range_offset)
+
+        # The player's own clock starts at 0 for the new stream; Perl counts
+        # the song from the offset it started at (``$song->startOffset`` +
+        # stream elapsed, HTTP.pm:976-979). The STAT handler adds this value.
+        try:
+            from lyrion.player.manager import PlayerManager
+            _sp = PlayerManager().get_player(mac)
+            if _sp is not None:
+                _sp.stream_start_offset = (
+                    float(start_seconds) if range_offset else 0.0)
+        except Exception:  # noqa: BLE001
+            pass
+        if range_offset:
+            logger.info(
+                "strm resume for %s track=%d: startOffset %.1fs → Range "
+                "bytes=%d- (of %d bytes)", mac, track_id, start_seconds,
+                range_offset, source_bytes)
 
         # Normal LMS proxy stream: autostart=1.  The player starts after
         # HTTP headers; it must not wait for a cont frame.
@@ -4148,6 +4322,14 @@ class SlimProtoClient:
                     # (`elapsed_milliseconds / 1000`, Slimproto.pm:811-814).
                     try:
                         _elapsed = stat["elapsed_seconds_precise"]
+                        # Perl's song clock counts from the offset the stream
+                        # was started at: ``$song->startOffset($seekdata->
+                        # {timeOffset})`` + ``remoteStreamStartTime(now -
+                        # timeOffset)`` (HTTP.pm:976-979, File.pm:196-223).
+                        # The player's own STAT clock restarts at 0 with every
+                        # new stream, so a resumed stream adds its offset here.
+                        _elapsed += float(
+                            getattr(player, "stream_start_offset", 0.0) or 0.0)
                         # A pause is NOT a stop: while paused the status must
                         # keep reporting the frozen position (Perl
                         # `playingSongElapsed` returns `resumeTime` when

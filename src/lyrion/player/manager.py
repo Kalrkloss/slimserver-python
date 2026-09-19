@@ -213,6 +213,28 @@ def jump_target(player: PlayerState, index) -> int | None:
     return int(stripped) % count                        # :1005, :1010-1013
 
 
+#: Perl ``$defaultPrefs`` ``powerOnResume`` (``Slim/Player/Player.pm:66``) —
+#: the "Power On Resume" player setting. Its TWO halves are read with a regex
+#: each: ``(.*)Off`` for the power-OFF behaviour (Player.pm:210) and
+#: ``-(.*)On`` for the power-ON/(re)connect behaviour (Player.pm:305). The six
+#: values of the setting page (``Slim/Web/Settings/Player/Audio.pm:33``) are
+#: PauseOff-NoneOn, PauseOff-PlayOn (default), StopOff-PlayOn, StopOff-NoneOn,
+#: StopOff-ResetPlayOn, StopOff-ResetOn.
+POWER_ON_RESUME_DEFAULT = "PauseOff-PlayOn"
+
+
+def power_on_resume_pref(player: PlayerState) -> str:
+    """The player's ``powerOnResume`` value, Perl's default when unset.
+
+    ``Slim/Player/Player.pm:66`` (``'powerOnResume' => 'PauseOff-PlayOn'``);
+    ``playerpref powerOnResume <value>`` stores it in ``player.playerprefs``
+    (``Slim/Control/Commands.pm:2631-2677``).
+    """
+    prefs = getattr(player, "playerprefs", None) or {}
+    value = str(prefs.get("powerOnResume") or "").strip()
+    return value or POWER_ON_RESUME_DEFAULT
+
+
 def _hashable(value):
     """A hashable, comparable view of a status field value.
 
@@ -910,6 +932,13 @@ class PlayerManager:
         except RuntimeError:
             pass  # no running loop — state-only fallback
         if not on:
+            # Perl records whether the player was REALLY playing before it
+            # stops/pauses it (``isPlaying(1)`` = playingState PLAYING, i.e.
+            # not paused/buffering): ``$prefs->client($client)->
+            # set('playingAtPowerOff', $playing)`` — Player.pm:230-231. The
+            # flag is what ``resumeOnPower`` later consumes to decide whether
+            # a power-on may start playing again (Player.pm:312-329).
+            player.playing_at_power_off = player.mode == "play"
             # Power off = stop playback (SlimProto strm 'q') + standby. The
             # stop-frame send is async; schedule it on the running loop (all
             # callers are async: JSON-RPC/CLI/alarm wake).
@@ -920,7 +949,167 @@ class PlayerManager:
                 loop.create_task(self.stop_player(mac))
             except RuntimeError:
                 pass  # no running loop — state-only fallback
+        else:
+            # Perl: power-on ends with ``$client->resumeOnPower() unless
+            # $noplay`` (Player.pm:296-297) — a player that was playing when
+            # it was switched off starts again (Player.pm:301-332). Nothing to
+            # resume on a first-ever power-on (``playingAtPowerOff`` unset).
+            try:
+                loop = asyncio.get_running_loop()
+                loop.create_task(self.resume_on_power(mac))
+            except RuntimeError:
+                pass  # no running loop — state-only fallback
         logger.debug("Player %s power: %s", mac, "on" if on else "off")
+
+    async def persist_playback_state_for_power_off(self, mac: str) -> None:
+        """Perl ``persistPlaybackStateForPowerOff`` — ``Slimproto.pm:305-321``.
+
+        Called on every close of a player's live slimproto socket
+        (``slimproto_close`` → ``persistPlaybackStateForPowerOff($client)``,
+        ``Slim/Networking/Slimproto.pm:283-286``): "treat a vanishing player
+        that's still playing the same way as a player that's turned off while
+        still playing, so we can make it start playing again if it reappears
+        and the user told us to resume playing when powering on" (:309-312).
+
+        Two client prefs are written, exactly like Perl:
+          * ``playingAtPowerOff = $client->isPlaying(1)`` (:313) — our
+            ``mode == "play"`` (``isPlaying(1)`` is ``playingState ==
+            PLAYING``, ``StreamingController.pm:1676-1678``: a PAUSED player
+            is NOT playing, so it must not resume);
+          * ``positionAtDisconnect``, but ONLY while playing (:315-318):
+            ``$client->playingSong()->canSeek() ? playingSongElapsed() : 0``.
+            Our remote (radio) streams cannot seek → 0, like Perl.
+        """
+        player = self.get_player(mac)
+        if player is None:
+            return
+        playing = player.mode == "play"                      # :313
+        player.playing_at_power_off = playing
+        if playing:                                          # :315-318
+            player.position_at_disconnect = (
+                0.0 if getattr(player, "remote", 0)
+                else float(getattr(player, "elapsed", 0.0) or 0.0)
+            )
+        logger.debug(
+            "persisted playback state for %s: playingAtPowerOff=%s "
+            "positionAtDisconnect=%.3f",
+            mac, playing, player.position_at_disconnect,
+        )
+
+    @staticmethod
+    def _playing_index(player: PlayerState) -> int:
+        """Perl ``Slim::Player::Source::playingSongIndex($client)``.
+
+        The index of the song the player is on — Player.pm:317 reads it for
+        the resume jump. Our ``playlist_position`` tracks it; if it points
+        past the playlist we fall back to the current track, then to 0.
+        """
+        items = list(getattr(player, "playlist", None) or [])
+        if not items:
+            return 0
+        index = int(getattr(player, "playlist_position", 0) or 0)
+        if 0 <= index < len(items):
+            return index
+        track_id = getattr(player, "current_track_id", None)
+        if track_id is not None and track_id in items:
+            return items.index(track_id)
+        return 0
+
+    async def resume_on_power(self, mac: str, connect: bool = False,
+                              was_online: bool = False) -> bool:
+        """Perl ``Slim::Player::Player::resumeOnPower`` — ``Player.pm:301-332``.
+
+        Called from the two places Perl calls it:
+
+        * the HELO handler of a (re)connecting client
+          (``Squeezebox.pm:89`` ``$client->resumeOnPower(1)`` for a client
+          that comes back after being gone, ``:96`` ``resumeOnPower()`` for a
+          reconnect with an active data connection),
+        * the power-on path (``Player.pm:297``).
+
+        Perl's logic:
+
+            if (!$client->controller->isPlaying()) {                    :304
+                my ($resumeOn) = ... =~ /-(.*)On/;                      :305
+                if ($resumeOn =~ /Reset/) {                             :307
+                    $client->execute(["playlist","jump", 0, 1, 1]);     :309
+                }
+                if ($resumeOn =~ /Play/ && track($client)               :312
+                        && playingAtPowerOff) {                         :313
+                    if ($connect) {                                     :316
+                        my $index    = playingSongIndex($client);       :317
+                        my $position = positionAtDisconnect;            :318
+                        $client->execute(["playlist","jump", $index, 1, 0,
+                                          { timeOffset => $position }]); :319
+                    } else {
+                        $client->execute(["play"]);  # resume if paused  :321
+                    }
+                    $prefs->client($client)->set('playingAtPowerOff', 0); :329
+                }
+            }
+
+        ``was_online`` is our reading of ``$controller->isPlaying()``: a client
+        that was ALREADY connected keeps its stream (its old socket was closed
+        with the ``reconnect`` flag only, ``Slimproto.pm:1193-1195``), so a
+        second HELO of a live player must not start a second stream.
+        """
+        player = self.get_player(mac)
+        if player is None:
+            return False
+        # Player.pm:304 — nothing to do while the player is really playing.
+        if player.mode == "play" and was_online:
+            return False
+        # Squeezebox.pm:85/:95 — the whole resume is gated on the power pref:
+        # a player that is switched OFF must stay silent when it reappears.
+        if not player.power:
+            return False
+        # Squeezebox.pm:86-90 — "Don't try to resume if we are synced, we
+        # might confuse others who have moved on. I think playerActive is not
+        # need should Sync::restoreSync be removed from Client::startup." The
+        # check sits in the HELO path only (that is ``connect`` here); the
+        # power-on path (Player.pm:297) has no such gate.
+        if connect and (player.sync_master is not None or player.sync_slaves):
+            return False
+
+        resume_on = power_on_resume_pref(player).split("-")[-1]   # :305
+        if "Reset" in resume_on:
+            # :307-310 — "reset playlist to start, but don't start the
+            # playback yet" (``playlist jump 0 1 1``: noplay=1).
+            if player.playlist:
+                player.playlist_position = 0
+                player.current_track_id = None
+        if "Play" not in resume_on:
+            return False
+        if not player.playlist:                                   # :312 track()
+            return False
+        if not player.playing_at_power_off:                        # :313
+            return False
+
+        index = self._playing_index(player)                        # :317
+        if connect:
+            # :316-319 — no stream exists yet (restarted player), so the
+            # track is streamed again and started at the saved position:
+            # ``playlist jump $index 1 0 { timeOffset => $position }``.
+            # The offset travels as the source byte range of the strm frame
+            # (Perl: ``$song->startOffset`` → File.pm:196-223 / HTTP.pm:963-971)
+            # and as the song clock base (HTTP.pm:976-979).
+            position = float(getattr(player, "position_at_disconnect", 0.0) or 0.0)
+            ok = await self.playlist_play(mac, index, start_seconds=position)
+        elif player.mode == "pause":
+            # :321 — ``play`` on a paused player is a RESUME (playcontrolCommand
+            # maps pause+play to 'resume', Commands.pm:747-748).
+            ok = await self.pause_player(mac, False)
+        else:
+            # :321 — ``play`` from stop: playcontrolCommand goes through
+            # ``playlist jump <playingSongIndex>`` (Commands.pm:756-763).
+            ok = await self.playlist_play(mac, index)
+
+        # :324-329 — the persisted flag is consumed. Leaving it set would let
+        # a later reconnect resume playback a second time.
+        player.playing_at_power_off = False
+        logger.info("resumed playback for %s (index=%s connect=%s)",
+                    mac, index, connect)
+        return bool(ok)
 
     async def power_on_for_playback(self, player: PlayerState) -> None:
         """Power a player on because playback starts (Perl powers it on first).
@@ -1135,8 +1324,14 @@ class PlayerManager:
     # Playback control (via SlimProto protocol handler)
     # ------------------------------------------------------------------
 
-    async def play_track(self, player_id: str, track_id: int) -> bool:
-        """Start playback of a track on a player (sends strm frame)."""
+    async def play_track(self, player_id: str, track_id: int,
+                         start_seconds: float = 0.0) -> bool:
+        """Start playback of a track on a player (sends strm frame).
+
+        ``start_seconds`` (Perl ``timeOffset``, Player.pm:319) starts the
+        stream at that position — used when a player resumes after being gone
+        (``resumeOnPower``); 0 for a normal play.
+        """
         player = self.get_player(player_id)
         if player is None:
             logger.warning("play_track: player not found: %s", player_id)
@@ -1165,14 +1360,18 @@ class PlayerManager:
             player.playlist_position = len(player.playlist) - 1
             player.playlist_total = len(player.playlist)
 
-        ok = await handler.send_strm_to_player(player.mac, track_id)
+        ok = await handler.send_strm_to_player(player.mac, track_id,
+                                               start_seconds)
         if ok:
             # Playing implies power-on (Perl enables the audio outputs then).
             await self.power_on_for_playback(player)
             player.mode = "play"
             player.current_track_id = track_id
             player.remote = 0  # local track: never a "live stream" flag
-            player.elapsed = 0.0
+            # Perl counts the song clock from the offset the stream starts at
+            # (`$song->startOffset($seekdata->{timeOffset})`, File.pm:196-223);
+            # the protocol layer adds the SAME value to every STAT elapsed.
+            player.elapsed = float(start_seconds or 0.0)
             # A local track must not inherit the radio's StreamTitle/meta
             # (else now-playing shows the old station name over the track):
             # Perl clears the client's metadata title when the new song opens
@@ -1296,6 +1495,9 @@ class PlayerManager:
             player.current_url = url
             player.current_track_id = None
             player.remote = 1  # radio stream: never "track end"
+            # A remote stream starts at 0 (Perl's ``canSeek()`` is false, so
+            # ``positionAtDisconnect`` is 0 and there is no timeOffset).
+            player.stream_start_offset = 0.0
             player.stream_bitrate = float(stream_bitrate or 0)
             player.mode = "play"
             player.last_activity = time.time()
@@ -1502,7 +1704,8 @@ class PlayerManager:
             )
         return bool(sent)
 
-    async def playlist_play(self, player_id: str, index: int) -> bool:
+    async def playlist_play(self, player_id: str, index: int,
+                            start_seconds: float = 0.0) -> bool:
         """Play the track at a playlist index (0-based).
 
         A playlist entry is either a DB track id (``int``) or a remote stream
@@ -1541,9 +1744,12 @@ class PlayerManager:
             player.current_track_id = None
             player.current_url = url
             player.elapsed = 0.0
+            # A remote stream cannot seek: Perl stores position 0 for it
+            # (Slimproto.pm:317 ``canSeek()``) and starts at 0 as well.
+            player.stream_start_offset = 0.0
             player.last_activity = time.time()
             return True
-        ok = await self.play_track(player_id, item)
+        ok = await self.play_track(player_id, item, start_seconds)
         if ok:
             player.playlist_position = index
             player.playlist_total = len(player.playlist)
