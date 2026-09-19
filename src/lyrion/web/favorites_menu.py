@@ -44,9 +44,6 @@ Word-for-word live answers live in ``tests/fixtures/perl_favorites_*
 
 Documented deviations from Perl
 -------------------------------
-* ``icon-id`` / ``presetParams.icon`` fall back to
-  ``html/images/favorites.png``: Perl proxies the OPML ``image``/``icon``
-  attribute, our ``favorites`` table has no icon column.
 * ``base.actions.playControl.cmd`` is the literal ``["favorites","items"]``
   from the fixtures instead of being recomputed from the request tokens.
 * ``defeatDestructiveTouchToPlay`` (``XMLBrowser.pm:1260-1271`` /
@@ -165,6 +162,34 @@ def base_actions(*, playcontrol_params: dict[str, Any],
 
 
 
+def _proxied(icon: str) -> str:
+    """``proxiedImage($item->{icon})`` — ``Slim/Web/ImageProxy.pm:407-425``."""
+    from lyrion.web.radiobrowser import proxied_image
+
+    return proxied_image(icon) or icon
+
+
+def row_icon(icon: str) -> dict[str, Any]:
+    """The icon field of a row — Perl's key/value rule, ``XMLBrowser.pm:1160-1166``.
+
+    ::
+
+        if ( $item->{icon} ) {
+            $hash{'icon' . ($item->{icon} =~ /^https?:/ ? '' : '-id')} = proxiedImage($item->{icon});
+            $hasImage = 1;
+        } elsif ( $item->{image} ) { … }
+
+    An external (``http(s):``) logo becomes the ``icon`` field, every
+    server-relative one (``/imageproxy/…``, ``html/images/favorites.png``,
+    ``/plugins/…``) the ``icon-id`` field — exactly what live Perl answers for
+    the favourites feed (``tests/fixtures/perl_favorites_items_menu_favorites
+    .json``).
+    """
+    raw = str(icon or FAVORITES_ICON)
+    key = "icon" if raw.startswith(("http://", "https://")) else "icon-id"
+    return {key: _proxied(raw)}
+
+
 def folder_item(text: str, item_id: str,
                 icon_id: str = FAVORITES_ICON,
                 menu: str = MENU) -> dict[str, Any]:
@@ -173,18 +198,19 @@ def folder_item(text: str, item_id: str,
     Only ``actions.go`` + ``addAction: "go"`` — the tap drills into
     ``<menu> items item_id:<this id>``.  ``menu`` is the feed's CLI tag
     (``favorites`` or the radio ``presets`` feed, see :func:`render_menu`).
+    ``icon_id`` is the folder outline's own ``icon`` attribute (Perl keeps the
+    OPML value; ``OpmlFavorites.pm:133-136``); :func:`row_icon` picks the field
+    name the value calls for.
     """
-    return {
-        "text": text,
-        "addAction": "go",
-        "icon-id": icon_id,
-        "actions": {
-            "go": {
-                "cmd": [menu, "items"],
-                "params": {"menu": menu, "item_id": str(item_id)},
-            },
+    item: dict[str, Any] = {"text": text, "addAction": "go"}
+    item.update(row_icon(icon_id))
+    item["actions"] = {
+        "go": {
+            "cmd": [menu, "items"],
+            "params": {"menu": menu, "item_id": str(item_id)},
         },
     }
+    return item
 
 
 def audio_item(text: str, item_id: str, *, url: str,
@@ -201,8 +227,23 @@ def audio_item(text: str, item_id: str, *, url: str,
     response-level ``base`` is injected into every item before parsing
     (``CometClient.java:555-566``).
 
-    Two branches, exactly like Perl's ``_defeatDestructiveTouchToPlay``
-    (``XMLBrowser.pm:1951-1983``) decides between them:
+    ``icon_id`` is the row's ``icon`` value — the favourites entry's stored
+    ``icon`` (its own OPML attribute, ``OpmlFavorites.pm:133-136``).  It lands
+    twice, exactly like Perl:
+
+    * as the row's ``icon``/``icon-id`` field, proxied
+      (``XMLBrowser.pm:1160-1166``, see :func:`row_icon`);
+    * **raw**, unproxied, as ``presetParams.icon`` — Perl's
+      ``_favoritesParams`` (``:1943``): ``$presetParams{'icon'} =
+      $item->{favorites_icon} || $item->{'image'} || $item->{'icon'} ||
+      $item->{'cover'}`` — the value the ``set-preset-*`` base actions send and
+      live Perl echoes back verbatim (probe ``favorites items … menu:favorites``
+      on a Chill row: ``"presetParams":{"icon":"/imageproxy/http%3A%2F%2Fcdn
+      -radiotime-logos.tunein.com%2Fs111987q.png/image.png"}``).
+
+    Two branches for the row itself, exactly like Perl's
+    ``_defeatDestructiveTouchToPlay`` (``XMLBrowser.pm:1951-1983``) decides
+    between them:
 
     * ``use_play_control=False`` → ``goAction: "play"`` + ``style:
       "itemplay"`` + ``touchToPlay``/``touchToPlaySingle``
@@ -223,21 +264,21 @@ def audio_item(text: str, item_id: str, *, url: str,
       :func:`play_control_context_menu`.
     """
     item_id = str(item_id)
-    icon = icon_id or FAVORITES_ICON
+    icon = str(icon_id or FAVORITES_ICON)
     params: dict[str, Any] = {"item_id": item_id, "isContextMenu": 1}
     item: dict[str, Any] = {
         "text": text,
         "type": "audio",
         "goAction": "playControl" if use_play_control else "play",
-        "icon-id": icon,
-        "params": params,
-        # _favoritesParams(): what the ``set-preset-*`` base actions send.
-        "presetParams": {
-            "favorites_url": url,
-            "favorites_title": text,
-            "favorites_type": favorites_type,
-            "icon": icon,
-        },
+    }
+    item.update(row_icon(icon))
+    item["params"] = params
+    # _favoritesParams(): what the ``set-preset-*`` base actions send.
+    item["presetParams"] = {
+        "favorites_url": url,
+        "favorites_title": text,
+        "favorites_type": favorites_type,
+        "icon": icon,
     }
     if use_play_control:
         # XMLBrowser.pm:1270-1271 — the defeated branch carries neither
@@ -400,4 +441,5 @@ __all__ = [
     "play_control_context_menu",
     "render_favorites_menu",
     "render_menu",
+    "row_icon",
 ]

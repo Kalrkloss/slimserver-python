@@ -189,6 +189,13 @@ async def migrate_legacy_db(engine: AsyncEngine) -> list[str]:
     mislabel artists; one full rescan under the new importer converges
     (old rows lose their tracks via retag, orphan cleanup removes them).
 
+    2026-09 (favourite logos): add the nullable ``favorites.icon`` column.
+    The value itself is not written here — ``favorites.ensure_opml_imported``
+    fills it from the user's ``favorites.opml`` (Perl's own source of the
+    ``icon`` attribute) on the next start, exactly like Perl's ``_urlindex``
+    fills a missing ``icon`` when it loads the file
+    (``Slim/Plugin/Favorites/OpmlFavorites.pm:133-136``).
+
     Returns the list of applied migration names.
     """
     applied: list[str] = []
@@ -220,6 +227,24 @@ async def migrate_legacy_db(engine: AsyncEngine) -> list[str]:
             logger.info("Migration: added albums.albumartist_sort")
     except Exception as exc:  # noqa: BLE001 - fresh DBs already have it
         logger.debug("Migration albums.albumartist_sort skipped: %s", exc)
+
+    def _ensure_favorites_icon(sync_conn) -> bool:
+        cols = [r[1] for r in
+                sync_conn.exec_driver_sql("PRAGMA table_info(favorites)")]
+        if "icon" not in cols:
+            sync_conn.exec_driver_sql(
+                "ALTER TABLE favorites ADD COLUMN icon VARCHAR(2000)")
+            return True
+        return False
+
+    try:
+        async with engine.begin() as conn:
+            changed = await conn.run_sync(_ensure_favorites_icon)
+        if changed:
+            applied.append("favorites.icon")
+            logger.info("Migration: added favorites.icon")
+    except Exception as exc:  # noqa: BLE001 - fresh DBs already have it
+        logger.debug("Migration favorites.icon skipped: %s", exc)
     return applied
 
 

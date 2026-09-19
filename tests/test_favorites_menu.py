@@ -46,9 +46,13 @@ from ``SlimBrowserApplet.lua:704-767`` (``_performJSONAction``) instead.
 
 Documented deviations from Perl (our data model forces them):
 
-* ``icon-id`` / ``presetParams.icon``: Perl proxies the station logo from
-  the OPML ``image``/``icon`` attribute.  Our ``favorites`` table has no
-  icon column, so both fall back to ``html/images/favorites.png``.
+* ``icon-id`` / ``presetParams.icon``: Perl ships the entry's own OPML
+  ``icon`` attribute on the row (``OpmlFavorites.pm:133-136``) and the raw
+  value in ``presetParams`` (``XMLBrowser.pm:1943``).  The stub tree below
+  therefore carries the same icons the live OPML does, and the row fields are
+  compared against the fixture verbatim — see ``tests/test_favorites_icons.py``
+  for the rule itself (external ``http(s):`` logo → ``icon``, else
+  ``icon-id``) and for the import that stores the attribute.
 * ``base.actions.playControl.cmd`` is ``["favorites","items"]`` verbatim
   from Perl — we do not recompute it from the request tokens.
 * The fixtures were recorded on a **connected, idle** client, so Perl answered
@@ -98,18 +102,25 @@ class _Favs:
     TREE: dict[Any, list[dict]] = {
         None: [
             {"id": FOLDER_ID, "title": "Chill", "url": None, "type": "folder",
-             "parent_id": None, "position": 0},
+             "parent_id": None, "position": 0,
+             "icon": "html/images/favorites.png"},
             {"id": STREAM_ID, "title": "1Mix Radio EDM Stream",
              "url": "http://opml.radiotime.com/Tune.ashx?id=s355203",
-             "type": "stream", "parent_id": None, "position": 1},
+             "type": "stream", "parent_id": None, "position": 1,
+             # the OPML ``icon`` of that very entry (live 192.168.1.90)
+             "icon": "/imageproxy/http%3A%2F%2Fcdn-profiles.tunein.com%2F"
+                     "s355203%2Fimages%2Flogoq.jpg%3Ft%3D1/image.jpg"},
         ],
         FOLDER_ID: [
             {"id": SUB_IDS[0], "title": "Hirschmilch Chillout",
              "url": "http://relay1.hirschmilch.de:7000/chillout.mp3",
-             "type": "stream", "parent_id": FOLDER_ID, "position": 0},
+             "type": "stream", "parent_id": FOLDER_ID, "position": 0,
+             "icon": "/imageproxy/http%3A%2F%2Fcdn-radiotime-logos.tunein.com"
+                     "%2Fs111987q.png/image.png"},
             {"id": SUB_IDS[1], "title": "Absolut relax",
              "url": "http://absolut-relax.live-sm.absolutradio.de/absolut-relax",
-             "type": "stream", "parent_id": FOLDER_ID, "position": 1},
+             "type": "stream", "parent_id": FOLDER_ID, "position": 1,
+             "icon": "html/images/favorites.png"},
         ],
     }
 
@@ -369,8 +380,10 @@ def test_folder_tap_opens_the_subfolder(favs):
 def test_audio_item_key_set_matches_perl(favs):
     ours = _audio_item(_items(MENU_ARGS))
     perl = _audio_item(_perl_result(USE_CM_FIXTURE))
-    # icon-id / presetParams.icon differ on purpose (no logo in our model)
     assert set(ours) == set(perl), "touch-to-play item key set"
+    # the stored OPML icon is what Perl ships — row field and presetParams
+    assert ours["icon-id"] == perl["icon-id"]
+    assert ours["presetParams"]["icon"] == perl["presetParams"]["icon"]
 
 
 def test_audio_item_is_touch_to_play(favs):
@@ -409,8 +422,11 @@ def test_audio_item_carries_preset_params(favs):
     assert ours["presetParams"]["favorites_title"] == ours["text"]
     assert ours["presetParams"]["favorites_url"] == (
         "http://opml.radiotime.com/Tune.ashx?id=s355203")
-    # deviation, documented: no logo column → favourites placeholder icon
-    assert ours["icon-id"] == "html/images/favorites.png"
+    # the entry's own OPML icon: proxied on the row, raw in presetParams
+    assert ours["icon-id"] == perl["icon-id"] == (
+        "/imageproxy/http%3A%2F%2Fcdn-profiles.tunein.com%2Fs355203%2F"
+        "images%2Flogoq.jpg%3Ft%3D1/image.jpg")
+    assert ours["presetParams"]["icon"] == ours["icon-id"]
 
 
 def test_audio_items_have_no_item_actions(favs):

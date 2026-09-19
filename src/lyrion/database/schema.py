@@ -655,6 +655,14 @@ class Favorite(Base):
     )
     title: Mapped[str] = mapped_column(String(512), nullable=False)
     url: Mapped[str | None] = mapped_column(String(2000), nullable=True)
+    #: The entry's ``icon`` attribute — Perl keeps it verbatim in the OPML and
+    #: only *derives* one when it is missing (``Slim/Plugin/Favorites/
+    #: OpmlFavorites.pm:133-136`` ``_urlindex``: ``$entry->{'icon'} =
+    #: $class->icon($entry->{'URL'})`` unless ``$entry->{'icon'}`` is set;
+    #: ``:83-88`` ``icon`` = ``ProtocolHandlers->iconForURL($url) ||
+    #: 'html/images/favorites.png'``).  NULL means "no value stored yet" — the
+    #: reader then derives it exactly like Perl.
+    icon: Mapped[str | None] = mapped_column(String(2000), nullable=True)
     position: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     created: Mapped[datetime] = mapped_column(
         DateTime, nullable=False, default=datetime.utcnow

@@ -122,15 +122,20 @@ class _Favs:
                 return True
         return False
 
-    async def add(self, title, url=None, parent_id=None):
+    async def add(self, title, url=None, parent_id=None, icon=None):
         title = (title or "").strip()
         if not title:
             return None
         new_id = self._next
         self._next += 1
+        url_value = url.strip() if url else None
+        from lyrion.music.favorites import favorite_icon
+
         self.rows.append({"id": new_id, "title": title,
-                          "url": url.strip() if url else None,
-                          "type": "folder" if url is None else "stream",
+                          "url": url_value,
+                          "icon": (str(icon or "").strip()
+                                   or favorite_icon(url_value)),
+                          "type": "folder" if url_value is None else "stream",
                           "parent_id": parent_id, "position": len(self.rows)})
         return new_id
 

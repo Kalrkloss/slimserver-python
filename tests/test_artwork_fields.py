@@ -166,18 +166,24 @@ def _install_player(playlist: list, position: int = 0,
 
 
 def test_favorites_rows_name_the_perl_icon_field(favs):
-    """XMLBrowser.pm:1159-1169 ↔ ``favorites_menu.FAVORITES_ICON``.
+    """XMLBrowser.pm:1159-1169 — every row carries the icon Perl would send.
 
-    Both the folder and the station row must carry ``icon-id`` — without an
-    image field ``JiveItemViewLogic.java:99-105`` falls back to the embedded
-    drawable and the controllers show nothing.
+    The stub tree has no stored ``icon``, so the *derived* default appears:
+    a folder gets ``html/images/favorites.png`` (``OpmlFavorites.pm:83-88``),
+    an http stream ``html/images/radio.png`` (``HTTP.pm:1138-1148``) — exactly
+    ``$favs->icon($url)``.  Stored logos (the OPML ``icon`` attribute) win, see
+    ``tests/test_favorites_icons.py``.  Without an image field
+    ``JiveItemViewLogic.java:99-105`` falls back to the embedded drawable and
+    the controllers show nothing.
     """
     res = asyncio.run(JSONRPCAPI()._json_favorites_items(PLAYER,
                                                          list(MENU_ARGS)))
-    for index, row in enumerate(res["item_loop"]):
-        assert row.get("icon-id") == favorites_menu.FAVORITES_ICON, (
+    rows = res["item_loop"]
+    assert rows[0].get("icon-id") == favorites_menu.FAVORITES_ICON
+    assert rows[1].get("icon-id") == "html/images/radio.png"
+    for index, row in enumerate(rows):
+        assert row.get("icon-id") in _VERIFIED_PATHS, (
             f"row {index} carries no resolvable icon: {sorted(row)}")
-        assert row["icon-id"] in _VERIFIED_PATHS
 
 
 # ── 2. Menu status (the frame Squeezer's Now-Playing reads) ───────────────
@@ -296,6 +302,9 @@ def test_local_track_id_stays_the_database_id():
 
 _VERIFIED_PATHS = {
     "html/images/favorites.png",
+    # ``HTTP.pm:1138-1148`` — the derived icon of a logo-less http stream
+    # (``$favs->icon($url)``); the live check prepends the missing slash.
+    "html/images/radio.png",
     "/html/EN/html/images/radio.png",
     "/music/1/cover.jpg",
     "/html/images/albums.png",

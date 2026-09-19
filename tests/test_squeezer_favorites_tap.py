@@ -661,7 +661,12 @@ def test_folder_and_stream_rows_differ_in_exactly_the_tap_fields(favs):
     assert set(stream) - set(folder) == {"goAction", "style", "type", "params",
                                          "presetParams"}
     assert "presetParams" not in folder
-    assert folder["icon-id"] == stream["icon-id"] == favorites_menu.FAVORITES_ICON
+    # Perl's per-entry icon: the folder outline's own value, the stream's
+    # ``$favs->icon($url)`` (``OpmlFavorites.pm:83-88``/:133-136) — the stub
+    # tree stores none, so the defaults appear (folder → favorites.png,
+    # http stream → radio.png, ``HTTP.pm:1138-1148``).
+    assert folder["icon-id"] == favorites_menu.FAVORITES_ICON
+    assert stream["icon-id"] == "html/images/radio.png"
 
 
 # ── 6. folder ids: numeric, stable, and resolvable again ──────────────────

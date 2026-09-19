@@ -44,6 +44,39 @@ def _is_session_root(token: object) -> bool:
     return bool(_SESSION_SID_RE.match(str(token or "")))
 
 
+#: ``Slim/Plugin/Favorites/OpmlFavorites.pm:87`` — the fallback every
+#: icon-less favourite ends on.
+FAVORITES_ICON = "html/images/favorites.png"
+
+#: ``Slim/Player/Protocols/HTTP.pm:1138-1148`` ``getIcon`` — the icon the
+#: HTTP protocol handler reports for a stream URL (``ProtocolHandlers::
+#: iconForURL``, ``Slim/Player/ProtocolHandlers.pm:138-153``).
+STREAM_ICON = "html/images/radio.png"
+
+
+def favorite_icon(url: object) -> str:
+    """``$favs->icon($url)`` — the icon of a favourites entry.
+
+    ``Slim/Plugin/Favorites/OpmlFavorites.pm:83-88``::
+
+        sub icon {
+            my $class = shift;
+            my $url = shift;
+
+            return Slim::Player::ProtocolHandlers->iconForURL($url)
+                || 'html/images/favorites.png';
+        }
+
+    ``iconForURL`` asks the URL's protocol handler (``ProtocolHandlers.pm:
+    138-153``); an http(s) stream answers ``HTTP.pm:1138-1148`` →
+    ``'html/images/radio.png'``.  Everything else (no URL, a file URL, a
+    folder) has no handler and gets the favourites icon.
+    """
+    if str(url or "").lower().startswith(("http://", "https://")):
+        return STREAM_ICON
+    return FAVORITES_ICON
+
+
 
 def _opml_path() -> Path | None:
     """Find favorites.opml: config prefs dir first (LYRION_SERVERDATA-aware),
@@ -76,6 +109,9 @@ class FavoritesManager:
             "id": fav.id,
             "title": fav.title,
             "url": fav.url,
+            # Perl never leaves ``icon`` undefined on a favourite: the OPML
+            # value wins, a missing one is derived (``OpmlFavorites.pm:133-136``).
+            "icon": fav.icon or favorite_icon(fav.url),
             "type": "folder" if fav.url is None else "stream",
             "parent_id": fav.parent_id,
             "position": fav.position,
@@ -220,12 +256,22 @@ class FavoritesManager:
         return int(result.scalar() or -1) + 1
 
     async def add(
-        self, title: str, url: Optional[str] = None, parent_id: Optional[int] = None
+        self, title: str, url: Optional[str] = None, parent_id: Optional[int] = None,
+        icon: Optional[str] = None,
     ) -> Optional[int]:
-        """Add a favorite. url=None creates a folder. Returns new id or None."""
+        """Add a favorite. url=None creates a folder. Returns new id or None.
+
+        ``icon`` is the entry's ``icon`` attribute; Perl stores
+        ``icon || $favs->icon($url)`` (``Slim/Plugin/Favorites/Plugin.pm:855``)
+        — the caller's value wins, otherwise it is derived exactly like Perl
+        (an http stream → ``html/images/radio.png``, a folder →
+        ``html/images/favorites.png``).
+        """
         title = (title or "").strip()
         if not title:
             return None
+        url_value = url.strip() if url else None
+        icon_value = (str(icon or "").strip()) or favorite_icon(url_value)
         async with self._db_session() as session:
             if parent_id is not None:
                 parent = await session.get(Favorite, parent_id)
@@ -233,7 +279,8 @@ class FavoritesManager:
                     return None
             fav = Favorite(
                 title=title,
-                url=url.strip() if url else None,
+                url=url_value,
+                icon=icon_value,
                 parent_id=parent_id,
                 position=await self._next_position(session, parent_id),
             )
@@ -293,15 +340,39 @@ class FavoritesManager:
             return True
 
     async def play(self, player_id: str, fav_id: int) -> bool:
-        """Play a favorite (stream) on a player."""
+        """Play a favorite (stream) on a player.
+
+        Perl registers the **row's logo** under the stream URL before the
+        stream starts: rendering the feed caches ``remote_image_$url`` from the
+        item's ``image``/``cover`` (``Slim/Control/XMLBrowser.pm:1043-1049``)::
+
+            if ( $isPlayable && $item->{url} && $item->{url} =~ /^http/
+                 && (my $cover = ($item->{image} || $item->{cover}))
+                 && !Slim::Utils::Cache->new->get("remote_image_" . $item->{url}) ) {
+                $cache->set("remote_image_" . $item->{url}, $cover, 86400);
+            }
+
+        and ``setRemoteMetadata`` caches it again for 30 days
+        (``Slim/Music/Info.pm:485-489``).  The logo the status then reports is
+        this favourite's ``icon`` — without the registration the receiver
+        falls back to the generic radio placeholder.
+        """
         async with self._db_session() as session:
             fav = await session.get(Favorite, fav_id)
             if fav is None or fav.url is None:
                 return False
             url = fav.url
             title = fav.title
+            icon = fav.icon or favorite_icon(fav.url)
         from lyrion.player import PlayerManager
         pm = PlayerManager()
+        player = pm.get_player(player_id)
+        if player is not None and icon:
+            # Same helper the radio feed uses for its station logo
+            # (``api._json_radio_feed`` → ``JSONRPCAPI._set_stream_image``).
+            from lyrion.web.api import JSONRPCAPI
+            JSONRPCAPI._set_stream_title(player, url, title)
+            JSONRPCAPI._set_stream_image(player, url, icon)
         return await pm.play_url(player_id, url, title)
 
 
@@ -339,6 +410,13 @@ async def ensure_opml_imported() -> None:
     DB (matched by URL for streams, by title+parent for folders), so
     existing DB favorites are kept and the user's OPML favorites survive
     the migration.
+
+    The outline's ``icon`` attribute travels with the entry — it is what Perl
+    answers as the row's image (``Slim/Plugin/Favorites/OpmlFavorites.pm:
+    83-88``/:133-136): the stored value wins, only a *missing* one is derived.
+    An entry the DB already knows but whose ``icon`` is still empty (rows
+    imported before the column existed) is filled from the OPML here, exactly
+    like Perl's ``_urlindex`` fills it when it loads the file.
     """
     global _opml_import_done
     if _opml_import_done:
@@ -354,30 +432,63 @@ async def ensure_opml_imported() -> None:
             mgr = FavoritesManager()
             async with mgr._db_session() as session:
                 rows = (await session.execute(
-                    select(Favorite.url, Favorite.title, Favorite.parent_id)
+                    select(Favorite.id, Favorite.url, Favorite.title,
+                           Favorite.parent_id, Favorite.icon)
                 )).all()
-            known_urls = {r[0] for r in rows if r[0]}
-            known_folders = {(r[1], r[2]) for r in rows if not r[0]}
+            # url -> (db id, stored icon); (title, parent) -> same for folders
+            known_urls = {r[1]: (r[0], r[4]) for r in rows if r[1]}
+            known_folders = {(r[2], r[3]): (r[0], r[4]) for r in rows if not r[1]}
             added = 0
+            reiconed = 0
 
             async def _merge(outline: ET.Element, parent_id: Optional[int]) -> None:
-                nonlocal added
+                nonlocal added, reiconed
                 attrs = outline.attrib
                 name = attrs.get("text") or attrs.get("title") or "???"
                 url = (attrs.get("URL") or "").strip() or None
+                icon = (attrs.get("icon") or "").strip() or None
                 if url:
-                    if url in known_urls:
+                    known = known_urls.get(url)
+                    if known is not None:
+                        await _backfill_icon(mgr, known, icon)
                         return
-                    known_urls.add(url)
+                    known_urls[url] = (None, icon)
+                    new_id = await mgr.add(name, url, parent_id, icon=icon)
+                    added += 1
                 else:
                     key = (name, parent_id)
-                    if key in known_folders:
-                        return
-                    known_folders.add(key)
-                new_id = await mgr.add(name, url, parent_id)
-                added += 1
+                    known = known_folders.get(key)
+                    if known is not None:
+                        # A known folder still gets its own icon filled *and*
+                        # its children walked: the legacy import kept every
+                        # row, only the icons are missing — descending is what
+                        # reaches the nested entries (the logos live there).
+                        await _backfill_icon(mgr, known, icon)
+                        new_id = known[0] if known[0] is not None else parent_id
+                    else:
+                        known_folders[key] = (None, icon)
+                        new_id = await mgr.add(name, url, parent_id, icon=icon)
+                        added += 1
                 for child in outline.findall("outline"):
                     await _merge(child, new_id)
+
+            async def _backfill_icon(
+                manager: FavoritesManager, known: tuple, icon: Optional[str]
+            ) -> None:
+                """Fill a stored-but-empty ``icon`` from the OPML — Perl's
+                ``_urlindex`` rule (``OpmlFavorites.pm:134-136``): never
+                overwrite an existing value."""
+                nonlocal reiconed
+                db_id, stored = known
+                if db_id is None or stored or not icon:
+                    return
+                async with manager._db_session() as session:
+                    await session.execute(
+                        update(Favorite).where(Favorite.id == db_id)
+                        .values(icon=icon)
+                    )
+                    await session.commit()
+                reiconed += 1
 
             tree = ET.parse(opml)
             body = tree.getroot().find("body")
@@ -385,7 +496,10 @@ async def ensure_opml_imported() -> None:
                 return
             for outline in body.findall("outline"):
                 await _merge(outline, None)
-            if added:
-                logger.info("Merged %d favorite(s) from %s into DB", added, opml)
+            if added or reiconed:
+                logger.info(
+                    "Merged %d favorite(s) from %s into DB (%d icon(s) filled)",
+                    added, opml, reiconed,
+                )
         except Exception as exc:  # noqa: BLE001
             logger.warning("OPML favorites import failed: %s", exc)

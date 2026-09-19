@@ -1502,16 +1502,15 @@ def _favorites_icon(url: str) -> str:
             || 'html/images/favorites.png';
 
     ``iconForURL`` asks the URL's protocol handler (``ProtocolHandlers.pm:
-    138-153``); an http(s) stream answers ``HTTP.pm:1138-1147`` →
-    ``'html/images/radio.png'``, which is the same fallback the port uses for
-    stream artwork (:data:`REMOTE_ART_FALLBACK`).  Everything else (a file URL,
-    a folder) gets the favourites icon.
+    138-153``); an http(s) stream answers ``HTTP.pm:1138-1148`` →
+    ``'html/images/radio.png'``.  Everything else (a file URL, a folder) gets
+    the favourites icon.  The rule lives with the data it describes
+    (``lyrion.music.favorites.favorite_icon``) because the OPML import needs it
+    too; this is the port's historical name for it.
     """
-    from lyrion.web.favorites_menu import FAVORITES_ICON
+    from lyrion.music.favorites import favorite_icon
 
-    if str(url).lower().startswith(("http://", "https://")):
-        return REMOTE_ART_FALLBACK
-    return FAVORITES_ICON
+    return favorite_icon(url)
 
 
 def _jive_string(key: str) -> str:
@@ -3105,14 +3104,21 @@ class JSONRPCAPI:
         path = parent_path  # hierarchical prefix for the item ids
         for i, it in enumerate(items):
             is_folder = it["type"] == "folder"
+            # ``it["icon"]`` is the entry's own icon (the OPML attribute, else
+            # the derived default — ``music/favorites.py``); Perl answers it as
+            # the row's ``icon``/``icon-id`` (``XMLBrowser.pm:1160-1166``) and
+            # in the flat shape as ``image`` (:1386-1387).
+            icon = it.get("icon") or _favorites_icon(it.get("url") or "")
             hier = path + f".{i}"
             if menu_mode:
                 from lyrion.web import favorites_menu
                 if is_folder:
-                    item = favorites_menu.folder_item(it["title"], hier, menu=menu)
+                    item = favorites_menu.folder_item(
+                        it["title"], hier, icon_id=icon, menu=menu)
                 else:
                     item = favorites_menu.audio_item(
                         it["title"], hier, url=it["url"] or "",
+                        icon_id=icon,
                         use_play_control=use_play_control, index=i)
             else:
                 # LMS reference format (lyrion.org): hierarchical id
@@ -3121,7 +3127,7 @@ class JSONRPCAPI:
                 item = {
                     "id": hier,
                     "name": it["title"],
-                    "image": "html/images/favorites.png",
+                    "image": _perl_proxied_image(icon),
                     "isaudio": 0 if is_folder else 1,
                     "hasitems": 1 if is_folder else 0,
                     "position": i,
@@ -3253,7 +3259,6 @@ class JSONRPCAPI:
             # 2026-09-14 16:48 with ``item_id:<sid>.0.0 isContextMenu:1
             # touchToPlay:… xmlBrowseInterimCM:1``).
             if menu_mode and parent is not None:
-                from lyrion.web import favorites_menu as _fav_menu
                 from lyrion.web import menus as _menus
                 try:
                     leaf = await fm.get(parent)
@@ -3262,12 +3267,14 @@ class JSONRPCAPI:
                 if leaf is not None and leaf.get("type") == "stream":
                     name = str(leaf.get("title") or "")
                     url = str(leaf.get("url") or "")
+                    leaf_icon = str(leaf.get("icon")
+                                    or _favorites_icon(str(leaf.get("url") or "")))
                     path = parent_path or str(parent)
                     index = path.rsplit(".", 1)[-1]
                     if any(str(a) == "xmlBrowseInterimCM:1" for a in rest):
                         return _menus.interim_context_menu(
                             path, name=name, url=url,
-                            icon=_fav_menu.FAVORITES_ICON,
+                            icon=leaf_icon,
                             favorite_type="audio",
                             item_index=index if index.isdigit() else "")
                     return _menus.leaf_info_menu(name, url)
@@ -3374,7 +3381,11 @@ class JSONRPCAPI:
                     parent = int(str(target))
                 else:
                     parent = await fm.resolve_path(str(target))
-            new_id = await fm.add(str(title), url, parent)
+            # Perl stores ``type`` (default 'audio', :854) and the icon
+            # (``'icon' => $icon || $favs->icon($url)``, :855) with the entry —
+            # that stored icon is what every later row and the status show.
+            new_id = await fm.add(str(title), url, parent,
+                                  icon=tagged.get("icon"))
         except Exception as exc:  # noqa: BLE001
             logger.warning("favorites add failed: %s", exc)
             return {}
