@@ -991,9 +991,92 @@ class MusicImporter:
         return (await session.execute(stmt)).scalars().first()
 
     @staticmethod
-    def _adopt_folder_album(album: Album, artist_key: str,
-                            album_by_key: dict[tuple, Album],
-                            titlesort: str) -> Album:
+    async def _identity_owner(session, album_by_key: dict[tuple, Album],
+                              titlesort: str, artist_key: str,
+                              album: Album) -> Album | None:
+        """Die *andere* Zeile, der ``(titlesort, artist_key)`` schon gehört.
+
+        Perl kennt diese Frage nicht: dort ist die Album-Identität der
+        ``albums.contributor`` (``Slim/Schema.pm:1289-1296``) und es gibt
+        keinen UNIQUE-Index auf (Titel, Album-Interpret); ``mergeSingleVAAlbum``
+        (:2207-2295) setzt ``compilation = 1`` + ``contributor = VA`` auf der
+        VORHANDENEN Zeile. Der Port trägt den Various-Artists-Schlüssel in die
+        Identität ein (``uq_album_titlesort_artist``) und muss deshalb zwei
+        Zeilen mit derselben Identität zusammenlegen, statt die zweite zu
+        erzeugen — sonst stirbt der Scan am UNIQUE-Index.
+
+        Der Stapel-Merker ``album_by_key`` führt nur die Identitäten DIESES
+        Stapels; die Zeile kann zu einem früheren Stapel gehören, deshalb wird
+        bei einem Fehlschlag in der Datenbank nachgesehen.
+        """
+        owner = album_by_key.get((titlesort, artist_key))
+        if owner is None:
+            owner = (await session.execute(select(Album).where(
+                Album.titlesort == titlesort,
+                Album.albumartist_sort == artist_key))).scalars().first()
+        return None if owner is None or owner is album else owner
+
+    async def _merge_albums(self, session, victim: Album, owner: Album,
+                            ta_set: set, ac_set: set,
+                            album_by_id: dict[int, Album] | None = None,
+                            album_by_key: dict[tuple, Album] | None = None,
+                            title_year_maps: tuple | None = None) -> Album:
+        """``victim`` in ``owner`` aufgehen lassen — EIN Album pro Identität.
+
+        Perl ``Slim/Schema.pm:1399-1415`` ruft ``mergeSingleVAAlbum``
+        (:2207-2295) auf: alle Tracks der Zeile gehören danach zu EINEM
+        (Various-Artists-)Album. Hier wird die Zeile nicht umbenannt, sondern
+        ihre Verknüpfungen auf die bereits vorhandene Zeile umgehängt; die
+        leere Zeile verschwindet. ``ta_set``/``ac_set`` halten die
+        Verknüpfungen des Stapels — sie werden mitgezogen, sonst würde gleich
+        darauf eine doppelte Verknüpfung eingefügt (PK ``tracks_albums``).
+        """
+        if victim is owner or victim.id == owner.id:
+            return owner
+        params = {"v": int(victim.id), "o": int(owner.id)}
+        # Was ``owner`` schon hat, fällt weg (PK (track, album) bzw.
+        # (album, contributor)); erst löschen, dann umhängen.
+        await session.execute(text(
+            "DELETE FROM tracks_albums WHERE album = :v AND track IN "
+            "(SELECT track FROM tracks_albums WHERE album = :o)"), params)
+        await session.execute(text(
+            "UPDATE tracks_albums SET album = :o WHERE album = :v"), params)
+        await session.execute(text(
+            "DELETE FROM albums_contributors WHERE album = :v AND contributor IN "
+            "(SELECT contributor FROM albums_contributors WHERE album = :o)"),
+            params)
+        await session.execute(text(
+            "UPDATE albums_contributors SET album = :o WHERE album = :v"),
+            params)
+        moved_tracks = {t for (t, a) in ta_set if a == victim.id}
+        ta_set.difference_update({(t, victim.id) for t in moved_tracks})
+        ta_set.update({(t, owner.id) for t in moved_tracks})
+        moved_ac = {c for (a, c) in ac_set if a == victim.id}
+        ac_set.difference_update({(victim.id, c) for c in moved_ac})
+        ac_set.update({(owner.id, c) for c in moved_ac})
+        if album_by_id is not None:
+            album_by_id.pop(victim.id, None)
+        for mapping in (album_by_key, *(title_year_maps or ())):
+            if not mapping:
+                continue
+            for key, row in list(mapping.items()):
+                if row is victim:
+                    mapping[key] = owner
+        for key, album_id in list(self._album_folder_cache.items()):
+            if album_id == victim.id:
+                self._album_folder_cache[key] = owner.id
+        await session.delete(victim)
+        logger.info(
+            "Album '%s' zusammengelegt (Zeile %d → %d, Perl: "
+            "mergeSingleVAAlbum, Slim/Schema.pm:2207-2295)",
+            owner.title, victim.id, owner.id)
+        return owner
+
+    async def _adopt_folder_album(self, session, album: Album, artist_key: str,
+                                  album_by_key: dict[tuple, Album],
+                                  titlesort: str, ta_set: set, ac_set: set,
+                                  album_by_id: dict[int, Album] | None = None,
+                                  title_year_maps: tuple | None = None) -> Album:
         """Übernimmt eine Ordner-Zeile als Album dieses Tracks.
 
         Perl ``Slim/Schema.pm:1399-1415`` (``mergeSingleVAAlbum``,
@@ -1001,13 +1084,26 @@ class MusicImporter:
         wird es zur Compilation — ``compilation = 1`` und Album-Contributor =
         Various Artists. Bei uns ist der Various-Artists-Schlüssel Teil der
         Album-Identität (``albumartist_sort``), deshalb wird er dort gesetzt.
+
+        Ist diese Identität schon von einer anderen Zeile belegt (die
+        Various-Artists-Zeile desselben Albums existiert bereits), wird diese
+        Zeile übernommen und die Ordner-Zeile hineingelegt — sonst stünde am
+        Ende zweimal ``(titlesort, 'various artists')`` in ``albums`` und der
+        Commit stürbe am UNIQUE-Index ``uq_album_titlesort_artist``.
         """
-        if not album.albumartist_sort:
-            album.albumartist_sort = artist_key
-        elif (album.albumartist_sort != artist_key
+        target = album.albumartist_sort or artist_key
+        if (album.albumartist_sort and album.albumartist_sort != artist_key
                 and album.albumartist_sort != VA_ARTIST_KEY):
             album.compilation = 1
-            album.albumartist_sort = VA_ARTIST_KEY
+            target = VA_ARTIST_KEY
+        owner = await self._identity_owner(session, album_by_key, titlesort,
+                                           target, album)
+        if owner is not None:
+            album = await self._merge_albums(
+                session, album, owner, ta_set, ac_set, album_by_id,
+                album_by_key, title_year_maps)
+        else:
+            album.albumartist_sort = target
         album_by_key[(titlesort, album.albumartist_sort)] = album
         return album
 
@@ -1057,8 +1153,10 @@ class MusicImporter:
             if album is None:
                 album = await self._album_in_folder(session, titlesort, folder_key[0])
             if album is not None:
-                album = self._adopt_folder_album(
-                    album, artist_key, album_by_key, titlesort)
+                album = await self._adopt_folder_album(
+                    session, album, artist_key, album_by_key, titlesort,
+                    ta_set, ac_set, album_by_id,
+                    (album_by_title_year, album_by_title_year_all))
                 album_by_id[album.id] = album
                 self._album_folder_cache[folder_key] = album.id
         if album is None:
@@ -1066,12 +1164,22 @@ class MusicImporter:
         if album is None and album_by_title_year:
             # Vor der Spalte entstandene Zeile adoptieren (Begründung beim
             # Aufbau der Map) und den fehlenden Artist-Sort nachtragen, damit
-            # der nächste Lauf den exakten Schlüssel findet.
+            # der nächste Lauf den exakten Schlüssel findet. Ist die Identität
+            # schon belegt, wird zusammengelegt statt umbenannt (UNIQUE-Index
+            # ``uq_album_titlesort_artist``).
             album = album_by_title_year.pop((_sort_string(album_name),
                                              year or None), None)
             if album is not None:
-                album.albumartist_sort = artist_key
-                album_by_key[key] = album
+                owner = await self._identity_owner(
+                    session, album_by_key, titlesort, artist_key, album)
+                if owner is not None:
+                    album = await self._merge_albums(
+                        session, album, owner, ta_set, ac_set, album_by_id,
+                        album_by_key,
+                        (album_by_title_year, album_by_title_year_all))
+                else:
+                    album.albumartist_sort = artist_key
+                    album_by_key[key] = album
         if album is None and album_by_title_year_all:
             # Zweite Ebene (siehe Map): gleiche Titel+Jahr-Zeile wiederverwenden,
             # statt in den alten UNIQUE-Index zu laufen. Ein bereits gesetzter
@@ -1079,7 +1187,15 @@ class MusicImporter:
             album = album_by_title_year_all.get((_sort_string(album_name),
                                                  year or None))
             if album is not None and not album.albumartist_sort:
-                album.albumartist_sort = artist_key
+                owner = await self._identity_owner(
+                    session, album_by_key, titlesort, artist_key, album)
+                if owner is not None:
+                    album = await self._merge_albums(
+                        session, album, owner, ta_set, ac_set, album_by_id,
+                        album_by_key,
+                        (album_by_title_year, album_by_title_year_all))
+                else:
+                    album.albumartist_sort = artist_key
             if album is not None:
                 album_by_key[key] = album
         if album is not None and compilation and not album.compilation:

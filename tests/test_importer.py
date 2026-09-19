@@ -98,3 +98,77 @@ def test_retag_removes_stale_links():
     ta, tc = asyncio.run(run())
     assert len(ta) == 1, f"stale album links left: {ta}"
     assert len(tc) == 1, f"stale contributor links left: {tc}"
+
+
+def test_folder_adoption_merges_into_existing_va_album():
+    """Ordner-Adoption darf den UNIQUE-Index (titlesort, albumartist_sort) nicht reißen.
+
+    Live-Regression (exit=1 des Scanprozesses nach ~1.900 Titeln):
+    ``sqlite3.IntegrityError: UNIQUE constraint failed: albums.titlesort,
+    albums.albumartist_sort`` beim ``UPDATE albums SET albumartist_sort=…``.
+    Wird ein Ordner-Album zur Compilation (Perl
+    ``Slim/Schema.pm:1399-1415`` ``mergeSingleVAAlbum``, :2207-2295), gibt es
+    die Various-Artists-Zeile desselben Titels oft schon (Ordner eines anderen
+    Termins derselben Charts-Reihe) — dann müssen die beiden Zeilen
+    zusammengelegt werden, statt die zweite Identität zu erzeugen.
+    """
+    async def run():
+        engine = _engine()
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+        Session = async_sessionmaker(engine, expire_on_commit=False)
+        importer = MusicImporter()
+        async with Session() as session:
+            # 1) Various-Artists-Zeile des Titels (anderer Ordner desselben
+            #    Samplers, eigenes Jahr — sonst greift die (titlesort, year)-
+            #    Wiederverwendung und der Konflikt entsteht gar nicht).
+            await _import(importer, session, [[
+                (Path("/m/A/1.mp3"),
+                 _info(artist="Various Artists", album="Charts", year=2023)),
+            ]])
+            # 2) Ordner-Zeile: erster Track dieses Ordners prägt die Identität.
+            await _import(importer, session, [[
+                (Path("/m/B/1.mp3"),
+                 _info(artist="Alice", album="Charts", year=2024)),
+            ]])
+            # 3) zweiter Track des Ordners, anderer Interpret -> Compilation-Übernahme.
+            await _import(importer, session, [[
+                (Path("/m/B/2.mp3"),
+                 _info(artist="Bob", album="Charts", year=2024)),
+            ]])
+            albums = (await session.execute(select(Album))).scalars().all()
+            rows = [(a.id, a.albumartist_sort, a.compilation) for a in albums]
+            links = sorted(r[0] for r in (await session.execute(
+                select(tracks_albums.c.album))).all())
+            return rows, links
+        await engine.dispose()
+
+    rows, links = asyncio.run(run())
+    assert len(rows) == 1, f"eine Identität = eine Albumzeile, bekam {rows}"
+    _id, artist_sort, compilation = rows[0]
+    assert artist_sort == "various artists", rows
+    assert compilation == 1, rows
+    # Alle drei Tracks hängen an der zusammengelegten Zeile (keine Waise).
+    assert links == [_id, _id, _id], links
+
+
+def test_folder_adoption_keeps_single_artist_album_together():
+    """Gegenprobe: gleicher Interpret im Ordner -> eine Zeile, kein Merge."""
+    async def run():
+        engine = _engine()
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+        Session = async_sessionmaker(engine, expire_on_commit=False)
+        importer = MusicImporter()
+        async with Session() as session:
+            await _import(importer, session, [[
+                (Path("/m/C/1.mp3"), _info(artist="Alice", album="Solo")),
+                (Path("/m/C/2.mp3"), _info(artist="Alice", album="Solo")),
+                (Path("/m/C/3.mp3"), _info(artist="Alice", album="Solo")),
+            ]])
+            albums = (await session.execute(select(Album))).scalars().all()
+            return [(a.id, a.albumartist_sort, a.compilation) for a in albums]
+        await engine.dispose()
+
+    rows = asyncio.run(run())
+    assert rows == [(1, "alice", 0)], rows
