@@ -19,7 +19,7 @@ class _FakeHandler:
     def __init__(self):
         self.remote_calls: list[tuple] = []
 
-    async def send_strm_to_player(self, mac, track_id):
+    async def send_strm_to_player(self, mac, track_id, start_seconds=0.0):
         return True
 
     async def send_remote_stream(self, mac, url, codec, **kw):

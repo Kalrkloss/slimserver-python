@@ -450,7 +450,7 @@ def test_manager_play_track_triggers_the_display_update():
             self.writer = _FakeWriter()
             self._player_writers = {MAC_CLEAN: self.writer}
 
-        async def send_strm_to_player(self, mac, track_id):
+        async def send_strm_to_player(self, mac, track_id, start_seconds=0.0):
             self.frames.append("strm")
             return True
 
