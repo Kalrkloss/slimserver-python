@@ -932,8 +932,13 @@ def _fixture_item(path: Path, n: int = 0) -> dict:
 
 
 def test_bmf_file_item_matches_the_live_perl_row(tmp_path, monkeypatch):
-    """Feld-für-Feld gegen die echte Perl-Zeile: gleiche Tap-Felder, nur die
-    dokumentierten Unterschiede (Artwork-Keys fehlen uns)."""
+    """Feld-für-Feld gegen die echte Perl-Zeile: gleiche Tap-Felder.
+
+    Die Artwork-Keys fehlen hier nur, weil dieses Fixture-``tracks``-Schema
+    keine ``albums``/``tracks_albums``-Zeilen hat — mit Album-Artwork trägt
+    unsere Zeile dieselben Keys wie Perl
+    (``test_bmf_file_rows_carry_perls_artwork_fields``).
+    """
     perl = _fixture_item(PERL_FILE_FIXTURE)
     _setup(tmp_path, monkeypatch, ONLY_FILES_ROWS, ROOT)
     ours = _only_files_browse()["item_loop"][0]
@@ -956,9 +961,9 @@ def test_bmf_file_item_matches_the_live_perl_row(tmp_path, monkeypatch):
         "icon"}          # unser row ohne coverid: kein icon (siehe window_style)
     assert set(ours["presetParams"]) == {"favorites_type", "favorites_title",
                                          "favorites_url"}
-    # dokumentierte Abweichung: Perls Artwork-Keys (``icon``/``icon-id`` aus
-    # ``coverid``, BrowseLibrary.pm:2098-2102) fehlen unseren bmf-Zeilen —
-    # deshalb bleibt das Fenster ``text_list`` (test_browselibrary_window_style)
+    # Kein Album-Artwork in diesem Fixture-Schema ⇒ kein ``icon``; Perl hat
+    # hier ``coverid`` (``BrowseLibrary.pm:2098-2102``).  Mit Artwork liefert
+    # unser Feed dieselben Keys (test_bmf_file_rows_carry_perls_artwork_fields).
     assert set(perl) - set(ours) == {"icon", "icon-id"}
     assert not (set(ours) - set(perl))
     # unser zusätzlicher, auflösbarer Token (Perl liest seinen Feed-Cache)
@@ -1015,3 +1020,99 @@ def test_bmf_file_row_is_always_the_touch_to_play_form(tmp_path, monkeypatch):
     assert ours["params"]["touchToPlay"] == "0"
 
 
+
+
+# ---------------------------------------------------------------------------
+# (j) Artwork der Dateizeilen — Perls ``_bmf``-Regel (das Cover in SqueezePlay)
+# ---------------------------------------------------------------------------
+
+def _add_album_artwork(db: str, albums, links) -> None:
+    """Legt ``albums``/``tracks_albums`` an, wie der Importer sie füllt."""
+    con = sqlite3.connect(db)
+    con.executescript(
+        "CREATE TABLE IF NOT EXISTS albums (id INTEGER PRIMARY KEY, "
+        "titlesort VARCHAR(255) NOT NULL, title VARCHAR(255) NOT NULL, "
+        "artwork VARCHAR(1000));"
+        "CREATE TABLE IF NOT EXISTS tracks_albums (track INTEGER NOT NULL, "
+        "album INTEGER NOT NULL, position INTEGER NOT NULL, "
+        "PRIMARY KEY (track, album));")
+    con.executemany(
+        "INSERT OR REPLACE INTO albums (id, titlesort, title, artwork)"
+        " VALUES (?, '', ?, ?)", [(aid, f"Album {aid}", art)
+                                  for aid, art in albums])
+    con.executemany(
+        "INSERT OR REPLACE INTO tracks_albums (track, album, position)"
+        " VALUES (?, ?, 0)", links)
+    con.commit()
+    con.close()
+
+
+def test_bmf_file_rows_carry_perls_artwork_fields(tmp_path, monkeypatch):
+    """``icon``/``icon-id``/``presetParams.icon`` an der Dateizeile.
+
+    Perl ``Slim/Menu/BrowseLibrary.pm:2097-2100`` (``_bmf``)::
+
+        if ( $_->{'coverid'} ) {
+            $_->{'image'} = 'music/' . $_->{'coverid'} . '/cover';
+            $_->{'artwork_track_id'} = $_->{'coverid'};
+        }
+
+    ``Slim/Control/XMLBrowser.pm:1160-1169`` macht daraus ``icon`` (aus
+    ``image``, weil der Pfad nicht ``https?:`` ist, ``proxiedImage`` reicht
+    relative Pfade unverändert durch, ``ImageProxy.pm:443-447``) und
+    ``icon-id`` (aus ``artwork_track_id``); beides setzt ``$hasImage`` und
+    damit ``windowStyle`` (``:1434-1441``).  Live Perl 9.1.1, 2026-09-19,
+    ``browselibrary items 0 4 menu:1 mode:bmf folder_id:204776``::
+
+        {"type": "audio", "text": "01. Queen - Somebody To Love.mp3",
+         "icon": "music/42a671d3/cover", "icon-id": "42a671d3",
+         "presetParams": {…, "icon": "music/42a671d3/cover"}}
+
+    Dieses Port veröffentlicht als Id die *Album*-Id — genau die Id, die seine
+    ``/music/<id>/cover(_<w>x<h>_<m|f>).jpg``-Route auflöst (``_artwork_id``,
+    dieselbe Regel wie die ``albums``-/``status``-Zeilen).  Ein Album ohne
+    ``artwork`` bekommt kein ``icon`` (Perls ``if $_->{coverid}``).
+    """
+    db = _setup(tmp_path, monkeypatch, ONLY_FILES_ROWS, ROOT)
+    _add_album_artwork(db, [(7, "/srv/covers/front.jpg"), (8, "")],
+                       [(101, 7), (102, 8)])
+    browse = _only_files_browse()
+    items = browse["item_loop"]
+    first = next(it for it in items if "01-hard_attack" in it["text"])
+    assert first["icon"] == "music/7/cover"
+    assert first["icon-id"] == "7"
+    assert first["presetParams"]["icon"] == "music/7/cover"
+    # Album ohne ``artwork``: Perls ``if $_->{coverid}`` ist falsch
+    second = next(it for it in items if "02-objection" in it["text"])
+    assert "icon" not in second and "icon-id" not in second
+    assert "icon" not in second["presetParams"]
+    # ``$hasImage`` ⇒ windowStyle home_menu (XMLBrowser.pm:1160-1169, :1434-1441)
+    # — live Perl antwortet genau das für dieselbe Datei-Ebene.
+    assert browse["window"] == {"windowStyle": "home_menu"}
+
+
+def test_bmf_folder_rows_never_carry_artwork(tmp_path, monkeypatch):
+    """Ordnerzeilen ohne Bild — Perl setzt dort nichts (:2051-2083)."""
+    db = _setup(tmp_path, monkeypatch, LIB_URLS, ROOT)
+    _add_album_artwork(db, [(7, "/srv/covers/front.jpg")],
+                       [(1, 7), (2, 7), (3, 7)])
+    items = _items(["items", "0", "50", "menu:1", "mode:bmf"])
+    folders = [it for it in items if it["type"] == "playlist"]
+    assert folders
+    assert not any("icon" in it or "icon-id" in it for it in folders)
+
+
+def test_bmf_file_artwork_from_the_readdirectory_path(tmp_path, monkeypatch):
+    """Dieselben Felder, wenn die Datei-Ids aus dem Verzeichnis-Listing kommen."""
+    root = tmp_path / "Musik"
+    (root / "Album").mkdir(parents=True)
+    track = root / "Album" / "01-track.mp3"
+    track.write_bytes(b"\0")
+    db = _setup(tmp_path, monkeypatch,
+                [(1, folders.file_url_from_path(track))], str(root))
+    _add_album_artwork(db, [(9, "/srv/covers/x.jpg")], [(1, 9)])
+    items = _items(["items", "0", "50", "menu:1", "mode:bmf",
+                    f"search:{root}/Album"])
+    assert len(items) == 1
+    assert items[0]["icon"] == "music/9/cover"
+    assert items[0]["icon-id"] == "9"

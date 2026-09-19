@@ -189,15 +189,22 @@ def test_tracks_window_is_text_list(tmp_path, monkeypatch):
 
 
 def test_music_folder_window_is_text_list(tmp_path, monkeypatch):
-    """Perl's bmf feed gives folder rows no icon at all
+    """Perl's bmf feed gives *folder* rows no icon at all
     (``BrowseLibrary.pm:2051-2083``; only a track row with a ``coverid`` gets
-    ``image``, :2097-2100) — live Perl answers text_list.  An invented
-    ``html/images/musicfolder.png`` on our rows forced home_menu."""
+    ``image``, :2097-2100) — the root window of pure folders is text_list.
+    An invented ``html/images/musicfolder.png`` on our rows forced home_menu.
+
+    The *file* level becomes home_menu as soon as one answered row carries the
+    track artwork (:1160-1169 → ``home_menu`` at :1434-1441) —
+    ``tests/test_musicdir_bmf.py::
+    test_bmf_file_rows_carry_perls_artwork_fields`` pins that with the album
+    artwork in the library (live-verified against Perl's file window).
+    """
     res = _mode(tmp_path, monkeypatch, "bmf")
     assert res["window"] == {"windowStyle": PERL_WINDOW["bmf"]}
     for item in res["item_loop"]:
         assert "icon" not in item and "icon-id" not in item, (
-            f"Perl's bmf rows carry no image: {sorted(item)}")
+            f"Perl's bmf folder rows carry no image: {sorted(item)}")
 
 
 def test_playcontrol_context_menu_stays_text_list(tmp_path, monkeypatch):

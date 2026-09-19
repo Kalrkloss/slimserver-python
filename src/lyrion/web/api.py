@@ -835,6 +835,43 @@ def _bmf_subdir_paths(directory: str) -> list[str]:
     return out
 
 
+def _bmf_track_artwork(track_ids: list[int]) -> dict[int, int]:
+    """``{tracks.id: albums.id}`` for the tracks that have album artwork.
+
+    Perl's bmf feed gives an audio row ``image = 'music/' . coverid . '/cover'``
+    and ``artwork_track_id = coverid`` (``Slim/Menu/BrowseLibrary.pm:2097-2100``
+    inside ``_bmf``, only ``if $_->{coverid}``); ``XMLBrowser.pm:1160-1167``
+    turns those two into the jive keys ``icon`` and ``icon-id``.  ``coverid`` is
+    the track's own artwork id (``Slim/Schema/Track.pm:713-740``, truncated md5
+    of url/mtime/size).  Our importer never fills ``tracks.artwork``/``cover``
+    (0 rows in the live library), so — like every other cover field of this port
+    (``JSONRPCAPI._artwork_id``) — the **album id** is the id our
+    ``/music/<id>/cover(_<w>x<h>_<m|f>).jpg`` route accepts
+    (``web/app.py:_serve_album_cover``).  Only albums with a real ``artwork``
+    path are returned, so a cover-less album keeps Perl's "no icon" case (and
+    with it ``windowStyle: text_list``, ``XMLBrowser.pm:1434-1441``).
+
+    One batch query for a whole listing; a lean/foreign DB without the
+    ``tracks_albums`` link degrades to "no artwork".
+    """
+    ids = sorted({int(t) for t in track_ids})
+    if not ids:
+        return {}
+    marks = ",".join("?" * len(ids))
+    out: dict[int, int] = {}
+    try:
+        for row in _db_query(
+                "SELECT ta.track AS tid, al.id AS aid"
+                " FROM tracks_albums ta JOIN albums al ON al.id = ta.album"
+                f" WHERE ta.track IN ({marks})"
+                " AND al.artwork IS NOT NULL AND al.artwork != ''",
+                tuple(ids)):
+            out.setdefault(int(row["tid"]), int(row["aid"]))
+    except Exception:  # noqa: BLE001 - lean DB without the link table
+        return {}
+    return out
+
+
 def _bmf_dir_row_ids(directories: list[str]) -> dict[str, int]:
     """``{absolute directory: tracks.id}`` for one listing (Perl ``create=>1``)."""
     from lyrion.media import dir_rows
@@ -1058,6 +1095,11 @@ def _bmf_children(directory: str, start: int = 0,
                 file_ids.setdefault(p, int(r["id"]))
     except Exception:  # noqa: BLE001 - lean DB: ids stay the file URLs
         file_ids = {}
+    # The cover of every audio child of this listing — one batch query
+    # (``_bmf_track_artwork``): Perl's row gets ``image``/``artwork_track_id``
+    # from the track's coverid (``BrowseLibrary.pm:2097-2100``), which is what
+    # makes SqueezePlay ask for the thumbnail (``icon-id``).
+    track_art = _bmf_track_artwork(list(file_ids.values()))
     from lyrion.media import folders
 
     try:
@@ -1079,9 +1121,13 @@ def _bmf_children(directory: str, start: int = 0,
                 # (``BrowseLibrary.pm:2125-2138``: ``type 'audio'``,
                 # ``playall = 1``); the musicfolder loop itself names it
                 # 'playlist' (``Queries.pm:2437-2440``).
-                out.append({"id": file_ids.get(p)
-                            or folders.file_url_from_path(p),
-                            "name": name, "title": name, "type": "audio"})
+                tid = file_ids.get(p)
+                row: dict = {"id": tid or folders.file_url_from_path(p),
+                             "name": name, "title": name, "type": "audio"}
+                if tid is not None and tid in track_art:
+                    # ``BrowseLibrary.pm:2097-2100`` → ``XMLBrowser.pm:1160-1167``
+                    row["artwork_id"] = track_art[tid]
+                out.append(row)
         return out[start:start + count], len(out)
     paths: dict[str, str] = {}     # path → display name
     # (1) directory rows of the children (Perl stores every directory;
@@ -1135,12 +1181,17 @@ def _bmf_children(directory: str, start: int = 0,
                 (like, off, left, t_off))
         except Exception:  # noqa: BLE001
             trows = []
+        t_art = _bmf_track_artwork([int(r["id"]) for r in trows])
         for r in trows:
             # Perl's bmf shows the decoded file name for files (tags are
             # what the album/year views are for).
             name = posixpath.basename(_bmf_path(r.get("url") or ""))
-            out.append({"id": r["id"], "name": name, "title": name,
-                        "type": "audio"})
+            row: dict = {"id": r["id"], "name": name, "title": name,
+                         "type": "audio"}
+            aid = t_art.get(int(r["id"]))
+            if aid is not None:
+                row["artwork_id"] = aid
+            out.append(row)
     return out, total
 
 
@@ -8748,6 +8799,29 @@ class JSONRPCAPI:
                     item["presetParams"] = {"favorites_type": "audio",
                                             "favorites_title": text,
                                             "favorites_url": str(url)}
+                # Album-Artwork des Titels — Perl ``BrowseLibrary.pm:2097-2100``
+                # (``image = 'music/' . coverid . '/cover'``,
+                # ``artwork_track_id = coverid``) → ``XMLBrowser.pm:1160-1167``
+                # (``icon``, ``icon-id``) → Jive baut daraus
+                # ``/music/<icon-id>/cover_<size>_<m|f>.jpg``
+                # (``SlimServer.lua:1189``).  Fehlten die Felder, blieb jede
+                # Zeile in SqueezePlay ohne Cover und das Fenster auf
+                # ``text_list`` (``XMLBrowser.pm:1434-1441``) — Squeeze
+                # Client/Squeezer holen ihr Cover aus anderen Feldern.
+                # Nur wenn ein Album wirklich Artwork hat (Perls ``if
+                # $_->{coverid}``).  Der ``mode:tracks``-Feed der Albumabteilung
+                # bleibt ohne Bildfeld: Perl setzt ``image``/``artwork_track_id``
+                # dort nur im ``if ($name2)``-Zweig (``BrowseLibrary.pm:
+                # 1898-1905``) und diese Zeilen tragen kein ``name2`` — live
+                # belegt (``mode:tracks album_id:11018`` → kein ``icon``).
+                aid = r.get("artwork_id")
+                if aid:
+                    item["icon"] = f"music/{aid}/cover"
+                    item["icon-id"] = str(aid)
+                    if "presetParams" in item:
+                        # perl ``_favoritesParams`` (XMLBrowser.pm:1943-1944):
+                        # ``icon = favorites_icon || image || icon || cover``
+                        item["presetParams"]["icon"] = f"music/{aid}/cover"
                 item["actions"] = {
                     "more": {"player": 0, "cmd": ["trackinfo", "items"],
                              "params": {"menu": 1, "track_id": ident},
