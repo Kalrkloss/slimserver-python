@@ -43,6 +43,84 @@ COVER_NAMES: list[str] = [
 JPEG_QUALITY = 85
 
 
+#: Padding colour Perl paints behind a fitted image.
+#: ``Slim/Web/Graphics.pm:227-234`` passes **no** ``bgcolor`` into
+#: ``GDResizer->resize``, ``Slim/Utils/GDResizer.pm:41`` therefore leaves it
+#: undef, its ``:104-106`` fixup only rewrites a non-empty wrong-length value,
+#: and ``:169`` hands ``hex(undef)`` — i.e. ``0`` — to Image::Scale.
+#: Live Perl 9.1.1 (read-only, 2026-09-19, ``/imageproxy/<160x85 logo>/<spec>``):
+#: every padded corner pixel is exactly ``(0, 0, 0, 255)`` — opaque black.
+PAD_RGB: tuple[int, int, int] = (0, 0, 0)
+
+
+def gd_effective_box(
+    in_w: int,
+    in_h: int,
+    req_w: int,
+    req_h: int,
+) -> tuple[int, int]:
+    """Perl ``Slim/Utils/GDResizer.pm:152-162`` — box actually resized into.
+
+    "requested size is larger than original - don't upscale": only when the
+    request is bigger in **both** dimensions is it pulled back to the
+    original's own long edge::
+
+        if ( $width > $in_width && $height > $in_height ) {
+            if ( $in_height / $in_width > 1 ) {   # portrait
+                $height = $height * ($in_width / $width);
+                $width  = $in_width;
+            } else {
+                $width  = $width * ($in_height / $height);
+                $height = $in_height;
+            }
+        }
+
+    The result is *not* the original size: a 160x85 logo asked for 200x200
+    comes back as a 85x85 box (live 9.1.1: ``/imageproxy/<160x85>/200x200_m``
+    -> 85x85 padded PNG; ``300x300_m`` -> the same 85x85), and a 40x40 source
+    asked for 200x200 comes back as 40x40.
+    """
+    if req_w and req_h and req_w > in_w and req_h > in_h:
+        if in_h / in_w > 1:
+            return in_w, max(1, int(round(req_h * (in_w / req_w))))
+        return max(1, int(round(req_w * (in_h / req_h)))), in_h
+    return req_w, req_h
+
+
+def fit_and_pad(
+    img: "Image.Image",
+    box_w: int,
+    box_h: int,
+    rgb: tuple[int, int, int] = PAD_RGB,
+) -> "Image.Image":
+    """Fit ``img`` into the box, keep the aspect, pad the rest — Perl's
+    ``$im->resize({width, height, bgcolor => hex($bgcolor), keep_aspect => 1})``
+    (``Slim/Utils/GDResizer.pm:166-171``).
+
+    ``Image::Scale`` fits the image into the requested box, centres it and
+    fills the remaining border with the background colour.  Live 9.1.1 for a
+    160x85 logo at ``40x40_m``: box 40x40, content 40x21, 9 black rows on top
+    and 10 below — i.e. **floor** centring, which is what this computes.
+    """
+    if box_w <= 0 or box_h <= 0:
+        return img
+    scale = min(box_w / img.width, box_h / img.height)
+    cw = max(1, min(box_w, int(round(img.width * scale))))
+    ch = max(1, min(box_h, int(round(img.height * scale))))
+    if (cw, ch) == (img.width, img.height) and (cw, ch) == (box_w, box_h):
+        return img                             # nothing to do at all
+    resample = getattr(
+        getattr(Image, "Resampling", Image), "LANCZOS", None
+    ) or getattr(Image, "LANCZOS", 1)
+    content = img if (cw, ch) == (img.width, img.height) else \
+        img.resize((cw, ch), resample)
+    if (cw, ch) == (box_w, box_h):
+        return content
+    canvas = Image.new("RGB", (box_w, box_h), rgb)
+    canvas.paste(content.convert("RGB"), ((box_w - cw) // 2, (box_h - ch) // 2))
+    return canvas
+
+
 # ---------------------------------------------------------------------------
 # Eingebettetes Tag-Bild (Perl ``_readCoverArtTags``)
 # ---------------------------------------------------------------------------
@@ -501,12 +579,16 @@ class ArtworkHandler:
         img_bytes = await self._image_to_bytes(img, fmt="JPEG")
         art_hash = hashlib.md5(img_bytes).hexdigest()
 
-        # Resize to all standard sizes
+        # Resize to all standard sizes.  Perl's box, not just a fit: a
+        # non-square cover is padded to the box (``GDResizer.pm:166-171``),
+        # so the cached file really is ``<w>x<h>`` — the key below already
+        # claimed that, the bytes did not.
         sizes: dict[tuple[int, int], Path] = {}
         for width, height in ARTWORK_SIZES:
             try:
-                resized = img.copy()
-                resized.thumbnail((width, height), Image.LANCZOS)
+                box_w, box_h = gd_effective_box(
+                    img.width, img.height, width, height)
+                resized = fit_and_pad(img, box_w, box_h)
                 out_path = self.artwork_cache_dir / f"{art_hash}_{width}x{height}.jpg"
                 await self._save_image(resized, out_path)
                 sizes[(width, height)] = out_path
@@ -535,7 +617,14 @@ class ArtworkHandler:
         source_image: Path,
         target_widths: list[int],
     ) -> dict[tuple[int, int], Path]:
-        """Resize a source image to a list of target widths."""
+        """Resize a source image into square boxes of the given widths.
+
+        The box is the *requested* size, padded like Perl's ``mode 'm'``
+        (``GDResizer.pm:140-171``): Perl's ``getResizeSpecs``
+        (``Slim/Music/Artwork.pm:864-870``) asks for ``64x64_m`` / ``41x41_m``
+        / ``40x40_m`` and a non-square logo comes back as exactly that box.
+        The key is the padded box, so callers can trust ``(w, h)`` again.
+        """
         try:
             img = await self._load_image(source_image)
         except Exception:  # noqa: BLE001
@@ -543,16 +632,15 @@ class ArtworkHandler:
 
         result = {}
         for width in target_widths:
-            height = int(img.height * (width / img.width))
             try:
-                resized = img.copy()
-                resized.thumbnail((width, height), Image.LANCZOS)
+                box_w, box_h = gd_effective_box(img.width, img.height, width, width)
+                resized = fit_and_pad(img, box_w, box_h)
                 art_hash = hashlib.md5(await self._image_to_bytes(resized)).hexdigest()
-                out_path = self.artwork_cache_dir / f"{art_hash}_{width}x{height}.jpg"
+                out_path = self.artwork_cache_dir / f"{art_hash}_{width}x{width}.jpg"
                 await self._save_image(resized, out_path)
-                result[(width, height)] = out_path
+                result[(width, width)] = out_path
             except Exception:  # noqa: BLE001
-                logger.debug("Resize to %dx%d failed", width, height)
+                logger.debug("Resize to %dx%d failed", width, width)
 
         return result
 

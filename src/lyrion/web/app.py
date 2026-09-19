@@ -26,6 +26,11 @@ from .cometd import (
     is_connect_channel,
 )
 
+#: Perl's resize rules (``Slim/Utils/GDResizer.pm``) live in the artwork
+#: module; the box clamp (:152-162) and the padding (:166-171) must be the
+#: *same* maths on the HTTP path as in the cached sizes.
+from lyrion.media.artwork import fit_and_pad, gd_effective_box
+
 logger = logging.getLogger(__name__)
 
 
@@ -543,9 +548,36 @@ _COVER_PATH_RE = _re.compile(
     # LMS sized form. Jive omits the extension when it fetches a browser
     # thumbnail (fetchArtwork without imgFormat) — SqueezePlay asked for
     # '/music/2441/cover_40x40_m' and our strict '.jpg' rule answered 404.
-    r"|cover_(\d+)x(\d+)(?:_[a-z])?(?:\.(?:jpg|png))?"
+    # The trailing letter is GDResizer's ``$mode`` and the extension its
+    # ``$ext`` (``Slim/Web/Graphics.pm:534-539`` ``parseSpec``); both change
+    # the answer, so both are captured here.
+    r"|cover_(\d+)x(\d+)(?:_([A-Za-z]))?(?:\.(jpg|png))?"
     r")$"
 )
+
+
+def _parse_cover_spec(
+    path: str,
+) -> tuple[int | str, tuple[int, int] | None, str, str] | None:
+    """``(id, box, mode, ext)`` of a ``/music/…/cover…`` URL — or ``None``.
+
+    ``mode``/``ext`` are what Perl's ``parseSpec`` yields: ``_m``/``_p`` pad to
+    the box, ``_o``/``_f``/``_c`` (any unknown letter) resize by width only,
+    ``_F`` returns the original size when the request is bigger; ``""`` means
+    "not given", which GDResizer reads as mode ``'m'`` (``:108-111``).  Both
+    defaults are what the server acts on — dropping them silently, as before,
+    made every non-square cover come back unpadded and every ``_o`` request
+    come back fitted instead of width-scaled.
+    """
+    m = _COVER_PATH_RE.match(path)
+    if not m:
+        return None
+    raw_id = m.group(1)
+    album_id: int | str = raw_id if raw_id == "current" else int(raw_id)
+    if m.group(2) and m.group(3):
+        return album_id, (int(m.group(2)), int(m.group(3))), \
+            m.group(4) or "", (m.group(5) or "")
+    return album_id, None, "", ""
 
 
 def _parse_cover_path(path: str) -> tuple[int | str, tuple[int, int] | None] | None:
@@ -561,43 +593,202 @@ def _parse_cover_path(path: str) -> tuple[int | str, tuple[int, int] | None] | N
 
     Perl's ImageProxy accepts ``/music/<albumid>/cover.jpg`` and the
     size-encoded form Jive/SqueezePlay use from their ``artworkspec``
-    (``cover_40x40_m.jpg``; the trailing ``_m``/``_f`` is the
-    crop flag). Accepting only the plain form made every cover request
+    (``cover_40x40_m.jpg``; the trailing ``_m``/``_f`` is the crop flag).
+    Accepting only the plain form made every cover request
     from SqueezePlay 404 — the album list then showed endless spinners.
     """
-    m = _COVER_PATH_RE.match(path)
-    if not m:
+    spec = _parse_cover_spec(path)
+    if spec is None:
         return None
-    raw_id = m.group(1)
-    album_id: int | str = raw_id if raw_id == "current" else int(raw_id)
-    if m.group(2) and m.group(3):
-        return album_id, (int(m.group(2)), int(m.group(3)))
-    return album_id, None
+    return spec[0], spec[1]
 
 
-def _resize_cover(data: bytes, size: tuple[int, int]) -> bytes:
-    """Downscale a cover with Pillow (Lanczos); returns the original data
-    unchanged when Pillow is unavailable or the image is already small."""
+def _gdresize(
+    data: bytes,
+    req_w: str | int | None,
+    req_h: str | int | None,
+    mode: str = "",
+    fmt: str = "",
+) -> tuple[bytes, str] | None:
+    """Perl ``Slim::Utils::GDResizer->resize`` (``Slim/Utils/GDResizer.pm:33-227``).
+
+    Returns ``(image_bytes, format)``, or ``None`` when the bytes are not a
+    decodable image (Perl dies on those, ``:99-101``/``:406-435``).  ``fmt`` is
+    the format explicitly requested by the spec's extension (``:82``,
+    ``:124-131``); ``""`` = derive it from the source (jpg stays jpg,
+    everything else becomes PNG).
+
+    Mode dispatch is Perl's letter for letter — every branch was read off the
+    live server (read-only, 2026-09-19, 160x85 logo through ``/imageproxy``)::
+
+        spec      branch                 live result
+        --------  ---------------------  -------------------------------------
+        40x40_m   :140-171  mode m/p      40x40 PNG, content 40x21, black border
+        40x40_p   :140-171  mode m/p      40x40 PNG (identical to _m)
+        40x40     :108-111  default 'm'   40x40 PNG (identical to _m)
+        40x40_c   :196-211  else (width)  40x21 JPEG — **no** padding, no crop
+        40x40_f   :196-211  else (width)  40x21 JPEG — no padding
+        40x40_o   :196-211  else (width)  40x21 JPEG — no padding
+        40x40_F   :174-194  mode F        40x40 JPEG — padded, but *no* PNG
+
+    The padded result being PNG is GDResizer's "Bug 17140" rule (``:141-149``):
+    as soon as the fitted image needs padding the output switches to PNG.  Live
+    9.1.1 applies it even when the spec asked for ``.jpg`` (``40x40_m.jpg``,
+    ``40x40_m.png``, ``40x40.jpg`` and bare ``40x40`` all answer ``image/png``
+    for a non-square logo, while a square one answers ``image/jpeg``) — the
+    reference copy's ``!$explicit_format`` guard at ``:143`` is therefore *not*
+    what the running server does, so this follows the live behaviour.
+    """
     try:
         import io as _io
 
         from PIL import Image
     except Exception:  # pragma: no cover - Pillow is a project dependency
-        return data
+        return None
+
+    def _dim(value: str | int | None) -> int | None:
+        # GDResizer.pm:87-89 — "$width = undef if $width eq 'X'"
+        if value is None:
+            return None
+        text = str(value).strip()
+        if not text or text.upper() == "X":
+            return None
+        try:
+            return int(text)
+        except ValueError:
+            return None          # :99-101 invalid params → original
+
     try:
         with Image.open(_io.BytesIO(data)) as im:
-            if im.width <= size[0] and im.height <= size[1]:
-                return data
-            im = im.convert("RGB")
-            resample = getattr(
-                getattr(Image, "Resampling", Image), "LANCZOS", None
-            ) or getattr(Image, "LANCZOS", 1)
-            im.thumbnail(size, resample)
+            in_w, in_h = im.size
+            if not in_w or not in_h:
+                return None
+            src_fmt = {"JPEG": "jpg", "PNG": "png"}.get(
+                (im.format or "").upper(), "png")
+            want = (fmt or "").split("/")[-1].lower()
+            explicit = "jpg" if want in ("jpg", "jpeg") else want
+            # :124-131 — output format: requested, else jpg only for jpg input
+            out_fmt = explicit or ("jpg" if src_fmt == "jpg" else "png")
+
+            rw, rh = _dim(req_w), _dim(req_h)
+            if not rw and not rh:
+                # :92-96 — no size requested: original bytes, source format
+                return data, (explicit or src_fmt)
+            if not rw or not rh:
+                # Only one dimension in the spec (``40xX_m``): Image::Scale
+                # gets the other one as undef (``GDResizer.pm:24`` "one of
+                # width or height is required") and derives it from the
+                # aspect — derive it here so the box maths sees a real box.
+                if rw and not rh:
+                    rh = max(1, int(round(rw * in_h / in_w)))
+                elif rh and not rw:
+                    rw = max(1, int(round(rh * in_w / in_h)))
+
+            # :108-111 — "default mode is always max"
+            md = (mode or "m")
+
+            if md in ("m", "p", "F"):
+                if md == "F":
+                    # :174-194 — requested ≥ original: resize to original
+                    box_w, box_h = ((in_w, in_h)
+                                    if rw and rh and rw >= in_w and rh >= in_h
+                                    else (rw or in_w, rh or in_h))
+                else:
+                    # :152-162 — don't upscale, pull the box back to the
+                    # original's long edge (see _gd_effective_box)
+                    box_w, box_h = gd_effective_box(
+                        in_w, in_h, rw or in_w, rh or in_h)
+                cw, ch = _fit_content_size(in_w, in_h, box_w, box_h)
+                padded = (cw, ch) != (box_w, box_h)
+                if padded and md != "F":
+                    out_fmt = "png"          # Bug 17140, :141-149
+                if not padded and (cw, ch) == (in_w, in_h):
+                    # Nothing to do: hand back the input bytes instead of
+                    # re-encoding (Perl would re-encode, but this port's
+                    # contract — tests/test_cover_urls.py::
+                    # test_resize_leaves_small_images_untouched — is to leave
+                    # an image that already *is* the box alone, and the label
+                    # always matches the bytes returned).
+                    return data, src_fmt
+                out_im = fit_and_pad(im, box_w, box_h)
+            else:
+                # :196-211 — mode 'o' (and any letter Perl does not know,
+                # incl. the lowercase 'c'/'f' the clients send): width only
+                width = rw or in_w
+                if rw and rh and rw > in_w and rh > in_h:
+                    if in_h / in_w > 1:
+                        width = max(1, int(round(rw * (in_h / rh))))
+                    else:
+                        width = in_w
+                height = max(1, int(round(in_h * (width / in_w))))
+                out_im = im.convert("RGB")
+                if (width, height) != (in_w, in_h):
+                    resample = getattr(
+                        getattr(Image, "Resampling", Image), "LANCZOS", None
+                    ) or getattr(Image, "LANCZOS", 1)
+                    out_im = out_im.resize((width, height), resample)
+
             out = _io.BytesIO()
-            im.save(out, format="JPEG", quality=85)
-            return out.getvalue()
-    except Exception:  # noqa: BLE001 - never break artwork on a bad file
+            if out_fmt == "jpg":
+                out_im.convert("RGB").save(out, format="JPEG", quality=85)
+            else:
+                out_fmt = "png"
+                out_im.convert("RGBA").save(out, format="PNG")
+            return out.getvalue(), out_fmt
+    except Exception:  # noqa: BLE001 - a bad image must never break the route
+        return None
+
+
+def _fit_content_size(in_w: int, in_h: int, box_w: int, box_h: int) -> tuple[int, int]:
+    """Size of the scaled image inside ``box`` — ``Image::Scale`` keep_aspect."""
+    if box_w <= 0 or box_h <= 0 or not in_w or not in_h:
+        return in_w, in_h
+    scale = min(box_w / in_w, box_h / in_h)
+    return (max(1, min(box_w, int(round(in_w * scale)))),
+            max(1, min(box_h, int(round(in_h * scale)))))
+
+
+def _resize_cover(
+    data: bytes,
+    size: tuple[int, int],
+    mode: str = "m",
+) -> bytes:
+    """Resize a cover into ``size`` exactly like Perl's ``mode 'm'``.
+
+    The box is padded with opaque black and the content is centred
+    (``Slim/Utils/GDResizer.pm:166-171`` — ``keep_aspect => 1`` plus
+    ``bgcolor => hex(undef)``), and a request bigger than the source is pulled
+    back to the source's long edge first (``:152-162``).  A non-square cover
+    therefore comes back as exactly the requested box — before this it came
+    back at the fitted size (160x85 at ``40x40_m`` → 40x21 instead of 40x40).
+
+    Returns the original bytes when there is nothing to resize (no Pillow, no
+    size, or the image already *is* the box) and on any error.
+    """
+    res = _gdresize(data, size[0], size[1], mode=mode)
+    if res is None:
         return data
+    out, _fmt = res
+    return out
+
+
+def _resize_cover_typed(
+    data: bytes,
+    size: tuple[int, int],
+    mode: str = "m",
+    fmt: str = "",
+) -> tuple[bytes, str]:
+    """``_resize_cover`` plus the content type Perl would send with it.
+
+    A padded answer is a PNG (``GDResizer.pm:141-149``, live 9.1.1), an
+    unpadded one keeps the requested/derived format — the album-cover route
+    must not label a padded PNG as JPEG.
+    """
+    res = _gdresize(data, size[0], size[1], mode=mode, fmt=fmt)
+    if res is None:
+        return data, "image/jpeg"
+    out, out_fmt = res
+    return out, "image/jpeg" if out_fmt == "jpg" else f"image/{out_fmt}"
 
 
 #: Wurzel der ausgelieferten html/-Dateien (setzt create_app); enthaelt den
@@ -918,72 +1109,17 @@ def _imageproxy_resize(data: bytes, spec: str, source_format: str,
                        use_spec_ext: bool = True) -> tuple[bytes, str] | None:
     """Perl ``Slim::Utils::ImageResizer``/``GDResizer::resize``.
 
-    ``ImageResizer.pm`` hands the spec to ``GDResizer`` (``GDResizer.pm:33-250``):
-    ``$mode`` defaults to ``'m'`` (:108-111, "default mode is always max"),
-    ``'m'``/``'p'`` keep the aspect ratio and never upscale (:140-171), the
-    output format is the requested extension and falls back to the source
-    format (:124-131) — except "Bug 17140" (:142-149) which switches to PNG
-    whenever the result would be padded.  ``_artworkError`` passes no format
-    (``use_spec_ext=False``), so the placeholder keeps the source format.
+    ``ImageResizer.pm:142-169`` hands the spec straight to ``GDResizer``, so
+    the whole rule set is :func:`_gdresize` — including the padding Perl adds
+    for a non-square logo: live 9.1.1 answers
+    ``/imageproxy/<160x85 logo>/40x40_m.jpg`` with **40x40 image/png**, content
+    40x21 centred on opaque black, where we used to answer a 40x21 JPEG.
+    ``_artworkError`` passes no format (``use_spec_ext=False``), so the
+    placeholder keeps the source format (``GDResizer.pm:124-131``).
     """
     width, height, mode, _bg, ext = _imageproxy_parse_spec(spec)
-    want = (ext if use_spec_ext else "") or source_format or ""
-    want = want.split("/")[-1].lower()
-    fmt = "jpg" if want in ("jpg", "jpeg") else (want or "png")
-    try:
-        import io as _io
-
-        from PIL import Image
-    except Exception:  # pragma: no cover - Pillow is a project dependency
-        return None
-    try:
-        with Image.open(_io.BytesIO(data)) as im:
-            ow, oh = im.size
-            if not ow or not oh:
-                return None
-            # ``$width = undef if $width eq 'X'`` (:87-89)
-            req_w = None if (not width or width == "X") else int(width)
-            req_h = None if (not height or height == "X") else int(height)
-            if req_w and not req_h:
-                req_h = max(1, int(round(req_w * oh / ow)))
-            elif req_h and not req_w:
-                req_w = max(1, int(round(req_h * ow / oh)))
-            if not req_w and not req_h:
-                return None
-            box_w = int(req_w or ow)
-            box_h = int(req_h or oh)
-            resample = getattr(
-                getattr(Image, "Resampling", Image), "LANCZOS", None
-            ) or getattr(Image, "LANCZOS", 1)
-            out_im = im.copy()
-            if str(mode).lower() in ("c", "f") or (str(mode) == "F"
-                                                   and (box_w < ow or box_h < oh)):
-                # crop/fill to the exact box (Image::Scale keep_aspect => 0)
-                scale = max(box_w / ow, box_h / oh)
-                box = (max(1, int(round(ow * scale))),
-                       max(1, int(round(oh * scale))))
-                out_im = out_im.resize(box, resample)
-                left = (box[0] - box_w) // 2
-                top = (box[1] - box_h) // 2
-                out_im = out_im.crop((left, top, left + box_w, top + box_h))
-            else:
-                # mode 'm' (default) / 'p': fit, never upscale (:151-161)
-                out_im.thumbnail((box_w, box_h), resample)
-                # Bug 17140 (:140-149): a padded result must be PNG
-                if fmt != "png":
-                    if (oh / ow) != (box_h / box_w):
-                        fmt = "png"
-            out = _io.BytesIO()
-            if fmt == "jpg":
-                out_im.convert("RGB").save(out, format="JPEG", quality=85)
-            elif fmt == "gif":
-                out_im.convert("RGB").save(out, format="GIF")
-            else:
-                fmt = "png"
-                out_im.convert("RGBA").save(out, format="PNG")
-            return out.getvalue(), fmt
-    except Exception:  # noqa: BLE001 - a bad image must never break the route
-        return None
+    return _gdresize(data, width, height, mode=mode,
+                     fmt=(ext if use_spec_ext else ""))
 
 
 def _imageproxy_placeholder_path() -> Path | None:
@@ -1214,7 +1350,8 @@ def _static_root() -> Path | None:
     return None
 
 
-def _placeholder_cover(size: tuple[int, int] | None = None) -> tuple[bytes, str] | None:
+def _placeholder_cover(size: tuple[int, int] | None = None, *,
+                       mode: str = "m") -> tuple[bytes, str] | None:
     """Perl's generic cover — ``html/images/cover.png``.
 
     Perl reports this image wherever a track/album has no artwork
@@ -1238,10 +1375,17 @@ def _placeholder_cover(size: tuple[int, int] | None = None) -> tuple[bytes, str]
     except OSError:
         return None
     if size is not None:
-        # The sized form is re-encoded as JPEG, matching Perl's answer for
-        # /music/current/cover_40x40_m.jpg (live: 200 image/jpeg).
-        data = _resize_cover(data, size)
-        return data, "image/jpeg"
+        # The sized form is the *skin* image: Perl rewrites the spec's
+        # extension to ``.png`` for this branch (``Slim/Web/Graphics.pm:286-287``
+        # — "our default artwork are PNG files": ``$path = 'html/images/cover_'
+        # . $spec`` / ``$spec =~ s/\.\w+$/.png/``) and serves the resized skin
+        # file.  Live 9.1.1, read-only 2026-09-19:
+        #   /music/2/cover_40x40_m    -> 200 image/png 1619 B 40x40
+        #   /music/2/cover_40x40_m.jpg-> 200 image/png 1619 B 40x40
+        # (the older note here claiming image/jpeg does not reproduce), and the
+        # padding rule still applies to a non-square default.
+        data, mime = _resize_cover_typed(data, size, mode=mode, fmt="png")
+        return data, mime
     return data, "image/png"      # unsized: Perl serves cover.png as-is
 
 
@@ -1288,11 +1432,12 @@ def _remote_cover(size: tuple[int, int] | None = None) -> tuple[bytes, str] | No
     return data, "image/png"
 
 
-async def _send_remote_cover(send, size: tuple[int, int] | None = None) -> None:
+async def _send_remote_cover(send, size: tuple[int, int] | None = None,
+                             mode: str = "m") -> None:
     """Answer a remote track's cover with Perl's default (else the generic one)."""
     res = _remote_cover(size)
     if res is None:
-        await _send_placeholder_cover(send, size)
+        await _send_placeholder_cover(send, size, mode)
         return
     data, mime = res
     await send({
@@ -1307,9 +1452,10 @@ async def _send_remote_cover(send, size: tuple[int, int] | None = None) -> None:
     await send({"type": "http.response.body", "body": data})
 
 
-async def _send_placeholder_cover(send, size: tuple[int, int] | None = None) -> None:
+async def _send_placeholder_cover(send, size: tuple[int, int] | None = None,
+                                  mode: str = "m") -> None:
     """Send the generic cover (200) — or 404 if even it is missing."""
-    res = _placeholder_cover(size)
+    res = _placeholder_cover(size, mode=mode)
     if res is None:
         await send({
             "type": "http.response.start",
@@ -1385,7 +1531,8 @@ def _album_id_for_track(track_id: int) -> int | None:
         return None
 
 
-async def _serve_album_cover(album_id: int, send, size: tuple[int, int] | None = None) -> None:
+async def _serve_album_cover(album_id: int, send, size: tuple[int, int] | None = None,
+                             mode: str = "m", fmt: str = "") -> None:
     """Serve the cover image stored in Album.artwork for /music/<id>/cover.
 
     Reads the image file in a thread (SMB reads block) and streams it with
@@ -1400,7 +1547,9 @@ async def _serve_album_cover(album_id: int, send, size: tuple[int, int] | None =
     """
     import asyncio as _asyncio
 
-    cache_key = (album_id, size)
+    # mode/format belong into the key: ``cover_40x40_m`` (padded) and
+    # ``cover_40x40_o`` (width only) are different pictures.
+    cache_key = (album_id, size, mode, fmt)
     cached = _cover_cache_get(cache_key)
     if cached is not None:
         data, mime = cached
@@ -1411,10 +1560,9 @@ async def _serve_album_cover(album_id: int, send, size: tuple[int, int] | None =
         except Exception:
             data, mime = None, None
         if data and size is not None:
-            data = await _asyncio.get_running_loop().run_in_executor(
-                None, _resize_cover, data, size
+            data, mime = await _asyncio.get_running_loop().run_in_executor(
+                None, _resize_cover_typed, data, size, mode, fmt
             )
-            mime = "image/jpeg"
         if data:
             _cover_cache_put(cache_key, data, mime)
     if not data:
@@ -1424,14 +1572,14 @@ async def _serve_album_cover(album_id: int, send, size: tuple[int, int] | None =
         # ``Slim/Music/Artwork.pm:387-400``); der Auslieferungspfad liest nur
         # Platte und ``artwork_online_cache`` (``media/art_online.py``
         # ``read_cached_album``) — nie wird hier gesucht.
-        data, mime = await _online_cover_for_album(album_id, size)
+        data, mime = await _online_cover_for_album(album_id, size, mode, fmt)
         if data:
             _cover_cache_put(cache_key, data, mime)
     if not data:
         # Perl answers the generic cover with 200 here (live: /music/2/cover.jpg
         # -> 200 image/png 13113 B), not a 404 — Material Skin relies on it to
         # switch away from the previous album's cover.
-        await _send_placeholder_cover(send, size)
+        await _send_placeholder_cover(send, size, mode)
         return
     await send({
         "type": "http.response.start",
@@ -1446,7 +1594,9 @@ async def _serve_album_cover(album_id: int, send, size: tuple[int, int] | None =
 
 
 async def _online_cover_for_album(album_id: int,
-                                  size: tuple[int, int] | None) -> tuple[bytes | None, str | None]:
+                                  size: tuple[int, int] | None,
+                                  mode: str = "m",
+                                  fmt: str = "") -> tuple[bytes | None, str | None]:
     """Gecachtes Online-Cover dieses Albums lesen (nur Platte/DB, kein Netz).
 
     Ermittelt zur Album-Zeile die passende Anfrage (Titel + Album-Interpret +
@@ -1510,9 +1660,9 @@ async def _online_cover_for_album(album_id: int,
     if not data:
         return None, None
     if size is not None:
-        resized = _resize_cover(data, size)
+        resized, resized_mime = _resize_cover_typed(data, size, mode=mode, fmt=fmt)
         if resized:
-            return resized, "image/jpeg"
+            return resized, resized_mime
     return data, mime
 
 
@@ -1596,28 +1746,30 @@ def create_app(
 
         # Album cover art (LMS convention): /music/<album_id>/cover.jpg and
         # the size-encoded form Jive asks for from its artworkspec
-        # (/music/<album_id>/cover_40x40_m.jpg).
+        # (/music/<album_id>/cover_40x40_m.jpg — the trailing letter is the
+        # GDResizer mode, see _parse_cover_spec).
         if path.startswith("/music/") and method == "GET":
-            parsed = _parse_cover_path(path)
+            parsed = _parse_cover_spec(path)
             if parsed is not None:
-                cover_id, cover_size = parsed
+                cover_id, cover_size, cover_mode, cover_fmt = parsed
                 if cover_id == "current":
                     # /music/current/cover.jpg?player=<mac> — cover of the
                     # current track, else the generic image (Perl Graphics.pm
                     # :155-172 plus the /html/images/cover.png fallback).
                     cover_id = _current_album_id(scope)
                     if cover_id is None:
-                        await _send_placeholder_cover(send, cover_size)
+                        await _send_placeholder_cover(send, cover_size, cover_mode)
                         return
                 if isinstance(cover_id, int) and cover_id < 0:
                     # A *negative* id is a remote track (Slim/Schema/
                     # RemoteTrack.pm:317) — Perl answers the skin's
                     # ``html/images/radio.png`` for its cover, whatever the
                     # stream carries (see _remote_cover, live-verified).
-                    await _send_remote_cover(send, cover_size)
+                    await _send_remote_cover(send, cover_size, cover_mode)
                     return
                 if isinstance(cover_id, int):
-                    await _serve_album_cover(cover_id, send, cover_size)
+                    await _serve_album_cover(
+                        cover_id, send, cover_size, cover_mode, cover_fmt)
                 return
 
         # Perl's ImageProxy (deviation D5): /imageproxy/<uri-escaped url>/<spec>.
