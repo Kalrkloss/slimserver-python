@@ -43,6 +43,203 @@ COVER_NAMES: list[str] = [
 JPEG_QUALITY = 85
 
 
+# ---------------------------------------------------------------------------
+# Eingebettetes Tag-Bild (Perl ``_readCoverArtTags``)
+# ---------------------------------------------------------------------------
+
+#: Unterordner des Server-Caches, in den ein Tag-Bild materialisiert wird.
+#: Perl hält seinen Artwork-Cache bei den Bibliotheksdaten
+#: (``Slim/Utils/ArtworkCache.pm:44-47``: ``librarycachedir``); hier ist das
+#: ``<serverdata>/cache/artwork/embedded``.
+EMBEDDED_ARTWORK_SUBDIR: tuple[str, ...] = ("artwork", "embedded")
+
+#: Magic Bytes → Dateiendung.  Die Endung bestimmt den Content-Type der
+#: Auslieferung (``web/app.py`` ``_MIME_BY_EXT``); Perl erkennt den Typ ebenso
+#: an den Magic Bytes (``Slim/Music/Artwork.pm:437-478`` ``_imageContentType``,
+#: ``:381-385`` ``_readCoverArtImage`` gibt ``($content, $contentType)``).
+_IMAGE_EXTENSIONS: tuple[tuple[bytes, str], ...] = (
+    (b"\xff\xd8\xff", ".jpg"),
+    (b"\x89PNG\r\n\x1a\n", ".png"),
+    (b"GIF87a", ".gif"),
+    (b"GIF89a", ".gif"),
+)
+
+
+def image_extension(data: bytes) -> str:
+    """Dateiendung aus den Magic Bytes (Fallback ``.jpg``).
+
+    Ein unbekanntes Format wird nicht verworfen: Perl gibt die Tag-Bytes
+    unverändert zurück (``Slim/Formats/MP3.pm:177-180``), und der
+    Auslieferungspfad nimmt bei unbekannter Endung ``image/jpeg`` an
+    (``web/app.py`` ``_MIME_BY_EXT``).
+    """
+    if not data:
+        return ".jpg"
+    for magic, ext in _IMAGE_EXTENSIONS:
+        if data.startswith(magic):
+            return ext
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return ".webp"
+    return ".jpg"
+
+
+def default_embedded_artwork_dir() -> Path:
+    """Wohin materialisierte Tag-Bilder geschrieben werden.
+
+    ``<serverdata>/cache/artwork/embedded`` (Perl: Artwork-Cache bei den
+    Bibliotheksdaten, ``Slim/Utils/ArtworkCache.pm:44-47``); ohne initialisierte
+    Konfiguration (Einzelskript, Tests) ``~/.lyrion/cache/artwork/embedded``.
+    """
+    try:
+        from lyrion.config import get_config
+
+        return Path(get_config().cache_dir).joinpath(*EMBEDDED_ARTWORK_SUBDIR)
+    except Exception:  # noqa: BLE001 - Start ohne Config ist erlaubt
+        return Path.home() / ".lyrion" / "cache" / "artwork" / "embedded"
+
+
+def _picture_data(picture: Any) -> bytes | None:
+    """Bilddaten eines mutagen-Bildobjekts (``Picture.data``) bzw. eines Dicts."""
+    if picture is None:
+        return None
+    data = getattr(picture, "data", None)
+    if data is None and isinstance(picture, dict):
+        data = picture.get("data")
+    if data is None:
+        return None
+    if isinstance(data, str):  # notfalls latin-1-Rohbytes
+        data = data.encode("latin-1", "replace")
+    try:
+        return bytes(data)
+    except (TypeError, ValueError):
+        return None
+
+
+def embedded_picture_bytes(audio_file: Any, tags: Any = None) -> bytes | None:
+    """Erstes eingebettetes Bild eines **geöffneten** mutagen-Objekts.
+
+    Perl ``Slim/Music/Artwork.pm:495-505`` (``_readCoverArtTags``) ruft dafür
+    ``getCoverArt`` der Formatsklasse auf; ``Slim/Formats/MP3.pm:159-181``
+    liest das ID3-``APIC`` und nimmt bei mehreren Bildern das mit dem
+    **kleinsten** ``image_type``.  Reihenfolge wie
+    :meth:`ArtworkHandler._extract_embedded_bytes`: FLAC/OGG ``pictures`` →
+    ID3 ``APIC`` → MP4 ``covr`` → die übrigen Bild-Tags (Vorbis
+    ``METADATA_BLOCK_PICTURE``, APE ``Cover Art (Front)``, ASF ``WM/Picture``).
+    Nimmt ein Format sein Bild nicht über diese Felder heraus, bleibt es bei
+    ``None`` — die *Tatsache* eines Tag-Bildes erkennt weiterhin
+    ``scanner._has_embedded_artwork``, die Online-Suche bleibt also aus.
+    """
+    if tags is None:
+        tags = getattr(audio_file, "tags", None)
+    try:
+        for container in (audio_file, tags):
+            if container is None:
+                continue
+            pictures = getattr(container, "pictures", None)
+            if pictures:
+                data = _picture_data(pictures[0])
+                if data:
+                    return data
+
+        if tags is None:
+            return None
+
+        getall = getattr(tags, "getall", None)          # ID3 kann mehrere APIC führen
+        if callable(getall):
+            found: Any = getall("APIC")
+            frames: list[Any] = list(found) if found else []
+            if frames:
+                # Perl ``Slim/Formats/MP3.pm:174-176``: bei mehreren Bildern das
+                # mit dem kleinsten ``image_type``.
+                frames.sort(key=lambda f: int(getattr(f, "type", 0) or 0))
+                data = _picture_data(frames[0])
+                if data:
+                    return data
+
+        apic = tags.get("APIC")
+        if apic:
+            data = _picture_data(apic[0] if isinstance(apic, (list, tuple)) else apic)
+            if data:
+                return data
+
+        covr = tags.get("covr")                          # MP4/M4A
+        if covr:
+            data = _picture_data(covr[0] if isinstance(covr, (list, tuple)) else covr)
+            if data:
+                return data
+
+        for key in ("metadata_block_picture", "METADATA_BLOCK_PICTURE",
+                    "Cover Art (Front)", "cover art (front)", "WM/Picture"):
+            sidecar = tags.get(key)
+            if not sidecar:
+                continue
+            data = _picture_data(sidecar[0] if isinstance(sidecar, (list, tuple))
+                                 else sidecar)
+            if data:
+                return data
+    except Exception:  # noqa: BLE001 - ein kaputter Tag-Container ist kein Fehler
+        logger.debug("Tag-Bild nicht lesbar aus %s", audio_file)
+    return None
+
+
+def write_embedded_artwork(data: bytes, cache_dir: Path | None = None) -> Path | None:
+    """Tag-Bild als Datei im Artwork-Cache ablegen — Pfad zurück.
+
+    Der Dateiname ist der Inhalts-Hash (``<sha1[:20]><endung>``): dasselbe Bild
+    wird nie doppelt geschrieben, und ein erneuter Scan findet dieselbe Datei
+    wieder — Perls ``generateImageId`` bildet den Cover-Schlüssel ebenfalls aus
+    dem Bild (``Slim/Music/Artwork.pm:404-440``, ``Slim/Schema.pm:1819-1826``)
+    und der Cache liegt dauerhaft auf Platte (``Slim/Utils/ArtworkCache.pm:44-66``).
+    Geschrieben wird atomar (``.part`` → ``replace``), damit ein abgebrochener
+    Scan keine halbe Bilddatei hinterlässt.  ``None`` = keine Bilddaten.
+    """
+    if not data:
+        return None
+    directory = Path(cache_dir) if cache_dir is not None else default_embedded_artwork_dir()
+    directory.mkdir(parents=True, exist_ok=True)
+    target = directory / f"{hashlib.sha1(data).hexdigest()[:20]}{image_extension(data)}"
+    if not target.is_file() or target.stat().st_size != len(data):
+        tmp = target.with_suffix(target.suffix + ".part")
+        tmp.write_bytes(data)
+        tmp.replace(target)
+    return target
+
+
+async def materialize_embedded_artwork(
+    track_path: Path,
+    cache_dir: Path | None = None,
+) -> Path | None:
+    """Tag-Bild einer Datei materialisieren (eigener mutagen-Lauf).
+
+    Für Aufrufer ohne bereits geöffnetes mutagen-Objekt.  Der Scanner nutzt
+    :func:`embedded_picture_bytes` + :func:`write_embedded_artwork` auf dem schon
+    geöffneten Objekt und spart sich den zweiten Parse.
+    """
+    loop = asyncio.get_running_loop()
+
+    def _work() -> Path | None:
+        from mutagen import File as MutagenFile
+
+        try:
+            audio = MutagenFile(str(track_path))
+        except Exception:  # noqa: BLE001
+            logger.debug("Tag-Bild: %s nicht lesbar", track_path)
+            return None
+        if audio is None:
+            return None
+        try:
+            data = embedded_picture_bytes(audio)
+        finally:
+            try:
+                audio.close()
+            except Exception:  # noqa: BLE001
+                pass
+        return write_embedded_artwork(data, cache_dir) if data else None
+
+    return await loop.run_in_executor(None, _work)
+
+
+
 @dataclass
 class ArtworkResult:
     """Result of an artwork lookup for a single track or album."""
@@ -226,15 +423,16 @@ class ArtworkHandler:
         """Discover artwork for a track: embedded first, then folder."""
         folder = track_path.parent
 
-        # 1. Try embedded
+        # 1. Try embedded (Perl ``_readCoverArtTags``, ``Slim/Music/Artwork.pm:480-516``).
         embedded_bytes = await self._extract_embedded_bytes(track_path)
         if embedded_bytes:
-            source = self.artwork_cache_dir / f"{track_path.stem}_embedded.jpg"
-            with open(source, "wb") as f:
-                f.write(embedded_bytes)
-            return await self._process_and_cache(source, source="embedded")
+            loop = asyncio.get_running_loop()
+            source = await loop.run_in_executor(
+                None, write_embedded_artwork, embedded_bytes, self.artwork_cache_dir)
+            if source is not None:
+                return await self._process_and_cache(source, source_name="embedded")
 
-        # 2. Try folder scan
+        # 2. Try folder scan (Perl ``_readCoverArtFiles``, ``:517-637``).
         cover_path = await self.scan_folder(folder)
         if cover_path:
             return await self._process_and_cache(cover_path, source="folder")

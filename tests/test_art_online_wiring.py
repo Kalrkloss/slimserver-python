@@ -142,19 +142,75 @@ def test_perl_uppercase_name_is_found(scanner_env, monkeypatch):
     assert stub.requests == []
 
 
-def test_embedded_tag_image_blocks_the_online_search(scanner_env, monkeypatch):
-    """Tag-Bild zuerst (Perl ``_readCoverArtTags``, :480-516)."""
+def test_embedded_tag_image_blocks_the_online_search(scanner_env, monkeypatch, tmp_path):
+    """Tag-Bild zuerst (Perl ``_readCoverArtTags``, :480-516).
+
+    Perls Reihenfolge ist **nicht** „Ordnerbild zuerst": ``Slim/Schema.pm:
+    1799-1813`` nimmt ``findStandaloneArtwork`` nur, wenn die Tags kein Bild
+    lieferten (``Audio::Scan`` liefert ``COVER``/``COVER_LENGTH``), und
+    ``albums.artwork`` hängt am Cover des Tracks (:1376-1381).  Das Tag-Bild
+    wird deshalb zu einer Datei materialisiert
+    (``artwork.write_embedded_artwork``) — nur dann kann die Cover-URL es
+    ausliefern (``web/app.py`` liest ``Album.artwork`` als Pfad).
+    """
     music, audio, patch = scanner_env
+    cover_bytes = jpeg_bytes(300)
     patch({"TIT2": "Song", "TPE1": "Bonfire", "TALB": "Point Blank"},
-          pictures=[{"type": 3, "data": jpeg_bytes(300)}])   # FLAC-/Vorbis-Bild
+          pictures=[{"type": 3, "data": cover_bytes}])   # FLAC-/Vorbis-Bild
 
     stub = _RecordingService()
     monkeypatch.setattr(art_online, "_service", stub)
-    result = _run(MediaScanner(config=ScanConfig(base_path=music)).scan_single_file(audio))
+    cache_dir = tmp_path / "artcache"
+    result = _run(MediaScanner(config=ScanConfig(
+        base_path=music, artwork_cache_dir=cache_dir)).scan_single_file(audio))
 
     assert result is not None and result.has_embedded_artwork is True
-    assert result.artwork_path is None
     assert stub.requests == [], "Tag-Bild vorhanden — keine Online-Suche"
+    assert result.artwork_path is not None, "Tag-Bild muss materialisiert werden"
+    assert result.artwork_path.parent == cache_dir
+    assert result.artwork_path.suffix == ".jpg"
+    assert result.artwork_path.read_bytes() == cover_bytes, "echte Bildbytes"
+    with Image.open(result.artwork_path) as img:      # echtes Bild, lesbar
+        assert (img.width, img.height) == (300, 300)
+
+
+def test_tag_image_wins_over_the_folder_image(scanner_env, monkeypatch, tmp_path):
+    """Perl ``Schema.pm:1799-1813``: Ordnerbild nur ohne Tag-Bild."""
+    music, audio, patch = scanner_env
+    tag_bytes = jpeg_bytes(300)
+    patch({"TIT2": "Song", "TPE1": "Bonfire", "TALB": "Point Blank"},
+          pictures=[{"type": 3, "data": tag_bytes}])
+    (music / "cover.jpg").write_bytes(jpeg_bytes(120))
+
+    stub = _RecordingService()
+    monkeypatch.setattr(art_online, "_service", stub)
+    result = _run(MediaScanner(config=ScanConfig(
+        base_path=music, artwork_cache_dir=tmp_path / "artcache")).scan_single_file(audio))
+
+    assert result is not None
+    assert result.artwork_path is not None
+    assert result.artwork_path.read_bytes() == tag_bytes
+    assert result.artwork_path.parent != music
+    assert stub.requests == []
+
+
+def test_same_tag_image_is_not_rewritten(scanner_env, monkeypatch, tmp_path):
+    """Inhalts-Hash als Dateiname: zwei Scans finden dieselbe Datei wieder."""
+    music, audio, patch = scanner_env
+    patch({"TIT2": "Song", "TPE1": "Bonfire", "TALB": "Point Blank"},
+          pictures=[{"type": 3, "data": jpeg_bytes(300)}])
+    config = ScanConfig(base_path=music, artwork_cache_dir=tmp_path / "artcache")
+    scanner = MediaScanner(config=config)
+
+    first = _run(scanner.scan_single_file(audio))
+    assert first is not None and first.artwork_path is not None
+    stamp = first.artwork_path.stat().st_mtime_ns
+    second = _run(scanner.scan_single_file(audio))
+
+    assert second is not None and second.artwork_path is not None
+    assert first.artwork_path == second.artwork_path
+    assert len(list(first.artwork_path.parent.iterdir())) == 1
+    assert second.artwork_path.stat().st_mtime_ns == stamp, "nicht neu geschrieben"
 
 
 def test_no_image_anywhere_starts_the_lookup_with_album_artist(scanner_env, monkeypatch):
@@ -392,6 +448,223 @@ def test_cover_route_without_cache_returns_nothing(tmp_path, monkeypatch):
     assert missing == (None, None)
     # Kein einziger HTTP-Aufruf im Auslieferungspfad.
     assert service.fetcher.urls == []
+
+
+# ---------------------------------------------------------------------------
+# 3b. Album-Zeile ↔ Treffer: ``albums.artwork`` aus dem Online-Cover
+# ---------------------------------------------------------------------------
+
+
+def _empty_album_cover_cache(tmp_path):
+    """Dienst mit leerem Plattencache (keine Netzanfrage in diesen Tests)."""
+    service = ArtOnlineService(ArtOnlineSettings(cache_dir=tmp_path / "online"))
+    service.fetcher = _RecordingFetcher()
+    return service
+
+
+def test_album_row_takes_the_new_online_cover(tmp_path, monkeypatch):
+    """``store_online_cover`` schreibt ``albums.artwork`` (Perl ``Schema.pm:1376-1381``).
+
+    Perl hängt das Album-Cover an den Cover-Schlüssel des Tracks
+    (``$albumHash->{artwork} = $trackColumns->{coverid}``) und trägt ihn nach,
+    sobald ein Track ein Bild bekommt
+    (``Slim/Utils/Scanner/Local.pm:1086-1091``).  Hier ist der ``on_cover``-
+    Rückruf des Dienstes die Stelle (``media/art_online.py:1244``).
+    """
+    from lyrion.media.importer import store_online_cover
+    from lyrion.media.art_online import AlbumQuery, CoverResult
+
+    service = _empty_album_cover_cache(tmp_path)
+    query = AlbumQuery(album="Point Blank", artist="Bonfire", year=1989)
+    written = service.cache.write_cover_sync(
+        query.key(), query, jpeg_bytes(500), provider="coverartarchive",
+        mime="image/jpeg", source_url="https://coverartarchive.org/x",
+        mbid="e104643d", width=500, height=500)
+    cover = CoverResult(path=written, provider="coverartarchive",
+                        mime="image/jpeg", width=500, height=500)
+    folder_cover = str(tmp_path / "cover.jpg")
+
+    async def run():
+        await init_db(tmp_path / "lyrion.db")
+        try:
+            async with db_session() as session:
+                session.add_all([
+                    Album(titlesort="point blank", title="Point Blank",
+                          albumartist_sort="bonfire", year=1989, artwork=None),
+                    # gleicher Titel, gleiches Jahr, anderer Album-Interpret
+                    Album(titlesort="point blank", title="Point Blank",
+                          albumartist_sort="jemand anderes", year=1989,
+                          artwork=None),
+                    # anderer Titel
+                    Album(titlesort="anderes album", title="Anderes Album",
+                          albumartist_sort="bonfire", year=1989, artwork=None),
+                    # hat schon ein Ordnerbild → darf nicht überschrieben werden
+                    Album(titlesort="cover album", title="Cover Album",
+                          albumartist_sort="bonfire", year=1989,
+                          artwork=folder_cover),
+                ])
+                await session.commit()
+
+            set_rows = await store_online_cover(query, cover)
+
+            async with db_session() as session:
+                rows = {(str(a.titlesort), str(a.albumartist_sort)): a.artwork
+                        for a in (await session.execute(select(Album))).scalars()}
+            return set_rows, rows
+
+        finally:
+            await close_db()
+
+    set_rows, rows = _run(run())
+    assert set_rows == 1, f"nur die passende Album-Zeile, war {set_rows} ({rows})"
+    assert rows[("point blank", "bonfire")] == str(written), \
+        "Titel+Artist+Jahr → Cover"
+    assert rows[("point blank", "jemand anderes")] is None, \
+        "gleicher Titel, anderer Album-Interpret bleibt ohne Cover"
+    assert rows[("anderes album", "bonfire")] is None, "anderer Titel bleibt ohne Cover"
+    assert rows[("cover album", "bonfire")] == folder_cover, \
+        "Album mit Ordnerbild wird nicht überschrieben"
+
+
+def test_album_row_without_matching_artist_stays_empty(tmp_path):
+    """Album-Artist ist Teil der Zuordnung — nicht jeder gleiche Titel zählt."""
+    from lyrion.media.importer import store_online_cover
+    from lyrion.media.art_online import AlbumQuery, CoverResult
+
+    service = _empty_album_cover_cache(tmp_path)
+    query = AlbumQuery(album="Point Blank", artist="Bonfire", year=1989)
+    written = service.cache.write_cover_sync(
+        query.key(), query, jpeg_bytes(500), provider="coverartarchive",
+        mime="image/jpeg", source_url="https://coverartarchive.org/x",
+        mbid="e104643d", width=500, height=500)
+
+    async def run():
+        await init_db(tmp_path / "lyrion.db")
+        try:
+            async with db_session() as session:
+                album = Album(titlesort="point blank", title="Point Blank",
+                              albumartist_sort="jemand anderes", year=1989,
+                              artwork=None)
+                session.add(album)
+                await session.commit()
+                album_id = int(album.id)
+            rows = await store_online_cover(
+                query, CoverResult(path=written, provider="coverartarchive"))
+            async with db_session() as session:
+                stored = await session.get(Album, album_id)
+                return rows, (stored.artwork if stored is not None else "?")
+
+        finally:
+            await close_db()
+
+    set_rows, artwork = _run(run())
+    assert (set_rows, artwork) == (0, None)
+
+
+def test_importer_reads_the_online_cache_for_empty_album_rows(tmp_path, monkeypatch):
+    """``online_cover_path`` liefert den Plattencache-Treffer — ohne Netz.
+
+    Reihenfolge bleibt Tag-Bild → Ordnerbild → online: nur wenn der Importer
+    kein Bild hatte, greift dieser Weg (``media/importer.py`` ``_online_cover``).
+    """
+    from lyrion.media.importer import online_cover_path, wire_online_artwork
+
+    service = _empty_album_cover_cache(tmp_path)
+    query = AlbumQuery(album="Point Blank", artist="Bonfire", year=1989)
+    written = service.cache.write_cover_sync(
+        query.key(), query, jpeg_bytes(500), provider="coverartarchive",
+        mime="image/jpeg", source_url="https://coverartarchive.org/x",
+        mbid="e104643d", width=500, height=500)
+
+    monkeypatch.setattr(art_online, "_service", service)
+    assert wire_online_artwork(service) is True
+    assert service.on_cover is not None
+    assert wire_online_artwork(service) is False, "idempotent"
+    assert online_cover_path("Point Blank", "bonfire", 1989) == written
+    assert online_cover_path("Point Blank", "Bonfire", 1989) == written
+    assert online_cover_path("Ganz anderes Album", "Bonfire", 1989) is None
+    assert getattr(service.fetcher, "urls") == [], \
+        "kein Netzzugriff beim Nachschlagen"
+
+
+def test_importer_has_no_online_service_without_one(tmp_path, monkeypatch):
+    """Ohne Dienst wird nichts gesucht und kein Dienst angelegt."""
+    from lyrion.media.importer import online_cover_path
+
+    monkeypatch.setattr(art_online, "_service", None)
+    assert online_cover_path("Point Blank", "Bonfire", 1989) is None
+    assert art_online.current_service() is None
+
+
+# ---------------------------------------------------------------------------
+# 5b. ``--localfile``-Konfiguration ↔ GUI-Einstellung (dieselbe Wirkung)
+# ---------------------------------------------------------------------------
+
+
+def test_artwork_online_settings_follow_the_localfile_conf(tmp_path):
+    """``artworkOnlineSearch=0`` aus der ``.conf``-Datei schaltet die Suche ab.
+
+    Perl liest Server-Prefs aus ``prefs.db`` (``--prefsfile``/``--prefsdir``,
+    ``Slim/Utils/Prefs.pm:60-92``); die Konfigurationsdatei dieses Ports
+    (``--localfile``) hat in ``LyrionConfig.get`` Vorrang.  Ohne die
+    ``.conf``-Ebene im Prefs-Store las der Scan-Prozess die
+    ``artworkOnline*``-Werte nur aus dem ``prefhash`` — der Dateiwert blieb
+    wirkungslos (live belegt 2026-09-19).  Gegenprobe: ein ``prefhash``-Wert
+    „an“ schlägt die Datei NICHT.
+    """
+    from lyrion.config import parse_conf
+    from lyrion.web import settings as settings_module
+
+    store = get_prefs()
+    before = dict(store._conf_overrides)
+    cache_before = dict(store._cache)
+    conf = parse_conf(
+        "artworkOnlineSearch = 0\n"
+        "artworkOnlineCacheDir = /tmp/online-covers\n"
+        "artworkOnlineRetryDays = 7\n")
+    try:
+        store.set_conf_overrides(conf.get("", {}))
+        # GUI-Wert (prefhash) steht auf „an“ — die Datei gewinnt.
+        store._cache["artworkOnlineSearch"] = "1"
+        settings = settings_module.load_art_online_settings()
+        from_file = (settings.enabled, str(settings.cache_dir), settings.retry_days)
+
+        # Ohne Konfigurationsdatei gilt wieder der prefhash-Wert.
+        store.set_conf_overrides({})
+        from_prefs = settings_module.load_art_online_settings().enabled
+    finally:
+        store.clear_conf_overrides()
+        store.set_conf_overrides(before)
+        store._cache.clear()
+        store._cache.update(cache_before)
+
+    assert from_file == (False, "/tmp/online-covers", 7), \
+        f"Konfigurationsdatei nicht wirksam: {from_file}"
+    assert from_prefs is True, "ohne Datei gilt der prefhash-Wert"
+
+
+def test_conf_layer_sits_below_the_cli_override():
+    """Rangfolge wie in ``LyrionConfig.get``: CLI > ``.conf`` > Prefs-DB."""
+    store = get_prefs()
+    before_conf = dict(store._conf_overrides)
+    before_cli = dict(store._cli_overrides)
+    cache_before = dict(store._cache)
+    before_value = store.get("artworkOnlineTimeout")
+    try:
+        store._cache["artworkOnlineTimeout"] = "30"
+        store.set_conf_overrides({"artworkOnlineTimeout": "8"})
+        assert store.get("artworkOnlineTimeout") == "8"
+        store.set_cli_override("artworkOnlineTimeout", 3)
+        assert store.get("artworkOnlineTimeout") == 3
+    finally:
+        store._cli_overrides.clear()
+        store._cli_overrides.update(before_cli)
+        store.clear_conf_overrides()
+        store.set_conf_overrides(before_conf)
+        store._cache.clear()
+        store._cache.update(cache_before)
+    # Der Store ist wieder im Ausgangszustand (für die folgenden Tests).
+    assert store.get("artworkOnlineTimeout") == before_value
 
 
 # ---------------------------------------------------------------------------

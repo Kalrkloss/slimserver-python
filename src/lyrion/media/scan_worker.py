@@ -152,6 +152,12 @@ async def _run(source: Path, args: argparse.Namespace,
         from lyrion.media.art_online import configured_service
 
         service = configured_service()
+        # Ein neuer Treffer hängt sofort an der Albumzeile (Perl
+        # ``Slim/Utils/Scanner/Local.pm:1086-1091``: ``$album->artwork($coverid)``);
+        # ohne diesen Rückruf bliebe der Treffer nur eine Cache-Datei.
+        from lyrion.media.importer import wire_online_artwork
+
+        wire_online_artwork(service)
         logger.info(
             "Online-Cover aktiv=%s, Anbieter=%s, Cache=%s, Queue=%d",
             service.settings.enabled, ",".join(service.settings.effective_providers()),

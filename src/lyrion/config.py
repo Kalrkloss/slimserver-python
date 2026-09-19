@@ -135,7 +135,8 @@ class PreferenceStore:
     validation, and change-tracking.
     """
 
-    __slots__ = ("_db_path", "_db", "_cache", "_meta_cache", "_cli_overrides", "_loaded")
+    __slots__ = ("_db_path", "_db", "_cache", "_meta_cache", "_cli_overrides",
+                 "_conf_overrides", "_loaded")
 
     _instance: PreferenceStore | None = None
 
@@ -155,6 +156,7 @@ class PreferenceStore:
         # prefmeta rows (name -> row) for synchronous type coercion.
         self._meta_cache: dict[str, dict] = {}
         self._cli_overrides: dict[str, Any] = {}
+        self._conf_overrides: dict[str, Any] = {}
         self._loaded = False
 
     def set_db_path(self, path: Path) -> None:
@@ -234,6 +236,28 @@ class PreferenceStore:
         """Record a CLI flag override that takes precedence over DB."""
         self._cli_overrides[name] = value
 
+    def set_conf_overrides(self, values: "dict[str, Any] | ConfigSection") -> None:
+        """Werte der ``.conf``-Datei (``--localfile``) als eigene Ebene setzen.
+
+        Perl liest Server-Prefs aus ``prefs.db`` (``Slim/Utils/Prefs.pm:60-92``
+        über ``--prefsfile``/``--prefsdir``); die Konfigurationsdatei dieses
+        Ports steht daneben und hat in :meth:`LyrionConfig.get` **Vorrang** vor
+        der Prefs-DB (``config.py`` ``get`` — „First check .conf file“).  Ohne
+        diese Ebene sah nur der jeweilige Leser mit ``cfg.get()`` den
+        Dateiwert: der Scan-Prozess las ``artworkOnlineSearch`` /
+        ``artworkOnlineCacheDir`` ausschliesslich aus dem ``prefhash``
+        (``web/settings.py`` ``art_online_pref_values``), ein Wert in der
+        ``--localfile``-Datei blieb also wirkungslos (live belegt 2026-09-19).
+
+        Die Werte sind Zeichenketten aus der Datei; die Typumwandlung macht
+        weiterhin :meth:`get` anhand der ``prefmeta``-Zeile.
+        """
+        self._conf_overrides = dict(values or {})
+
+    def clear_conf_overrides(self) -> None:
+        """Die ``.conf``-Ebene wieder entfernen (Tests, Neu-Einlesen)."""
+        self._conf_overrides = {}
+
     def get(
         self,
         name: str,
@@ -244,14 +268,21 @@ class PreferenceStore:
         """
         Get a preference value.
 
-        Priority: CLI override > DB value > default.
-        Type coercion is handled automatically based on the stored type metadata.
+        Priority: CLI override > ``.conf``-Datei (``--localfile``) > DB value >
+        default.  Type coercion is handled automatically based on the stored
+        type metadata.
+
+        Die ``.conf``-Ebene ist die Entsprechung zu ``LyrionConfig.get`` (dort
+        „First check .conf file“): die Kommandozeilen-Konfiguration und die
+        GUI-Einstellung (``prefhash``) sollen dieselbe Wirkung haben.
         """
         if name in self._cli_overrides:
             return self._cli_overrides[name]
 
         meta_row = self._get_meta_sync(name)
-        value_str = self._cache.get(name)
+        value_str = self._conf_overrides.get(name)
+        if value_str is None:
+            value_str = self._cache.get(name)
         if value_str is None:
             if default is not None:
                 return default
@@ -301,7 +332,8 @@ class PreferenceStore:
         await self._save(name, str_value)
 
     def __contains__(self, name: str) -> bool:
-        return name in self._cache or name in self._cli_overrides
+        return (name in self._cache or name in self._cli_overrides
+                or name in self._conf_overrides)
 
     async def init_preference(
         self,
@@ -635,6 +667,13 @@ class LyrionConfig:
         # before it opens its DB.
         self._prefs.set_db_path(self.prefs_dir / "prefs.db")
         self.load_conf()
+        # Die Werte der Konfigurationsdatei (``--localfile``/``Lyrion.conf``)
+        # gelten ab hier auch über ``prefs.get()``: Perl bestimmt seine
+        # Prefs-Quelle über ``--prefsfile``/``--prefsdir``, und :meth:`get`
+        # liest die Datei bereits VOR der Prefs-DB.  Ohne diese Ebene sah der
+        # Scan-Prozess ``artworkOnlineSearch``/``artworkOnlineCacheDir`` nur im
+        # ``prefhash`` — der Dateiwert wirkungslos (live belegt 2026-09-19).
+        self._prefs.set_conf_overrides(self._conf.get("", {}))
         await self._prefs.init()
         # Register known preferences
         await self._register_known_prefs()

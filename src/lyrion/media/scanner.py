@@ -229,6 +229,11 @@ class ScanConfig:
     max_depth: int = 20
     extract_metadata: bool = True
     generate_artwork: bool = True
+    #: Wohin ein eingebettetes Tag-Bild materialisiert wird (Perl: Artwork-Cache
+    #: bei den Bibliotheksdaten, ``Slim/Utils/ArtworkCache.pm:44-47``).
+    #: ``None`` = ``<serverdata>/cache/artwork/embedded``
+    #: (``media/artwork.py:default_embedded_artwork_dir``).
+    artwork_cache_dir: Path | None = None
 
     def __post_init__(self) -> None:
         if self.base_path is None:
@@ -497,12 +502,20 @@ class MediaScanner:
 
         Format-agnostic tag lookup: ID3 frame IDs, Vorbis/APE-style
         keys, MP4 atom names. Returns the fourteen metadata values plus
-        ``album_artist``, ``compilation`` and ``has_embedded_artwork``
-        (appended at the end keeps the older positional callers intact).
+        ``album_artist``, ``compilation``, ``has_embedded_artwork`` and the
+        **bytes** of the embedded picture (appended at the end keeps the
+        older positional callers intact).
+
+        Die Bild-Bytes fallen hier ab, weil die Datei ohnehin offen ist: Perl
+        liest das Tag-Bild im selben Format-Durchgang
+        (``Slim/Music/Artwork.pm:495-505`` → ``Slim/Formats/MP3.pm:159-181``
+        ``getCoverArt``).  Ein zweiter mutagen-Lauf nur fürs Bild würde den
+        Scan verdoppeln.
         """
         title = artist = album = genre = ""
         album_artist = ""
         compilation = has_embedded_artwork = False
+        embedded_art: bytes | None = None
         year = track = duration = bitrate = sample_rate = channels = 0
         rg_gain = rg_peak = rg_album_gain = rg_album_peak = None
         try:
@@ -512,7 +525,8 @@ class MediaScanner:
                 return (title, artist, album, genre, year, track,
                         duration, bitrate, sample_rate, channels,
                         rg_gain, rg_peak, rg_album_gain, rg_album_peak,
-                        album_artist, compilation, has_embedded_artwork)
+                        album_artist, compilation, has_embedded_artwork,
+                        embedded_art)
             try:
                 tags = getattr(audio_file, "tags", None)
                 info = getattr(audio_file, "info", None)
@@ -536,6 +550,12 @@ class MediaScanner:
                     tags, "TCMP", "compilation", "COMPILATION", "cpil",
                     "WM/IsCompilation", "ITUNESCOMPILATION"))
                 has_embedded_artwork = _has_embedded_artwork(audio_file, tags)
+                if has_embedded_artwork:
+                    # Bild-Bytes für die Materialisierung mitnehmen (Perl
+                    # ``Formats/MP3.pm:159-181`` ``getCoverArt``).
+                    from lyrion.media.artwork import embedded_picture_bytes
+
+                    embedded_art = embedded_picture_bytes(audio_file, tags)
                 genre = _tag_value(tags, "TCON", "genre", "\xa9gen",
                                    "WM/Genre", "Genre")
                 year_str = _tag_value(tags, "TDRC", "TYER", "date", "\xa9day",
@@ -571,7 +591,8 @@ class MediaScanner:
         return (title, artist, album, genre, year, track,
                 duration, bitrate, sample_rate, channels,
                 rg_gain, rg_peak, rg_album_gain, rg_album_peak,
-                album_artist, compilation, has_embedded_artwork)
+                album_artist, compilation, has_embedded_artwork,
+                embedded_art)
 
     async def _process_file(self, file_path: Path) -> ScanResult | None:
         """Process a single music file."""
@@ -599,7 +620,8 @@ class MediaScanner:
          duration, bitrate, sample_rate, channels,
          replay_gain, replay_peak,
          album_replay_gain, album_replay_peak,
-         album_artist, compilation, has_embedded_artwork) = (
+         album_artist, compilation, has_embedded_artwork,
+         embedded_art) = (
             await asyncio.to_thread(self._extract_tags, file_path))
 
         # Metadata heuristics: fill gaps from folder structure and the
@@ -619,12 +641,31 @@ class MediaScanner:
             logger.debug("Heuristics failed for %s: %s", file_path, exc)
 
         # Look for cover artwork — Perl's order: image in the tags first
-        # (``_readCoverArtTags``, ``Slim/Music/Artwork.pm:480-516``), then an
-        # image file in the folder (``_readCoverArtFiles``, ``:517-637``), and
-        # only when both are missing does the port's online search get asked
+        # (``_readCoverArtTags``, ``Slim/Music/Artwork.pm:480-516`` → das
+        # ``getCoverArt`` der Formatsklasse, ``Slim/Formats/MP3.pm:159-181``),
+        # then an image file in the folder (``_readCoverArtFiles``, ``:517-637``),
+        # and only when both are missing does the port's online search get asked
         # (``media/art_online.py``; the lookup is queued, never awaited here).
+        #
+        # Perls Track-Cover entsteht ebenso: ``Slim/Schema.pm:1799-1813`` nimmt
+        # ``findStandaloneArtwork`` NUR, wenn die Tags kein Bild lieferten, und
+        # ``albums.artwork`` hängt danach am Cover des Tracks
+        # (``:1376-1381``).  Das Tag-Bild wird deshalb hier zu einer **Datei**
+        # materialisiert (``artwork.write_embedded_artwork``) — sonst blieb ein
+        # Album, das NUR ein Tag-Bild trägt, ohne ``albums.artwork`` und die
+        # Cover-URL zeigte das generische Bild.
         artwork_path = None
+        embedded_artwork_path = None
         if self.config.generate_artwork:
+            if embedded_art:
+                try:
+                    from lyrion.media.artwork import write_embedded_artwork
+
+                    embedded_artwork_path = await asyncio.to_thread(
+                        write_embedded_artwork, embedded_art,
+                        self.config.artwork_cache_dir)
+                except Exception as e:  # noqa: BLE001 - kein Bild ist kein Scanfehler
+                    logger.debug("Tag-Bild von %s nicht ablegbar: %s", file_path, e)
             try:
                 # Try to find artwork in same folder as file
                 folder_artwork = await self._find_artwork_in_folder(file_path.parent)
@@ -632,6 +673,7 @@ class MediaScanner:
                     artwork_path = folder_artwork
             except Exception as e:
                 logger.debug("No artwork found for %s", file_path)
+            artwork_path = embedded_artwork_path or artwork_path
             if artwork_path is None and not has_embedded_artwork:
                 self._request_online_cover(
                     album=album, artist=album_artist or artist,
@@ -751,8 +793,13 @@ class MediaScanner:
             return
         try:
             from lyrion.media.art_online import AlbumQuery, configured_service
+            from lyrion.media.importer import wire_online_artwork
 
-            configured_service().request_lookup(
+            service = configured_service()
+            # Treffer sofort an ``albums.artwork`` hängen (Perl
+            # ``Slim/Utils/Scanner/Local.pm:1086-1091``).
+            wire_online_artwork(service)
+            service.request_lookup(
                 AlbumQuery(album=album, artist=artist or "",
                            year=int(year) if year else None))
         except Exception as exc:  # noqa: BLE001 - der Scan darf nie scheitern

@@ -202,6 +202,135 @@ def _album_dir_prefix(file_path: Path) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Online-Cover an der Album-Zeile (``media/art_online.py``)
+# ---------------------------------------------------------------------------
+
+
+def album_artist_key(artist: str) -> str:
+    """Album-Artist-Schlüssel für ``albums.albumartist_sort``.
+
+    Dieselbe Bildung wie :func:`album_identity`: ``ALBUMARTIST || ARTIST``
+    sortiert, und das Various-Artists-Objekt bleibt EIN kanonischer Schlüssel
+    (Perl ``Slim/Schema.pm:1286-1296``, :3065).
+    """
+    key = _sort_string(artist) if artist else ""
+    if key in VA_ARTIST_NAMES:
+        return VA_ARTIST_KEY
+    return key
+
+
+def online_cover_path(album: str, artist: str = "",
+                      year: int | None = None) -> Path | None:
+    """Gecachtes Online-Cover eines Albums — **nur Platte/DB, kein Netz**.
+
+    Perl verknüpft ``albums.artwork`` mit dem Cover des Tracks
+    (``Slim/Schema.pm:1376-1381``: ``$albumHash->{artwork} =
+    $trackColumns->{coverid}``; ``Slim/Utils/Scanner/Local.pm:1086-1091`` trägt
+    es nach).  Der Online-Anbieter ist die letzte Stufe dieser Kette
+    (``media/art_online.py``); sein Treffer steht im Plattencache — diese
+    Funktion holt ihn beim Import nach, damit die Albumzeile darauf zeigt.
+
+    Ohne laufenden Dienst (``current_service()`` ist ``None``) und ohne Treffer
+    ``None``: es wird **kein** Dienst angelegt und nichts gesucht.
+    """
+    try:
+        from lyrion.media.art_online import current_service
+
+        service = current_service()
+        if service is None:
+            return None
+        result = service.read_cached_album(album, artist, year)
+    except Exception as exc:  # noqa: BLE001 - ein Cover ist nie ein Importfehler
+        logger.debug("Online-Cover für %r nicht lesbar (%s)", album, exc)
+        return None
+    return result.path if result is not None else None
+
+
+#: ``albums.artwork`` einer Zeile ohne Bild auf das gefundene Cover setzen.
+#: Nur leere Zeilen: ein Ordner-/Tag-Bild der Sammlung schlägt den Treffer
+#: (Perls Reihenfolge, ``Slim/Music/Artwork.pm:387-400``).
+_ONLINE_ARTWORK_SQL = text("""
+    SELECT a.id FROM albums a
+    WHERE a.titlesort = :titlesort
+      AND (a.artwork IS NULL OR a.artwork = '')
+      AND (:year IS NULL OR a.year IS NULL OR a.year = :year)
+      AND (
+            :artist_key = ''
+            OR a.albumartist_sort = :artist_key
+            OR EXISTS (
+                SELECT 1 FROM albums_contributors ac
+                JOIN contributors c ON c.id = ac.contributor
+                WHERE ac.album = a.id AND lower(c.name) = :artist_lower)
+      )
+""")
+
+
+async def store_online_cover(query: Any, cover: Any) -> int:
+    """``albums.artwork`` auf ein neu gefundenes Online-Cover setzen.
+
+    Rückruf für ``ArtOnlineService.on_cover`` (``media/art_online.py:1244``),
+    ausgelöst sobald ein **neuer** Treffer im Plattencache liegt.  Damit hängt
+    das Cover an der Albumzeile wie in Perl, wo ``albums.artwork`` den Cover-
+    Schlüssel des Tracks trägt (``Slim/Schema.pm:1376-1381``) und der Scanner
+    ihn nachträgt, sobald ein Track ein Bild bekommt
+    (``Slim/Utils/Scanner/Local.pm:1086-1091``) — die Album-Liste einer
+    Steuerung nennt dann ``album.artwork`` statt des generischen Symbols.
+
+    Zuordnung: ``albums.titlesort`` (dieselbe Bildung wie beim Import,
+    ``_sort_string``) + Jahr (wenn beide Seiten eines haben) + Album-Artist
+    (Sortierschlüssel oder Anzeige-Name des Album-Contributors).  Nur leere
+    ``artwork``-Spalten werden gefüllt.  Liefert die Anzahl gesetzter Zeilen.
+    """
+    album = str(getattr(query, "album", "") or "")
+    artist = str(getattr(query, "artist", "") or "")
+    year = getattr(query, "year", None)
+    path = getattr(cover, "path", None)
+    if not album or path is None:
+        return 0
+
+    from lyrion.database.sqlite_helper import db_session
+
+    params = {
+        "titlesort": _sort_string(album),
+        "year": int(year) if year else None,
+        "artist_key": album_artist_key(artist),
+        "artist_lower": artist.strip().lower(),
+    }
+    try:
+        async with db_session() as session:
+            rows = (await session.execute(_ONLINE_ARTWORK_SQL, params)).all()
+            for row in rows:
+                await session.execute(
+                    text("UPDATE albums SET artwork = :art, artwork_front = :art "
+                         "WHERE id = :id"),
+                    {"art": str(path), "id": int(row[0])})
+            await session.commit()
+    except Exception as exc:  # noqa: BLE001 - Rückruf darf nichts brechen
+        logger.warning("Online-Cover %s nicht an der Album-Zeile %r (%s)",
+                       path, album, exc)
+        return 0
+    if rows:
+        logger.info("Online-Cover für %r: albums.artwork gesetzt (%d Zeile(n))",
+                    album, len(rows))
+    else:
+        logger.debug("Online-Cover für %r: keine leere Album-Zeile gefunden", album)
+    return len(rows)
+
+
+def wire_online_artwork(service: Any) -> bool:
+    """``on_cover``-Rückruf des Dienstes setzen (idempotent).
+
+    Der Scanner und ``scan_worker`` rufen das nach dem Anlegen des Dienstes:
+    Perls Scanner trägt ``album.artwork`` ebenfalls nach, sobald ein Track ein
+    Bild bekommt (``Slim/Utils/Scanner/Local.pm:1086-1091``).
+    """
+    if service is None or getattr(service, "on_cover", None) is not None:
+        return False
+    service.on_cover = store_online_cover
+    return True
+
+
+# ---------------------------------------------------------------------------
 # Importer
 # ---------------------------------------------------------------------------
 
@@ -217,6 +346,10 @@ class MusicImporter:
         # Lauf gemerkt (Perls Suche fragt die DB pro Track, Schema.pm:1198-1209;
         # wir halten die IDs und sparen den wiederholten LIKE-Query).
         self._album_folder_cache: dict[tuple[str, str], int] = {}
+        # ``(album, artist, jahr) -> Pfad|None``: der Blick in den Online-Cache
+        # (``online_cover_path``) gilt pro Album, nicht pro Track — ohne diesen
+        # Merker fragt jeder Track desselben Albums denselben Cache erneut.
+        self._online_cover_cache: dict[tuple[str, str, int], Path | None] = {}
         # No source path configured: fall back to the configured music folder
         # (Perl picks the OS music folder as the default media dir,
         # ``Slim/Utils/Prefs.pm:687-712`` → ``OSDetect::dirsFor('music')``).
@@ -227,6 +360,20 @@ class MusicImporter:
 
     def add_progress_callback(self, cb: Callable[[ImportStats], Any]) -> None:
         self._progress_callbacks.append(cb)
+
+    def _online_cover(self, album_name: str, info: Any, artist: str,
+                      year: int) -> Path | None:
+        """Gecachtes Online-Cover dieses Albums (pro Lauf gemerkt, kein Netz).
+
+        Die Anfrage-Schreibweise stammt vom Scan (Albumtag + ``ALBUMARTIST ||
+        ARTIST``, ``media/importer.py:album_identity``); ``online_cover_path``
+        vergleicht die Album-Spalten.  Ohne Dienst oder ohne Treffer ``None``.
+        """
+        key = (album_name, _album_artist_tag(info) or artist or "", int(year or 0))
+        if key not in self._online_cover_cache:
+            self._online_cover_cache[key] = online_cover_path(
+                key[0], key[1], key[2] or None)
+        return self._online_cover_cache[key]
 
     # -- main entry ---------------------------------------------------------
 
@@ -241,6 +388,7 @@ class MusicImporter:
         # Ordner→Album-Treffer gelten nur für diesen Lauf (Album-Zeilen können
         # zwischen zwei Scans gelöscht werden).
         self._album_folder_cache = {}
+        self._online_cover_cache = {}
 
         from lyrion.media.scan_state import SCAN_STATE
 
@@ -939,9 +1087,13 @@ class MusicImporter:
             # contributor is VA") bzw. :1406 (mergeSingleVAAlbum).
             album.compilation = 1
         if album is None:
-            # Cover artwork: scanner found cover.jpg/png/… in the track's
-            # folder — store the path so the API can serve it to players.
-            artwork = getattr(info, "artwork_path", None)
+            # Cover artwork: tags first (materialisiertes Tag-Bild), dann
+            # cover.jpg/png/… im Ordner, zuletzt der Plattencache der
+            # Online-Suche — Perl ``Slim/Music/Artwork.pm:387-400`` und die
+            # Verknüpfung ``albums.artwork = Cover des Tracks``
+            # (``Slim/Schema.pm:1376-1381``).
+            artwork = getattr(info, "artwork_path", None) or self._online_cover(
+                album_name, info, artist, year)
             album = Album(
                 titlesort=_sort_string(album_name),
                 title=album_name,
@@ -959,8 +1111,10 @@ class MusicImporter:
         else:
             if not album.artwork:
                 # Album existed without artwork (e.g. imported before this
-                # column was filled) — backfill from this track's folder.
-                artwork = getattr(info, "artwork_path", None)
+                # column was filled) — backfill from this track's folder, dann
+                # aus dem Plattencache der Online-Suche.
+                artwork = getattr(info, "artwork_path", None) or self._online_cover(
+                    album_name, info, artist, year)
                 if artwork:
                     album.artwork = str(artwork)
                     album.artwork_front = str(artwork)
