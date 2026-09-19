@@ -50,13 +50,76 @@ SKIP_PATTERNS: list[re.Pattern[str]] = [
     re.compile(r"\.part$"),
 ]
 
-# Folder-level cover image names (in priority order)
+# Folder-level cover image names, in Perl's order.
+# Perl baute die Liste als ``@names`` × ``@ext`` — erst alle Endungen eines
+# Namens, dann der nächste Name (``Slim/Music/Artwork.pm:523-524``:
+# ``qw(cover Cover thumb Thumb album Album folder Folder)``,
+# ``qw(png jpg jpeg gif)`` → ``:523-532`` ``%nameslist``/``@filestotry``).
+# Die zweite Schreibweise (``Cover``, ``Thumb``, ``Album``, ``Folder``) ist
+# kein Zierrat: Perl prüft jede mit ``-f`` (:617) und trifft damit auf einem
+# fallunterscheidenden Dateisystem auch ``Cover.jpg``.
+# Abweichend/Ergänzung dieses Ports (unten angehängt, also NACH Perls Liste,
+# damit Perls Reihenfolge unangetastet bleibt): ``webp``.
 COVER_NAMES: list[str] = [
-    "cover.jpg", "cover.jpeg", "cover.png", "cover.gif", "cover.webp",
-    "folder.jpg", "folder.jpeg", "folder.png",
-    "album.jpg", "album.jpeg", "album.png",
-    "front.jpg",
+    "cover.png", "cover.jpg", "cover.jpeg", "cover.gif",
+    "Cover.png", "Cover.jpg", "Cover.jpeg", "Cover.gif",
+    "thumb.png", "thumb.jpg", "thumb.jpeg", "thumb.gif",
+    "Thumb.png", "Thumb.jpg", "Thumb.jpeg", "Thumb.gif",
+    "album.png", "album.jpg", "album.jpeg", "album.gif",
+    "Album.png", "Album.jpg", "Album.jpeg", "Album.gif",
+    "folder.png", "folder.jpg", "folder.jpeg", "folder.gif",
+    "Folder.png", "Folder.jpg", "Folder.jpeg", "Folder.gif",
+    "cover.webp", "Cover.webp", "folder.webp", "Folder.webp",
 ]
+
+#: Wie lange ein Scan am Ende auf angestossene Online-Cover-Suchen wartet.
+#: Der Scan selbst wartet nie auf das Netz (die Suchen laufen in der Queue,
+#: ``lyrion/media/art_online.py`` ``request_lookup``); dieser Deckel hält das
+#: Scan-Ende trotzdem begrenzt (Perl beendet ``scanner.pl`` direkt nach dem
+#: Import, ``Slim/Music/Import.pm:206-230``).
+ONLINE_DRAIN_TIMEOUT = 20.0
+
+
+def _tag_bool(value: Any) -> bool:
+    """Tag-Wert als Ja/Nein lesen (``1``, ``true``, ``yes``, ``ja`` …).
+
+    ITUNES/ID3 schreiben das Compilation-Flag als ``1``/``0`` (TCMP),
+    MP4 als Bool (``cpil``), Vorbis als ``1`` (``COMPILATION``).
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    text = str(value).strip().lower()
+    return text in ("1", "true", "yes", "on", "ja")
+
+
+def _has_embedded_artwork(audio_file: Any, tags: Any) -> bool:
+    """Trägt die Datei ein eingebettetes Bild (APIC & Co.)?
+
+    Perl liest das Tag-Bild über ``getCoverArt`` der Formatsklasse
+    (``Slim/Music/Artwork.pm:480-516`` ``_readCoverArtTags`` — ID3 ``APIC``,
+    Vorbis ``METADATA_BLOCK_PICTURE``, MP4 ``covr``, APE ``Cover Art (Front)``).
+    Die Verdrahtung braucht nur die *Tatsache*: der Scan fragt den
+    Online-Anbieter genau dann nicht, wenn schon ein Tag-Bild existiert
+    (``readCoverArt`` :387-400: Tags → Dateien).
+    """
+    try:
+        if getattr(audio_file, "pictures", None):      # FLAC/OGG-Vorbis
+            return True
+        if tags is None:
+            return False
+        for key in ("APIC", "covr", "metadata_block_picture",
+                    "METADATA_BLOCK_PICTURE", "Cover Art (Front)",
+                    "cover art (front)", "WM/Picture"):
+            if tags.get(key):
+                return True
+        getall = getattr(tags, "getall", None)         # ID3 kennt mehrere Frames
+        if callable(getall) and getall("APIC"):
+            return True
+    except Exception:  # noqa: BLE001 - ein kaputter Tag-Container ist kein Fehler
+        return False
+    return False
 
 
 def _tag_value(tags: Any, *keys: str) -> str:
@@ -221,6 +284,18 @@ class ScanResult:
     title: str = ""
     artist: str = ""
     album: str = ""
+    #: Album-Interpret aus dem Tag (ID3 ``TPE2``, Vorbis ``ALBUMARTIST``, MP4
+    #: ``aART``).  Perl bildet den Album-Contributor als ``ALBUMARTIST ||
+    #: ARTIST || TRACKARTIST`` (``Slim/Schema.pm:3065``); der Importer liest
+    #: das Feld über ``_album_artist_tag`` (``media/importer.py:151-160``).
+    album_artist: str = ""
+    #: Compilation-Flag (ID3 ``TCMP``, Vorbis ``COMPILATION``, MP4 ``cpil``)
+    #: — Perl ``Slim/Schema.pm:1178-1186``/``:1289-1295``.
+    compilation: bool = False
+    #: Trägt die Datei ein eingebettetes Tag-Bild?  Perl liest es vor dem
+    #: Ordnerbild (``Slim/Music/Artwork.pm:387-400`` → ``:480-516``); der Scan
+    #: fragt den Online-Anbieter nur, wenn hier nichts liegt.
+    has_embedded_artwork: bool = False
     genre: str = ""
     year: int = 0
     track: int = 0
@@ -250,6 +325,9 @@ class ScanResult:
             "title": self.title,
             "artist": self.artist,
             "album": self.album,
+            "album_artist": self.album_artist,
+            "compilation": self.compilation,
+            "has_embedded_artwork": self.has_embedded_artwork,
             "genre": self.genre,
             "year": self.year,
             "track": self.track,
@@ -418,9 +496,13 @@ class MediaScanner:
         """mutagen tag extraction — sync, runs in a worker thread.
 
         Format-agnostic tag lookup: ID3 frame IDs, Vorbis/APE-style
-        keys, MP4 atom names. Returns the ten metadata values.
+        keys, MP4 atom names. Returns the fourteen metadata values plus
+        ``album_artist``, ``compilation`` and ``has_embedded_artwork``
+        (appended at the end keeps the older positional callers intact).
         """
         title = artist = album = genre = ""
+        album_artist = ""
+        compilation = has_embedded_artwork = False
         year = track = duration = bitrate = sample_rate = channels = 0
         rg_gain = rg_peak = rg_album_gain = rg_album_peak = None
         try:
@@ -429,7 +511,8 @@ class MediaScanner:
                 logger.warning("No audio metadata for %s", file_path)
                 return (title, artist, album, genre, year, track,
                         duration, bitrate, sample_rate, channels,
-                        rg_gain, rg_peak, rg_album_gain, rg_album_peak)
+                        rg_gain, rg_peak, rg_album_gain, rg_album_peak,
+                        album_artist, compilation, has_embedded_artwork)
             try:
                 tags = getattr(audio_file, "tags", None)
                 info = getattr(audio_file, "info", None)
@@ -438,8 +521,21 @@ class MediaScanner:
                     tags, "TPE1", "artist", "\xa9ART", "Author",
                     "Album Artist", "WM/AlbumArtist",
                 )
+                # Album-Interpret (TPE2 / ALBUMARTIST / aART) getrennt vom
+                # Track-Interpreten — Perl: ``ALBUMARTIST || ARTIST ||
+                # TRACKARTIST`` (``Slim/Schema.pm:3065``).
+                album_artist = _tag_value(
+                    tags, "TPE2", "albumartist", "ALBUMARTIST", "Album Artist",
+                    "aART", "WM/AlbumArtist",
+                )
                 album = _tag_value(tags, "TALB", "album", "\xa9alb",
                                    "WM/AlbumTitle", "Album")
+                # Compilation-Flag (TCMP / COMPILATION / cpil) — Perl
+                # ``Slim/Schema.pm:1178-1186``.
+                compilation = _tag_bool(_tag_value(
+                    tags, "TCMP", "compilation", "COMPILATION", "cpil",
+                    "WM/IsCompilation", "ITUNESCOMPILATION"))
+                has_embedded_artwork = _has_embedded_artwork(audio_file, tags)
                 genre = _tag_value(tags, "TCON", "genre", "\xa9gen",
                                    "WM/Genre", "Genre")
                 year_str = _tag_value(tags, "TDRC", "TYER", "date", "\xa9day",
@@ -474,7 +570,8 @@ class MediaScanner:
             logger.warning("Failed to extract metadata from %s: %s", file_path, e)
         return (title, artist, album, genre, year, track,
                 duration, bitrate, sample_rate, channels,
-                rg_gain, rg_peak, rg_album_gain, rg_album_peak)
+                rg_gain, rg_peak, rg_album_gain, rg_album_peak,
+                album_artist, compilation, has_embedded_artwork)
 
     async def _process_file(self, file_path: Path) -> ScanResult | None:
         """Process a single music file."""
@@ -501,7 +598,8 @@ class MediaScanner:
         (title, artist, album, genre, year, track,
          duration, bitrate, sample_rate, channels,
          replay_gain, replay_peak,
-         album_replay_gain, album_replay_peak) = (
+         album_replay_gain, album_replay_peak,
+         album_artist, compilation, has_embedded_artwork) = (
             await asyncio.to_thread(self._extract_tags, file_path))
 
         # Metadata heuristics: fill gaps from folder structure and the
@@ -520,7 +618,11 @@ class MediaScanner:
         except Exception as exc:  # noqa: BLE001
             logger.debug("Heuristics failed for %s: %s", file_path, exc)
 
-        # Look for cover artwork
+        # Look for cover artwork — Perl's order: image in the tags first
+        # (``_readCoverArtTags``, ``Slim/Music/Artwork.pm:480-516``), then an
+        # image file in the folder (``_readCoverArtFiles``, ``:517-637``), and
+        # only when both are missing does the port's online search get asked
+        # (``media/art_online.py``; the lookup is queued, never awaited here).
         artwork_path = None
         if self.config.generate_artwork:
             try:
@@ -530,6 +632,10 @@ class MediaScanner:
                     artwork_path = folder_artwork
             except Exception as e:
                 logger.debug("No artwork found for %s", file_path)
+            if artwork_path is None and not has_embedded_artwork:
+                self._request_online_cover(
+                    album=album, artist=album_artist or artist,
+                    year=year, file_path=file_path)
 
         # Calculate checksum
         checksum = ""
@@ -556,6 +662,9 @@ class MediaScanner:
             sample_rate=sample_rate,
             channels=channels,
             artwork_path=artwork_path,
+            album_artist=album_artist,
+            compilation=compilation,
+            has_embedded_artwork=has_embedded_artwork,
             replay_gain=replay_gain,
             replay_peak=replay_peak,
             album_replay_gain=album_replay_gain,
@@ -568,7 +677,13 @@ class MediaScanner:
         return result
 
     async def _find_artwork_in_folder(self, folder: Path) -> Path | None:
-        """Find cover artwork in a folder."""
+        """Find cover artwork in a folder (Perl ``_readCoverArtFiles``).
+
+        ``COVER_NAMES`` hat Perls Reihenfolge (``Slim/Music/Artwork.pm:523-524``:
+        cover/Cover/thumb/Thumb/album/Album/folder/Folder × png/jpg/jpeg/gif);
+        die unscharfe Suche danach ist die Ergänzung dieses Ports für
+        Release-Ordner wie ``00-artist-album-cover.jpg``.
+        """
         for cover_name in COVER_NAMES:
             artwork_path = folder / cover_name
             if artwork_path.exists() and artwork_path.is_file():
@@ -612,3 +727,67 @@ class MediaScanner:
                 self.stats.added += 1
 
         self.stats.processed_files = len(scan_results)
+        # Perls Scanner endet mit dem Import (``Slim/Music/Import.pm:206-230``
+        # beendet ``scanner.pl``); die nachgelagerten Online-Suchen dieses Ports
+        # laufen in der Queue, damit der Scan nie auf das Netz wartet.  Hier
+        # werden sie eingesammelt, bevor ``scan()`` zurückkehrt.
+        await self._drain_online_lookups()
+
+    # ------------------------------------------------------------------
+    # Online-Cover (media/art_online.py) — angestossen, nie im Scan gewartet
+    # ------------------------------------------------------------------
+
+    def _request_online_cover(self, *, album: str, artist: str, year: int,
+                              file_path: Path) -> None:
+        """Online-Suche für dieses Album anstoßen (nicht blockierend).
+
+        Der Aufruf legt nur eine Anfrage in die Queue des Dienstes
+        (``ArtOnlineService.request_lookup``); der Worker erledigt das Netz
+        nebenher.  Kein Fehler darf den Scan brechen — ohne Albumtitel gibt es
+        nichts zu suchen, und ohne laufenden Loop (Einzelaufruf) wird nur
+        geloggt.
+        """
+        if not album or album.strip().casefold() == "unknown album":
+            return
+        try:
+            from lyrion.media.art_online import AlbumQuery, configured_service
+
+            configured_service().request_lookup(
+                AlbumQuery(album=album, artist=artist or "",
+                           year=int(year) if year else None))
+        except Exception as exc:  # noqa: BLE001 - der Scan darf nie scheitern
+            logger.debug("Online-Cover-Anfrage für %s übersprungen (%s)",
+                         file_path, exc)
+
+    async def _drain_online_lookups(self) -> None:
+        """Angestoßene Online-Suchen abarbeiten (Scan-Ende).
+
+        Begrenzt (:data:`ONLINE_DRAIN_TIMEOUT`): der Scan darf nicht am Netz
+        hängen bleiben.  Was nicht mehr durchläuft, bleibt für den nächsten Lauf
+        offen — die Queue ist beschränkt und verwirft Überschuss (``request_lookup``).
+        """
+        service = _online_service_if_configured()
+        if service is None:
+            return
+        pending = await service.drain(timeout=ONLINE_DRAIN_TIMEOUT)
+        if pending:
+            logger.warning(
+                "Online-Cover: %d Suche(n) blieben nach %.0fs offen "
+                "(nächster Scan holt sie nach)", pending, ONLINE_DRAIN_TIMEOUT)
+
+
+def _online_service_if_configured() -> Any | None:
+    """Der bereits angelegte Online-Dienst — oder ``None``.
+
+    Wichtig: hier wird **kein** Dienst angelegt.  Ein Scan ohne angestoßene
+    Suche (Ordnerbild/Tag-Bild vorhanden) darf keine Netz-Infrastruktur
+    aufbauen; ``configured_service()`` entsteht erst in
+    ``_request_online_cover`` (und damit nur bei echtem Bedarf).
+    """
+    try:
+        from lyrion.media.art_online import current_service
+
+        return current_service()
+    except Exception as exc:  # noqa: BLE001 - Import-/Prefs-Fehler sind kein Scanfehler
+        logger.debug("Online-Cover-Dienst nicht verfügbar (%s)", exc)
+        return None

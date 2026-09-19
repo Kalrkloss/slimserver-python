@@ -122,7 +122,7 @@ def test_scanner_extracts_replaygain(monkeypatch, tmp_path):
 
     (title, artist, album, genre, year, track, duration, bitrate,
      sample_rate, channels, rg_gain, rg_peak, rg_album_gain,
-     rg_album_peak) = MediaScanner()._extract_tags(audio)
+     rg_album_peak, *_rest) = MediaScanner()._extract_tags(audio)
 
     assert title == "Testtitel" and album == "Testalbum"
     assert (rg_gain, rg_peak) == (-7.32, 0.9888)
@@ -138,4 +138,4 @@ def test_scanner_without_replaygain_tags(monkeypatch, tmp_path):
     audio.write_bytes(b"ID3")
 
     values = MediaScanner()._extract_tags(audio)
-    assert values[10:] == (None, None, None, None)
+    assert values[10:14] == (None, None, None, None)

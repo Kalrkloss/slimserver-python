@@ -1330,6 +1330,16 @@ async def _serve_album_cover(album_id: int, send, size: tuple[int, int] | None =
         if data:
             _cover_cache_put(cache_key, data, mime)
     if not data:
+        # Kein Bild in ``albums.artwork``/auf Platte: das **gecachte**
+        # Online-Cover ausliefern, bevor der generische Platzhalter kommt.
+        # Reihenfolge wie im Scan (Tag-Bild → Ordnerbild → online,
+        # ``Slim/Music/Artwork.pm:387-400``); der Auslieferungspfad liest nur
+        # Platte und ``artwork_online_cache`` (``media/art_online.py``
+        # ``read_cached_album``) — nie wird hier gesucht.
+        data, mime = await _online_cover_for_album(album_id, size)
+        if data:
+            _cover_cache_put(cache_key, data, mime)
+    if not data:
         # Perl answers the generic cover with 200 here (live: /music/2/cover.jpg
         # -> 200 image/png 13113 B), not a 404 — Material Skin relies on it to
         # switch away from the previous album's cover.
@@ -1344,6 +1354,77 @@ async def _serve_album_cover(album_id: int, send, size: tuple[int, int] | None =
         ],
     })
     await send({"type": "http.response.body", "body": data})
+
+
+async def _online_cover_for_album(album_id: int,
+                                  size: tuple[int, int] | None) -> tuple[bytes | None, str | None]:
+    """Gecachtes Online-Cover dieses Albums lesen (nur Platte/DB, kein Netz).
+
+    Ermittelt zur Album-Zeile die passende Anfrage (Titel + Album-Interpret +
+    Jahr) und liest den Treffer über ``read_cached_album``.  Als Interpret wird
+    zuerst der **Anzeige-Name** des Album-Contributors versucht (Perl
+    ``Schema.pm:1289-1296`` schreibt dorthin den Album-Artist), dann der
+    Sortierschlüssel ``albums.albumartist_sort``: der Scan fragt mit der
+    Tag-Schreibweise, der Sortierschlüssel hat Kleinbuchstaben und keinen
+    führenden Artikel (``media/importer.py:91-98``) — deshalb nicht immer
+    derselbe Schlüssel (``media/art_online.py`` ``find_by_album_sync``).
+    """
+    import asyncio as _asyncio
+
+    def _run():
+        import asyncio as _aio
+
+        async def _q():
+            from sqlalchemy import select, text as _text
+
+            from lyrion.database.schema import Album
+            from lyrion.database.sqlite_helper import db_session
+
+            async with db_session() as session:
+                album = (
+                    await session.execute(
+                        select(Album).where(Album.id == album_id))
+                ).scalar_one_or_none()
+                if album is None or not album.title:
+                    return None, None
+                contributors: list[str] = []
+                try:
+                    rows = (await session.execute(_text(
+                        "SELECT c.name FROM albums_contributors ac "
+                        "JOIN contributors c ON c.id = ac.contributor "
+                        "WHERE ac.album = :aid"), {"aid": album_id})).all()
+                    contributors = [str(r[0]) for r in rows if r[0]]
+                except Exception:  # noqa: BLE001 - fehlende Tabelle ≠ Fehlerfall
+                    contributors = []
+                candidates = contributors + [album.albumartist_sort or ""]
+                from lyrion.media.art_online import configured_service
+
+                service = configured_service()
+                for artist in candidates:
+                    result = service.read_cached_album(
+                        album.title, artist, album.year)
+                    if result is not None:
+                        return result.path.read_bytes(), result.mime
+                return None, None
+
+        return _aio.run(_q())
+
+    try:
+        loop = _asyncio.get_running_loop()
+        data, mime = await loop.run_in_executor(None, _run)
+    except Exception as exc:  # noqa: BLE001 - nie die Cover-Auslieferung sprengen
+        import logging as _logging
+
+        _logging.getLogger(__name__).debug(
+            "Online-Cover für Album %s nicht lesbar (%s)", album_id, exc)
+        return None, None
+    if not data:
+        return None, None
+    if size is not None:
+        resized = _resize_cover(data, size)
+        if resized:
+            return resized, "image/jpeg"
+    return data, mime
 
 
 def _load_sync_factory(album_id: int):

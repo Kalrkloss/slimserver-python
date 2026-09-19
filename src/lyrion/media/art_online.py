@@ -513,6 +513,28 @@ class FetchResponse:
             raise ProviderError(f"ungültiges JSON von {self.url}") from exc
 
 
+#: MusicBrainz bittet um höchstens **eine Anfrage pro Sekunde**
+#: (``https://musicbrainz.org/doc/MusicBrainz_API/Rate_Limiting``).  Ohne
+#: Drossel antwortet der Dienst mit 503 — live belegt am 2026-09-19: zwei
+#: Suchen 0,5 s auseinander (Album-Queue) → ``MusicBrainz 503 (Rate-Limit)``.
+#: Die Drossel sitzt im echten HTTP-Pfad (:meth:`HttpFetcher.get`), nicht in
+#: der Suchfunktion — Tests mit einem Fake-Fetcher warten also nicht.
+MB_MIN_INTERVAL = 1.0
+
+_mb_lock: asyncio.Lock = asyncio.Lock()
+_mb_last_request = 0.0
+
+
+async def _throttle_musicbrainz() -> None:
+    """Nächste MusicBrainz-Anfrage auf ``MB_MIN_INTERVAL`` Abstand schieben."""
+    global _mb_last_request
+    async with _mb_lock:
+        wait = MB_MIN_INTERVAL - (time.monotonic() - _mb_last_request)
+        if wait > 0:
+            await asyncio.sleep(wait)
+        _mb_last_request = time.monotonic()
+
+
 class HttpFetcher:
     """Dünner ``httpx``-Wrapper: User-Agent, Umleitungen, Timeout, Fehlerlog.
 
@@ -543,6 +565,9 @@ class HttpFetcher:
         return self._client
 
     async def get(self, url: str, params: Mapping[str, Any] | None = None) -> FetchResponse:
+        # MusicBrainz' Rate-Limit gilt pro Client — die Drossel hier hält es ein.
+        if "musicbrainz.org" in url:
+            await _throttle_musicbrainz()
         client = await self._ensure_client()
         try:
             response = await client.get(url, params=params)
@@ -789,6 +814,52 @@ async def search_musicbrainz(fetch: Any, settings: ArtOnlineSettings,
     return None, 0
 
 
+def _failure_is_definitive(text: str) -> bool:
+    """Sagt der Anbieter „es gibt kein Bild“ — oder war er nur gestört?
+
+    Nur eine **definitive** Absage darf als Fehlschlag in den Cache: er
+    verhindert weitere Versuche für ``artworkOnlineRetryDays`` (Vorgabe 30
+    Tage).  Ein Rate-Limit (503), eine Zeitüberschreitung oder ein fehlender
+    MusicBrainz-Treffer nach einem Anbieterfehler ist dagegen vorübergehend —
+    live belegt am 2026-09-19: zwei Suchen 0,5 s auseinander → MusicBrainz 503,
+    und mit der alten Regel stand der Sampler danach 30 Tage als „kein Cover“
+    im Cache.  Diese Regel ist eine Zutat des Ports (Perl hat keine
+    Online-Suche), sie ändert nur die Cache-Politik, nicht die Kette.
+    """
+    definitive = (
+        "kein passender treffer",        # MusicBrainz kennt das Album nicht
+        "ohne vorder-cover",             # CAA hat kein Vorder-Cover (404)
+        "kennt kein cover",              # TheAudioDB: Treffer ohne Bild
+        "kein albumtreffer",             # TheAudioDB: nichts gefunden
+        "treffer ohne cover",
+        "kennt die release-group nicht",  # fanart.tv 404
+        "kein album-cover in der antwort",
+        "api-key abgelehnt",             # falscher Key: retry bringt nichts
+    )
+    lowered = text.casefold()
+    return any(marker in lowered for marker in definitive)
+
+
+def _failure_is_transient(text: str) -> bool:
+    """Vorübergehender Fehler (Netz, 5xx, Zeitüberschreitung, Rate-Limit)?"""
+    lowered = text.casefold()
+    return any(marker in lowered for marker in (
+        "503", "rate-limit", "zeitüberschreitung", "timed out", "timeout",
+        "connection", "http 5", "unerwartet", "keine musicbrainz-id",
+        "keine release-group-mbid", "kein api-key",
+    ))
+
+
+#: Fehlschläge mit diesem Präfix sind **vorübergehend** (Rate-Limit, Netz weg,
+#: Zeitüberschreitung) und gelten nur :data:`TRANSIENT_RETRY_SECONDS` lang —
+#: nicht ``artworkOnlineRetryDays``.  Grund (live, 2026-09-19): zwei Suchen im
+#: Abstand von 0,5 s → MusicBrainz ``503 (Rate-Limit)``; mit der vollen
+#: Wiederholungsfrist hätte dieses Album einen Monat lang kein Cover bekommen,
+#: obwohl der Katalog es kennt.
+TRANSIENT_REASON_PREFIX = "vorübergehend: "
+TRANSIENT_RETRY_SECONDS = 6 * 3600.0
+
+
 def _describe_candidates(candidates: Sequence[Candidate]) -> str:
     parts = []
     for cand in candidates[:3]:
@@ -1024,6 +1095,49 @@ class ArtOnlineCache:
             return None
         return _entry_from_row(row) if row else None
 
+    def find_by_album_sync(self, album: str, artist: str = "",
+                           year: int | None = None) -> CacheEntry | None:
+        """Trefferzeile über die **Album-Spalten** finden (ohne Hash-Schlüssel).
+
+        Siehe :meth:`ArtOnlineService.read_cached_album` für den Grund: der
+        Aufrufer kennt nur die Bibliothekszeile (Titel + Sortierschlüssel +
+        Jahr).  Bewertung: Titel muss passen (in Vergleichsform), dann zählt
+        Interpretengleichheit (2) und Jahresgleichheit (1); der beste Treffer
+        gewinnt, bei Gleichstand der erste.  Ohne Trefferzeile mit vorhandener
+        Bilddatei gibt es ``None`` (der Aufrufer fällt auf den Platzhalter
+        zurück, ``web/app.py`` ``_send_placeholder_cover``).
+        """
+        if not album:
+            return None
+        try:
+            with self._connect() as conn:
+                rows = conn.execute(
+                    "SELECT * FROM artwork_online_cache WHERE status = 'hit'"
+                ).fetchall()
+        except sqlite3.Error as exc:
+            logger.debug("art_online: Cache-Lesefehler (%s)", exc)
+            return None
+
+        wanted_album = normalize(album)
+        wanted_artist = normalize(artist)
+        best: sqlite3.Row | None = None
+        best_rank = -1
+        for row in rows:
+            if normalize(str(row["album"] or "")) != wanted_album:
+                continue
+            rank = 0
+            if wanted_artist and normalize(str(row["artist"] or "")) == wanted_artist:
+                rank += 2
+            row_year = row["year"]
+            if year is not None and row_year is not None and int(row_year) == int(year):
+                rank += 1
+            if rank > best_rank:
+                best, best_rank = row, rank
+        if best is None:
+            return None
+        entry = _entry_from_row(best)
+        return entry if entry.cover_path(self.cache_dir) is not None else None
+
     async def read(self, album_key: str) -> CacheEntry | None:
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, self.read_sync, album_key)
@@ -1147,6 +1261,8 @@ class ArtOnlineService:
         self._queue: asyncio.Queue[tuple[AlbumQuery, bool]] = asyncio.Queue(maxsize=queue_size)
         self._worker: asyncio.Task[None] | None = None
         self._inflight: dict[str, asyncio.Task[CoverResult | None]] = {}
+        #: Album-Schlüssel, die in der Queue stehen (eine Anfrage je Album).
+        self._queued: set[str] = set()
 
     # ---- Suche (cache-first) ----
 
@@ -1175,7 +1291,11 @@ class ArtOnlineService:
                     )
             elif cached.status == "miss":
                 age_days = (time.time() - cached.created_at) / 86400.0
-                if age_days < self.settings.retry_days:
+                window = float(self.settings.retry_days)
+                if (cached.reason or "").startswith(TRANSIENT_REASON_PREFIX):
+                    # Vorübergehender Fehlschlag: nur kurz liegen lassen.
+                    window = min(window, TRANSIENT_RETRY_SECONDS / 86400.0)
+                if age_days < window:
                     logger.debug(
                         "art_online: Fehlschlag im Cache für %r (%.1f Tage alt, %s)",
                         query.album, age_days, cached.reason or "ohne Grund")
@@ -1273,6 +1393,11 @@ class ArtOnlineService:
             return result
 
         reason = "; ".join(failures) or "keine Anbieter"
+        if failures and not any(_failure_is_definitive(f) for f in failures):
+            # Kein Anbieter hat definitiv „nein“ gesagt: den Fehlschlag als
+            # vorübergehend markieren, damit er nur kurz liegen bleibt
+            # (``TRANSIENT_RETRY_SECONDS`` statt ``retry_days``).
+            reason = TRANSIENT_REASON_PREFIX + reason
         await self.cache.write_miss(key, query, reason)
         logger.info("art_online: kein Online-Cover für %r / %r — %s",
                     query.album, query.artist, reason)
@@ -1283,6 +1408,27 @@ class ArtOnlineService:
     def read_cached(self, query: AlbumQuery) -> CoverResult | None:
         """Gecachtes Cover ohne jede Netzabfrage (auch synchron nutzbar)."""
         entry = self.cache.read_sync(query.key())
+        return self._result_from_entry(entry)
+
+    def read_cached_album(self, album: str, artist: str = "",
+                          year: int | None = None) -> CoverResult | None:
+        """Gecachtes Cover über die **Album-Zeile** finden (Platte/DB, kein Netz).
+
+        Für den Auslieferungspfad (``web/app.py`` ``/music/<id>/cover…``): dort
+        ist nur die Zeile aus ``albums`` bekannt — ``title``,
+        ``albumartist_sort`` und ``year``.  Der Cache-Schlüssel entsteht
+        dagegen aus den *Tag*-Schreibweisen des Scans (:meth:`AlbumQuery.key`),
+        und ``albums.albumartist_sort`` ist der Sortierschlüssel
+        (``media/importer.py:91-98``: kleingeschrieben, ohne führenden Artikel),
+        also nicht immer gleich ``normalize(<Albumartist-Tag>)`` („The
+        Beatles“ → ``beatles`` gegen ``the beatles``).  Deshalb vergleicht
+        diese Suche die gespeicherten Album-Spalten statt den Schlüssel.
+        """
+        entry = self.cache.find_by_album_sync(album, artist, year)
+        return self._result_from_entry(entry)
+
+    def _result_from_entry(self, entry: CacheEntry | None) -> CoverResult | None:
+        """``CacheEntry`` → :class:`CoverResult` (nur bei ``status='hit'`` + Datei)."""
         if entry is None or entry.status != "hit":
             return None
         path = entry.cover_path(self.cache.cache_dir)
@@ -1305,9 +1451,22 @@ class ArtOnlineService:
 
         Rückgabe ``False`` heisst: Queue voll — die Anfrage wird verworfen und
         geloggt (kein Aufstauen von Netzlast bei riesigen Sammlungen).
+
+        Ein Album wird nur **einmal** eingereiht: der Scan fragt pro *Datei* an,
+        ein Album mit zwölf Titeln würde die Queue sonst zwölfmal füllen und
+        echte Anfragen anderer Alben verdrängen (``maxsize``).
+
+        Perl-Beleg fürs Zusammenfassen: LMS sucht/cacht Artwork pro Album, nicht
+        pro Datei (``Slim/Utils/ArtworkCache.pm:44-66`` legt einen Eintrag je
+        Album-Cache-Schlüssel an).
         """
         if not self.settings.enabled:
             return False
+        key = query.key()
+        if key in self._inflight or key in self._queued:
+            logger.debug("art_online: %r ist schon in Arbeit — nicht erneut eingereiht",
+                         query.album)
+            return True
         self._ensure_worker()
         try:
             self._queue.put_nowait((query, False))
@@ -1315,6 +1474,7 @@ class ArtOnlineService:
             logger.warning("art_online: Queue voll (%d) — %r verworfen",
                            self._queue.maxsize, query.album)
             return False
+        self._queued.add(key)
         return True
 
     def _ensure_worker(self) -> None:
@@ -1324,6 +1484,7 @@ class ArtOnlineService:
     async def _worker_loop(self) -> None:
         while True:
             query, force = await self._queue.get()
+            self._queued.discard(query.key())
             try:
                 await self.find_cover(query, force=force)
             except Exception as exc:  # noqa: BLE001 - Worker darf nie sterben
@@ -1341,6 +1502,16 @@ class ArtOnlineService:
                 logger.warning("art_online: Queue nicht leer nach %.1fs (%d offen)",
                                timeout or 0.0, self._queue.qsize())
         return self._queue.qsize()
+
+    @property
+    def queue_capacity(self) -> int:
+        """Wie viele Album-Anfragen gleichzeitig in der Queue stehen dürfen."""
+        return int(self._queue.maxsize)
+
+    @property
+    def queue_pending(self) -> int:
+        """Wie viele Anfragen gerade in der Queue stehen (Statistik/Log)."""
+        return int(self._queue.qsize())
 
     async def close(self) -> None:
         """Worker beenden und HTTP-Client schliessen."""
@@ -1374,10 +1545,44 @@ def get_service(settings: ArtOnlineSettings | None = None) -> ArtOnlineService:
     return _service
 
 
+def configured_service() -> ArtOnlineService:
+    """Dienst dieses Prozesses, beim ersten Aufruf mit den Prefs konfiguriert.
+
+    Die Verdrahtung (``media/scanner.py``, ``media/scan_worker.py``,
+    ``web/app.py``) ruft **nur** diese Funktion: so entsteht pro Prozess genau
+    ein Dienst mit einer Queue, und ein zweiter Aufruf ersetzt ihn nicht (sonst
+    gingen eingereihte Suchen verloren).  Die Prefs kommen über
+    ``web/settings.load_art_online_settings`` (Lazy-Import: ``media`` darf
+    ``web`` nicht auf Modulebene importieren); ohne lesbare Prefs gelten die
+    Defaults aus :data:`PREF_DEFAULTS` — die Suche läuft also auch im
+    Scan-Prozess ohne Server-Kontext.
+    """
+    global _service
+    if _service is None:
+        settings: ArtOnlineSettings | None = None
+        try:
+            from lyrion.web.settings import load_art_online_settings
+
+            settings = load_art_online_settings()
+        except Exception as exc:  # noqa: BLE001 - ohne Prefs gelten die Defaults
+            logger.debug("art_online: Prefs nicht lesbar (%s) — Defaults", exc)
+        _service = ArtOnlineService(settings)
+    return _service
+
+
 def reset_service() -> None:
     """Dienst vergessen (Tests, Konfigurationswechsel)."""
     global _service
     _service = None
+
+
+def current_service() -> ArtOnlineService | None:
+    """Der in diesem Prozess schon angelegte Dienst (oder ``None``).
+
+    Für Aufrufer, die einen vorhandenen Dienst *benutzen*, aber keinen neuen
+    anlegen wollen (z. B. das Scan-Ende in ``media/scanner.py``).
+    """
+    return _service
 
 
 async def lookup_cover(
@@ -1414,7 +1619,8 @@ __all__ = [
     "PREF_ENABLED", "PREF_FANART_KEY", "PREF_LANGUAGE", "PREF_PROVIDERS",
     "PREF_RETRY_DAYS", "PREF_TIMEOUT", "PROVIDER_ALIASES", "PROVIDER_KEY_PREFS",
     "PROVIDER_NEEDS_MBID",
-    "ProviderError", "candidate_matches", "default_cache_dir", "get_service",
+    "ProviderError", "candidate_matches", "configured_service", "current_service",
+    "default_cache_dir", "get_service",
     "image_dimensions", "lookup_cover", "mb_query_variants",
     "normalize_provider_list", "pick_candidate", "read_cached_cover",
     "reset_service", "sniff_mime", "validate_image",

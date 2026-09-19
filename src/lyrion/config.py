@@ -692,6 +692,21 @@ class LyrionConfig:
         # ``fileFilter`` skips entries matching this regex
         # (``Slim/Utils/Misc.pm:859-861``).
         await prefs.init_preference("ignoreDirRE", default="", category="library")
+        # Online-Cover-Suche (``media/art_online.py``).  Perl registriert seine
+        # Artwork-Prefs an derselben Stelle (``Slim/Utils/Prefs.pm:265-268``
+        # ``coverArt``/``artfolder``/``thumbSize``); ohne Registrierung zeigte
+        # /settings/server/basic.html beim ersten Aufruf leere Felder, obwohl
+        # die Suche längst mit ihren Defaults arbeitet.  Lazy-Import: ``web``
+        # hängt an ``config``, ein Import auf Modulebene wäre ein Zyklus.
+        try:
+            from lyrion.web.settings import register_art_online_prefs
+
+            await register_art_online_prefs()
+        except Exception as exc:  # noqa: BLE001 - Prefs dürfen den Start nicht brechen
+            import logging as _logging
+
+            _logging.getLogger(__name__).warning(
+                "artworkOnline*-Prefs nicht registriert: %s", exc)
 
     async def close(self) -> None:
         """Shutdown configuration (close DB, etc.)."""
