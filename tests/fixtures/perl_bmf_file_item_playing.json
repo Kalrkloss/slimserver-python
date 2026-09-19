@@ -1,0 +1,303 @@
+{
+ "result": {
+  "offset": 0,
+  "base": {
+   "actions": {
+    "set-preset-2": {
+     "itemsParams": "presetParams",
+     "cmd": [
+      "jivefavorites",
+      "set_preset",
+      "key:2"
+     ],
+     "player": 0
+    },
+    "set-preset-7": {
+     "player": 0,
+     "cmd": [
+      "jivefavorites",
+      "set_preset",
+      "key:7"
+     ],
+     "itemsParams": "presetParams"
+    },
+    "set-preset-3": {
+     "itemsParams": "presetParams",
+     "player": 0,
+     "cmd": [
+      "jivefavorites",
+      "set_preset",
+      "key:3"
+     ]
+    },
+    "more": {
+     "cmd": [
+      "browselibrary",
+      "items"
+     ],
+     "player": 0,
+     "window": {
+      "isContextMenu": 1
+     },
+     "params": {
+      "menu": "browselibrary",
+      "mode": "bmf",
+      "folder_id": "204573"
+     },
+     "itemsParams": "params"
+    },
+    "set-preset-4": {
+     "itemsParams": "presetParams",
+     "cmd": [
+      "jivefavorites",
+      "set_preset",
+      "key:4"
+     ],
+     "player": 0
+    },
+    "set-preset-9": {
+     "player": 0,
+     "cmd": [
+      "jivefavorites",
+      "set_preset",
+      "key:9"
+     ],
+     "itemsParams": "presetParams"
+    },
+    "add-hold": {
+     "cmd": [
+      "browselibrary",
+      "playlist",
+      "insert"
+     ],
+     "player": 0,
+     "params": {
+      "menu": "browselibrary",
+      "mode": "bmf",
+      "folder_id": "204573"
+     },
+     "itemsParams": "params"
+    },
+    "play": {
+     "nextWindow": "nowPlaying",
+     "params": {
+      "menu": "browselibrary",
+      "mode": "bmf",
+      "folder_id": "204573"
+     },
+     "itemsParams": "params",
+     "cmd": [
+      "browselibrary",
+      "playlist",
+      "play"
+     ],
+     "player": 0
+    },
+    "add": {
+     "itemsParams": "params",
+     "params": {
+      "menu": "browselibrary",
+      "mode": "bmf",
+      "folder_id": "204573"
+     },
+     "player": 0,
+     "cmd": [
+      "browselibrary",
+      "playlist",
+      "add"
+     ]
+    },
+    "set-preset-0": {
+     "itemsParams": "presetParams",
+     "player": 0,
+     "cmd": [
+      "jivefavorites",
+      "set_preset",
+      "key:0"
+     ]
+    },
+    "go": {
+     "cmd": [
+      "browselibrary",
+      "items"
+     ],
+     "player": 0,
+     "window": {
+      "isContextMenu": 1
+     },
+     "params": {
+      "_index": "0",
+      "_quantity": "2",
+      "menu": "1",
+      "mode": "bmf",
+      "folder_id": "204573"
+     },
+     "itemsParams": "playControlParams"
+    },
+    "playControl": {
+     "cmd": [
+      "browselibrary",
+      "items"
+     ],
+     "player": 0,
+     "window": {
+      "isContextMenu": 1
+     },
+     "params": {
+      "_index": "0",
+      "_quantity": "2",
+      "menu": "1",
+      "mode": "bmf",
+      "folder_id": "204573"
+     },
+     "itemsParams": "playControlParams"
+    },
+    "set-preset-5": {
+     "itemsParams": "presetParams",
+     "cmd": [
+      "jivefavorites",
+      "set_preset",
+      "key:5"
+     ],
+     "player": 0
+    },
+    "set-preset-8": {
+     "itemsParams": "presetParams",
+     "player": 0,
+     "cmd": [
+      "jivefavorites",
+      "set_preset",
+      "key:8"
+     ]
+    },
+    "set-preset-6": {
+     "player": 0,
+     "cmd": [
+      "jivefavorites",
+      "set_preset",
+      "key:6"
+     ],
+     "itemsParams": "presetParams"
+    },
+    "set-preset-1": {
+     "cmd": [
+      "jivefavorites",
+      "set_preset",
+      "key:1"
+     ],
+     "player": 0,
+     "itemsParams": "presetParams"
+    }
+   }
+  },
+  "item_loop": [
+   {
+    "icon": "music/521d87c5/cover",
+    "text": "01-accept-hard_attack-e1049215.mp3",
+    "params": {
+     "item_id": "0a20a1fe.0",
+     "isContextMenu": 1
+    },
+    "goAction": "playControl",
+    "icon-id": "521d87c5",
+    "presetParams": {
+     "icon": "music/521d87c5/cover",
+     "favorites_type": "audio",
+     "favorites_title": "01-accept-hard_attack-e1049215.mp3",
+     "favorites_url": "file:///mnt/media/Musik/Accept/01-accept-hard_attack-e1049215.mp3"
+    },
+    "actions": {
+     "more": {
+      "params": {
+       "menu": 1,
+       "track_id": 123166
+      },
+      "player": 0,
+      "cmd": [
+       "trackinfo",
+       "items"
+      ],
+      "window": {
+       "isContextMenu": 1
+      }
+     }
+    },
+    "type": "audio",
+    "textkey": "0",
+    "playControlParams": {
+     "xmlbrowserPlayControl": "0"
+    }
+   },
+   {
+    "playControlParams": {
+     "xmlbrowserPlayControl": "1"
+    },
+    "textkey": "0",
+    "type": "audio",
+    "icon-id": "6d93674c",
+    "actions": {
+     "more": {
+      "params": {
+       "track_id": 123167,
+       "menu": 1
+      },
+      "window": {
+       "isContextMenu": 1
+      },
+      "player": 0,
+      "cmd": [
+       "trackinfo",
+       "items"
+      ]
+     }
+    },
+    "presetParams": {
+     "favorites_url": "file:///mnt/media/Musik/Accept/01-accept-objection_overruled-6df57ab9.mp3",
+     "favorites_title": "01-accept-objection_overruled-6df57ab9.mp3",
+     "favorites_type": "audio",
+     "icon": "music/6d93674c/cover"
+    },
+    "icon": "music/6d93674c/cover",
+    "goAction": "playControl",
+    "text": "01-accept-objection_overruled-6df57ab9.mp3",
+    "params": {
+     "isContextMenu": 1,
+     "item_id": "0a20a1fe.1"
+    }
+   }
+  ],
+  "count": 33,
+  "window": {
+   "windowStyle": "home_menu"
+  }
+ },
+ "id": 1,
+ "method": "slim.request",
+ "params": [
+  "",
+  [
+   "browselibrary",
+   "items",
+   "0",
+   2,
+   "menu:1",
+   "mode:bmf",
+   "folder_id:204573"
+  ]
+ ],
+ "_capture": {
+  "request": {
+   "player": "",
+   "args": [
+    "browselibrary",
+    "items",
+    0,
+    2,
+    "menu:1",
+    "mode:bmf",
+    "folder_id:204573"
+   ]
+  },
+  "note": "read-only live Perl 9.1.1, 192.168.1.90:9000/jsonrpc.js, 2026-09-19. Ohne Player-Parameter liefert _defeatDestructiveTouchToPlay 1 (XMLBrowser.pm:1976!) und die Zeile traegt goAction playControl."
+ }
+}

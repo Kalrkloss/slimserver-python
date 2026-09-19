@@ -448,13 +448,20 @@ def window_style_for_items(items: list[dict]) -> dict:
 
 
 def base_actions(kind: str, filters: dict | None = None, start: int = 0,
-                 count: int = 1, preset_fav_set: bool = False) -> dict:
+                 count: int = 1, preset_fav_set: bool = False,
+                 all_touch_to_play: bool = False, folder_id: str = "") -> dict:
     """Perl ``base.actions`` for a browselibrary menu window.
 
     ``preset_fav_set`` mirrors Perl's ``$presetFavSet``: the ``set-preset-*``
     block is only added when an item of the window carried ``presetParams``
     (``XMLBrowser.pm:1131-1135,1427``) — live: albums/artists/years/tracks
     have it, genres do not.
+
+    ``all_touch_to_play`` mirrors Perl's ``$allTouchToPlay``
+    (``XMLBrowser.pm:801`` starts at 1, :1231/:1256/:1275 set it to 0 for
+    every row that is *not* ``type 'audio'``): when it survives, Perl
+    REPLACES the window's ``go`` with its ``play``
+    (``XMLBrowser.pm:1429-1430``) so a tap fires the feed's playlist action.
     """
     if kind in ("search", "playlists"):
         # Perl's modeless BrowseLibrary feeds (``_search`` / ``_playlists``)
@@ -540,6 +547,15 @@ def base_actions(kind: str, filters: dict | None = None, start: int = 0,
         # tap produced no drill request at all: "Musikordner sieht nur die
         # folder, kann sie aber nicht öffnen".
         go_params: dict = {"mode": "bmf", "menu": "browselibrary"}
+        if folder_id:
+            # Perl merges the WINDOW's own drill token into the base params
+            # (``$feed->{'query'}``, XMLBrowser.pm:899-901): live Perl 9.1.1
+            # ``browselibrary items 0 2 menu:1 mode:bmf folder_id:204573`` →
+            # ``params {mode: 'bmf', folder_id: '204573', menu:
+            # 'browselibrary'}``.  A row's own ``folder_id`` still wins in the
+            # client's merge (SlimBrowserApplet.lua:2014-2022), so the drill
+            # is unaffected.
+            go_params["folder_id"] = str(folder_id)
         cm_action: dict = {
             "player": 0, "cmd": ["browselibrary", "items"],
             "itemsParams": "playControlParams",
@@ -565,6 +581,18 @@ def base_actions(kind: str, filters: dict | None = None, start: int = 0,
         }
         if preset_fav_set:
             folder_actions.update(set_preset_actions())
+        if all_touch_to_play:
+            # Perl ``XMLBrowser.pm:1429-1430``: ``$baseActions->{'go'} =
+            # $baseActions->{'play'}`` once EVERY row of the window took the
+            # touch-to-play branch.  Live Perl 9.1.1 ``browselibrary items 0 2
+            # menu:1 mode:bmf folder_id:204573`` (the Accept folder, all
+            # files) answers exactly that: ``go`` carries the same
+            # ``[browselibrary, playlist, play]`` + ``nextWindow: nowPlaying``
+            # as ``play``.  A window that contains a folder row never
+            # qualifies (``BrowseLibrary.pm:2062-2075`` makes it type
+            # 'playlist', ``XMLBrowser.pm:1275`` clears the flag), so the
+            # drill-``go`` above stays for every mixed window.
+            folder_actions["go"] = dict(folder_actions["play"])
         return folder_actions
 
     more = more_action(kind, filters)

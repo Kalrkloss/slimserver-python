@@ -1,0 +1,302 @@
+{
+ "result": {
+  "offset": 0,
+  "base": {
+   "actions": {
+    "play": {
+     "player": 0,
+     "cmd": [
+      "browselibrary",
+      "playlist",
+      "play"
+     ],
+     "itemsParams": "params",
+     "nextWindow": "nowPlaying",
+     "params": {
+      "mode": "bmf",
+      "menu": "browselibrary"
+     }
+    },
+    "more": {
+     "itemsParams": "params",
+     "params": {
+      "mode": "bmf",
+      "menu": "browselibrary"
+     },
+     "window": {
+      "isContextMenu": 1
+     },
+     "player": 0,
+     "cmd": [
+      "browselibrary",
+      "items"
+     ]
+    },
+    "add-hold": {
+     "itemsParams": "params",
+     "params": {
+      "mode": "bmf",
+      "menu": "browselibrary"
+     },
+     "player": 0,
+     "cmd": [
+      "browselibrary",
+      "playlist",
+      "insert"
+     ]
+    },
+    "playControl": {
+     "itemsParams": "playControlParams",
+     "params": {
+      "_index": "0",
+      "_quantity": "3",
+      "menu": "1",
+      "mode": "bmf"
+     },
+     "player": 0,
+     "cmd": [
+      "browselibrary",
+      "items"
+     ],
+     "window": {
+      "isContextMenu": 1
+     }
+    },
+    "go": {
+     "cmd": [
+      "browselibrary",
+      "items"
+     ],
+     "params": {
+      "mode": "bmf",
+      "menu": "browselibrary"
+     },
+     "itemsParams": "params"
+    },
+    "add": {
+     "itemsParams": "params",
+     "params": {
+      "mode": "bmf",
+      "menu": "browselibrary"
+     },
+     "player": 0,
+     "cmd": [
+      "browselibrary",
+      "playlist",
+      "add"
+     ]
+    }
+   }
+  },
+  "item_loop": [
+   {
+    "params": {
+     "item_id": "0",
+     "isContextMenu": 1
+    },
+    "textkey": "6",
+    "text": "6MzM6F.Fetenhits_Rock_Classics_Best_Of-3CD-2020-NoGroup.nfo",
+    "actions": {
+     "add": {
+      "params": {
+       "cmd": "add",
+       "folder_id": 204572,
+       "menu": 1
+      },
+      "cmd": [
+       "playlistcontrol"
+      ],
+      "player": 0
+     },
+     "more": {
+      "cmd": [
+       "folderinfo",
+       "items"
+      ],
+      "player": 0,
+      "window": {
+       "isContextMenu": 1
+      },
+      "params": {
+       "menu": 1,
+       "folder_id": 204572
+      }
+     },
+     "play": {
+      "player": 0,
+      "cmd": [
+       "playlistcontrol"
+      ],
+      "nextWindow": "nowPlaying",
+      "params": {
+       "folder_id": 204572,
+       "cmd": "load",
+       "menu": 1
+      }
+     },
+     "add-hold": {
+      "player": 0,
+      "cmd": [
+       "playlistcontrol"
+      ],
+      "params": {
+       "folder_id": 204572,
+       "cmd": "insert",
+       "menu": 1
+      }
+     }
+    },
+    "type": "playlist"
+   },
+   {
+    "type": "playlist",
+    "actions": {
+     "more": {
+      "cmd": [
+       "folderinfo",
+       "items"
+      ],
+      "player": 0,
+      "window": {
+       "isContextMenu": 1
+      },
+      "params": {
+       "folder_id": 204573,
+       "menu": 1
+      }
+     },
+     "play": {
+      "cmd": [
+       "playlistcontrol"
+      ],
+      "player": 0,
+      "nextWindow": "nowPlaying",
+      "params": {
+       "cmd": "load",
+       "folder_id": 204573,
+       "menu": 1
+      }
+     },
+     "add-hold": {
+      "params": {
+       "cmd": "insert",
+       "folder_id": 204573,
+       "menu": 1
+      },
+      "player": 0,
+      "cmd": [
+       "playlistcontrol"
+      ]
+     },
+     "add": {
+      "player": 0,
+      "cmd": [
+       "playlistcontrol"
+      ],
+      "params": {
+       "menu": 1,
+       "folder_id": 204573,
+       "cmd": "add"
+      }
+     }
+    },
+    "text": "Accept",
+    "textkey": "A",
+    "params": {
+     "item_id": "1",
+     "isContextMenu": 1
+    }
+   },
+   {
+    "actions": {
+     "add-hold": {
+      "params": {
+       "cmd": "insert",
+       "folder_id": 204574,
+       "menu": 1
+      },
+      "player": 0,
+      "cmd": [
+       "playlistcontrol"
+      ]
+     },
+     "more": {
+      "window": {
+       "isContextMenu": 1
+      },
+      "cmd": [
+       "folderinfo",
+       "items"
+      ],
+      "player": 0,
+      "params": {
+       "menu": 1,
+       "folder_id": 204574
+      }
+     },
+     "play": {
+      "nextWindow": "nowPlaying",
+      "params": {
+       "folder_id": 204574,
+       "cmd": "load",
+       "menu": 1
+      },
+      "cmd": [
+       "playlistcontrol"
+      ],
+      "player": 0
+     },
+     "add": {
+      "player": 0,
+      "cmd": [
+       "playlistcontrol"
+      ],
+      "params": {
+       "cmd": "add",
+       "folder_id": 204574,
+       "menu": 1
+      }
+     }
+    },
+    "type": "playlist",
+    "textkey": "A",
+    "text": "AC+DC",
+    "params": {
+     "isContextMenu": 1,
+     "item_id": "2"
+    }
+   }
+  ],
+  "count": 303,
+  "window": {
+   "windowStyle": "text_list"
+  }
+ },
+ "id": 1,
+ "method": "slim.request",
+ "params": [
+  "24:0a:c4:29:77:90",
+  [
+   "browselibrary",
+   "items",
+   "0",
+   3,
+   "menu:1",
+   "mode:bmf"
+  ]
+ ],
+ "_capture": {
+  "request": {
+   "player": "24:0a:c4:29:77:90",
+   "args": [
+    "browselibrary",
+    "items",
+    0,
+    3,
+    "menu:1",
+    "mode:bmf"
+   ]
+  },
+  "note": "read-only live Perl 9.1.1, 192.168.1.90:9000/jsonrpc.js, 2026-09-19. Ohne Player-Parameter liefert _defeatDestructiveTouchToPlay 1 (XMLBrowser.pm:1976!) und die Zeile traegt goAction playControl."
+ }
+}

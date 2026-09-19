@@ -51,6 +51,7 @@ eine Bibliothek ohne geschriebene dir-Zeilen weiter browst.
 from __future__ import annotations
 
 import asyncio
+import json
 import sqlite3
 import urllib.parse
 from pathlib import Path
@@ -71,6 +72,9 @@ EMPTY_TEXT = menus_mod.menu_title("EMPTY")
 # ---------------------------------------------------------------------------
 
 ROOT = "/srv/music"
+
+#: Player-MAC der Tap-Tests (dieselbe Form wie im Live-Log der App).
+MAC = "1C:87:2C:47:FC:36"
 
 #: Library URLs with percent-encoding like the importer stores them
 #: (``Path.as_uri()``), plus three strays under ~/Music that must never
@@ -296,7 +300,11 @@ def test_bmf_loose_tracks_listed_as_audio(tmp_path, monkeypatch):
     # track rows carry a track id (Perl: params.item_id) for play
     audio = next(it for it in items if it["text"] == "track-a.mp3")
     assert audio["type"] == "audio"
-    assert audio["commonParams"]["track_id"] == 1
+    # Perls Tap-Form: ``params`` (nicht ``commonParams``) — die
+    # Basis-``play``-Aktion liest ``itemsParams: params``
+    # (XMLBrowser.pm:1139-1149/:1259-1267, siehe (h)).
+    assert audio["params"]["track_id"] == 1
+    assert audio["goAction"] == "play"
 
 
 # ---------------------------------------------------------------------------
@@ -528,9 +536,11 @@ def test_bmf_app_tap_answers_the_jive_window(tmp_path, monkeypatch):
     assert res["offset"] == 0
     assert [it["text"] for it in res["item_loop"]] == ["Accept", "Iron Maiden"]
     assert res["window"] == {"windowStyle": "text_list"}
-    # die Basis-Aktion der Antwort ist wieder der eigene Feed (Perl)
+    # die Basis-Aktion der Antwort ist wieder der eigene Feed (Perl) — inklusive
+    # des Drill-Tokens des FENSTERS (live Perl: params {mode, folder_id, menu})
     go = res["base"]["actions"]["go"]
-    assert go["params"] == {"mode": "bmf", "menu": "browselibrary"}
+    assert go["params"] == {"mode": "bmf", "folder_id": str(metal["id"]),
+                            "menu": "browselibrary"}
     assert go["itemsParams"] == "params"
     # Live Perl 9.1.1, gleiche Anfrageform gegen den Aerosmith-Ordner:
     # ``{count: 10, offset: 0, item_loop: [… 10 Dateien …], window, base,
@@ -598,3 +608,410 @@ def test_bmf_flat_form_keeps_the_opensqueeze_shape(tmp_path, monkeypatch):
     assert "item_loop" not in res
     assert res["count"] == 2
     assert [it["text"] for it in res["loop_loop"]] == ["Accept", "Iron Maiden"]
+
+
+# ---------------------------------------------------------------------------
+# (h) Datei-Tap im Musikordner: Perls Item-Form + der daraus gebaute Aufruf
+#
+# Symptom: „Im Musikordner erscheinen jetzt Unterordner und Audiodateien, aber
+# Anklicken spielt sie nicht ab" — im Live-Log der App kam beim Tap auf eine
+# Datei KEIN Abspiel-Kommando an.  Ursache war die Item-Form: Perls bmf-Zeile
+# für eine Audiodatei trägt ``goAction: 'play'``, ``style: 'itemplay'`` und
+# ``params`` (``touchToPlay``/``item_id``/``isContextMenu``), unsere nur
+# ``commonParams`` + Item-Aktionen — und Jive bricht den Tap bei einer
+# Basis-Aktion ohne passenden ``itemsParams``-Eintrag still ab
+# (``SlimBrowserApplet.lua:2003-2026`` „No params entry in item, no action
+# taken").
+# ---------------------------------------------------------------------------
+
+#: Musikordner ohne Unterordner — nur Dateien (Reihenfolge = URL-Sortierung).
+ONLY_FILES_DIR = "Only/Accept"
+ONLY_FILES_ROWS = [
+    (101, f"file://{ROOT}/{ONLY_FILES_DIR}/01-hard_attack.mp3"),
+    (102, f"file://{ROOT}/{ONLY_FILES_DIR}/02-objection.mp3"),
+]
+
+
+def _only_files_browse():
+    return _browse(["items", "0", "50", "menu:1", "mode:bmf",
+                    f"folder_id:{ROOT}/{ONLY_FILES_DIR}"])
+
+
+def test_bmf_audio_file_item_is_perl_shaped(tmp_path, monkeypatch):
+    """Die Dateizeile trägt Perls Tap-Felder (live Perl: ``goAction: 'play'``,
+    ``style: 'itemplay'``, ``params {item_id, touchToPlay, isContextMenu}``,
+    ``actions.more → trackinfo``, ``presetParams``)."""
+    _setup(tmp_path, monkeypatch, ONLY_FILES_ROWS, ROOT)
+
+    item = _only_files_browse()["item_loop"][0]
+    assert item["type"] == "audio"
+    assert item["text"] == "01-hard_attack.mp3"
+    # XMLBrowser.pm:1265/:1267 — goAction + style der touch-to-play-Zeile
+    assert item["goAction"] == "play"
+    assert item["style"] == "itemplay"
+    # XMLBrowser.pm:1142/:1146/:1261 — params der Zeile
+    assert item["params"]["item_id"] == "0"
+    assert item["params"]["touchToPlay"] == "0"
+    assert item["params"]["isContextMenu"] == 1
+    # dieses Ports auflösbarer Token für dieselbe Zeile (_bmf_tap_tracks)
+    assert item["params"]["track_id"] == 101
+    # BrowseLibrary.pm:2091-2096 — itemActions info → trackinfo
+    assert item["actions"]["more"]["cmd"] == ["trackinfo", "items"]
+    assert item["actions"]["more"]["params"]["track_id"] == 101
+    assert item["actions"]["more"]["window"] == {"isContextMenu": 1}
+    # XMLBrowser.pm:1131-1136 — isPlayable-Zeilen tragen presetParams
+    assert item["presetParams"] == {
+        "favorites_type": "audio",
+        "favorites_title": "01-hard_attack.mp3",
+        "favorites_url": f"file://{ROOT}/{ONLY_FILES_DIR}/01-hard_attack.mp3",
+    }
+    # keine Item-Aktion, an der der Tap hängen bleibt: ``play``/``add`` kommen
+    # aus ``base.actions`` (Perl) und werden über ``itemsParams: params``
+    # ergänzt.
+    assert "commonParams" not in item
+    assert "play" not in item["actions"]
+
+
+def test_bmf_all_file_window_go_is_the_feed_play(tmp_path, monkeypatch):
+    """Sind ALLE Zeilen des Fensters touch-to-play, ersetzt Perl
+    ``base.actions.go`` durch ``base.actions.play`` (XMLBrowser.pm:1429-1430)
+    — live Perl 9.1.1 (Accept) antwortet genau so; ``count``/``offset``/
+    ``window`` bleiben unverändert."""
+    _setup(tmp_path, monkeypatch, ONLY_FILES_ROWS, ROOT)
+
+    res = _only_files_browse()
+    actions = res["base"]["actions"]
+    assert actions["go"] == actions["play"]
+    assert actions["play"]["cmd"] == ["browselibrary", "playlist", "play"]
+    assert actions["play"]["itemsParams"] == "params"
+    assert actions["play"]["nextWindow"] == "nowPlaying"
+    # Perl-Fixture desselben Fensters (live, Accept): dieselbe Ersetzung,
+    # dieselben params-Schlüssel {mode, folder_id, menu}
+    perl_actions = json.loads(PERL_FILE_FIXTURE.read_text())["result"]["base"]["actions"]
+    assert perl_actions["go"] == perl_actions["play"]
+    assert set(perl_actions["play"]["params"]) == {"menu", "folder_id", "mode"}
+    assert set(actions["play"]["params"]) <= {"mode", "menu", "folder_id"}
+    # presetParams einer Zeile → Perls $presetFavSet (XMLBrowser.pm:1427)
+    assert "set-preset-0" in actions
+    assert res["count"] == 2 and res["offset"] == 0
+    assert res["window"] == {"windowStyle": "text_list"}
+
+
+def test_bmf_root_window_base_has_no_folder_id(tmp_path, monkeypatch):
+    """Das WURZEL-Fenster trägt kein ``folder_id`` — Perl hat dort keinen
+    Drill-Token (live ``browselibrary items 0 3 menu:1 mode:bmf`` →
+    ``params {mode: menu}``); ein gedrilltes Fenster schon (Fixture oben)."""
+    perl = json.loads(PERL_FOLDER_FIXTURE.read_text())["result"]
+    assert set(perl["base"]["actions"]["go"]["params"]) == {"mode", "menu"}
+
+    _setup(tmp_path, monkeypatch, LIB_URLS, ROOT)
+    ours = _browse(["items", "0", "50", "menu:1", "mode:bmf"])
+    assert set(ours["base"]["actions"]["go"]["params"]) == {"mode", "menu"}
+
+
+def test_bmf_mixed_window_keeps_the_drill_go(tmp_path, monkeypatch):
+    """Enthält das Fenster einen Ordner, bleibt ``go`` der Drill
+    (XMLBrowser.pm:1275 löscht ``$allTouchToPlay``) — sonst würde jeder
+    Ordner-Tap den Elternordner abspielen."""
+    rows = ONLY_FILES_ROWS + [
+        (103, f"file://{ROOT}/{ONLY_FILES_DIR}/Deep/03-deep.mp3"),
+    ]
+    _setup(tmp_path, monkeypatch, rows, ROOT)
+
+    folder_item = next(it for it in _browse(
+        ["items", "0", "50", "menu:1", "mode:bmf",
+         f"folder_id:{ROOT}/{ONLY_FILES_DIR}"])["item_loop"]
+        if it["type"] == "playlist")
+    res = _browse(["items", "0", "50", "menu:1", "mode:bmf",
+                   f"folder_id:{ROOT}/{ONLY_FILES_DIR}"])
+    go = res["base"]["actions"]["go"]
+    assert go["cmd"] == ["browselibrary", "items"]
+    assert go["params"]["mode"] == "bmf"
+    assert go["params"]["menu"] == "browselibrary"
+    # der Ordner selbst bleibt ohne ``goAction`` (Basis-``go`` = Drill)
+    assert "goAction" not in folder_item
+    # ``folder_id`` ist die ``tracks``-Zeile des Ordners (hier die beim
+    # Auflisten angelegte dir-Zeile) — Perls Drill-Token; ``id`` bleibt die
+    # Ganzzahl, die die Controller parsen.
+    assert str(folder_item["params"]["folder_id"]).isdigit()
+    assert isinstance(folder_item["id"], int)
+
+
+class _TapHandler:
+    def __init__(self):
+        self.strm = []
+
+    async def send_strm_to_player(self, mac, track_id):
+        self.strm.append(track_id)
+        return True
+
+    async def send_remote_stream(self, mac, url, codec="m", **kw):
+        self.strm.append(url)
+        return True
+
+
+class _TapPlayer:
+    def __init__(self):
+        self.mac = MAC
+        self.power = False
+        self.mode = "stop"
+        self.playlist = []
+        self.playlist_position = 0
+        self.playlist_total = 0
+        self.playlist_modified = 0
+        self.remote = 0
+        self.last_activity = 0.0
+
+
+class _TapPM:
+    def __init__(self):
+        self.player = _TapPlayer()
+        self._protocol_handler = _TapHandler()
+        self.modes = []
+
+    def get_player(self, mac):
+        return self.player if mac == MAC else None
+
+    def get_all_players(self):
+        return [self.player]
+
+    async def power_on_for_playback(self, player):
+        player.power = True
+
+    def set_mode(self, mac, mode):
+        self.modes.append(mode)
+        self.player.mode = mode
+
+
+#: Die Form, die SqueezePlay aus ``base.actions.play`` + den Zeilen-``params``
+#: baut: ``cmd`` + ``from`` + ``qty`` + Parameter
+#: (SlimBrowserApplet.lua:756-767).
+def _file_tap_args(item: dict, folder: str) -> list[str]:
+    return ["playlist", "play", "0", "50", "useContextMenu:1", "mode:bmf",
+            f"folder_id:{folder}", "menu:browselibrary",
+            f"item_id:{item['params']['item_id']}",
+            f"touchToPlay:{item['params']['touchToPlay']}",
+            "isContextMenu:1",
+            f"track_id:{item['params']['track_id']}"]
+
+
+def test_bmf_file_tap_plays_exactly_the_tapped_track(tmp_path, monkeypatch):
+    """Der Tap startet GENAU den angetippten Titel (nicht den Ordner, nicht
+    den Fenster-``from``-Index): Queue = [102], ``mode=play``, ``strm`` an den
+    Player."""
+    _setup(tmp_path, monkeypatch, ONLY_FILES_ROWS, ROOT)
+    item = _only_files_browse()["item_loop"][1]        # 02-objection (id 102)
+    assert item["params"]["track_id"] == 102
+
+    pm = _TapPM()
+    args = _file_tap_args(item, f"{ROOT}/{ONLY_FILES_DIR}")
+    asyncio.run(api_mod.JSONRPCAPI()._bmf_playlist(
+        MAC, "play", args[2:], pm=pm))
+
+    assert pm.player.playlist == [102]
+    assert pm.player.playlist_total == 1
+    assert pm.player.playlist_position == 0
+    assert pm.player.mode == "play"
+    assert pm._protocol_handler.strm == [102]
+
+
+def test_bmf_file_tap_resolves_the_row_without_track_id(tmp_path, monkeypatch):
+    """Ohne ``track_id`` (Perls eigene Form: nur ``item_id``/``touchToPlay``)
+    findet der Server die Zeile über Fenster-``folder_id`` + Index."""
+    _setup(tmp_path, monkeypatch, ONLY_FILES_ROWS, ROOT)
+    res = _only_files_browse()
+    item = res["item_loop"][1]
+    args = ["playlist", "play", "0", "50", "useContextMenu:1", "mode:bmf",
+            f"folder_id:{ROOT}/{ONLY_FILES_DIR}", "menu:browselibrary",
+            f"item_id:{item['params']['item_id']}",
+            f"touchToPlay:{item['params']['touchToPlay']}",
+            "isContextMenu:1"]
+    pm = _TapPM()
+    asyncio.run(api_mod.JSONRPCAPI()._bmf_playlist(
+        MAC, "play", args[2:], pm=pm))
+    assert pm.player.playlist == [102]
+
+
+def test_bmf_folder_row_tap_loads_the_whole_folder(tmp_path, monkeypatch):
+    """Perls ``playall`` für eine Ordnerzeile: der ganze Ordner wandert in die
+    Queue (BrowseLibrary.pm:2084)."""
+    rows = ONLY_FILES_ROWS + [(103, f"file://{ROOT}/{ONLY_FILES_DIR}/x.mp3")]
+    _setup(tmp_path, monkeypatch, rows, ROOT)
+    res = _only_files_browse()
+    args = ["playlist", "play", "0", "50", "useContextMenu:1", "mode:bmf",
+            f"folder_id:{ROOT}", "menu:browselibrary",
+            f"item_id:{res['item_loop'][0]['params']['item_id']}",
+            f"touchToPlay:{res['item_loop'][0]['params']['touchToPlay']}",
+            "isContextMenu:1"]
+    # Fenster = Wurzel, Zeile 0 = Ordner "Only" → alle Tracks darunter
+    pm = _TapPM()
+    asyncio.run(api_mod.JSONRPCAPI()._bmf_playlist(
+        MAC, "play", args[2:], pm=pm))
+    assert pm.player.playlist == [101, 102, 103]
+    assert pm.player.mode == "play"
+
+
+def test_bmf_file_tap_add_and_insert_do_not_start(tmp_path, monkeypatch):
+    """``add``/``insert`` der Zeile ändern nur die Queue (Perl startet dabei
+    nicht; ``insert`` landet direkt hinter dem laufenden Titel)."""
+    _setup(tmp_path, monkeypatch, ONLY_FILES_ROWS, ROOT)
+    item = _only_files_browse()["item_loop"][1]
+
+    pm = _TapPM()
+    pm.player.playlist = [999]
+    pm.player.playlist_position = 0
+    asyncio.run(api_mod.JSONRPCAPI()._bmf_playlist(
+        MAC, "add", _file_tap_args(item, f"{ROOT}/{ONLY_FILES_DIR}")[2:],
+        pm=pm))
+    assert pm.player.playlist == [999, 102]
+    assert pm.player.mode == "stop"
+    assert pm._protocol_handler.strm == []
+
+    pm = _TapPM()
+    pm.player.playlist = [999, 888]
+    pm.player.playlist_position = 0
+    asyncio.run(api_mod.JSONRPCAPI()._bmf_playlist(
+        MAC, "insert", _file_tap_args(item, f"{ROOT}/{ONLY_FILES_DIR}")[2:],
+        pm=pm))
+    assert pm.player.playlist == [999, 102, 888]
+    assert pm.player.mode == "stop"
+
+
+def test_bmf_tap_reaches_the_feed_playlist_action(tmp_path, monkeypatch):
+    """``browselibrary playlist …`` mit ``mode:bmf`` läuft über den
+    Feed-Zweig — nur ein Tap eines ANDEREN Feeds geht an das generische
+    ``playlist``-Kommando."""
+    _setup(tmp_path, monkeypatch, ONLY_FILES_ROWS, ROOT)
+    item = _only_files_browse()["item_loop"][0]
+
+    seen = {"bmf": [], "generic": []}
+
+    async def fake_bmf(self, pid, sub, rest, pm=None):
+        seen["bmf"].append((sub, list(rest)))
+
+    async def fake_control(self, pm, pid, cmd, args):
+        seen["generic"].append((cmd, list(args)))
+
+    monkeypatch.setattr(api_mod.JSONRPCAPI, "_bmf_playlist", fake_bmf)
+    monkeypatch.setattr(api_mod.JSONRPCAPI, "_json_control", fake_control)
+    api = api_mod.JSONRPCAPI()
+
+    asyncio.run(api._json_browselibrary(
+        "browselibrary", _file_tap_args(item, f"{ROOT}/{ONLY_FILES_DIR}"), MAC))
+    assert seen["bmf"] and seen["bmf"][0][0] == "play"
+    assert seen["generic"] == []
+
+    asyncio.run(api._json_browselibrary(
+        "browselibrary", ["playlist", "play", "0", "50", "mode:albums",
+                          "menu:browselibrary", "album_id:7"], MAC))
+    assert seen["generic"] == [("playlist", ["play", "0", "50",
+                                             "mode:albums",
+                                             "menu:browselibrary",
+                                             "album_id:7"])]
+    assert len(seen["bmf"]) == 1
+
+
+# ---------------------------------------------------------------------------
+# (i) Rohvergleich gegen die live Perl-Zeilen (fixtures/) — Datei und Ordner
+# ---------------------------------------------------------------------------
+
+_FIXTURES = Path(__file__).resolve().parent / "fixtures"
+
+#: live Perl 9.1.1, 192.168.1.90, Player ``24:0a:c4:29:77:90`` (gestoppt),
+#: ``browselibrary items 0 3 menu:1 mode:bmf folder_id:204573`` (Accept).
+PERL_FILE_FIXTURE = _FIXTURES / "perl_bmf_folder_files_menu.json"
+#: dieselbe Query ohne ``folder_id`` (Wurzel) — erste Zeile ist ein Ordner.
+PERL_FOLDER_FIXTURE = _FIXTURES / "perl_bmf_top_folders_menu.json"
+#: dieselbe Datei-Query OHNE Player-Parameter: ``_defeatDestructiveTouchToPlay``
+#: liefert ohne Client immer 1 (``XMLBrowser.pm:1976``) → ``playControl``-Form.
+PERL_FILE_PLAYING_FIXTURE = _FIXTURES / "perl_bmf_file_item_playing.json"
+
+
+def _fixture_item(path: Path, n: int = 0) -> dict:
+    return json.loads(path.read_text())["result"]["item_loop"][n]
+
+
+def test_bmf_file_item_matches_the_live_perl_row(tmp_path, monkeypatch):
+    """Feld-für-Feld gegen die echte Perl-Zeile: gleiche Tap-Felder, nur die
+    dokumentierten Unterschiede (Artwork-Keys fehlen uns)."""
+    perl = _fixture_item(PERL_FILE_FIXTURE)
+    _setup(tmp_path, monkeypatch, ONLY_FILES_ROWS, ROOT)
+    ours = _only_files_browse()["item_loop"][0]
+
+    assert perl["type"] == ours["type"] == "audio"
+    assert perl["goAction"] == ours["goAction"] == "play"
+    assert perl["style"] == ours["style"] == "itemplay"
+    assert set(perl["params"]) == {"item_id", "touchToPlay", "isContextMenu"}
+    assert set(perl["params"]) <= set(ours["params"])
+    # Perls ``item_id`` ist der Index-PFAD in seinen Feed-Cache
+    # (``<feed-sid>.<index>``, XMLBrowser.pm:334-384); die letzte Komponente
+    # ist der Zeilenindex, den dieses Port direkt führt.
+    assert perl["params"]["item_id"].split(".")[-1] == "0"
+    assert perl["params"]["touchToPlay"] == perl["params"]["item_id"]
+    assert ours["params"]["item_id"] == "0"
+    assert ours["params"]["touchToPlay"] == "0"
+    assert ours["params"]["isContextMenu"] == 1
+    assert perl["actions"]["more"]["cmd"] == ours["actions"]["more"]["cmd"]
+    assert set(perl["presetParams"]) <= set(ours["presetParams"]) | {
+        "icon"}          # unser row ohne coverid: kein icon (siehe window_style)
+    assert set(ours["presetParams"]) == {"favorites_type", "favorites_title",
+                                         "favorites_url"}
+    # dokumentierte Abweichung: Perls Artwork-Keys (``icon``/``icon-id`` aus
+    # ``coverid``, BrowseLibrary.pm:2098-2102) fehlen unseren bmf-Zeilen —
+    # deshalb bleibt das Fenster ``text_list`` (test_browselibrary_window_style)
+    assert set(perl) - set(ours) == {"icon", "icon-id"}
+    assert not (set(ours) - set(perl))
+    # unser zusätzlicher, auflösbarer Token (Perl liest seinen Feed-Cache)
+    assert set(ours["params"]) - set(perl["params"]) == {"track_id"}
+
+
+def test_bmf_folder_item_matches_the_live_perl_row(tmp_path, monkeypatch):
+    """Die Ordnerzeile trägt dieselben Felder wie Perl — ohne ``goAction``
+    (der Tap läuft über ``base.actions.go`` = Drill)."""
+    perl = _fixture_item(PERL_FOLDER_FIXTURE)
+    _setup(tmp_path, monkeypatch, LIB_URLS, ROOT)
+    ours = next(it for it in _items(["items", "0", "50", "menu:1", "mode:bmf"])
+                if it["type"] == "playlist")
+
+    assert perl["type"] == ours["type"] == "playlist"
+    assert "goAction" not in perl and "goAction" not in ours
+    assert set(perl["params"]) == {"item_id", "isContextMenu"}
+    assert {"item_id", "isContextMenu"} <= set(ours["params"])
+    assert set(perl["actions"]) == {"add", "add-hold", "play", "more"}
+    # unser ``add``/``add-hold``/``play`` sind Perls ``playlistcontrol``-Form;
+    # ``more`` fehlt uns, weil ``folderinfo`` (Perl :2067-2070) hier noch nicht
+    # implementiert ist — dokumentierte Abweichung.
+    assert {"add", "add-hold", "play"} <= set(ours["actions"])
+    for key, cmd in (("add", ["playlistcontrol"]),
+                     ("add-hold", ["playlistcontrol"]),
+                     ("play", ["playlistcontrol"])):
+        assert ours["actions"][key]["cmd"] == perl["actions"][key]["cmd"] == cmd
+        assert ours["actions"][key]["params"]["cmd"] == \
+            perl["actions"][key]["params"]["cmd"]
+    # unser Drill-Vokabular (folder_id/url) zusätzlich zu Perls ``item_id``
+    assert {"folder_id", "url"} <= set(ours["params"])
+
+
+def test_bmf_file_row_is_always_the_touch_to_play_form(tmp_path, monkeypatch):
+    """Dokumentierte Abweichung: Perl schaltet je nach Player-Zustand um.
+
+    ``_defeatDestructiveTouchToPlay`` (XMLBrowser.pm:1951-1983) gibt für den
+    Vorgabe-Pref 4 ``isPlaying``-abhängig 1 zurück — und ohne Client SOGAR
+    immer (``:1976`` ``return 1 if $pref == 1 || !$client``); dann trägt die
+    Zeile ``goAction: 'playControl'`` + ``playControlParams``
+    (:1268-1272) und der Tap öffnet Perls Play-Control-Kontextmenü.  Dieses
+    Port liefert immer die touch-to-play-Form (der Fall der Live-App:
+    gestoppt), d.h. ein Tap spielt direkt — ohne den CM-Zwischenschritt.
+    """
+    playing = _fixture_item(PERL_FILE_PLAYING_FIXTURE)
+    assert playing["goAction"] == "playControl"
+    assert playing["playControlParams"] == {"xmlbrowserPlayControl": "0"}
+    assert "touchToPlay" not in playing["params"]
+
+    _setup(tmp_path, monkeypatch, ONLY_FILES_ROWS, ROOT)
+    ours = _only_files_browse()["item_loop"][0]
+    assert ours["goAction"] == "play"
+    assert "playControlParams" not in ours
+    assert ours["params"]["touchToPlay"] == "0"
+
+

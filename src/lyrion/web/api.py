@@ -915,6 +915,102 @@ def _bmf_index_dir(index_path: str, root: str) -> str | None:
     return directory
 
 
+#: Mode tokens that mark a request as the „Musikordner“ (Perl bmf) feed.
+_BMF_MODES = ("bmf", "musicfolder")
+
+
+def _is_bmf_tap(args: list) -> bool:
+    """Is this ``browselibrary playlist <verb>`` request a „Musikordner“ tap?
+
+    The bmf feed is the only browselibrary feed whose rows are touch-to-play:
+    Perl stamps ``params.touchToPlay`` on every audio row
+    (``Slim/Control/XMLBrowser.pm:1259-1267``) and the window's own base
+    params carry ``mode: bmf`` (``Slim/Menu/BrowseLibrary.pm:2044-2046``).
+    Both markers also arrive on the tap the client builds from
+    ``base.actions.play`` (``XMLBrowser.pm:1429-1430``) — and neither is sent
+    by the ``playlistcontrol`` actions of the other feeds, which must keep
+    going through the generic ``playlist`` command.
+    """
+    for a in args:
+        s = str(a)
+        if s.startswith("touchToPlay:"):
+            return True
+        if s.startswith("mode:") and s[5:] in _BMF_MODES:
+            return True
+    return False
+
+
+def _bmf_tap_tracks(tagged: dict) -> list[int]:
+    """Track ids of the „Musikordner“ row a tap addressed.
+
+    Perl resolves the tapped row from the request's ``item_id`` — the index
+    path of the row inside the (cached) feed, ``XMLBrowser.pm:331-405`` — and
+    plays the single track it finds there (``:667-702``); a folder row plays
+    its whole contained track list (``BrowseLibrary.pm:2084`` ``playall``).
+
+    This port resolves the same row without a feed cache:
+
+    1. ``track_id`` — the resolvable token our own file rows add to
+       ``params`` (Perl has no equivalent: it re-reads its cached feed);
+    2. ``url`` — a row-less file keeps its ``file://`` URL as its id, and the
+       URL also identifies the track row;
+    3. ``folder_id`` + ``item_id``/``touchToPlay`` — the window's directory
+       plus the row's absolute index, walked with :func:`_bmf_children` (the
+       same listing that produced the row, in the same order).
+
+    A directory resolves to every track below it, exactly like Perl's
+    ``folder_id`` playlistcontrol expansion.
+    """
+    tid = str(tagged.get("track_id") or "").strip()
+    if tid.isdigit():
+        return [int(tid)]
+
+    from lyrion.media.folders import _track_id_by_url
+
+    url = str(tagged.get("url") or "").strip()
+    if url:
+        resolved = _track_id_by_url(url)
+        if resolved is not None:
+            return [resolved]
+
+    fid = str(tagged.get("folder_id") or url or "").strip()
+    directory = _bmf_resolve_dir(fid, _bmf_music_root()) if fid else None
+    idx = next((str(tagged[k]).strip() for k in ("item_id", "touchToPlay")
+                if str(tagged.get(k) or "").strip().isdigit()), "")
+    if directory and idx:
+        rows, _total = _bmf_children(directory, int(idx), 1)
+        if rows:
+            row = rows[0]
+            if str(row.get("type")) == "audio":
+                rid = row.get("id")
+                if isinstance(rid, int):
+                    return [rid]
+                resolved = _track_id_by_url(str(rid))
+                return [resolved] if resolved is not None else []
+            # A folder row: Perl's ``playall`` loads the whole folder.
+            directory = str(row.get("path") or directory)
+    if not directory:
+        return []
+    return _expand_track_ids({"folder_id": directory})
+
+
+def _bmf_window_folder_id(directory: str) -> str:
+    """``folder_id`` Perl echoes into the browsed window's own base params.
+
+    Live Perl 9.1.1 ``browselibrary items 0 2 menu:1 mode:bmf
+    folder_id:204573`` answers ``base.actions.play.params {mode: 'bmf',
+    folder_id: '204573', menu: 'browselibrary'}`` — the feed's
+    ``$feed->{'query'}`` (``XMLBrowser.pm:899-901``) carries the drill token
+    of the *window*, which is why the tap of a track inherits it.  Looked up
+    read-only: the listing already stored its child rows
+    (``_bmf_dir_row_ids``), so this browse never writes one for itself.
+    """
+    from lyrion.media import dir_rows
+
+    rid = dir_rows.lookup_dir_id(directory, db_path=_library_db_path())
+    return str(rid) if rid is not None else ""
+
+
 def _bmf_children(directory: str, start: int = 0,
                   count: int = 200) -> tuple[list, int]:
     """Children of ``directory`` — Perl's ``readDirectory`` listing.
@@ -8018,6 +8114,25 @@ class JSONRPCAPI:
         if args and str(args[0]) == "playlist":
             sub = str(args[1]) if len(args) > 1 else ""
             if sub in ("add", "insert", "play", "load"):
+                # „Musikordner“ (mode:bmf): the tap on an AUDIO row arrives
+                # here too — Perl gives every bmf audio row
+                # ``goAction: 'play'`` (XMLBrowser.pm:1259-1267) and replaces
+                # the all-audio window's ``base.actions.go`` with its ``play``
+                # (:1429-1430), so the client sends
+                # ``browselibrary playlist play <from> <qty> …row params…``
+                # with the row's ``item_id``/``touchToPlay``.  Perl resolves
+                # that row against its cached feed and plays it
+                # (:331-405, :667-702).  This must run BEFORE the generic
+                # ``playlist`` command: the client inserts the window's
+                # from/qty between the command and the params
+                # (SlimBrowserApplet.lua:756-767), which the generic handler
+                # would read as the playlist index — and its ``folder_id``
+                # expansion would load the whole folder instead of the
+                # tapped track.
+                if _is_bmf_tap(args):
+                    await self._bmf_playlist(pid, sub,
+                                             [str(a) for a in args[2:]])
+                    return {}
                 await self._json_control(None, pid, "playlist",
                                          [sub] + [str(a) for a in args[2:]])
             return {}
@@ -8189,6 +8304,20 @@ class JSONRPCAPI:
             return ({"count": 0, "item_loop": [], "offset": start}
                     if is_menu else {"count": 0, "loop_loop": []})
 
+        # Perl echoes the WINDOW's own drill token into its base params: live
+        # Perl 9.1.1 ``browselibrary items 0 2 menu:1 mode:bmf
+        # folder_id:204573`` → ``base.actions.play.params {mode, folder_id,
+        # menu}`` (XMLBrowser.pm:899-901 merges ``$feed->{'query'}``), while
+        # the WURZEL window has no drill token and carries no ``folder_id``
+        # (live ``… mode:bmf`` → ``{mode, menu}``).  A row's own ``folder_id``
+        # still wins in the client's merge, so the drill is unaffected.
+        window_folder_id = ""
+        if kind == "folder" and search:
+            _wm_root = _bmf_music_root()
+            _wm_dir = _bmf_resolve_dir(search, _wm_root)
+            if _wm_dir:
+                window_folder_id = _bmf_window_folder_id(_wm_dir)
+
         # menu:1 → SqueezePlay/Jive MENU window (Perl BrowseLibrary shape:
         # window.style + base.actions + text/type/commonParams items), NOT
         # the OpenSqueeze loop_loop. SqueezePlay's My-Music renders these
@@ -8224,7 +8353,8 @@ class JSONRPCAPI:
                 empty = [_menus.empty_placeholder_item()]
                 return {
                     "base": {"actions": self._browselibrary_menu_actions(
-                        kind, filters, start, count, False)},
+                        kind, filters, start, count, False, False,
+                        window_folder_id)},
                     "count": 1,
                     "offset": start,
                     "window": _menus.window_style_for_items(empty),
@@ -8251,6 +8381,13 @@ class JSONRPCAPI:
             # Perl's $presetFavSet: _jivePresetBase runs only when an item
             # carried presetParams (XMLBrowser.pm:1131-1135,1427).
             preset_fav_set = any("presetParams" in it for it in menu)
+            # Perl's $allTouchToPlay (XMLBrowser.pm:801): a window whose rows
+            # are ALL touch-to-play audio rows gets its base ``go`` replaced
+            # by its ``play`` (:1429-1430) — the Accept folder of the live
+            # Perl answers exactly that for ``menu:1 mode:bmf``.
+            all_touch_to_play = bool(menu) and all(
+                it.get("goAction") == "play" and it.get("type") == "audio"
+                for it in menu)
             # The windowStyle is an item property, not a per-mode constant
             # (XMLBrowser.pm:1104-1127,1434-1441) — see menus.window_style_
             # for_items.  Live Perl 9.1.1 (2026-09-14): albums icon_list,
@@ -8258,7 +8395,8 @@ class JSONRPCAPI:
             # answered icon_list for every one of them.
             return {
                 "base": {"actions": self._browselibrary_menu_actions(
-                    kind, filters, start, count, preset_fav_set)},
+                    kind, filters, start, count, preset_fav_set,
+                    all_touch_to_play, window_folder_id)},
                 "count": total,
                 "offset": start,
                 "window": _menus.window_style_for_items(menu),
@@ -8428,9 +8566,12 @@ class JSONRPCAPI:
         # Track rows carry presetParams (the preset/favorite base actions
         # read presetParams), which need the file URL. Looked up separately
         # and defensively: minimal/test DBs may expose tracks without url.
+        # The bmf file rows need the same URL (Perl's ``_favoritesParams``,
+        # XMLBrowser.pm:1131-1136/1892) — one batch query for both feeds.
         track_urls: dict = {}
-        if kind == "tracks":
-            tids = [r["id"] for r in rows if r.get("id") is not None]
+        if kind in ("tracks", "folder"):
+            tids = [r["id"] for r in rows
+                    if isinstance(r.get("id"), int)]
             if tids:
                 try:
                     marks = ",".join("?" * len(tids))
@@ -8529,8 +8670,8 @@ class JSONRPCAPI:
                     preset["favorites_url"] = str(url)
                 item["presetParams"] = preset
             elif kind == "folder" and r.get("type") == "audio":
-                # A file in the browsed folder (Perl bmf lists files too):
-                # an audio leaf carrying the track, not a drill target.
+                # A file in the browsed folder (Perl bmf lists files too): an
+                # audio leaf carrying the track, not a drill target.
                 # ``id`` is normally the ``tracks.id`` — but a child Perl would
                 # have created a row for while listing (``Queries.pm:2263-2268``
                 # ``objectForUrl({create => 1, playlist => isPlaylist($url)})``),
@@ -8539,30 +8680,73 @@ class JSONRPCAPI:
                 # it through the ``tmp://`` volatile URL, ``BrowseLibrary.pm:
                 # 2125-2138``).  The numeric ``track_id`` fields must survive
                 # that token.
+                #
+                # Perl's row for such a file (live Perl 9.1.1, read-only,
+                # ``browselibrary items 0 2 menu:1 mode:bmf folder_id:204573``
+                # — the Accept folder)::
+                #
+                #   {"type": "audio", "style": "itemplay",
+                #    "goAction": "play", "text": "<file name>",
+                #    "textkey": "0",
+                #    "params": {"item_id": "27235260.0",
+                #               "touchToPlay": "27235260.0",
+                #               "isContextMenu": 1},
+                #    "presetParams": {...}, "icon"/"icon-id": ...,
+                #    "actions": {"more": {"player": 0,
+                #                         "cmd": ["trackinfo", "items"],
+                #                         "params": {"track_id": 123166,
+                #                                    "menu": 1},
+                #                         "window": {"isContextMenu": 1}}}}
+                #
+                # Every one of those fields is load-bearing for the TAP:
+                # ``BrowseLibrary.pm:2087-2096`` marks a track child
+                # ``playall = 1``, so ``XMLBrowser.pm:1259-1267`` takes the
+                # touch-to-play branch and sets ``goAction``/``style`` plus
+                # ``params.touchToPlay``; Jive rewrites the window action
+                # ``go`` into ``item.goAction`` (``SlimBrowserApplet.lua:
+                # 1774-1853``) and — when it falls back to a base action —
+                # ABORTS with ``EVENT_UNUSED`` if the item has no entry under
+                # the action's ``itemsParams`` (:2003-2026 "No params entry in
+                # item, no action taken").  Our old row had neither
+                # ``goAction`` nor ``params``, so the tap never built a
+                # request at all: "Audiodateien erscheinen, aber Antippen
+                # spielt nicht ab".
                 text = r["name"] or ""
                 item["type"] = "audio"
                 item["text"] = text
                 item["textkey"] = text[:1].upper()
+                item["style"] = "itemplay"
+                item["goAction"] = "play"
                 try:
                     ident: Any = int(r["id"])
                 except (TypeError, ValueError):
                     ident = str(r["id"])
-                item["commonParams"] = {"track_id": ident}
-                item["actions"] = {
-                    "play": {"player": 0, "cmd": ["playlistcontrol"],
-                             "params": {"cmd": "load", "menu": 1,
-                                        "track_id": str(ident)},
-                             "nextWindow": "nowPlaying"},
-                    "add": {"player": 0, "cmd": ["playlistcontrol"],
-                            "params": {"cmd": "add", "menu": 1,
-                                       "track_id": str(ident)}},
-                }
-                if not isinstance(ident, int):
-                    # Perl's ``tmp://`` equivalent: the file URL the client can
-                    # hand back to play a playlist that has no library row.
+                # ``item_id``/``touchToPlay`` are Perl's own keys (the row's
+                # index inside the feed, ``XMLBrowser.pm:1142``/``:1261``);
+                # ``track_id`` is this port's resolvable token for the same
+                # row (``_bmf_tap_track_ids``) — the client merges the whole
+                # map into the base ``play``/``add``/``add-hold`` action.
+                row_index = str(start + pos)
+                item["params"] = {"item_id": row_index,
+                                  "touchToPlay": row_index,
+                                  "isContextMenu": 1}
+                if isinstance(ident, int):
+                    item["params"]["track_id"] = ident
+                else:
+                    # Row-less file: the file URL is all we have.  The tap
+                    # resolves nothing for it (no ``tracks.id``) — the honest
+                    # deviation from Perl's ``tmp://`` volatile URL.
+                    item["params"]["url"] = str(ident)
+                url = track_urls.get(r["id"]) if isinstance(ident, int) else None
+                if url:
                     item["presetParams"] = {"favorites_type": "audio",
                                             "favorites_title": text,
-                                            "favorites_url": ident}
+                                            "favorites_url": str(url)}
+                item["actions"] = {
+                    "more": {"player": 0, "cmd": ["trackinfo", "items"],
+                             "params": {"menu": 1, "track_id": ident},
+                             "window": {"isContextMenu": 1}},
+                }
             elif kind == "folder":
                 text = r["name"] or ""
                 ident = str(r["id"])
@@ -8675,7 +8859,9 @@ class JSONRPCAPI:
     def _browselibrary_menu_actions(kind: str, filters: dict | None = None,
                                     start: int = 0,
                                     count: int = 1,
-                                    preset_fav_set: bool = False) -> dict:
+                                    preset_fav_set: bool = False,
+                                    all_touch_to_play: bool = False,
+                                    folder_id: str = "") -> dict:
         """Perl base.actions for a browselibrary menu window — SqueezePlay
         uses 'go' to drill (album→mode:tracks, artist→mode:albums, …),
         'play'/'add' to load the commonParams item into the playlist,
@@ -8695,10 +8881,93 @@ class JSONRPCAPI:
         (XMLBrowser.pm:1131-1135,1427) — the caller sets it when at least one
         item of the window carried ``presetParams`` (live Perl:
         albums/artists/years/tracks yes, genres no).  The shapes live in
-        ``lyrion/web/menus.py``."""
+        ``lyrion/web/menus.py``.
+
+        ``all_touch_to_play`` mirrors Perl's ``$allTouchToPlay``
+        (XMLBrowser.pm:1429-1430) — an all-audio window's ``go`` becomes its
+        ``play``, which is what makes a „Musikordner“ file tap send
+        ``browselibrary playlist play`` instead of nothing.
+
+        ``folder_id`` is the browsed window's own directory id (Perl echoes
+        it into the base params, XMLBrowser.pm:899-901)."""
         from lyrion.web import menus
 
-        return menus.base_actions(kind, filters, start, count, preset_fav_set)
+        return menus.base_actions(kind, filters, start, count, preset_fav_set,
+                                  all_touch_to_play, folder_id)
+
+    async def _bmf_playlist(self, pid: str | None, sub: str,
+                            rest: list[str], pm=None) -> None:
+        """Play/add/insert a tapped „Musikordner“ row (Perl bmf feed).
+
+        Perl's own path for the tap of an audio row:
+
+        * ``BrowseLibrary.pm:2087-2096`` marks a track child ``playall = 1``;
+        * ``XMLBrowser.pm:1259-1267`` therefore takes the touch-to-play
+          branch and stamps ``goAction: 'play'`` + ``params.touchToPlay``;
+        * ``XMLBrowser.pm:1429-1430`` replaces the all-audio window's
+          ``go`` with its ``play``, so the client issues
+          ``browselibrary playlist play`` (:943-966 base actions);
+        * the tapped row is resolved from ``item_id`` (:331-405) and a
+          single audio row is played through ``playlist play <url>``
+          (:667-702), while a folder row loads its whole track list.
+
+        ``sub`` is the feed's playlist verb (``play``/``load`` from
+        ``base.actions.play``, ``add``, ``insert`` from the row's
+        ``playlistcontrol`` actions).  ``rest`` still contains the window's
+        from/qty the client puts before the params
+        (``SlimBrowserApplet.lua:756-767``) — only the ``key:value`` tokens
+        are read.  ``pm`` is injectable for tests, like ``_json_control``'s.
+        """
+        from lyrion.player.manager import PlayerManager
+
+        pm = pm or PlayerManager()
+        if not pid:
+            players = pm.get_all_players()
+            pid = players[0].mac if players else None
+        if not pid:
+            return
+        player = pm.get_player(pid)
+        if player is None:
+            return
+        tagged: dict = {}
+        for a in rest:
+            s = str(a)
+            if ":" in s:
+                k, _, v = s.partition(":")
+                tagged[k] = v
+        ids = _bmf_tap_tracks(tagged)
+        if not ids:
+            # Perl plays a row-less file through its ``tmp://`` volatile URL
+            # (BrowseLibrary.pm:2125-2138); this port refuses DB writes, so
+            # such a row cannot be resolved to a stream.  Nothing is sent —
+            # never a wrong track.
+            logger.debug("bmf tap: no resolvable track for %s", tagged)
+            return
+        if sub == "add":
+            for tid in ids:
+                if tid not in player.playlist:
+                    player.playlist.append(tid)
+            player.playlist_total = len(player.playlist)
+            player.last_activity = time.time()
+            return
+        if sub == "insert":
+            # Perl inserts directly behind the currently playing song
+            # (Playlist.pm addTracks/_insert_done:992-1050).
+            playlist = list(player.playlist or [])
+            pos = int(player.playlist_position or 0) + 1
+            pos = max(0, min(pos, len(playlist)))
+            playlist[pos:pos] = ids
+            player.playlist = playlist
+            player.playlist_total = len(playlist)
+            player.last_activity = time.time()
+            return
+        # play/load: Perl replaces the queue (stopAndClear + addTracks,
+        # Commands.pm:1941/:1694-1696) and starts with the first loaded item.
+        player.playlist = list(ids)
+        player.playlist_total = len(ids)
+        player.playlist_position = 0
+        player.last_activity = time.time()
+        await self._play_playlist_item(pm, player, 0)
 
     @staticmethod
     def _playcontrol_context_menu(rows: list, start: int,
