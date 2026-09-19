@@ -38,9 +38,19 @@ Seiten + Feldlisten (je ``page()``/``prefs()``/``handler()``)
   ``HTML/EN/plugins/Podcast/settings/basic.html:81-87``,
   ``Slim/Plugin/Podcast/strings.txt`` ``PLUGIN_PODCAST_COUNTRY``); dessen
   String-Tabelle ist in Perls globale Tabelle eingemischt (``Slim/Utils/Strings.pm``
-  lädt auch ``Slim/Plugin/*/strings.txt``), der Schlüssel ist also global gültig.
-  Die Auswahlliste ist eine Zutat dieses Ports (radio-browser statt TuneIn) und
-  kommt aus ``lyrion.web.radiobrowser.countries()``.
+ lädt auch ``Slim/Plugin/*/strings.txt``), der Schlüssel ist also global gültig.
+ Die Auswahlliste ist eine Zutat dieses Ports (radio-browser statt TuneIn) und
+ kommt aus ``lyrion.web.radiobrowser.countries()``.
+ **Zusatzfelder der Online-Cover-Suche** (``artworkOnline*``, siehe
+ ``lyrion/media/art_online.py``): Perl hat dafür KEINE Pref und keinen Anbieter —
+ seine Kette endet bei Tags/Ordnerbild (``Slim/Music/Artwork.pm:388-400``,
+ ``:480-637``) und liefert sonst ``html/images/cover_*.png``
+ (``Slim/Web/Graphics.pm:275-291``).  Wir hängen die Felder an dieselbe Seite,
+ auf der Perls Artwork-nahe Prefs liegen (``coverArt``/``artfolder``/``thumbSize``;
+ Perl zeigt sie in der Web-UI unter Formatting/Interface, nicht auf ``Basic`` —
+ die Zuordnung hier ist die unsere).  Vorbild der Felder ist der Kodi-UAS
+ (``metadata.album.universal`` ``resources/settings.xml``: Anbieter-Schalter,
+ Sprache) plus die Key-/Cache-Felder unseres Ports.
 * ``GET|POST /settings/player/audio.html`` — ``.../Player/Audio.pm``: ``page`` :22-24,
   ``needsClient`` :26-28, ``prefs`` :30-120 (hier die unbedingten: :33),
   ``HTML/EN/settings/player/audio.html:4,144,348,367``.
@@ -99,6 +109,21 @@ from typing import Any, Callable, Optional
 from urllib.parse import quote, parse_qs
 
 from lyrion.config import get_prefs
+from lyrion.media.art_online import (
+    DEFAULT_PROVIDER_ORDER,
+    PREF_AUDIODB_KEY as _ART_AUDIODB_KEY_PREF,
+    PREF_CACHE_DIR as _ART_CACHE_DIR_PREF,
+    PREF_COUNTRY as _ART_COUNTRY_PREF,
+    PREF_DEFAULTS as _ART_PREF_DEFAULTS,
+    PREF_ENABLED as _ART_ENABLED_PREF,
+    PREF_FANART_KEY as _ART_FANART_KEY_PREF,
+    PREF_LANGUAGE as _ART_LANGUAGE_PREF,
+    PREF_PROVIDERS as _ART_PROVIDERS_PREF,
+    PREF_RETRY_DAYS as _ART_RETRY_DAYS_PREF,
+    PREF_TIMEOUT as _ART_TIMEOUT_PREF,
+    ArtOnlineSettings,
+    normalize_provider_list,
+)
 from lyrion.player.manager import PlayerManager
 from lyrion.player.playerprefs import apply_player_pref
 from lyrion.utils.strings import get_string
@@ -187,6 +212,75 @@ class SettingsPage:
 
 # ── Feldlisten: je Seite die ``prefs()``-Liste der Perl-Klasse ───────────────
 
+# ── Online-Cover-Suche (Zutat dieses Ports, KEIN Perl-Fund) ──────────────────
+#
+# Perl hat keinen Online-Cover-Anbieter; die Felder sind an den Kodi-UAS
+# angelehnt (``metadata.album.universal`` ``resources/settings.xml``:
+# ``fanarttvalbumthumbs``/``tadbalbumthumbs`` = Anbieter-Schalter,
+# ``tadbalbumlanguage`` = Sprache, Default ``en``) und ergänzen nur, was dieser
+# Port zusätzlich braucht (Cache-Verzeichnis, optionale Keys).
+# Die Werte liest/schreibt ``lyrion.media.art_online`` (``PREF_DEFAULTS``).
+
+
+def _is_provider_list(value: str) -> bool:
+    """Anbieter-Liste: bekannte Namen, Komma/Leerzeichen-getrennt, oder leer."""
+    text = (value or "").strip()
+    if not text:
+        return True
+    names = [n for n in text.replace(",", " ").split() if n]
+    return all(n.lower() in DEFAULT_PROVIDER_ORDER for n in names)
+
+
+def _is_positive_int(value: str) -> bool:
+    text = (value or "").strip()
+    if not text:
+        return True
+    return text.isdigit() and int(text) >= 0
+
+
+def _is_positive_number(value: str) -> bool:
+    text = (value or "").strip()
+    if not text:
+        return True
+    try:
+        return float(text) > 0
+    except ValueError:
+        return False
+
+
+_ART_ONLINE_FIELDS: tuple[Field, ...] = (
+    Field(_ART_ENABLED_PREF, "SETUP_ART_ONLINE", "Online cover search",
+          "select",
+          options=(("1", "SETUP_ART_ONLINE_ON", "On"),
+                   ("0", "SETUP_ART_ONLINE_OFF", "Off")),
+          perl_source="kein Perl-Fund; Vorbild metadata.album.universal/resources/settings.xml:14-21"),
+    Field(_ART_PROVIDERS_PREF, "SETUP_ART_PROVIDERS",
+          "Providers (order = priority)",
+          validator=_is_provider_list,
+          perl_source="kein Perl-Fund; Reihenfolge wie metadata.album.universal/albumuniversal.xml:122-137"),
+    Field(_ART_LANGUAGE_PREF, "SETUP_ART_LANGUAGE", "Cover search language",
+          perl_source="Vorbild metadata.album.universal/resources/settings.xml:12 (tadbalbumlanguage)"),
+    Field(_ART_COUNTRY_PREF, "SETUP_ART_COUNTRY", "Cover search country",
+          validator=_is_country_code,
+          perl_source="kein Perl-Fund (UAS kennt kein Land; freies Feld)"),
+    Field(_ART_CACHE_DIR_PREF, "SETUP_ART_CACHE_DIR", "Cover cache folder",
+          perl_source=("kein Perl-Fund; Perls Artwork-Cache liegt bei den "
+                       "Bibliotheksdaten (Slim/Utils/ArtworkCache.pm:44-47)")),
+    Field(_ART_RETRY_DAYS_PREF, "SETUP_ART_RETRY_DAYS", "Retry after no match (days)",
+          validator=_is_positive_int,
+          perl_source="kein Perl-Fund (Negative-Cache dieses Ports)"),
+    Field(_ART_TIMEOUT_PREF, "SETUP_ART_TIMEOUT", "Provider timeout (seconds)",
+          validator=_is_positive_number,
+          perl_source="kein Perl-Fund (Frist je Anbieter)"),
+    Field(_ART_AUDIODB_KEY_PREF, "SETUP_ART_AUDIODB_KEY", "TheAudioDB API key (optional)",
+          perl_source="kein Perl-Fund; UAS trägt den Key im Addon (tadb.xml:677)"),
+    Field(_ART_FANART_KEY_PREF, "SETUP_ART_FANART_KEY", "fanart.tv API key (optional)",
+          perl_source="kein Perl-Fund; UAS-Key im Addon (fanarttv.xml:5)"),
+)
+
+#: Öffentlicher Name für Tests/Verdrahtung.
+ART_ONLINE_FIELDS: tuple[Field, ...] = _ART_ONLINE_FIELDS
+
 _BASIC_SERVER = SettingsPage(
     route="/settings/server/basic.html",
     perl_class="Slim::Web::Settings::Server::Basic",
@@ -212,6 +306,7 @@ _BASIC_SERVER = SettingsPage(
                            " Podcast/Settings.pm:19,29-31 + HTML/EN/plugins/Podcast/settings/"
                            "basic.html:81-87 + Podcast/strings.txt PLUGIN_PODCAST_COUNTRY"
                            " (no Perl country pref for TuneIn's local node, TuneIn.pm:38-40)")),
+        *_ART_ONLINE_FIELDS,
     ),
 )
 
@@ -482,6 +577,47 @@ def _client_value(page: SettingsPage, f: Field, player) -> str:
         except (TypeError, ValueError):
             return str(raw)
     return str(raw)
+
+
+# ── Online-Cover-Suche: Pref-Werte ↔ Laufzeit-Konfiguration ─────────────────
+#
+# Perl wertet die Prefs seiner Artwork-Kette an der Fundstelle aus
+# (``Slim/Music/Artwork.pm:72`` ``$prefs->get('coverArt')``, ``:870``
+# ``thumbSize``); genauso liest ``lyrion.media.art_online`` seine Prefs über
+# diese Funktionen.  Fehlt eine Pref (frischer Server), gilt der Default aus
+# ``art_online.PREF_DEFAULTS`` — die Suche läuft also ohne Einrichtung und ohne
+# jeden API-Key (MusicBrainz + Cover Art Archive brauchen keinen).
+
+def art_online_pref_values() -> dict[str, str]:
+    """Alle ``artworkOnline*``-Prefs mit Vorbelegung (nie ``None``)."""
+    prefs = get_prefs()
+    values: dict[str, str] = {}
+    for name, default in _ART_PREF_DEFAULTS.items():
+        raw = prefs.get(name)
+        values[name] = default if raw is None else str(raw)
+    return values
+
+
+def load_art_online_settings() -> ArtOnlineSettings:
+    """Laufzeit-Einstellungen der Online-Suche aus den Prefs bauen."""
+    return ArtOnlineSettings.from_mapping(art_online_pref_values())
+
+
+async def register_art_online_prefs() -> None:
+    """``artworkOnline*``-Prefs mit Default registrieren (idempotent).
+
+    Wie Perls ``%defaults`` beim Start (``Slim/Utils/Prefs.pm:265-268``
+    registriert ``coverArt``/``artfolder``/``thumbSize``): ohne Registrierung
+    hätte die Settings-Seite beim ersten Aufruf leere Felder, obwohl die Suche
+    mit Defaults arbeitet.
+    """
+    prefs = get_prefs()
+    for name, default in _ART_PREF_DEFAULTS.items():
+        try:
+            await prefs.init_preference(name, default=default, category="artwork")
+        except Exception as exc:  # noqa: BLE001 - Settings-Seite darf nicht brechen
+            logger.warning("settings: %s konnte nicht registriert werden (%s)",
+                           name, exc)
 
 
 async def _save_simple_prefs(page: SettingsPage, params: dict[str, str],
@@ -773,6 +909,11 @@ async def handle_settings_request(scope: dict, receive, send) -> None:
 
         await radiobrowser.ensure_country_pref()
         extra_options[_RADIO_COUNTRY_PREF] = await _radio_country_options()
+
+    # Dasselbe für die Online-Cover-Felder dieser Seite: Prefs mit Default
+    # registrieren, damit das Formular die wirksamen Werte zeigt.
+    if any(f.pref in _ART_PREF_DEFAULTS for f in page.fields):
+        await register_art_online_prefs()
 
     if method == "POST" and "saveSettings" in params:
         if page.needs_client and player is None:
