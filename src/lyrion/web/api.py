@@ -7807,6 +7807,15 @@ class JSONRPCAPI:
               -> the row's info menu (Titel/URL/Bitrate); with
                  ``xmlBrowseInterimCM:1`` the play-control menu with
                  "In Favoriten speichern" (``menus.interim_context_menu``)
+
+        ``count`` on a station level is the feed's **total** (194 TuneIn
+        stations), not the number of rows in the window — Perl's
+        ``$subFeed->{'total'}`` (``XMLBrowser.pm:792-793``), the value a client
+        pages against.  With radio-browser as the source the total comes from
+        the facet index (``radiobrowser.node_total``; live 2026-09-19: country
+        ``DE`` 6397, tag ``pop`` 6257).  A window past the end answers
+        ``count``/``offset`` without rows (Perl's invalid ``normalize()``
+        branch); the ``Leer`` row belongs to a feed that is empty itself.
         """
         from lyrion.web import favorites_menu, radiobrowser
 
@@ -7846,11 +7855,25 @@ class JSONRPCAPI:
 
         level = await radiobrowser.level_for(
             node, start=start, qty=qty, use_play_control=use_play_control)
+        # ``count`` is the feed's total, ``offset`` the requested window — the
+        # pair Perl's ``normalize()``/``dynamicAutoQuery`` answers with
+        # (``Slim/Control/Request.pm:1805-1839``, ``XMLBrowser.pm:851``).  The
+        # ``Leer`` row belongs to a feed that is empty *itself*
+        # (``XMLBrowser.pm:837-846`` ``$menuMode && !$count``, ``$count = 1``);
+        # a window *past* the feed's end is Perl's invalid branch instead:
+        # ``count``/``offset`` (and ``window``) without a single row, no
+        # placeholder — live Perl 9.1.1 ``browselibrary items 303 100 menu:1
+        # mode:bmf`` answers exactly ``{count, offset, window}``.
+        if not level.items and not level.total:
+            return favorites_menu.render_menu(
+                feed, [], title=level.title, playcontrol_params=tagged,
+                use_play_control=use_play_control, count=1,
+                offset=start, empty_placeholder=True)
         return favorites_menu.render_menu(
             feed, level.items, title=level.title, playcontrol_params=tagged,
             use_play_control=use_play_control,
-            count=level.total if level.items else None,
-            offset=start, empty_placeholder=True)
+            count=level.total,
+            offset=start)
 
     async def _radio_station_leaf(self, feed: str, station, item_id: str,
                                   rest: list) -> dict:

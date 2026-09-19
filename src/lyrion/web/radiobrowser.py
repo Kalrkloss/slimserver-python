@@ -38,6 +38,22 @@ and item shapes stay Perl-equal; only the stations behind them come from
 https://api.radio-browser.info (spoken ``User-Agent`` required, results
 cached briefly, failures degrade to an empty list — never an exception and
 never invented data).
+
+Paging (the ``count`` of an answered level) is Perl's paging: ``count`` is the
+**feed's total**, not the size of the answered window (``Slim/Control/
+XMLBrowser.pm:792-793`` ``my $count = $subFeed->{'total'}``, sliced by
+``Slim/Control/Request.pm:1805-1839`` ``normalize``).  TuneIn ships that total
+with the feed; radio-browser publishes none per query, so the total comes from
+the *facet index* the leaf is built from — ``/json/countries`` and
+``/json/languages`` carry a ``stationcount``, ``/json/tags/<tag>`` the exact
+tag's (see :func:`node_total`).  ``search`` and the unfiltered ``local`` have
+no such index: their level is its own (bounded) list, whose length is the
+count (:func:`full_stations`).  Either way the number is *stable* across the
+pages of one browse — Jive's list treats ``count`` as the length of the whole
+long list and discards its cache the moment two answers disagree
+(``share/jive/applets/SlimBrowser/DB.lua:63`` and :125-136), which a
+page-dependent count (the port's earlier ``start + len + 1`` marker) never
+survives.
 """
 
 from __future__ import annotations
@@ -90,8 +106,16 @@ CACHE_TTL = 180.0
 _MAX_CACHE = 256
 _MAX_SIDS = 512
 
-#: radio-browser caps ``limit``; keep answers small (a controller pages).
-_MAX_LIMIT = 100
+#: Ceiling of one answer's page size.  radio-browser has no documented cap
+#: (live 2026-09-19: ``limit=10000`` answers 6001 rows) — this is *our* bound,
+#: and it must not be smaller than what a controller asks for: Jive requests
+#: 200 rows per chunk (``share/jive/applets/SlimBrowser/DB.lua:48``
+#: ``local BLOCK_SIZE = 200``, ``SlimBrowserApplet.lua:211`` ``qty =
+#: DB:getBlockSize()``), and ``DB.menuItems`` stores the answer under the key
+#: ``floor(cFrom/BLOCK_SIZE)`` (``DB.lua:186-201``) — a *short* page leaves a
+#: hole in that chunk.  The old cap of 100 handed a 200-row client 100 rows and
+#: with them a list that looked cut off.
+_MAX_LIMIT = 1000
 
 _cache: dict[str, tuple[float, Any]] = {}
 _sids: dict[str, "RadioNode"] = {}
@@ -299,6 +323,111 @@ async def top_stations(limit: int = 20, offset: int = 0) -> list[Station]:
     """
     return _stations(await _get_json("/json/stations/search",
                                      _station_params(limit, offset)))
+
+
+async def full_stations(node: "RadioNode") -> list[Station]:
+    """The *whole* station list of a node radio-browser publishes no total for.
+
+    ``search`` and the unfiltered ``local`` (``COUNTRY_PREF`` empty) have no
+    facet index to read a count from, so the level's list itself is the total:
+    one cached request of up to :data:`_MAX_LIMIT` rows, whose length becomes
+    the answer's ``count`` and whose slices are the pages.  That is Perl's
+    model — its feed holds the whole cached document (``XMLBrowser.pm:353-371``
+    ``CACHE_TIME`` 3600) and every ``_index``/``_quantity`` request slices that
+    in-memory list (``dynamicAutoQuery``/``normalize``).  A term with more hits
+    than :data:`_MAX_LIMIT` therefore ends after those rows, exactly as TuneIn's
+    own directory listing ends at its document bound.
+    """
+    return await stations_for(node, limit=_MAX_LIMIT, offset=0)
+
+
+async def country_total(code: str) -> Optional[int]:
+    """radio-browser's own station count of a country (``/json/countries``).
+
+    Perl's ``count`` is the *feed's* item total — a stable number the
+    controllers use to size the list and to fetch the next page
+    (``Slim/Control/XMLBrowser.pm:792-793`` ``my $count = $subFeed->{'total'};
+    $count ||= defined $items ? scalar @$items : 0;`` and the same ``$count``
+    ``Slim/Control/Request.pm:1805-1839`` ``normalize`` slices against).  TuneIn
+    hands that total over with the feed; radio-browser answers no per-query
+    total, but its country index carries ``stationcount`` (live 2026-09-19:
+    ``DE`` → 6397).  The facet counts every station of the country, the
+    ``hidebroken`` filter below delivers 6001 of them (live) — so it is an
+    *upper bound* of the deliverable list: every row the source has stays
+    reachable, the last page is merely short.  ``None`` = the code is unknown to
+    the index (no count to publish).
+    """
+    code = (code or "").strip().upper()
+    if len(code) != 2:
+        return None
+    for row in await countries():
+        if row["code"] == code:
+            return int(row["stationcount"])
+    return None
+
+
+async def language_total(name: str) -> Optional[int]:
+    """The ``stationcount`` of one language (``/json/languages``, exact match).
+
+    Same rule as :func:`country_total`; the index's junk names (``#english``,
+    ``1``, …) are dropped by :func:`languages` exactly as they are for the
+    language *index* level, so no dead count can be published.
+    """
+    want = (name or "").strip().casefold()
+    if not want:
+        return None
+    for row in await languages():
+        if str(row["name"]).strip().casefold() == want:
+            return int(row["stationcount"])
+    return None
+
+
+async def tag_total(tag: str) -> Optional[int]:
+    """The ``stationcount`` of one tag (``/json/tags/<tag>``, exact match).
+
+    ``/json/tags/<term>`` is radio-browser's tag *search*: it answers every tag
+    containing the term (live ``pop`` → 297 rows, 12 KB, ~0.17 s) and the entry
+    with the exact name is the one the ``bytagexact`` station list below is
+    built from.  ``None`` when no entry carries the exact name — then the level
+    falls back to its own list length (:func:`full_stations`).
+    """
+    want = (tag or "").strip()
+    if not want:
+        return None
+    payload = await _get_json("/json/tags/" + urllib.parse.quote(want, safe=""))
+    if not isinstance(payload, list):
+        return None
+    for row in payload:
+        if not isinstance(row, dict):
+            continue
+        if str(row.get("name") or "").strip().casefold() != want.casefold():
+            continue
+        try:
+            return int(row.get("stationcount") or 0)
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+async def node_total(node: "RadioNode") -> Optional[int]:
+    """The published total of a station level, ``None`` when there is none.
+
+    The index a leaf's stations come from is the same index that carries its
+    ``stationcount`` (country list, language list, tag search) — the one cheap,
+    *stable* number :func:`level_for` can put into ``count``.  ``search``, the
+    unfiltered ``local`` and any leaf the index does not know have no such
+    number and are answered from their own list (:func:`full_stations`).
+    """
+    arg = (node.arg or "").strip()
+    if not arg:
+        return None
+    if node.feed in ("local", "location"):
+        return await country_total(arg)
+    if node.feed == "language":
+        return await language_total(arg)
+    if node.feed in TAG_INDEX:
+        return await tag_total(arg)
+    return None
 
 
 async def countries() -> list[dict]:
@@ -947,9 +1076,14 @@ async def level_for(node: RadioNode, *, start: int = 0, qty: int = 0,
                     use_play_control: bool = False) -> FeedLevel:
     """Render any radio feed level.
 
-    ``qty <= 0`` means "the whole list" (Perl's ``_quantity`` 0 leaves the
-    paging to the controller, ``XMLBrowser.pm:303-304``).  The play-control
-    branch is decided by the caller and applied to the station rows here.
+    ``qty <= 0`` means "as much as the level has" (no client quantity: Perl's
+    ``normalize()`` uses the feed's own ``$count`` then, ``Request.pm:1815``).
+
+    A station level's ``FeedLevel.total`` is the **feed's total**, not the size
+    of the answered window: Perl's ``$subFeed->{'total'}``
+    (``XMLBrowser.pm:792-793``) — see the ``stations`` branch below.  The
+    play-control branch is decided by the caller and applied to the station
+    rows here.
     """
     feed = node.feed
     if node.kind == "empty" or feed in ("podcast", "sounds"):
@@ -971,26 +1105,39 @@ async def level_for(node: RadioNode, *, start: int = 0, qty: int = 0,
         return FeedLevel(title=node.title or FEED_TITLES.get(feed, ""),
                          items=items, total=total, feed=feed)
     if node.kind == "stations":
-        limit = qty if qty > 0 else 20
-        # radio-browser answers without a total; Perl's ``count`` is the
-        # directory's ``totalItems`` (a paging hint the controllers use to size
-        # the list and fetch the next page).  One extra row is fetched to tell
-        # "the feed ends here" from "there is at least one more page", and the
-        # count then carries that +1 marker — an honest lower bound with the
-        # same *effect* as Perl's total (see the module docstring).
-        probe = limit + 1 if qty > 0 else limit
-        stations = await stations_for(node, limit=probe, offset=start)
-        more = qty > 0 and len(stations) > limit
-        stations = stations[:limit] if qty > 0 else stations
+        # ``count`` is the feed's **total**, exactly as Perl's
+        # ``$subFeed->{'total'}`` (``XMLBrowser.pm:792-793``) is: Jive's list
+        # stores it as the length of the whole long list (``DB.lua:63``
+        # ``count = 0, -- =last_chunk.count, the total number of items in the
+        # long list``), pages in 200-row chunks towards it (``DB.lua:272-300``
+        # ``missing``) and **drops and refetches everything** whenever a chunk
+        # reports a different count (``DB.lua:125-136``).  The former
+        # ``start + len(items) + 1`` marker therefore had two effects: the
+        # first answer already looked like the end of the list (100 of 6001
+        # country stations) and every following page invalidated the client's
+        # cache.  Squeezer/Squeeze Client read ``count`` the same way.
+        total = await node_total(node)
+        if total is None:
+            # No published total (``search``, unfiltered ``local``): the list
+            # itself is the feed and every page is a slice of it.
+            whole = await full_stations(node)
+            total = len(whole)
+            window = whole[start:start + qty] if qty > 0 else whole[start:]
+        else:
+            # Perl's ``_quantity`` page of a feed whose total is known
+            # (``Request.pm:1805-1839``).  A request without a quantity gets
+            # the whole (bounded) list — Perl's ``normalize`` defaults
+            # ``$numofitems`` to ``$count`` in that case.
+            limit = qty if qty > 0 else _MAX_LIMIT
+            window = await stations_for(node, limit=limit, offset=start)
         sid = node_sid(node)
         items = [station_item(s, f"{sid}.{start + index}", index=start + index,
                               use_play_control=use_play_control)
-                 for index, s in enumerate(stations)]
+                 for index, s in enumerate(window)]
         if feed == "search":
             title = SEARCH_TITLE.format(term=node.arg)
         else:
             title = node.title or STATIONS_TITLE
-        total = start + len(items) + (1 if more else 0)
         return FeedLevel(title=title, items=items, total=total, feed=feed)
     return FeedLevel(title=node.title, total=0, feed=feed)
 
@@ -1128,18 +1275,22 @@ __all__ = [
     "Station",
     "countries",
     "country_name",
+    "country_total",
     "derived_country",
     "empty_placeholder",
     "ensure_country_pref",
+    "full_stations",
     "home_menu_items",
     "index_child",
     "index_rows",
+    "language_total",
     "languages",
     "level_for",
     "link_item",
     "local_country",
     "node_for_sid",
     "node_sid",
+    "node_total",
     "parse_item_id",
     "proxied_image",
     "resolve",
@@ -1153,5 +1304,6 @@ __all__ = [
     "stations_by_language",
     "stations_by_tag",
     "stations_for",
+    "tag_total",
     "top_stations",
 ]

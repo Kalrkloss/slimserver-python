@@ -582,8 +582,18 @@ def test_query_params_reach_the_radio_browser_endpoints(monkeypatch):
         return [radiobrowser.Station.from_json(STATIONS[0])]
 
     monkeypatch.setattr(radiobrowser, "search_stations", fake_search)
-    feed("search", ["6", "4", "menu:search", "search:jazz"])
-    assert seen == [("jazz", 5, 6)], seen  # limit+1 probes for "more pages"
+    got = feed("search", ["6", "4", "menu:search", "search:jazz"])
+    # A *name search* is the one level radio-browser publishes no total for:
+    # the level fetches its whole (bounded) list and slices the requested window
+    # out of it — Perl's model, whose feed holds the cached document and slices
+    # it per request (``XMLBrowser.pm:353-371``, ``normalize()``).  The page
+    # offset must NOT travel to the endpoint: ``count`` may not depend on the
+    # page, or every page invalidates the client's list (``DB.lua:125-136``).
+    assert seen == [("jazz", radiobrowser._MAX_LIMIT, 0)], seen
+    # start 6 of a one-row list = a window past the end: the total (1) stays,
+    # no row and no ``Leer`` placeholder (Perl's invalid ``normalize()``
+    # branch, ``Request.pm:1805-1839``).
+    assert got["count"] == 1 and got["item_loop"] == []
 
 
 def test_station_leaf_and_interim_context_menu():

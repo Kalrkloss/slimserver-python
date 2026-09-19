@@ -353,15 +353,95 @@ def test_index_and_station_levels(monkeypatch):
     assert station_level.title == "Rock"
 
 
-def test_count_hints_that_more_pages_exist(monkeypatch):
-    """radio-browser has no total — the +1 marker replaces TuneIn's."""
+def test_count_is_the_feed_total_not_the_window_size(monkeypatch):
+    """``count`` must not move with the page — Perl's ``$subFeed->{'total'}``.
+
+    Jive's list takes ``count`` as the length of the *whole* long list
+    (``share/jive/applets/SlimBrowser/DB.lua:63``) and throws its cache away
+    whenever two answers disagree about it (``DB.lua:125-136``) — a count that
+    grows page by page (the port's old ``start + len(items) + 1``) makes every
+    page a fresh list.  A level radio-browser publishes no total for answers
+    from its own (bounded) list instead.
+    """
     monkeypatch.setattr(radiobrowser, "_get_json",
                         _static_json([dict(ROW)] * 3))
     node = RadioNode("stations", "music", "rock", "Rock")
     short = asyncio.run(radiobrowser.level_for(node, start=0, qty=5))
     assert len(short.items) == 3 and short.total == 3      # the feed ends
     page = asyncio.run(radiobrowser.level_for(node, start=0, qty=2))
-    assert len(page.items) == 2 and page.total == 3        # one more exists
+    assert len(page.items) == 2 and page.total == 3        # two of three
+    second = asyncio.run(radiobrowser.level_for(node, start=2, qty=2))
+    assert len(second.items) == 1 and second.total == 3    # count unchanged
+    # A window past the end: no rows, the total stays (Perl's invalid
+    # ``normalize()`` branch) — never a shrunk/placeholder answer.
+    past = asyncio.run(radiobrowser.level_for(node, start=9, qty=2))
+    assert past.items == [] and past.total == 3
+
+
+def test_page_ceiling_covers_a_jive_chunk(monkeypatch):
+    """The cap must not be smaller than the client's chunk (Jive: 200)."""
+    assert radiobrowser._MAX_LIMIT >= 200                  # DB.lua:48
+    seen: list[tuple] = []
+
+    async def fake(tag, limit=20, offset=0):
+        seen.append((tag, limit, offset))
+        return [Station.from_json(ROW)]
+
+    monkeypatch.setattr(radiobrowser, "stations_by_tag", fake)
+    node = RadioNode("stations", "music", "rock", "Rock")
+    asyncio.run(radiobrowser.level_for(node, start=0, qty=200))
+    assert seen == [("rock", 200, 0)], seen
+
+
+def test_country_total_is_radio_browsers_own_station_count(monkeypatch):
+    """``count`` of a country leaf = the facet index's ``stationcount``.
+
+    Perl's ``count`` is the feed's total (``XMLBrowser.pm:792-793``); TuneIn
+    ships it, radio-browser publishes it per facet (``/json/countries``,
+    ``/json/languages``, ``/json/tags/<tag>``).
+    """
+    monkeypatch.setattr(radiobrowser, "_get_json", _json_by_path({
+        "/json/countries": [
+            {"name": "Germany", "iso_3166_1": "DE", "stationcount": 6397}],
+        "/json/languages": [
+            {"name": "german", "stationcount": 3135}],
+        "/json/tags/": [
+            {"name": "pop", "stationcount": 6257},
+            {"name": "pop rock", "stationcount": 12}],
+        "/json/stations/": [dict(ROW)] * 2,
+    }))
+    assert asyncio.run(radiobrowser.country_total("de")) == 6397
+    assert asyncio.run(radiobrowser.country_total("zz")) is None
+    assert asyncio.run(radiobrowser.country_total("deutschland")) is None
+    assert asyncio.run(radiobrowser.language_total("german")) == 3135
+    assert asyncio.run(radiobrowser.language_total("klingon")) is None
+    # ``/json/tags/<term>`` is a search: only the *exact* entry counts
+    assert asyncio.run(radiobrowser.tag_total("pop")) == 6257
+    assert asyncio.run(radiobrowser.tag_total("popp")) is None
+
+
+def test_country_leaf_reports_the_facet_total_and_pages_past_the_window(
+        monkeypatch):
+    """``local`` → Sender: ``count`` 6397 while the page delivers 2 rows.
+
+    This is the user-visible fix for "Radio – Lokales Radio – Sender zeigt
+    recht wenige Sender": the answer names the whole feed, and every further
+    page keeps that count (so the clients do fetch page 2 instead of treating
+    page 1 as the end of the list).
+    """
+    monkeypatch.setattr(radiobrowser, "_get_json", _json_by_path({
+        "/json/countries": [
+            {"name": "Germany", "iso_3166_1": "DE", "stationcount": 6397}],
+        "/json/stations/": [dict(ROW)] * 2,
+    }))
+    node = RadioNode("stations", "local", "DE", "Sender")
+    one = asyncio.run(radiobrowser.level_for(node, start=0, qty=4))
+    assert one.total == 6397 and len(one.items) == 2
+    two = asyncio.run(radiobrowser.level_for(node, start=4, qty=4))
+    assert two.total == 6397 and len(two.items) == 2
+    # the row ids continue the window (Perl's ``$sid.$index`` crumbs)
+    assert one.items[0]["params"]["item_id"].endswith(".0")
+    assert two.items[0]["params"]["item_id"].endswith(".4")
 
 
 def test_search_level_title_uses_the_query():
