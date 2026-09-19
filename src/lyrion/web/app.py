@@ -86,18 +86,43 @@ async def _respond_401(send) -> None:
     await send({"type": "http.response.body", "body": b"Unauthorized"})
 
 
+def _finite_headers(headers, body: bytes) -> dict[str, str]:
+    """Perl's framing for finite answers: ``Content-Length``, never chunked.
+
+    ``Slim/Web/HTTP.pm`` answers every non-streamed request with a length
+    (live Perl 9.1.1, 2026-09-19: ``/html/images/radio.png`` →
+    ``Content-Length: 16749``, ``/html/images/radio_40x40_m.png`` → 1961,
+    ``/imageproxy/…/image_40x40_m.png`` → 2355, static 404 → ``text/html``
+    97 B). Only streamed answers (cometd server push, audio) go chunked.
+
+    Without the length uvicorn frames the body as
+    ``Transfer-Encoding: chunked``, and ``jive/net/SocketHttp.lua:777`` treats
+    *every* chunked socket as a long-term server-push connection
+    (``self:socketInactive()``).  SqueezePlay's artwork pool then stops
+    completing its fetches (live client log 2026-09-19: 7 requests sent, only
+    3 ``_getArtworkThumbSink`` callbacks, ``artworkFetchCount`` pinned at the
+    limit of 4) — the queue never dispatches again, so **no** subsequent
+    artwork (station logos!) is ever requested.
+    """
+    hdr = dict(headers)
+    if not any(str(k).lower() == "content-length" for k in hdr):
+        hdr["Content-Length"] = str(len(body))
+    return hdr
+
+
 async def _send_cometd_reply(send, replies: list[dict]) -> None:
     """One complete JSON reply (Content-Length framing, no chunked body)."""
     import json as _json
 
+    body = _json.dumps(replies).encode("utf-8")
     await send({
         "type": "http.response.start",
         "status": 200,
         "headers": [(b"Content-Type", b"application/json"),
-                    (b"Cache-Control", b"no-cache")],
+                    (b"Cache-Control", b"no-cache"),
+                    (b"Content-Length", str(len(body)).encode())],
     })
-    await send({"type": "http.response.body",
-                "body": _json.dumps(replies).encode("utf-8")})
+    await send({"type": "http.response.body", "body": body})
 
 
 async def _watch_disconnect(receive) -> None:
@@ -513,7 +538,7 @@ def _cover_cache_put(key, data: bytes, mime) -> None:
 
 
 _COVER_PATH_RE = _re.compile(
-    r"^/music/(\d+|current)/(?:"
+    r"^/music/(-?\d+|current)/(?:"
     r"cover\.(?:jpg|png)"                          # plain: cover.jpg
     # LMS sized form. Jive omits the extension when it fetches a browser
     # thumbnail (fetchArtwork without imgFormat) — SqueezePlay asked for
@@ -1220,6 +1245,68 @@ def _placeholder_cover(size: tuple[int, int] | None = None) -> tuple[bytes, str]
     return data, "image/png"      # unsized: Perl serves cover.png as-is
 
 
+def _remote_cover(size: tuple[int, int] | None = None) -> tuple[bytes, str] | None:
+    """Perl's cover of a **remote** track — the skin's ``html/images/radio.png``.
+
+    ``Slim/Schema/RemoteTrack.pm:317`` gives every remote stream a *negative*
+    ``id``; ``/music/<id>/cover…`` for such an id resolves the stream's
+    artwork, and a remote stream without a stored logo carries
+    ``cover = html/images/radio.png`` (``Slim/Player/Protocols/HTTP.pm:
+    1136-1147`` ``getIcon``: a protocol icon handler, else the skin's radio
+    image) — resized by ``Slim/Web/ImageProxy.pm:410-425``
+    (``fixHttpPath($prefs->get('skin'), 'html/images/radio.png')``).
+
+    Live Perl 9.1.1 (read-only 2026-09-19), both streams of the live server::
+
+        /music/-94115161401160/cover.jpg          -> 200 image/png 16749 B
+        /music/-94115161401160/cover_40x40_m.jpg  -> 200 image/png  1961 B
+        /music/-94115167819792/cover_40x40_m.jpg  -> 200 image/png  1961 B
+
+    — the exact byte counts of ``html/images/radio.png`` and its 40x40 skin
+    resize (the same file ``/imageproxy`` falls back to, see
+    :func:`_imageproxy_placeholder`).  Our cover route answered **404** for
+    every negative id, so a logo-less radio stream had no default logo in the
+    clients that resolve their artwork through the id (Jive's
+    ``NowPlayingApplet.lua:102-115`` ``params.track_id`` branch — "this is for
+    placeholder artwork, either for local tracks or radio streams with no
+    art").  ``None`` = the skin file is missing (then the generic cover is
+    served instead).
+    """
+    p = _imageproxy_placeholder_path()
+    data = None
+    if p is not None:
+        try:
+            data = p.read_bytes()
+        except OSError:
+            data = None
+    if data is None:
+        return None
+    if size is not None:
+        res = _resize_skin_image(data, size)     # PNG, like Perl's sized answer
+        if res is not None:
+            return res, "image/png"
+    return data, "image/png"
+
+
+async def _send_remote_cover(send, size: tuple[int, int] | None = None) -> None:
+    """Answer a remote track's cover with Perl's default (else the generic one)."""
+    res = _remote_cover(size)
+    if res is None:
+        await _send_placeholder_cover(send, size)
+        return
+    data, mime = res
+    await send({
+        "type": "http.response.start",
+        "status": 200,
+        "headers": [
+            (b"Content-Type", (mime or "image/png").encode()),
+            (b"Cache-Control", b"max-age=86400"),
+            (b"Content-Length", str(len(data)).encode()),
+        ],
+    })
+    await send({"type": "http.response.body", "body": data})
+
+
 async def _send_placeholder_cover(send, size: tuple[int, int] | None = None) -> None:
     """Send the generic cover (200) — or 404 if even it is missing."""
     res = _placeholder_cover(size)
@@ -1238,6 +1325,7 @@ async def _send_placeholder_cover(send, size: tuple[int, int] | None = None) -> 
         "headers": [
             (b"Content-Type", mime.encode()),
             (b"Cache-Control", b"max-age=86400"),
+            (b"Content-Length", str(len(data)).encode()),
         ],
     })
     await send({"type": "http.response.body", "body": data})
@@ -1351,6 +1439,7 @@ async def _serve_album_cover(album_id: int, send, size: tuple[int, int] | None =
         "headers": [
             (b"Content-Type", (mime or "image/jpeg").encode()),
             (b"Cache-Control", b"max-age=86400"),
+            (b"Content-Length", str(len(data)).encode()),
         ],
     })
     await send({"type": "http.response.body", "body": data})
@@ -1520,7 +1609,15 @@ def create_app(
                     if cover_id is None:
                         await _send_placeholder_cover(send, cover_size)
                         return
-                await _serve_album_cover(cover_id, send, cover_size)
+                if isinstance(cover_id, int) and cover_id < 0:
+                    # A *negative* id is a remote track (Slim/Schema/
+                    # RemoteTrack.pm:317) — Perl answers the skin's
+                    # ``html/images/radio.png`` for its cover, whatever the
+                    # stream carries (see _remote_cover, live-verified).
+                    await _send_remote_cover(send, cover_size)
+                    return
+                if isinstance(cover_id, int):
+                    await _serve_album_cover(cover_id, send, cover_size)
                 return
 
         # Perl's ImageProxy (deviation D5): /imageproxy/<uri-escaped url>/<spec>.
@@ -1529,6 +1626,11 @@ def create_app(
         # Slim::Web::ImageProxy->getImage (ImageProxy.pm:111-236).
         if path.startswith("/imageproxy/") and method in ("GET", "HEAD"):
             status, headers, body = await _serve_imageproxy(path)
+            # Perl frames the proxied image with Content-Length (live 9.1.1:
+            # /imageproxy/…/image_40x40_m.png → Content-Length: 2355).  A
+            # chunked answer would flip SqueezePlay's socket into its
+            # server-push mode and stall the artwork pool — see _finite_headers.
+            headers = _finite_headers(headers, body)
             await send({
                 "type": "http.response.start",
                 "status": status,
@@ -1559,7 +1661,10 @@ def create_app(
             method, path, body
         )
 
-        # Build ASGI response
+        # Build ASGI response.  Perl answers finite bodies with
+        # Content-Length (Slim/Web/HTTP.pm), so add it here — chunked framing
+        # stalls SqueezePlay's artwork pool (see _finite_headers).
+        headers = _finite_headers(headers, response_body)
         await send({
             "type": "http.response.start",
             "status": status,

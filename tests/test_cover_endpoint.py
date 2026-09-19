@@ -27,6 +27,7 @@ from pathlib import Path
 from lyrion.web.app import (
     _parse_cover_path,
     _placeholder_cover,
+    _remote_cover,
     _set_static_root,
 )
 
@@ -49,6 +50,52 @@ def test_numeric_paths_still_work():
 def test_invalid_paths_are_rejected():
     assert _parse_cover_path("/music/current/foo.jpg") is None
     assert _parse_cover_path("/music/abc/cover.jpg") is None
+
+
+def test_negative_remote_ids_are_accepted():
+    """A negative id is a remote track (``Schema/RemoteTrack.pm:317``).
+
+    Perl answers ``/music/<negative id>/cover.jpg`` with the skin's
+    ``html/images/radio.png`` — live 9.1.1, read-only 2026-09-19:
+    ``/music/-94115161401160/cover.jpg`` → 200 image/png 16749 B,
+    ``…/cover_40x40_m.jpg`` → 200 image/png 1961 B.  Our regex only knew
+    ``\\d+``/``current``, so every remote id 404'd and a logo-less radio
+    stream had no default logo.
+    """
+    assert _parse_cover_path("/music/-94115161401160/cover.jpg") == \
+        (-94115161401160, None)
+    assert _parse_cover_path("/music/-94115161401160/cover_40x40_m.jpg") == \
+        (-94115161401160, (40, 40))
+    assert _parse_cover_path("/music/-170263893352417/cover_240x240_m") == \
+        (-170263893352417, (240, 240))
+
+
+#: the skin file, as the running server resolves it (``html/`` IS the static
+#: root, ``html/EN/html/images/radio.png`` the skin fallback).
+RADIO_PNG = REPO_ROOT / "html" / "EN" / "html" / "images" / "radio.png"
+
+
+def test_remote_cover_is_perls_radio_png():
+    """The remote default is ``html/images/radio.png`` — Perl's exact bytes."""
+    _set_static_root(REPO_ROOT / "html")
+    assert RADIO_PNG.stat().st_size == 16749        # live Perl: same file
+    res = _remote_cover()
+    assert res is not None
+    data, mime = res
+    assert data[:8] == b"\x89PNG\r\n\x1a\n"        # real PNG
+    assert mime == "image/png"
+    assert data == RADIO_PNG.read_bytes()
+
+
+def test_sized_remote_cover_is_png_like_perl():
+    """``cover_40x40_m.jpg`` on a remote id → a 40x40 **PNG** (Perl: image/png)."""
+    _set_static_root(REPO_ROOT / "html")
+    res = _remote_cover((40, 40))
+    assert res is not None
+    data, mime = res
+    assert mime == "image/png"
+    assert data[:8] == b"\x89PNG\r\n\x1a\n"
+    assert len(data) < RADIO_PNG.stat().st_size
 
 
 def test_placeholder_is_perls_cover_png():

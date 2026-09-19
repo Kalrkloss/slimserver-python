@@ -118,6 +118,32 @@ except ImportError:
         return json.dumps(obj).encode("utf-8")
 
 
+def _static_404_page(path: str) -> bytes:
+    """Perl's missing-file page — ``html/errors/404.html``.
+
+    ``Slim/Web/HTTP.pm:708-711`` answers a missing static file with
+    ``code(RC_NOT_FOUND)``, ``content_type('text/html')`` and
+    ``filltemplatefile('html/errors/404.html', $params)``.  Live Perl 9.1.1
+    (2026-09-19) renders exactly::
+
+        HTTP/1.1 404 Not Found
+        Content-Type: text/html; charset=utf-8
+        Content-Length: 97
+        <HTML><HEAD><TITLE>404 Not Found</TITLE></HEAD>
+        <BODY>404 Not Found: nonexistent
+
+        </BODY></HTML>
+
+    — the placeholder ``[% path | html_entity %]`` without the leading slash
+    and without the optional suggestion line.
+    """
+    from html import escape
+    return (
+        "<HTML><HEAD><TITLE>404 Not Found</TITLE></HEAD>\n"
+        f"<BODY>404 Not Found: {escape(path.lstrip('/'))}\n\n</BODY></HTML>\n"
+    ).encode("utf-8")
+
+
 def _library_db_path() -> str:
     """Resolve the library DB path from the active config (test/dev runs use
     LYRION_SERVERDATA; the production default stays /root/.lyrion)."""
@@ -10340,7 +10366,11 @@ class WebAPIHandler:
                         {"Content-Type": "image/png",
                          "Cache-Control": "max-age=604800"},
                         resized if resized is not None else raw)
-            return 404, {}, b"Not found"
+            # Perl: Slim/Web/HTTP.pm:708-711 — a missing skin image is answered
+            # with code(RC_NOT_FOUND), content_type('text/html') and the
+            # html/errors/404.html template (never an empty body).
+            return (404, {"Content-Type": "text/html; charset=utf-8"},
+                    _static_404_page(path))
 
         import mimetypes
         mime, _ = mimetypes.guess_type(str(file_path))

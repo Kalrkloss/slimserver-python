@@ -67,8 +67,8 @@ import pytest
 from lyrion.player.manager import PlayerManager
 from lyrion.player.state import PlayerState
 from lyrion.web import favorites_menu
-from lyrion.web.api import (RADIO_PLACEHOLDER_ICON, JSONRPCAPI,
-                            _remote_track_id, _remote_url_for_id)
+from lyrion.web.api import (RADIO_PLACEHOLDER_ICON, REMOTE_ART_FALLBACK,
+                            JSONRPCAPI, _remote_track_id, _remote_url_for_id)
 
 MAC = "1c:87:2c:47:fc:36"
 MAC_CLEAN = "1C872C47FC36"
@@ -166,7 +166,7 @@ def _install_player(playlist: list, position: int = 0,
 
 
 def test_favorites_rows_name_the_perl_icon_field(favs):
-    """XMLBrowser.pm:1159-1169 — every row carries the icon Perl would send.
+    """XMLBrowser.pm:1159-1169 — every rows carries the icon Perl would send.
 
     The stub tree has no stored ``icon``, so the *derived* default appears:
     a folder gets ``html/images/favorites.png`` (``OpmlFavorites.pm:83-88``),
@@ -190,21 +190,48 @@ def test_favorites_rows_name_the_perl_icon_field(favs):
 
 
 def test_menu_status_remote_item_uses_the_radio_placeholder():
-    """Queries.pm:5628-5630 — the cover-less remote fallback.
+    """Queries.pm:5618-5633 — the cover-less remote fallback is Perl's ``icon``.
 
-    Perl names the skin-relative ``/html/images/radio.png``; we emit the
-    skin-qualified path our HTTP layer really serves (curl: 404 vs. 200).
+    Live Perl 9.1.1, read-only 2026-09-19, ``status - 1 menu:menu`` on a
+    logo-less stream (the live server's ``http://192.168.1.90/alarm.mp3``)::
+
+        {"icon": "html/images/radio.png", "text": "…", "style": "itemplay",
+         "params": {"playlist_index": 0, "track_id": -94115161401160},
+         "trackType": "radio"}
+
+    — Perl puts the *skin-relative* ``html/images/radio.png`` into the
+    ``icon`` field: the stream's ``artwork_url`` is that path
+    (``Slim/Player/Protocols/HTTP.pm:1136-1147`` ``getIcon``) and
+    ``_addJiveSong`` sends a defined ``artwork_url`` as ``icon``
+    (``Queries.pm:5619-5633``).  ``icon-id`` is kept alongside pointing at the
+    same path — the controllers read it first (``JiveItem.java:250``) and both
+    spellings resolve to ``/html/images/radio_<size>_m.png`` (curl 200).
     """
     _install_player([STREAM_URL])
     res = _status(_current(), ["-", 10, "menu:menu", "tags:ABdejJKlrStTuxy"])
     item = res["item_loop"][0]
     assert item["trackType"] == "radio"
-    # ``icon-id`` (not ``icon``): Perl's fallback is an id field, and the
-    # stand-in ``artwork_url`` of the plain playlist item must not be taken
-    # for real artwork (it stays on the non-menu shape only).
+    assert item["icon"] == REMOTE_ART_FALLBACK == "html/images/radio.png"
     assert item["icon-id"] == RADIO_PLACEHOLDER_ICON
-    assert item.get("icon") != RADIO_PLACEHOLDER_ICON
+    # both spellings name a path the live server answers (see _VERIFIED_PATHS)
+    assert "/" + item["icon"] in _VERIFIED_PATHS
     assert item["icon-id"] in _VERIFIED_PATHS
+
+
+def test_menu_status_keeps_a_stored_stream_logo(monkeypatch):
+    """A stream *with* a logo keeps naming it — nothing changes for it.
+
+    ``player.stream_images`` is the logo the stored station entry /
+    the metadata handler delivered (``_simg``, ``Queries.pm:5619-5627``);
+    the default only applies when there is none (Perl's
+    ``if (defined $songData->{artwork_url})`` branch).
+    """
+    player = _install_player([STREAM_URL])
+    player.stream_images = {STREAM_URL: "http://logos.example/station.png"}
+    res = _status(_current(), ["-", 10, "menu:menu", "tags:ABdejJKlrStTuxy"])
+    item = res["item_loop"][0]
+    assert item["icon"] == "http://logos.example/station.png"
+    assert "icon-id" not in item
 
 
 def _current() -> PlayerState:
