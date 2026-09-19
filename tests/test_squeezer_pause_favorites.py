@@ -278,7 +278,16 @@ def test_root_ids_carry_a_perl_session_handle(favs):
 
 
 def test_menu_items_keep_item_id_and_touch_to_play_on_the_same_id(favs):
-    """XMLBrowser.pm:1142/1261 — the tap id and the touch id are identical."""
+    """XMLBrowser.pm:1142/1261 — the tap id and the touch id are identical.
+
+    Vorbedingung ist ein *nicht spielender* Client: die schlichte
+    ``play``/``touchToPlay``-Zeile gilt nur, solange
+    ``_defeatDestructiveTouchToPlay`` (:1977) ``isPlaying() &&
+    playingSong()->duration()`` verneint.  Ohne eigene Vorbedingung hing das
+    Ergebnis davon ab, welchen Player ein frueherer Test im Singleton
+    hinterliess.
+    """
+    _install_player("stop")
     items = _items(["items", 0, 10, "menu:favorites"])["item_loop"]
     folder, stream = items[0], items[1]
     folder_id = folder["actions"]["go"]["params"]["item_id"]

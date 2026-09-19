@@ -506,6 +506,25 @@ def _defeat_destructive_touch_to_play(rest: list, player=None,
     if num == 4:
         # :1977 `$client->isPlaying() && $client->playingSong()->duration()
         #        && !$client->playingSong()->isPlaylist()`
+        #
+        # ``duration()`` is the CURRENT song's duration, and a remote stream
+        # has none: ``RemoteTrack::duration`` answers undef unless ``secs``
+        # is set (``Slim/Schema/RemoteTrack.pm:483-489``), so Perl's live
+        # answer for a playing radio stream carries ``"duration": "0"``.  A
+        # live stream is therefore NOT a reason to defeat the tap — only a
+        # loaded local track is.
+        #
+        # ``player.duration`` is the port's field of the *loaded* track
+        # (``manager.load_track``) and is not cleared when a stream starts
+        # (``manager.play_url`` sets ``current_url``/``remote`` only), so it
+        # still holds the previous local track's length.  Reading it while
+        # ``remote`` is set would defeat every radio row of a client that
+        # last played a local track — Perl's row shape is the plain one
+        # (measured: a SqueezePlay client with a running radio stream gets
+        # ``goAction: "play"`` + ``touchToPlay``, and the tap then sends
+        # ``<feed> playlist play …``).
+        if getattr(player, "remote", 0):
+            return False                 # remote stream: duration() == 0
         url = str(getattr(player, "current_url", "") or "")
         return bool(getattr(player, "mode", "") == "play"
                     and float(getattr(player, "duration", 0) or 0) > 0
@@ -7999,7 +8018,40 @@ class JSONRPCAPI:
             node = self._radio_node(feed, search)
 
         if station is not None:
+            # Perl :295-299 — a request that carries ``touchToPlay`` AND is
+            # not an interim context menu (``xmlBrowseInterimCM``) *is* a
+            # playlist command: ``$isPlaylistCmd = 1`` and the row's URL goes
+            # to the player (:649-675).  A client that taps a row through
+            # ``base.actions.go`` (whose ``itemsParams`` are the row's
+            # ``params``, i.e. ``item_id`` + ``touchToPlay``, :960-990) starts
+            # playback with the identical argument vector — answering the info
+            # rows instead left such a tap with a popup instead of the stream.
+            if tagged.get("touchToPlay") and not tagged.get("xmlBrowseInterimCM"):
+                return await self._json_radio_playlist(feed, rest, pid)
             return await self._radio_station_leaf(feed, station, item_id, rest)
+
+        # ── Perl's ``xmlbrowserPlayControl`` branch (:805-836) ────────────
+        # The client's tap on a *defeated* row does not name the row's own
+        # id: it re-sends the list request it got the rows from and adds the
+        # row's ``playControlParams`` —
+        # ``['local','items',<start>,200,'menu:local','useContextMenu:1',
+        #   'item_id:<sid>.1','xmlbrowserPlayControl:3','xmlBrowseInterimCM:1']``
+        # (live payload of a SqueezePlay tap, 2026-09-19).  ``item_id``
+        # therefore resolves to the *list* and ``xmlbrowserPlayControl`` is
+        # the row's absolute index inside it (Perl builds the row id as
+        # ``join('.', @crumbIndex, '') . $itemIndex`` and hands out
+        # ``{xmlbrowserPlayControl => $itemIndex}`` for the same value,
+        # :1012-1022/:1271 — the offset is subtracted again at :808
+        # ``my $i = $xmlbrowserPlayControl - $subFeed->{'offset'}``).
+        # Perl answers the play-control context menu of THAT row, with
+        # ``noFavorites => 1`` (:823) and ``playalbum => 1`` (:826) — the
+        # unconditional favourites row never appears there (:1883) and the
+        # radio items carry no ``playall``, so it is the three playlist rows.
+        # Answering it with the level again is what made the tap re-open the
+        # station list, recursively.
+        play_ctl = tagged.get("xmlbrowserPlayControl")
+        if play_ctl is not None and "menu" in tagged:
+            return await self._radio_playcontrol_tap(feed, node, play_ctl)
 
         if node is None:
             # Unknown/expired browse session or an out-of-range path: Perl
@@ -8030,6 +8082,48 @@ class JSONRPCAPI:
             use_play_control=use_play_control,
             count=level.total,
             offset=start)
+
+    async def _radio_playcontrol_tap(self, feed: str, node, token: str) -> dict:
+        """A tap on a defeated radio row — Perl ``XMLBrowser.pm:805-836``.
+
+        ``token`` is the row's absolute index inside the list ``node`` (the
+        ``xmlbrowserPlayControl`` value, numified exactly like Perl's
+        arithmetic at :808 — see :func:`_playctl_index`).  Perl picks
+        ``$items->[$i]`` from the feed the ``item_id`` resolved to and renders
+        the play-control context menu for it (:1811-1844, ``noFavorites => 1``
+        and ``playalbum => 1``).  The row is therefore addressed by the
+        *index*, not by an id — the client never sends the row's own id on
+        this path (measured live payload, see the caller).
+
+        Out of range — or a row that is not playable at all (``hasAudio``,
+        :1823 — e.g. a drill-down row of an ``index`` level, or an
+        ``index`` node that the ``item_id`` fell back to) — Perl adds no
+        ``item_loop`` and answers the bare envelope; live Perl 9.1.1
+        (read-only, 2026-09-19) for
+        ``local items 0 200 menu:local item_id:<sid>.1 xmlbrowserPlayControl:3
+        xmlBrowseInterimCM:1`` is exactly
+        ``{"offset":0,"count":0,"window":{"windowStyle":"text_list"}}``.
+        """
+        from lyrion.web import favorites_menu, radiobrowser
+
+        index = _playctl_index(token)
+        # A non-``stations`` level (Perl's ``hasAudio`` guard, :1823) and a
+        # negative index are out of range without any lookup.
+        stations_node = node if node is not None and node.kind == "stations" \
+            else None
+        row = None
+        if index >= 0 and stations_node is not None:
+            # The station at that absolute index of the feed — the same row
+            # the level handed out as ``<sid>.<index>``
+            # (``radiobrowser.level_for``: ``f"{sid}.{start + index}"``).
+            stations = await radiobrowser.stations_for(
+                stations_node, limit=index + 1, offset=index)
+            row = stations[0] if stations else None
+        if row is None or stations_node is None:
+            return {"offset": 0, "count": 0,
+                    "window": dict(favorites_menu.WINDOW_TEXT_LIST)}
+        row_id = f"{radiobrowser.node_sid(stations_node)}.{index}"
+        return favorites_menu.play_control_context_menu(row_id, menu=feed)
 
     async def _radio_station_leaf(self, feed: str, station, item_id: str,
                                   rest: list) -> dict:
@@ -8115,6 +8209,21 @@ class JSONRPCAPI:
             loop = await self._fav_items_loop(fm, parent, parent_path, False,
                                               True, use_play_control,
                                               menu="presets")
+        # Perl's ``xmlbrowserPlayControl`` branch (:805-836) covers every
+        # menu-mode feed, this one included: a tap on a defeated preset row
+        # re-sends *this* list plus the row's index and gets that row's
+        # play-control menu — answering the list again is the self-reference
+        # the station levels had.  The rows are favourites children, so the
+        # row id is a favourites path (``_fav_item_id``) and the menu's
+        # commands stay in this feed (``menu="presets"``).
+        play_ctl = tagged.get("xmlbrowserPlayControl")
+        if play_ctl is not None:
+            fav_id = self._fav_item_id(loop, _playctl_index(play_ctl))
+            if fav_id is None:
+                return {"offset": 0, "count": 0,
+                        "window": dict(favorites_menu.WINDOW_TEXT_LIST)}
+            return favorites_menu.play_control_context_menu(fav_id,
+                                                            menu="presets")
         return favorites_menu.render_menu(
             "presets", loop, playcontrol_params=tagged,
             use_play_control=use_play_control, offset=start,
