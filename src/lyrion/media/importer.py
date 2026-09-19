@@ -15,7 +15,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-from sqlalchemy import select
+from sqlalchemy import select, text
 
 from lyrion.database.schema import (
     Album,
@@ -68,6 +68,9 @@ class ImportStats:
     error_files: int = 0
     scanned_files: int = 0
     deleted_files: int = 0
+    # Album-Zeilen ohne Track, die der Scan entfernt hat
+    # (Perl Slim/Schema/Album.pm:383-406 ``Album->rescan``).
+    orphan_albums_removed: int = 0
     start_time: Optional[datetime] = None
     end_time: Optional[datetime] = None
 
@@ -133,6 +136,71 @@ def genre_namesearch(name: str) -> str:
     return s or name.upper()
 
 
+# Perls ``variousArtistsObject``: der Album-Interpret einer Zusammenstellung.
+# Perl benutzt ihn als Album-Contributor, sobald ``compilation`` gesetzt ist,
+# und ersetzt damit die Artist-Bedingung der Album-Suche
+# (Slim/Schema.pm:1286-1288, :1178-1186).
+VA_ARTIST_KEY = "various artists"
+# Perl vergleicht den Album-Contributor mit dem VA-Objekt (Schema.pm:1289-1295
+# „Set compilation to 1 if the primary contributor is VA"); dessen Name ist
+# lokalisiert (``string('VARIOUS_ARTISTS')``, strings.txt) — „Various Artists"
+# bzw. „Diverse Interpreten". Beide Formen meinen dasselbe Objekt.
+VA_ARTIST_NAMES = frozenset({VA_ARTIST_KEY, "diverse interpreten"})
+
+
+def _album_artist_tag(info: Any) -> str:
+    """ALBUMARTIST-Tag der Datei (ID3 TPE2, MP4 ``aART``, Vorbis
+    ``ALBUMARTIST``) — leer, wenn das Scan-Ergebnis das Feld nicht führt."""
+    for attr in ("album_artist", "albumartist", "album_artists"):
+        value = getattr(info, attr, None)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+        if isinstance(value, (list, tuple)) and value:
+            return str(value[0]).strip()
+    return ""
+
+
+def album_identity(info: Any, file_path: Path) -> tuple[str, str, bool, int | None]:
+    """Album-Identität nach Perl: ``(title_sort, album_artist_key,
+    has_album_artist, disc)``.
+
+    Perl bildet den Album-Interpreten als ``ALBUMARTIST || ARTIST ||
+    TRACKARTIST`` (`Slim/Schema.pm:3065`) und speichert ihn als
+    Album-Contributor (`:1289-1296`); für eine Zusammenstellung tritt das
+    Various-Artists-Objekt an die Stelle des Track-Interpreten
+    (`:1286-1288`), und in der Album-Suche ersetzt das compilation-Flag die
+    Artist-Bedingung (`:1178-1186`, Bug-Kommentar „a contributor match would
+    fail"). Der Track-Interpret entscheidet also NICHT, zu welchem Album ein
+    Track gehört — er bleibt am Track (`:3100`, contributor_track).
+    """
+    album_name = getattr(info, "album", None) or "Unknown Album"
+    track_artist = getattr(info, "artist", None) or "Unknown Artist"
+    album_artist = _album_artist_tag(info)
+    compilation = bool(getattr(info, "compilation", False))
+    disc = getattr(info, "disc_number", None) or getattr(info, "disc", None) or None
+    if album_artist:
+        akey = _sort_string(album_artist)
+        # Ist der Album-Interpret das VA-Objekt, ist das Album ein Sampler
+        # (Perl Schema.pm:1293) — der Schlüssel bleibt kanonisch EINER.
+        if akey in VA_ARTIST_NAMES:
+            akey = VA_ARTIST_KEY
+        return _sort_string(album_name), akey, True, disc
+    if compilation:
+        return _sort_string(album_name), VA_ARTIST_KEY, False, disc
+    return _sort_string(album_name), _sort_string(track_artist), False, disc
+
+
+def _album_dir_prefix(file_path: Path) -> str:
+    """``file://…/ordner/`` — Perls ``$basename`` für die Ordner-Suche.
+
+    Perl sucht ein Album ohne DISC/DISCC/MUSICBRAINZ_ALBUM_ID zusätzlich über
+    ``tracks.url LIKE "$basename%"`` im SELBEN Ordner (Slim/Schema.pm:1198-1209:
+    ``dirname($trackColumns->{'url'})``).  Wildcards im Ordnernamen werden wie
+    bei Perl nicht maskiert (`_`/`%` wirken als LIKE-Platzhalter).
+    """
+    return _file_url(file_path).rsplit("/", 1)[0] + "/"
+
+
 # ---------------------------------------------------------------------------
 # Importer
 # ---------------------------------------------------------------------------
@@ -145,6 +213,10 @@ class MusicImporter:
         self.config = config or ImportConfig()
         self.stats = ImportStats()
         self._progress_callbacks: list[Callable[[ImportStats], Any]] = []
+        # ``(ordner, album-titel) -> album-id``: der Ordner-Treffer wird pro
+        # Lauf gemerkt (Perls Suche fragt die DB pro Track, Schema.pm:1198-1209;
+        # wir halten die IDs und sparen den wiederholten LIKE-Query).
+        self._album_folder_cache: dict[tuple[str, str], int] = {}
         # No source path configured: fall back to the configured music folder
         # (Perl picks the OS music folder as the default media dir,
         # ``Slim/Utils/Prefs.pm:687-712`` → ``OSDetect::dirsFor('music')``).
@@ -166,6 +238,9 @@ class MusicImporter:
         logger.info("Starting music import from: %s", self.config.source_path)
         self.stats = ImportStats()
         self.stats.start_time = datetime.now()
+        # Ordner→Album-Treffer gelten nur für diesen Lauf (Album-Zeilen können
+        # zwischen zwei Scans gelöscht werden).
+        self._album_folder_cache = {}
 
         from lyrion.media.scan_state import SCAN_STATE
 
@@ -335,6 +410,15 @@ class MusicImporter:
         walker.join(timeout=10)
         self.stats.end_time = datetime.now()
 
+        # Verwaiste Album-Zeilen: Perl prüft nach JEDEM Scan, dass zu einem
+        # Album noch mindestens ein Track existiert, und löscht es sonst
+        # (``Slim::Schema::Album->rescan``, Slim/Schema/Album.pm:383-406,
+        # aufgerufen am Scan-Ende Slim/Utils/Scanner/Local.pm:855). Ohne diesen
+        # Schritt blieben die Zeilen eines zuvor pro Track-Interpret
+        # gespaltenen Samplers als leere Alben in der Bibliothek stehen.
+        if not aborted:
+            self.stats.orphan_albums_removed = await self._prune_orphan_albums()
+
         # Directory rows: one ``content_type='dir'`` row per walked directory,
         # so a folder id is the row's ``tracks.id`` (Perl: the scan records the
         # dirs — Slim/Utils/Scanner/Local/AIO.pm:62-67/:135-142 — and the
@@ -361,6 +445,38 @@ class MusicImporter:
             (self.stats.end_time - self.stats.start_time).total_seconds(),
         )
         return self.stats
+
+    async def _prune_orphan_albums(self) -> int:
+        """Album-Zeilen ohne Track entfernen.
+
+        Perl ``Slim::Schema::Album->rescan`` (Slim/Schema/Album.pm:383-406):
+        „make sure at least 1 track from this album still exists in the
+        database. If not, delete the album." — am Scan-Ende aufgerufen
+        (Slim/Utils/Scanner/Local.pm:855).  Bei uns hängt ein Track über
+        ``tracks_albums`` am Album, in Perl direkt über ``tracks.album``.
+        """
+        from lyrion.database.sqlite_helper import db_session
+
+        try:
+            async with db_session() as session:
+                result = await session.execute(text(
+                    "DELETE FROM albums WHERE id NOT IN "
+                    "(SELECT album FROM tracks_albums)"))
+                removed = int(result.rowcount or 0)  # type: ignore[attr-defined]
+                if removed:
+                    # Verwaiste Verknüpfungen der gelöschten Alben bleiben
+                    # sonst als Karteileichen stehen (Perls FK-Cascade deckt
+                    # sie nicht ab, wenn das Pragma aus ist).
+                    await session.execute(text(
+                        "DELETE FROM albums_contributors WHERE album NOT IN "
+                        "(SELECT id FROM albums)"))
+                await session.commit()
+        except Exception as exc:  # noqa: BLE001 - ein Scan darf daran nicht scheitern
+            logger.warning("Orphan album cleanup failed: %s", exc)
+            return 0
+        if removed:
+            logger.info("Removed %d album(s) without tracks", removed)
+        return removed
 
     async def _sync_dir_rows(self, found_dirs: set[str]) -> tuple[int, int]:
         """Store a ``dir`` row per walked directory (Perl's folder ids).
@@ -550,25 +666,31 @@ class MusicImporter:
                 ac_set.add((r[0], r[1]))
 
         # Existing albums/contributors for the batch keys.
-        # Album identity = (title sort, artist sort) — NOT year (different
-        # track years must not split a compilation) and NOT title alone
-        # (different artists' same-title albums must not merge).
+        # Album identity = (title sort, ALBUM-ARTIST sort): Perls
+        # ``ALBUMARTIST || ARTIST || TRACKARTIST`` (Slim/Schema.pm:3065), für
+        # eine Zusammenstellung das Various-Artists-Objekt (:1286-1288) —
+        # NICHT der Track-Interpret (der bleibt am Track), NICHT das Jahr
+        # (verschiedene Track-Jahre dürfen ein Album nicht spalten) und NICHT
+        # der Titel allein (gleichnamige Alben verschiedener Interpreten
+        # bleiben getrennt).
         album_keys = set()
         artist_names: set[str] = set()
-        for _, info in extracted:
-            album_name = getattr(info, "album", None) or "Unknown Album"
+        for file_path, info in extracted:
+            titlesort, artist_key, _, _ = album_identity(info, file_path)
+            album_keys.add((titlesort, artist_key))
             artist = getattr(info, "artist", None) or "Unknown Artist"
-            compilation = bool(getattr(info, "compilation", False))
-            artist_key = "various artists" if compilation else _sort_string(artist)
-            album_keys.add((_sort_string(album_name), artist_key))
             if artist and artist != "Unknown Artist":
                 artist_names.add(artist.strip().lower())
+        # Eine Abfrage für alle Album-Zeilen dieser Titel; die Sichten
+        # (exakter Schlüssel, Altbestand ohne Artist-Sort, Zeilen über
+        # Titel+Jahr, Zeile per ID für den Ordner-Treffer) entstehen daraus.
+        album_rows: list[Album] = list((await session.execute(
+            select(Album).where(
+                Album.titlesort.in_([k[0] for k in album_keys])))).scalars())
         album_by_key: dict[tuple, Album] = {
-            (a.titlesort, a.albumartist_sort): a for a in (
-                await session.execute(
-                    select(Album).where(
-                        Album.titlesort.in_([k[0] for k in album_keys])))).scalars()
+            (a.titlesort, a.albumartist_sort): a for a in album_rows
             if (a.titlesort, a.albumartist_sort) in album_keys}
+        album_by_id: dict[int, Album] = {a.id: a for a in album_rows}
         # Altbestand: Alben, die vor der Spalte ``albumartist_sort`` entstanden
         # sind, tragen dort NULL (die Migration füllt nicht nach). Der Import
         # sucht über (titlesort, artist_sort), findet sie also nie und legt eine
@@ -578,10 +700,7 @@ class MusicImporter:
         # Deshalb zusätzlich über (titlesort, year) indexieren, adoptieren und
         # ``albumartist_sort`` nachtragen.
         album_by_title_year: dict[tuple, Album] = {
-            (a.titlesort, a.year): a for a in (
-                await session.execute(
-                    select(Album).where(
-                        Album.titlesort.in_([k[0] for k in album_keys])))).scalars()
+            (a.titlesort, a.year): a for a in album_rows
             if not a.albumartist_sort}
         # Zweite Ebene: ALLE Zeilen des Stapels über (titlesort, year). Nötig,
         # weil der alte UNIQUE-Index (titlesort, year) jede zweite Zeile mit
@@ -591,10 +710,7 @@ class MusicImporter:
         # Altindex entfernt ist, wird die Zeile hier gefunden und
         # wiederverwendet (ein vorhandener Artist-Sort bleibt stehen).
         album_by_title_year_all: dict[tuple, Album] = {
-            (a.titlesort, a.year): a for a in (
-                await session.execute(
-                    select(Album).where(
-                        Album.titlesort.in_([k[0] for k in album_keys])))).scalars()}
+            (a.titlesort, a.year): a for a in album_rows}
         contrib_by_name: dict[str, Contributor] = {
             c.namespell: c for c in (
                 await session.execute(
@@ -621,7 +737,8 @@ class MusicImporter:
                                          contrib_by_name, ta_set, tc_set, ac_set,
                                          genre_by_namespell, tg_set, tg_tracks,
                                          album_by_title_year,
-                                         album_by_title_year_all)
+                                         album_by_title_year_all,
+                                         album_by_id)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Import failed for %s: %s", file_path, exc)
                 self.stats.error_files += 1
@@ -703,6 +820,49 @@ class MusicImporter:
             track.lastscanned = datetime.utcnow()
             await session.flush()
 
+    async def _album_in_folder(self, session, titlesort: str,
+                              prefix: str) -> Album | None:
+        """Album mit diesem Titel, das im SELBEN Ordner einen Track hat.
+
+        Perl ``Slim/Schema.pm:1206-1209``: ``tracks.url LIKE "$basename%"``
+        (JOIN tracks) — die Zeile, deren Track im selben Ordner liegt, ist das
+        gesuchte Album. Bevorzugt wird eine schon als Sampler markierte Zeile
+        (``compilation`` / Various Artists), sonst die älteste: damit laufen
+        die Reste eines früheren, pro Track-Interpret gespaltenen Scans wieder
+        zusammen. Perl nimmt an dieser Stelle ohne ORDER BY die erste Zeile —
+        eine Reihenfolge, die vom Scanverlauf abhängt.
+        """
+        stmt = (
+            select(Album)
+            .join(tracks_albums, tracks_albums.c.album == Album.id)
+            .join(Track, Track.id == tracks_albums.c.track)
+            .where(Album.titlesort == titlesort, Track.url.like(prefix + "%"))
+            .order_by(Album.compilation.desc(), Album.id.asc())
+            .limit(1)
+        )
+        return (await session.execute(stmt)).scalars().first()
+
+    @staticmethod
+    def _adopt_folder_album(album: Album, artist_key: str,
+                            album_by_key: dict[tuple, Album],
+                            titlesort: str) -> Album:
+        """Übernimmt eine Ordner-Zeile als Album dieses Tracks.
+
+        Perl ``Slim/Schema.pm:1399-1415`` (``mergeSingleVAAlbum``,
+        :2207-2295): unterscheiden sich die Track-Interpreten eines Albums,
+        wird es zur Compilation — ``compilation = 1`` und Album-Contributor =
+        Various Artists. Bei uns ist der Various-Artists-Schlüssel Teil der
+        Album-Identität (``albumartist_sort``), deshalb wird er dort gesetzt.
+        """
+        if not album.albumartist_sort:
+            album.albumartist_sort = artist_key
+        elif (album.albumartist_sort != artist_key
+                and album.albumartist_sort != VA_ARTIST_KEY):
+            album.compilation = 1
+            album.albumartist_sort = VA_ARTIST_KEY
+        album_by_key[(titlesort, album.albumartist_sort)] = album
+        return album
+
     async def _import_links(
         self, session, file_path: Path, info: Any,
         track_by_url: dict[str, Track],
@@ -714,22 +874,47 @@ class MusicImporter:
         tg_tracks: set | None = None,
         album_by_title_year: dict[tuple, Album] | None = None,
         album_by_title_year_all: dict[tuple, Album] | None = None,
+        album_by_id: dict[int, Album] | None = None,
     ) -> None:
         """Album + contributor + genre links for a track (Core inserts only)."""
         url = _file_url(file_path)
         track = track_by_url[url]
+        if album_by_id is None:
+            album_by_id = {}
         artist = (info.artist or "Unknown Artist") if hasattr(info, "artist") else "Unknown Artist"
         album_name = info.album or "Unknown Album" if hasattr(info, "album") else "Unknown Album"
         year = getattr(info, "year", 0) or 0
-        compilation = bool(getattr(info, "compilation", False))
-        artist_key = "various artists" if compilation else _sort_string(artist)
-        key = (_sort_string(album_name), artist_key)
+        titlesort, artist_key, has_album_artist, disc = album_identity(info, file_path)
+        # Perl Schema.pm:1289-1295: ist der primäre Contributor das VA-Objekt,
+        # ist das Album eine Compilation.
+        compilation = bool(getattr(info, "compilation", False)) or artist_key == VA_ARTIST_KEY
+        key = (titlesort, artist_key)
         # Album-ReplayGain (Perl Schema.pm:1299-1322; Kommentar dort: "we do
         # want to update album gain tags if they are changed").
         album_rg = getattr(info, "album_replay_gain", None)
         album_peak = getattr(info, "album_replay_peak", None)
 
-        album = album_by_key.get(key)
+        album = None
+        # Perls Album-Suche matcht zuerst Titel + ORDNER (``tracks.url LIKE
+        # "$basename%"``, Schema.pm:1198-1209) — die Bedingung entfällt nur,
+        # wenn DISC/DISCC/MUSICBRAINZ_ALBUM_ID bekannt sind. Genau das hält
+        # Sampler zusammen, deren Dateien NUR TALB+TPE1 tragen (kein
+        # ALBUMARTIST, kein COMPILATION): der Track-Interpret darf das Album
+        # nicht spalten. Trägt die Datei ein Album-Artist- oder
+        # Compilation-Tag, entscheidet dieses (=der Schlüssel), wie oben.
+        folder_key = (_album_dir_prefix(file_path), titlesort)
+        folder_eligible = not has_album_artist and not compilation and disc is None
+        if folder_eligible:
+            album = album_by_id.get(self._album_folder_cache.get(folder_key, -1))
+            if album is None:
+                album = await self._album_in_folder(session, titlesort, folder_key[0])
+            if album is not None:
+                album = self._adopt_folder_album(
+                    album, artist_key, album_by_key, titlesort)
+                album_by_id[album.id] = album
+                self._album_folder_cache[folder_key] = album.id
+        if album is None:
+            album = album_by_key.get(key)
         if album is None and album_by_title_year:
             # Vor der Spalte entstandene Zeile adoptieren (Begründung beim
             # Aufbau der Map) und den fehlenden Artist-Sort nachtragen, damit
@@ -749,6 +934,10 @@ class MusicImporter:
                 album.albumartist_sort = artist_key
             if album is not None:
                 album_by_key[key] = album
+        if album is not None and compilation and not album.compilation:
+            # Perl Schema.pm:1293 ("Set compilation to 1 if the primary
+            # contributor is VA") bzw. :1406 (mergeSingleVAAlbum).
+            album.compilation = 1
         if album is None:
             # Cover artwork: scanner found cover.jpg/png/… in the track's
             # folder — store the path so the API can serve it to players.
