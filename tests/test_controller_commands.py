@@ -262,6 +262,25 @@ def test_readdirectory_lists_folder_files_and_dirs(tmp_path):
     assert [i["isfolder"] for i in res["fsitems_loop"]] == [1, 1, 0]
 
 
+def test_readdirectory_sorts_case_insensitively_like_perl(tmp_path):
+    """``sortFilename`` (``Slim/Utils/OS.pm:334-353``) sortiert die Namen
+    ``lc``-basiert und ohne die Prozess-Locale zu befragen; der Ordner-vor-
+    Dateien-Lauf (:3183-3193) ist stabil und hält die Reihenfolge je Gruppe.
+    Reine Byte-Ordnung (``names.sort()``) stellte ``Zebra`` vor ``apple`` und
+    ``AC+DC`` vor ``Accept``.  Dieselbe Reihenfolge liefert Live-Perl für
+    ``/mnt/media/Musik`` (``Accept``, ``AC+DC``, …, ``Apple…``).
+    """
+    for d in ("Zebra", "AC+DC", "Accept", "apple"):
+        (tmp_path / d).mkdir()
+    for f in ("Zebra.mp3", "apple.mp3"):
+        (tmp_path / f).write_bytes(b"")
+    res = _req(["readdirectory", "0", "20", f"folder:{tmp_path}"])
+    assert [(i["name"], i["isfolder"]) for i in res["fsitems_loop"]] == [
+        ("Accept", 1), ("AC+DC", 1), ("apple", 1), ("Zebra", 1),
+        ("apple.mp3", 0), ("Zebra.mp3", 0),
+    ], res
+
+
 def test_readdirectory_filters_and_pages(tmp_path):
     """``filter:filesonly``/``filetype:`` und Paging über ``normalize``
     (Request.pm:1805-1839)."""

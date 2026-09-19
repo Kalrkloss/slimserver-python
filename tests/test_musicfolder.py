@@ -221,12 +221,88 @@ def test_list_directory_entries_missing_dir_is_empty(tmp_path):
     assert folders.list_directory_entries(tmp_path / "nope") == []
 
 
-def test_sort_filenames_falls_back_to_case_insensitive(monkeypatch):
+def test_sort_filenames_ignores_case():
+    """Perl ``sortFilename``/``noCaseFilename``: ``lc`` + native collation
+    (``Slim/Utils/OS.pm:334-356``) — Gross-/Kleinschreibung entscheidet nicht.
+    ``Zebra`` nach ``apple``, obwohl ``Z`` vor ``a`` liegt (Byte-Ordnung)."""
+    assert folders.sort_filenames(["Zebra", "apple"]) == ["apple", "Zebra"]
+    assert folders.sort_filenames(["b", "A", "c"]) == ["A", "b", "c"]
+    assert folders.sort_filenames(["abba", "ABBA"]) == ["abba", "ABBA"]
+
+
+def test_sort_filenames_tie_break_is_readdir_order():
+    """Perl sortiert stabil: bei gleichem ``lc``-Schlüssel bleibt die Reihenfolge
+    der Eingabe (``readdir``) erhalten —
+    ``perl -e 'print join " ", sort {lc($a) cmp lc($b)} qw(ABBA abba)'`` →
+    ``ABBA abba``, umgekehrte Eingabe → ``abba ABBA``."""
+    assert folders.sort_filenames(["ABBA", "abba"]) == ["ABBA", "abba"]
+    assert folders.sort_filenames(["abba", "ABBA"]) == ["abba", "ABBA"]
+
+
+def test_sort_filenames_does_not_consult_process_locale(monkeypatch):
+    """Die Reihenfolge darf nicht von der Prozess-Locale abhängen.
+
+    Der Perl-Server läuft unter einer UTF-8-Locale, unser Prozess unter ``C``
+    — ``locale.strxfrm``/``setlocale`` dürfen darum nicht befragt werden.
+    """
+    names = ["Zebra", "apple", "AC+DC", "Accept", "abba", "ABBA"]
+    expected = folders.sort_filenames(names)
+
     def boom(*_args, **_kwargs):
-        raise locale.Error("no locale")
+        raise AssertionError("sort_filenames must not use the process locale")
 
     monkeypatch.setattr(locale, "setlocale", boom)
-    assert folders.sort_filenames(["b", "A", "c"]) == ["A", "b", "c"]
+    monkeypatch.setattr(locale, "strxfrm", boom)
+    for value in ("C", "C.UTF-8", "en_US.UTF-8"):
+        monkeypatch.setenv("LC_ALL", value)
+        monkeypatch.setenv("LANG", value)
+        monkeypatch.setenv("LC_COLLATE", value)
+        assert folders.sort_filenames(names) == expected
+    assert expected == ["abba", "ABBA", "Accept", "AC+DC", "apple", "Zebra"]
+
+
+def test_sort_filenames_matches_perl_on_real_media_folder():
+    """Golden: echte Namen aus ``/mnt/media/Musik`` in der Reihenfolge, die der
+    Live-Perl-LMS (192.168.1.90) für ``readdirectory folder:/mnt/media/Musik``
+    liefert (gruppenweise: erst alle Ordner, dann Dateien, ``sortFilename`` je
+    Gruppe). Perl ignoriert in der nativen Kollation Satzzeichen und Akzente und
+    faltet die Gross-/Kleinschreibung — ``Accept`` vor ``AC+DC``,
+    ``Boy_Harsher_-_Careful…`` vor ``Boy_Harsher-Country_Girl…``,
+    ``L’Âme Immortelle`` zwischen ``Lamb of God`` und ``Lars Leonhard``.
+    """
+    as_perl_sorted = [
+        "Accept",
+        "AC+DC",
+        "Boy Harsher-Burn It Down-VINYL-2023-FWYH",
+        "Boy_Harsher_-_Careful_(2019)_MP3",
+        "Boy_Harsher-Country_Girl_(Extended_Version)-EP-WEB-2018-ENTiTLED",
+        "Boy_Harsher-Lesser_Man_(Extended_Version)-WEB-2017-POWPOW",
+        "Boy_Harsher-Pain_II-WEB-2018-WV",
+        "Boy_Harsher-Yr_Body_Is_Nothing-Reissue-CD-2018-FWYH",
+        "Fetenhits_-_25_Years_(2021)-NoGroup",
+        "Fetenhits_Compilation_-_70s_(2020)",
+        "Fetenhits_Compilation_-_90s_(2020)",
+        "Fetenhits_Compilation_-_Discofox_(2020)",
+        "Fetenhits_Compilation_-_Sommerparty_(2020)",
+        "Fetenhits_Compilation_-_The_Real_Classics_(2020)",
+        "Fetenhits_-_Disco_-",
+        "Fetenhits_NDW_Maxi_Classics_Best_Of_-2020-NoGroup part01 rar",
+        "Fetenhits_NDW_Maxi_Classics_Best_Of_-2020-NoGroup.part01.rar",
+        "Laibach",
+        "Lamb of God",
+        "L’Âme Immortelle",
+        "Lars Leonhard",
+        "Levellers_-_Greatest_Hits_(2014)_MP3",
+    ]
+    # Eingabe in Perls Reihenfolge (das ist zugleich die ``readdir``-Reihenfolge
+    # der Tie-Breaks) — die Sortierung darf nichts umstellen.
+    assert folders.sort_filenames(list(as_perl_sorted)) == as_perl_sorted
+    # Umgekehrte Eingabe: gleiche Schlüssel bleiben in Eingabe-Reihenfolge,
+    # verschiedene Schlüssel landen in Perls Reihenfolge.
+    assert folders.sort_filenames(list(reversed(as_perl_sorted))) == as_perl_sorted
+    # Gegenprobe: reine Byte-/``lower()``-Ordnung wäre falsch.
+    assert folders.sort_filenames(["Accept", "AC+DC"]) == ["Accept", "AC+DC"]
+    assert sorted(["Accept", "AC+DC"]) == ["AC+DC", "Accept"]
 
 
 # ---------------------------------------------------------------------------

@@ -25,7 +25,7 @@ Perl reference (read-only, /tmp/lms-ref)
 * ``Slim/Utils/Misc.pm:835-909``         ``fileFilter`` — dirs always, files only for known types
 * ``Slim/Utils/Misc.pm:292-331``         ``fileURLFromPath`` — URI::file escaping
 * ``Slim/Utils/Misc.pm:1060-1160``       ``findAndScanDirectoryTree`` → ``readDirectory``
-* ``Slim/Utils/OS.pm:334-353``           ``sortFilename`` — locale collation of ``lc(name)``
+* ``Slim/Utils/OS.pm:334-353``           ``sortFilename`` — native collation of ``lc(name)``
 * ``Slim/Utils/OS.pm:268-274``           ``ignoredItems`` (linux: ``lost+found``)
 * ``Slim/Utils/Prefs.pm:163,207``        defaults: ``mediadirs``→``defaultMediaDirs``, ``ignoreInAudioScan``→``[]``
 * ``Slim/Utils/Prefs.pm:383-403``        validation: array of unique, existing folders
@@ -49,11 +49,11 @@ working, and ``media/dir_rows.py`` logs the reason.
 
 from __future__ import annotations
 
-import locale
 import logging
 import os
 import re
 import sqlite3
+import unicodedata
 import urllib.parse
 from pathlib import Path
 from typing import Any, Iterable
@@ -408,20 +408,65 @@ def path_from_file_url(url: str | os.PathLike[str]) -> str:
 # ---------------------------------------------------------------------------
 
 
+def name_collation_key(name: str) -> tuple[str, str]:
+    """Sort key of one file/folder *name* — Perl ``noCaseFilename``.
+
+    Perl ``sortFilename`` (``Slim/Utils/OS.pm:334-353``) lowercases every name
+    (:340 with :354-356 ``noCaseFilename`` = ``lc(fileName)``) and compares the
+    results with ``cmp`` under ``use locale``; for that comparison it swaps
+    ``LC_COLLATE`` for the ``LC_CTYPE`` locale (Bug 14906, :344-345) so the
+    *native* collation sequence of the character encoding decides.  So the rule
+    is **case-insensitive**, and the order of two names that only differ in
+    case is decided by the sort's stability, i.e. the ``readdir`` order —
+    ``perl -e 'print join " ", sort {lc($a) cmp lc($b)} qw(ABBA abba)'`` keeps
+    ``ABBA abba``, and the reversed input keeps ``abba ABBA``.
+
+    The process locale must not decide the order: the server runs under ``C``
+    or ``C.UTF-8`` (where the collation is plain byte order, so ``Zebra`` would
+    come before ``apple``) while the Perl reference runs under a glibc UTF-8
+    locale.  So the *native* collation is reproduced deterministically here.
+    On a glibc UTF-8 locale that collation ignores punctuation and accents at
+    its primary level and folds case; live Perl (192.168.1.90) therefore lists
+    ``Accept`` before ``AC+DC``, ``Boy_Harsher_-_Careful…`` before
+    ``Boy_Harsher-Country_Girl…`` and ``6MzM6F.…`` before ``(Nils_Petter_…``.
+    :func:`sort_filenames` checks that against the live server: this key has no
+    ordering conflict with Perl on any of the 442 real entries of
+    ``/mnt/media/Musik``, ``/tmp`` and ``/mnt/media``, while a plain
+    ``lower()``/``casefold()`` key has 317.
+
+    Two levels, like the collation's primary and secondary weight:
+
+    * ``NFKD`` decomposition, combining marks removed, case folded, then
+      everything that is not alphanumeric dropped — the primary level;
+    * the case-folded name — the secondary level, so names that differ only in
+      punctuation keep a defined order.
+
+    Equal keys stay in input order because :func:`sort_filenames` sorts
+    stably, which is Perl's tie-break.  ``str.lower()`` is used because it is
+    the locale-independent equivalent of Perl's ``lc`` (``casefold`` would also
+    fold ``ß``→``ss``, which ``lc`` does not).
+    """
+    folded = name.lower()
+    primary = "".join(
+        ch for ch in unicodedata.normalize("NFKD", folded)
+        if not unicodedata.combining(ch) and ch.isalnum()
+    )
+    return (primary, folded)
+
+
 def sort_filenames(names: list[str]) -> list[str]:
     """Perl ``sortFilename`` — ``Slim/Utils/OS.pm:334-353``.
 
-    ``use locale`` + ``sort { lc($a) cmp lc($b) }`` under the process
-    collation: on a glibc UTF-8 locale ``Accept`` sorts before ``AC+DC``.
-    Falls back to a plain case-insensitive sort when no collation is available.
+    Case-insensitive (``lc``) and locale-independent; see
+    :func:`name_collation_key` for the derivation and the live-Perl check.
+    Python's sort is stable, so names that fold to the same key keep the
+    ``readdir`` order — Perl's tie-break.  This is *the* sort of every file and
+    folder listing Perl builds from the file system (``readDirectory``,
+    ``Slim/Utils/Misc.pm:1037``); it is not used for the album/artist lists,
+    which Perl sorts in the database (see :func:`name_collation_key` notes in
+    ``media/folders.py`` and ``web/api.py``).
     """
-    try:
-        locale.setlocale(locale.LC_COLLATE, "")
-        if locale.setlocale(locale.LC_COLLATE) not in ("C", "POSIX"):
-            return sorted(names, key=locale.strxfrm)
-    except (locale.Error, TypeError, ValueError):
-        pass
-    return sorted(names, key=lambda n: n.lower())
+    return sorted(names, key=name_collation_key)
 
 
 def _entry_is_listable(directory: str, name: str) -> bool:

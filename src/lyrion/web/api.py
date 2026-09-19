@@ -1101,8 +1101,9 @@ def _bmf_children(directory: str, start: int = 0,
     #     missing in a library that was scanned before this change).
     for p in _bmf_subdir_paths(directory):
         paths.setdefault(p, posixpath.basename(p))
-    folders = sorted(paths.items(), key=lambda t: t[1].casefold())
-    dir_ids = _bmf_dir_row_ids([p for p, _ in folders])
+    folders_list = sorted(paths.items(),
+                          key=lambda t: folders.name_collation_key(t[1]))
+    dir_ids = _bmf_dir_row_ids([p for p, _ in folders_list])
     try:
         cnt = _db_query(
             "SELECT COUNT(*) AS n FROM tracks WHERE url LIKE ?"
@@ -1111,7 +1112,7 @@ def _bmf_children(directory: str, start: int = 0,
         loose_total = int(list(cnt[0].values())[0]) if cnt else 0
     except Exception:  # noqa: BLE001
         loose_total = 0
-    total = len(folders) + loose_total
+    total = len(folders_list) + loose_total
     # Folders first, then the loose files of this directory (Perl returns
     # both in one list).  A directory row is never a loose *file*: it is
     # listed as a folder above.  Without a stored row the item keeps the
@@ -1120,10 +1121,10 @@ def _bmf_children(directory: str, start: int = 0,
     out: list[dict] = [{"id": dir_ids.get(path, path),
                         "path": path, "name": name, "title": name,
                         "type": "folder"}
-                       for path, name in folders[start:start + count]]
+                       for path, name in folders_list[start:start + count]]
     left = count - len(out)
     if left > 0:
-        t_off = 0 if start < len(folders) else start - len(folders)
+        t_off = 0 if start < len(folders_list) else start - len(folders_list)
         trows: list = []
         try:
             trows = _db_query(
@@ -1907,8 +1908,13 @@ def _read_directory(args: list) -> dict:
                      if pattern.search(os.path.join(folder, n))]
 
     # Perl sortiert Ordner vor Dateien (Queries.pm:3183-3193); die
-    # Namenssortierung davor macht die Reihenfolge bestimmt.
-    names.sort()
+    # Namenssortierung davor macht die Reihenfolge bestimmt. Perl sortiert die
+    # Namen in ``readDirectory`` mit ``sortFilename`` (Misc.pm:1037 →
+    # OS.pm:334-353, Gross-/Kleinschreibung egal), der Ordner-vor-Dateien-Lauf
+    # ist ein stabiler ``sort`` und hält diese Reihenfolge je Gruppe.
+    from lyrion.media import folders
+
+    names = folders.sort_filenames(names)
     ordered = ([n for n in names if is_dir[n]]
                + [n for n in names if not is_dir[n]])
     count = len(ordered)
