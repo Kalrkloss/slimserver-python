@@ -10328,6 +10328,24 @@ class WebAPIHandler:
             return resolved
 
         file_path: Path | None = None
+        # ``_static_path_variants`` also covers Perl's *plugin* HTML roots.
+        # A plugin's skin-relative URL ``/plugins/<Plugin>/html/images/x.png``
+        # is resolved by ``Slim::Web::HTTP::fixHttpPath`` against every
+        # template root plus the skin directory — ``Slim/Web/Template/
+        # NoWeb.pm:154-186`` over the INCLUDE_PATH built in
+        # ``Slim/Web/Template/SkinManager.pm:169-179`` (``catdir($rootDir,
+        # $dir)`` per root and skin), with each plugin's ``HTML/`` added as a
+        # root by ``Slim/Utils/PluginManager.pm:366-377``
+        # (``addTemplateDirectory``).  Physical home of e.g. the TuneIn row
+        # icons is therefore ``<plugin>/HTML/EN/plugins/TuneIn/html/images/
+        # <name>.png``, i.e. ``EN/<URL-Pfad>`` relative to a root — the
+        # ``EN/`` candidate of the variant list, and our static root *is*
+        # Perl's ``HTML/`` (``html/``).  The assets live in
+        # ``html/EN/plugins/TuneIn/html/images/`` (11 PNGs, byte-identical to
+        # Perl's ``Slim/Plugin/InternetRadio/HTML/EN/plugins/TuneIn/html/
+        # images/``): without them SqueezePlay's first level under Radio drew
+        # no symbols ("GET /plugins/TuneIn/html/images/radiopresets_40x40_m
+        # .png" → 404, client log ``SocketHttp.lua:186``).
         for rel in _static_path_variants(path):
             file_path = _resolve(rel)
             if file_path is not None:
