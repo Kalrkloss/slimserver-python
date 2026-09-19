@@ -769,16 +769,34 @@ def test_playlist_entity_queue_state_queries(entity, expected, tmp_path,
 def test_playlist_entity_name_is_the_remote_stream_title(tmp_path, monkeypatch):
     """``playlist name ?`` — Remote-Stream: ``remote_title`` (:2766-2767).
 
-    Live Perl: ``{"_name":"1.FM - Ambient Psychill"}`` (Stream-Titel, NICHT
-    der Tracktitel). Für einen LOKALEN Track setzt Perl kein ``name`` (Tag
-    ``N`` = ``remote_title`` greift nur bei Streams) → kein Result.
+    Live Perl 9.1.1 (read-only 2026-09-19, Player 00:04:20:2B:88:C8, Sender
+    Hirschmilch Chillout): bei ``current_title: "Vibrasphere - Tierra Azul
+    (Nordlight Remix)"`` (ICY) antwortet ``playlist name ?`` mit
+    ``Hirschmilch Chillout`` — dem NAMEN des Eintrags (``$track->title``, per
+    ``setRemoteMetadata`` aus der Feed-Zeile, ``Slim/Control/XMLBrowser.pm:
+    693-700``), NICHT dem ICY-Titel des laufenden Streams.  ``playlist
+    title ?`` liefert dagegen den ICY-Anteil (``_songData``:5972).
+
+    Für einen LOKALEN Track setzt Perl kein ``name`` (Tag ``N`` =
+    ``remote_title`` greift nur bei Streams) → kein Result.
     """
     stream = "http://stream.example.org:8000/live.mp3"
-    player = _playlist_player(tmp_path, monkeypatch, [stream], 0, mode="play",
-                              elapsed=5.0, current_url=stream,
-                              current_title="1.FM - Ambient Psychill")
+    player = _playlist_player(
+        tmp_path, monkeypatch, [stream], 0, mode="play", elapsed=5.0,
+        current_url=stream,
+        # ICY-Titel des Streams und der Name des Eintrags sind VERSCHIEDEN —
+        # genau darum ging es im Live-Fall.
+        current_title="Vibrasphere - Tierra Azul (Nordlight Remix)",
+        stream_baseline_title="Hirschmilch Chillout",
+        stream_meta_url=stream,
+        remote_meta={"streamtitle": "Vibrasphere - Tierra Azul (Nordlight Remix)",
+                     "title": "Tierra Azul (Nordlight Remix)",
+                     "artist": "Vibrasphere", "url": stream},
+        stream_titles={stream: "Hirschmilch Chillout"})
     assert _pl_req(player, ["playlist", "name", "?"]) == {
-        "_name": "1.FM - Ambient Psychill"}
+        "_name": "Hirschmilch Chillout"}
+    assert _pl_req(player, ["playlist", "title", "?"]) == {
+        "_title": "Tierra Azul (Nordlight Remix)"}
 
     local = _playlist_player(tmp_path, monkeypatch, [11, 12], 0, mode="play",
                              elapsed=5.0)

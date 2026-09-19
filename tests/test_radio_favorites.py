@@ -468,3 +468,99 @@ def test_favorites_delete_without_url_or_valid_index_is_a_no_op(favs):
     assert rpc("favorites", "delete", "url:http://nowhere.invalid/x") == {}
     assert rpc("favorites", "delete", "item_id:999") == {}
     assert [r["title"] for r in favs.rows] == [r["title"] for r in before]
+
+
+# ── Logo der Zeile: Perl setRemoteMetadata(cover => …) ────────────────────
+#
+# Perl registriert beim Start einer Zeile Name UND Logo unter der URL
+# (`setRemoteMetadata($url, {title => …, cover => $subFeed->{cover} ||
+# {image} || {icon}}, …)`, `Slim/Control/XMLBrowser.pm:693-700` →
+# `Slim/Music/Info.pm:489-492` cacht es als `remote_image_$url`); `_songData`
+# reicht es als `artwork_url`/`icon` weiter (Queries.pm:5618-5633,
+# `Protocols/HTTP.pm:1133` `cover => $cover || $icon`).  Live Perl 9.1.1
+# (read-only 2026-09-19) liefert genau die proxied Form:
+# `/imageproxy/https%3A%2F%2F…%2Flogog.png%3Ft%3D155074/image.png`.
+
+def _feed_player(monkeypatch, playlist, **kw):
+    """Ein echter PlayerState im Singleton-PlayerManager (für `stream_images`)."""
+    from lyrion.player.manager import PlayerManager
+    from lyrion.player.state import PlayerState
+
+    player = PlayerState(mac=PLAYER, name="Taverne", ip="192.168.1.130",
+                         port=58044)
+    player.power = True
+    player.playlist = list(playlist)
+    player.playlist_position = 0
+    player.playlist_total = len(player.playlist)
+    for key, value in kw.items():
+        setattr(player, key, value)
+    pm = PlayerManager()
+    pm.players = {PLAYER: player}
+    return player
+
+
+def test_playing_a_feed_station_registers_the_row_logo(favs, monkeypatch):
+    """Der Start registriert das Logo der Zeile unter der URL (Perl: cover)."""
+    async def fake_play_url(self, player_id, url, title=""):
+        return True
+
+    monkeypatch.setattr("lyrion.player.manager.PlayerManager.play_url",
+                        fake_play_url)
+    player = _feed_player(monkeypatch, [STATION_URL])
+
+    index = rpc("music", "items", 0, 5, "menu:music")
+    sid = index["item_loop"][0]["actions"]["go"]["params"]["item_id"]
+    stations = rpc("music", "items", 0, 5, "menu:music", f"item_id:{sid}")
+    item_id = stations["item_loop"][0]["params"]["item_id"]
+    # Die Browse-Zeile trägt das Logo bereits proxied (XMLBrowser.pm:1171).
+    row_icon = stations["item_loop"][0]["icon"]
+    assert row_icon == "/imageproxy/http%3A%2F%2Fstream.invalid%2Flogo.png/image.png"
+
+    rpc("music", "playlist", "play", "menu:music", f"item_id:{item_id}")
+
+    assert player.stream_images[STATION_URL] == row_icon
+    # Der Status reicht es als `artwork_url`/`icon` weiter — MIT führendem
+    # Schrägstrich (so liefert Perl es live; `/html/EN/imageproxy/…` wäre 404).
+    item = call(JSONRPCAPI()._json_player_status(
+        _FeedPm(player), PLAYER, ["-", "1", "menu:menu"]))["item_loop"][0]
+    assert item["artwork_url"] == row_icon
+    assert item["icon"] == row_icon
+
+
+class _FeedPm:
+    def __init__(self, player):
+        self._player = player
+
+    def get_player(self, mac, *a, **k):
+        return self._player if mac == self._player.mac else None
+
+    def get_all_players(self):
+        return [self._player]
+
+
+def test_feed_row_without_a_logo_keeps_the_default_image(favs, monkeypatch):
+    """Ohne Logo bleibt Perl's Default (`html/images/radio.png`)."""
+    from lyrion.web.api import REMOTE_ART_FALLBACK
+
+    async def fake_play_url(self, player_id, url, title=""):
+        return True
+
+    monkeypatch.setattr("lyrion.player.manager.PlayerManager.play_url",
+                        fake_play_url)
+    radiobrowser._cache.clear()
+    row = dict(ROW)
+    row["favicon"] = ""
+    monkeypatch.setattr(radiobrowser, "_get_json", _static_json([row]))
+    player = _feed_player(monkeypatch, [STATION_URL])
+
+    index = rpc("music", "items", 0, 5, "menu:music")
+    sid = index["item_loop"][0]["actions"]["go"]["params"]["item_id"]
+    stations = rpc("music", "items", 0, 5, "menu:music", f"item_id:{sid}")
+    item_id = stations["item_loop"][0]["params"]["item_id"]
+    assert "icon" not in stations["item_loop"][0]
+    rpc("music", "playlist", "play", "menu:music", f"item_id:{item_id}")
+
+    assert player.stream_images == {}
+    item = call(JSONRPCAPI()._json_player_status(
+        _FeedPm(player), PLAYER, ["-", "1"]))["playlist_loop"][0]
+    assert item["artwork_url"] == REMOTE_ART_FALLBACK == "html/images/radio.png"

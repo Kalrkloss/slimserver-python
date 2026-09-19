@@ -247,7 +247,14 @@ def test_tags_status_keeps_the_plain_playlist_item(tmp_path, monkeypatch):
     ``status - 1 tags:ABdejJKlrStTuxy``, JiveItem.java:83) holt nur die
     Tags-Form (Perl ``_addSong`` / statusQuery:4425-4470): artist ja
     (Tag 'A'/'a'), aber kein NP-Zusatz — Perl-gleich, live gegen 9.1.1
-    geprüft (playlist_loop[0] ohne track/album/text)."""
+    geprüft (playlist_loop[0] ohne track/album/text).
+
+    Der Titel des Items ist Perls ``_songData``-Titel
+    (``$remoteMeta->{title} || $track->title``, Queries.pm:5972): hier der
+    ICY-Anteil ``Chill On! #862 - 2026-09-13``.  Der frühere Host-Stand-in
+    (``hirschmilch.de``) war der gemeldete Fehler — Perl schickt nie den
+    Stream-Host.
+    """
     monkeypatch.setattr(api_mod, "_library_db_path", lambda: _db(tmp_path))
     player = _player([STREAM_URL], 0, mode="play", elapsed=5.0,
                      current_url=STREAM_URL, current_title=ICY, remote=1,
@@ -257,7 +264,7 @@ def test_tags_status_keeps_the_plain_playlist_item(tmp_path, monkeypatch):
     item = res["playlist_loop"][0]
 
     assert item["artist"] == "Dense (chillgressive tunes)"
-    assert item["title"] == "hirschmilch.de"          # unser Host-Stand-in
+    assert item["title"] == "Chill On! #862 - 2026-09-13"
     assert "base" not in res                          # kein menuMode
 
 

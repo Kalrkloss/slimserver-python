@@ -1750,6 +1750,130 @@ def _perl_proxied_image(url: object, force: bool = False) -> object:
     return f"/imageproxy/{quote(url, safe='-_.')}/image{ext}"
 
 
+def _stream_registered_name(player: object, url: str) -> str:
+    """The NAME registered for a stream URL — Perl's ``$track->title``.
+
+    A station started from a feed is registered UNDER its URL with the feed
+    row's name: ``setRemoteMetadata($url, {title => $subFeed->{name} ||
+    $subFeed->{title}})`` (``Slim/Control/XMLBrowser.pm:693-700``) writes the
+    ``TITLE`` attribute of that URL's RemoteTrack
+    (``Slim/Music/Info.pm:395-478``).  Perl's ``objectForUrl($url)`` therefore
+    answers ``$track->title`` = the station NAME — never the URL.
+
+    The same association lives here in ``player.stream_titles``
+    (``_set_stream_title``), in the imported radio row (``remote_media.name``)
+    and, for the stream playing right now, in the baseline title the play was
+    started with (``stream_baseline_title`` — this is the URL itself when no
+    name was passed, ``Info.pm:479-481``/``:552``).
+
+    Deliberately NO URL/host fallback: Perl has no such fallback either (the
+    URL only appears as the *title* when nothing else exists — see
+    :func:`_stream_entry_title`).
+    """
+    url = str(url or "")
+    if not url:
+        return ""
+    name = str((getattr(player, "stream_titles", {}) or {}).get(url, "") or "")
+    if name:
+        return name
+    try:
+        rows = _db_query("SELECT name FROM remote_media WHERE url = ? LIMIT 1",
+                         (url,))
+        name = str((rows[0]["name"] if rows else "") or "")
+    except Exception:  # noqa: BLE001 — ohne DB bleibt es beim Baseline-Titel
+        name = ""
+    if name:
+        return name
+    if url == str(getattr(player, "current_url", "") or ""):
+        baseline = str(getattr(player, "stream_baseline_title", "") or "")
+        if baseline and baseline != url:
+            return baseline
+    return ""
+
+
+def _stream_live_title(player: object, url: str) -> str:
+    """The in-stream (ICY) title cached for ``url`` — Perl ``%currentTitles``.
+
+    ``Slim/Player/Protocols/HTTP.pm:271-357`` (``parseMetadata``) files every
+    ``StreamTitle`` under the URL of the PLAYING stream
+    (``Slim::Music::Info::setCurrentTitle($url, $newTitle, $client)``,
+    ``:333-334`` → ``Info.pm:513-552``), and ``Info.pm:572-574`` only ever
+    returns a TRUTHY cache entry for exactly that URL — an empty
+    ``StreamTitle`` therefore leaves the station's own title standing
+    (``standardTitle``, ``Info.pm:556-583``; live: SUNSHINE LIVE sends
+    ``StreamTitle='';``).
+
+    Our store for it is the player's ``current_title`` of the stream that is
+    open now (``networking/protocol.py:4104-4122``/``:4148``); while the
+    stream reported nothing yet it equals the baseline title — then there is
+    no in-stream title and this returns "".
+    """
+    url = str(url or "")
+    if not url or url != str(getattr(player, "current_url", "") or ""):
+        return ""
+    # Metadata of the stream we replaced must never pass as this one's.
+    meta_url = str(getattr(player, "stream_meta_url", "") or "")
+    if meta_url and meta_url != url:
+        return ""
+    streamtitle = str((getattr(player, "remote_meta", {}) or {}).get(
+        "streamtitle") or "")
+    if streamtitle:
+        return streamtitle
+    raw = str(getattr(player, "current_title", "") or "")
+    if raw and raw != str(getattr(player, "stream_baseline_title", "") or ""):
+        return raw
+    return ""
+
+
+def _split_stream_title(raw: str) -> tuple[str, str]:
+    """Perl's artist/title split of a remote metadata title.
+
+    ``Slim/Player/Protocols/HTTP.pm:1076-1083``: a title that looks like
+    ``Artist - Title`` is split at the separator.  The port splits at the
+    FIRST ``' - '`` (``networking/protocol.py:4064-4068`` stores
+    ``remote_meta['title']``/``['artist']`` the same way) — Perl additionally
+    requires EXACTLY one ``' - '`` (``scalar @dashes == 1``); with two or more
+    Perl keeps the whole value as the title and reports no artist.  That
+    difference is a known deviation of the port, kept here so both paths stay
+    consistent.
+    """
+    head, sep, tail = raw.partition(" - ")
+    if sep and tail.strip():
+        return tail.strip(), head.strip()
+    return raw, ""
+
+
+def _stream_entry_title(player: object, url: str) -> tuple[str, str]:
+    """``(title, artist)`` of ONE stream entry — Perl's ``_songData``.
+
+    ``Slim/Control/Queries.pm:5972``::
+
+        $returnHash{'title'} = $remoteMeta->{title} || $track->title;
+
+    ``$remoteMeta`` comes from the URL's protocol handler
+    (``Slim/Player/Protocols/HTTP.pm:1031-1085`` ``getMetadataFor``): the
+    value of ``getCurrentTitle`` — the in-stream (ICY) title while the stream
+    is playing and reports one, else the URL's standard title, which is the
+    NAME registered for it (see :func:`_stream_registered_name`) — split into
+    artist/title (``:1076-1083``).  ``$track->title`` is that very name.
+
+    The URL is Perl's LAST fallback: a stream entry with nothing registered
+    answers its own URL (live Perl 9.1.1, read-only 2026-09-19,
+    ``status … tags:galduNtxK`` on the ``http://192.168.1.90/alarm.mp3``
+    entry: ``title:http://192.168.1.90/alarm.mp3`` and no ``remote_title``;
+    ``Slim/Music/Info.pm:669-673`` ``plainTitle`` — "If no metadata is
+    available, use this to get a title, which is derived from the file path or
+    URL").
+    """
+    url = str(url or "")
+    if not url:
+        return "", ""
+    live = _stream_live_title(player, url)
+    if live:
+        return _split_stream_title(live)
+    return (_stream_registered_name(player, url) or url), ""
+
+
 def _stream_display_title(player: object, entry: object) -> str:
     """Perl ``$track->title`` for the playing entry — ``Player.pm:653``.
 
@@ -2823,15 +2947,15 @@ class JSONRPCAPI:
                     art_by_track = {}
             for i, entry in enumerate(tracks):
                 if isinstance(entry, str):
-                    stream_name = getattr(player, "stream_titles", {}).get(entry, "")
+                    # Perl `_songData` (Queries.pm:5972): ICY-Titel, sonst der
+                    # SENDENAME des Eintrags, die URL als letzter Rueckfall —
+                    # nie ein Platzhalter wie „Radio Stream“ und nie der Host.
+                    stream_title = _stream_entry_title(player, entry)[0] or entry
                     art = getattr(player, "stream_images", {}).get(entry, "")
                     out.append({
                         "index": i,
                         "url": entry,
-                        "title": stream_name
-                        or (player.current_title
-                            if i == player.playlist_position and player.current_title
-                            else "Radio Stream"),
+                        "title": stream_title,
                         # Senderlogo: explizit hinterlegtes Bild oder Radio-Icon.
                         # static_dir enthält bereits "html/", also ohne /html/-
                         # Präfix im URL-Pfad (sonst doppelt -> 404).
@@ -5491,46 +5615,31 @@ class JSONRPCAPI:
         # cur_info/elapsed are derived later in this function.
         _cur = player.playlist_position or 0
         _cur_tid = playlist_ids[_cur] if 0 <= _cur < len(playlist_ids) else None
-        _cur_title = getattr(player, "current_title", "") or ""
-        _cur_artist = ""
-        _cur_track = _cur_title
-        if _cur_tid is not None and _local_id(_cur_tid) is None and " - " in _cur_title:
-            _artist, _track = _cur_title.split(" - ", 1)
-            _cur_artist = _artist.strip()
-            _cur_track = _track.strip()
+        _cur_remote = _cur_tid is not None and _local_id(_cur_tid) is None
+        _cur_url = (str(getattr(player, "current_url", "") or _cur_tid)
+                    if _cur_remote else "")
+        # Perl `_songData`: der Titel des laufenden Eintrags ist
+        # `$remoteMeta->{title} || $track->title` (Queries.pm:5972) — der
+        # ICY-Titel, solange der Stream einen sendet, sonst der SENDENAME des
+        # Eintrags; die URL ist Perls letzter Rueckfall
+        # (`_stream_entry_title`).
+        _cur_track, _cur_artist = (
+            _stream_entry_title(player, _cur_url) if _cur_remote else ("", ""))
 
-        # Perl's ``remote_title`` for a URL stream — the station/entry title
-        # (``$parentTrack->title`` resp. ``$track->title``, _songData
-        # Queries.pm:5968-5981). Our store for it is ``remote_media.name``
-        # (the radio row the importer writes), the player's ``stream_titles``
-        # map, else the URL host (this file's earlier stand-in). Perl feeds it
-        # in as the stream's ALBUM when there is no album metadata
-        # (_addJiveSong Queries.pm:5611-5615: ``$album = $remote_title``) and
-        # Squeezer renders that ``album`` as the second Now-Playing line
-        # (Song.java:75 + CurrentTrack.java:54-60).
-        station_title = ""
-        if _cur_tid is not None and _local_id(_cur_tid) is None:
-            _cur_url = str(getattr(player, "current_url", "") or _cur_tid)
-            station_title = (getattr(player, "stream_titles", {}) or {}).get(
-                _cur_url, "") or ""
-            if not station_title:
-                try:
-                    _rows = _db_query(
-                        "SELECT name FROM remote_media WHERE url = ? LIMIT 1",
-                        (_cur_url,))
-                    station_title = (_rows[0]["name"] if _rows else "") or ""
-                except Exception:  # noqa: BLE001
-                    station_title = ""
-            if not station_title:
-                # Perl's ``$track->title`` for a bare URL stream (what the
-                # playlist entry carries): our stand-in is the same URL host
-                # the item title uses below.
-                try:
-                    from urllib.parse import urlparse
-                    station_title = (urlparse(_cur_url).hostname or "").replace(
-                        "www.", "")
-                except Exception:  # noqa: BLE001
-                    station_title = ""
+        # Perl's ``remote_title`` for a URL stream — the NAME the feed
+        # registered for that URL (``$parentTrack->title`` resp.
+        # ``$track->title``, _songData Queries.pm:5981-5986; the registration
+        # is ``setRemoteMetadata``, Control/XMLBrowser.pm:693-700).  Our store
+        # for it is ``remote_media.name`` (the radio row the importer writes),
+        # the player's ``stream_titles`` map and the running stream's baseline.
+        # Nothing registered ⇒ Perl OMITS the field (live: the bare
+        # ``http://192.168.1.90/alarm.mp3`` entry carries no ``remote_title``)
+        # — the former URL-host stand-in was wrong and is gone.
+        # Perl feeds the name in as the stream's ALBUM when there is no album
+        # metadata (_addJiveSong Queries.pm:5611-5616: ``$album =
+        # $remote_title``) and Squeezer renders that ``album`` as the second
+        # Now-Playing line (Song.java:75 + CurrentTrack.java:54-60).
+        station_title = _stream_registered_name(player, _cur_url) if _cur_remote else ""
 
         def np_text(title: str, artist: str, album: str) -> str:
             """Perl ``_addJiveSong``'s multi-line NP text (Queries.pm:5603-5620).
@@ -5582,18 +5691,18 @@ class JSONRPCAPI:
                 url = info.get("url", "")
                 duration = info.get("duration", 0) or 0
             else:
-                # Remote stream URL (radio) — title from the URL host
-                title = str(tid)
+                # Remote stream URL (radio) — Perl's `_songData` title:
+                # `$remoteMeta->{title} || $track->title` (Queries.pm:5972)
+                # with `$track->title` = the NAME the playing feed registered
+                # for this URL (setRemoteMetadata, Control/XMLBrowser.pm:693-700).
+                # The URL is only Perl's last fallback
+                # (`_stream_entry_title`); the former URL-host stand-in showed
+                # the stream's host instead of the station's name.
+                title, _entry_artist = _stream_entry_title(player, str(tid))
+                title = title or str(tid)
                 url = str(tid)
                 duration = 0
-                try:
-                    from urllib.parse import urlparse
-                    host = urlparse(url).hostname or ""
-                    if host:
-                        title = host.replace("www.", "")
-                except Exception:
-                    pass
-                info = {"remote": 1}
+                info = {"remote": 1, "stream_artist": _entry_artist}
             item: dict = {
                 # Perl `_addSong` → `$returnHash{'id'} = $track->id`
                 # (Queries.pm:5971/_songData:5880): a DB integer for a local
@@ -5633,11 +5742,21 @@ class JSONRPCAPI:
                 # skin-relative default `html/images/radio.png`.
                 _simg = str(getattr(player, "stream_images", {}).get(str(tid), "")
                             or "")
-                if _simg.startswith("/"):
-                    # Perl's field value is skin-relative (no leading slash);
-                    # SqueezePlay then asks for /html/EN/<value> (the skin
-                    # base), Squeeze Client for the origin + "/" + value — both
-                    # resolve against the fixed static resolver.
+                if _simg.startswith("/") and not _simg.startswith("/imageproxy/"):
+                    # A skin-relative value (Perl's default coverurl is
+                    # `html/images/radio.png`, live) is published WITHOUT the
+                    # leading slash: SqueezePlay prepends the skin base
+                    # (`/html/EN/<value>`) and Squeeze Client the origin
+                    # (`/` + value) — both resolve for `html/...`.
+                    #
+                    # `/imageproxy/…` must NOT be stripped: it is a
+                    # SERVER-absolute route (Perl sends the proxied station
+                    # logo with the leading slash — live 192.168.1.90,
+                    # Hirschmilch: ``"artwork_url":
+                    # "/imageproxy/http%3A%2F%2Fcdn-radiotime-logos.tunein.com
+                    # %2Fs111987q.png/image.png"``), while the stripped form
+                    # resolves to `/html/EN/imageproxy/…` which this server
+                    # answers with 404 (measured 2026-09-19).
                     _simg = _simg[1:]
                 item["coverid"] = item["id"]
                 item["artwork_url"] = _simg or REMOTE_ART_FALLBACK
@@ -5651,6 +5770,9 @@ class JSONRPCAPI:
                 if i == player.playlist_position:
                     # Enrich the CURRENT stream item so SqueezePlay's
                     # Now-Playing has artist/duration/url to render.
+                    # Perl's `_songData` title/artist pair (Queries.pm:5972 +
+                    # Protocols/HTTP.pm:1076-1083): the ICY title split into
+                    # track/artist, else the station name.
                     item["url"] = str(tid)
                     item["track"] = _cur_track or item.get("title", "")
                     item["artist"] = _cur_artist or ""
@@ -5730,7 +5852,15 @@ class JSONRPCAPI:
                     item["icon"] = _simg
                 else:
                     # "send radio placeholder art for remote tracks with no
-                    # art" — Queries.pm:5633, Perl's literal path.
+                    # art" — Queries.pm:5631-5633.  The *playlist* item keeps
+                    # the ``icon-id`` spelling this port has always published
+                    # (the controllers read it first and crashed on a stream
+                    # start without an image field); Perl's own ``icon`` field
+                    # for that case is added to the MENU item below, where
+                    # ``_addJiveSong`` builds it (live Perl 9.1.1, 2026-09-19:
+                    # the playlist item carries ``artwork_url``/``coverid``/
+                    # ``coverart`` and no ``icon``, the menu item
+                    # ``{"icon": "html/images/radio.png", …}``).
                     item["icon-id"] = RADIO_PLACEHOLDER_ICON
             else:
                 _art = info.get("artwork_url") or ""
@@ -5759,15 +5889,14 @@ class JSONRPCAPI:
         else:
             cur_info = {}
         if cur_valid and cur_local is None:
-            # Radio stream: title = station name (current_title if set,
-            # else host) — never the full URL.
+            # Radio-Stream: Titel = Perls `_songData`-Titel
+            # (`$remoteMeta->{title} || $track->title`, Queries.pm:5972) — der
+            # ICY-Titel, sonst der SENDENAME des Eintrags; die URL ist nur der
+            # letzte Rueckfall (`_stream_entry_title`).  Der hier frueher
+            # gebildete URL-Host war genau der gemeldete Fehler
+            # („regiocast.streamabc.net“ statt des SenderNAMENS).
             url_str = str(playlist_ids[cur])
-            try:
-                from urllib.parse import urlparse
-                host = urlparse(url_str).hostname or url_str
-                title = host.replace("www.", "")
-            except Exception:
-                title = url_str
+            title = _stream_entry_title(player, url_str)[0] or url_str
             cur_info = {"title": title, "url": url_str}
         # Only a remote stream's StreamTitle may override the now-playing
         # line — a local track's title comes from the DB row (a stale radio
@@ -5921,6 +6050,22 @@ class JSONRPCAPI:
             np_loop: list[dict] = []
             for it, is_remote in zip(item_loop, window_remote):
                 np_it = dict(it)
+                # Perl `_addJiveSong` (Queries.pm:5618-5633): the MENU item of
+                # a remote stream *without* a logo names the default artwork
+                # ("send radio placeholder art for remote tracks with no art")
+                # — a defined ``artwork_url`` becomes ``icon``, and the stream's
+                # ``artwork_url`` is ``html/images/radio.png``
+                # (``Slim/Player/Protocols/HTTP.pm:1136-1147`` ``getIcon``).
+                # Live Perl 9.1.1, read-only 2026-09-19, ``status - 1
+                # menu:menu`` on a logo-less stream: ``{"icon":
+                # "html/images/radio.png", "text": …, "style": "itemplay",
+                # "params": {…}, "trackType": "radio"}``.  The plain
+                # *playlist* item does NOT carry it (it keeps
+                # ``artwork_url``/``coverid``/``coverart``, verified live) —
+                # which is why this line sits in the menu branch.  A stream
+                # with a stored logo already carries that logo as ``icon``.
+                if is_remote and "icon" not in np_it:
+                    np_it["icon"] = REMOTE_ART_FALLBACK
                 line1 = it.get("title") or ""
                 # `is_remote` = `$track->remote` (Perl Queries.pm:5576) — siehe
                 # `_remote_flags`; das Item selbst führt das Feld nicht mehr.
@@ -6675,27 +6820,27 @@ class JSONRPCAPI:
         if tid is not None:
             info = dict((await self._load_tracks([tid])).get(tid) or {})
         else:
-            # Remote-Stream: Titel des laufenden Items wie in
-            # _json_player_status (current_title = ICY/Stationstitel, sonst
-            # der Host) — Perls ``$remoteMeta->{title} || $track->title``.
-            title = str(getattr(player, "current_title", "") or "")
-            if not title:
-                try:
-                    from urllib.parse import urlparse
-                    title = (urlparse(url_str).hostname or url_str).replace("www.", "")
-                except Exception:  # noqa: BLE001
-                    title = url_str
-            info = {"title": title, "url": url_str, "duration": 0}
+            # Remote-Stream: Perls `_songData` (`$remoteMeta->{title} ||
+            # $track->title`, Queries.pm:5972) — ICY-Titel, sonst der
+            # SENDENAME des Eintrags, die URL als letzter Rueckfall.
+            title, artist = _stream_entry_title(player, url_str)
+            info = {"title": title or url_str, "url": url_str, "duration": 0,
+                    "name": _stream_registered_name(player, url_str)}
             if index == int(getattr(player, "playlist_position", 0) or 0):
-                info["artist"] = str(getattr(player, "current_artist", "") or "")
+                info["artist"] = artist or str(
+                    getattr(player, "current_artist", "") or "")
 
         if entity == "duration":
             # Auch 0 ist definiert → der Schlüssel bleibt (:2763-2764).
             return {"_duration": float(info.get("duration", 0) or 0)}
         if entity == "name":
-            # Tag 'N' → remote_title; nur ein Stream hat einen Namen
-            # (:2766-2767). Ein lokaler Track liefert kein Result.
-            value = info.get("title") if is_remote else None
+            # Tag 'N' → remote_title (`$songData->{remote_title}`,
+            # Queries.pm:2766-2767) = der SENDENAME des Eintrags — NICHT der
+            # ICY-Titel des laufenden Streams (live Perl 9.1.1: `playlist
+            # name ?` = „Hirschmilch Chillout“ bei ICY-Titel „Vibrasphere -
+            # Tierra Azul (Nordlight Remix)“).  Ein lokaler Track liefert
+            # kein Result.
+            value = info.get("name") if is_remote else None
         else:
             value = info.get(entity)
         if value in (None, ""):
@@ -8009,7 +8154,31 @@ class JSONRPCAPI:
             return {}
         from lyrion.player.manager import PlayerManager
 
-        ok = await PlayerManager().play_url(pid, station.url, station.title)
+        pm = PlayerManager()
+        # Perl's `setRemoteMetadata($url, {title => $subFeed->{name} ||
+        # $subFeed->{title}, …})` registers the feed row's NAME under the URL
+        # BEFORE the play (Slim/Control/XMLBrowser.pm:693-700 → Music/Info.pm:
+        # 395-478): that name is what `$track->title`/`getCurrentTitle` answer
+        # for this URL from then on — i.e. what the status shows as long as
+        # the stream sends no (or an empty) ICY title.
+        player = pm.get_player(pid)
+        if player is not None:
+            self._set_stream_title(player, station.url, station.title)
+            # Perl registriert mit dem Namen AUCH das Logo der Zeile unter der
+            # URL: `setRemoteMetadata($url, {title => …, cover => $subFeed
+            # ->{cover} || {image} || {icon}, …})` (Control/XMLBrowser.pm:693-700
+            # → Music/Info.pm:489-492 caches es als `remote_image_$url`), und
+            # `_songData` reicht es als `artwork_url`/`icon` weiter
+            # (Queries.pm:5618-5633, HTTP.pm:1133 `cover => $cover || $icon`).
+            # Ohne das zeigt das Player-Fenster nur den Radio-Platzhalter.
+            # Der Wert ist schon der proxied Pfad (Perl-Regel XMLBrowser.pm:1171
+            # + proxiedImage) — dieselbe Form, die Perl live ausliefert:
+            # `/imageproxy/http%3A%2F%2Fcdn-radiotime-logos.tunein.com%2F…/
+            # image.png`.
+            _icon_key, _icon = radiobrowser.station_icon(station)
+            if _icon:
+                self._set_stream_image(player, station.url, _icon)
+        ok = await pm.play_url(pid, station.url, station.title)
         logger.info("radio stream %s on %s: %s (%s)", feed, pid,
                     station.title, "ok" if ok else "failed")
         return {}
