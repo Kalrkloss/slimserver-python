@@ -8074,7 +8074,22 @@ class JSONRPCAPI:
         play_ctl = next((str(a)[22:] for a in args
                          if str(a).startswith("xmlbrowserPlayControl:")),
                         None)
-        is_menu = any(str(a) == "menu:1" for a in args)
+        # Perl's menu mode is *any* ``menu`` parameter, not the literal
+        # ``menu:1``: ``Slim/Control/XMLBrowser.pm:313`` ``my $menuMode =
+        # defined $menu;`` — and the browsable feeds name *themselves* in
+        # ``base.actions.go`` (live Perl ``mode:bmf``:
+        # ``params {mode: bmf, menu: browselibrary}``, ``BrowseLibrary.pm:
+        # 2044-2046``), so the tap Squeeze Client/SqueezePlay builds from
+        # that base sends ``menu:browselibrary`` back.  Answering *that* in
+        # the modeless ``loop_loop`` shape (no ``item_loop``, no ``offset``)
+        # made Squeeze Client's pager page on forever: its
+        # ``serverHasMoreData`` is ``items.size + offset < count``
+        # (``BasePagingListFragment.kt:125`` → ``model/ListResponse.kt``)
+        # and an item-less answer with ``offset`` defaulting to 0 never
+        # reached the folder's child count ("Musikordner zeigt nur die
+        # oberste Ebene, darunter ist nichts").
+        is_menu = any(str(a) == "menu" or str(a).startswith("menu:")
+                      for a in args)
         # ── mode:search / mode:playlists — Perl's own feeds ──────────────
         # Both are *modeless* BrowseLibrary feeds whose item set does not
         # depend on the library rows: ``_search`` answers the five-row search
@@ -8189,6 +8204,48 @@ class JSONRPCAPI:
                 return self._playcontrol_context_menu(rows, start,
                                                       _playctl_index(play_ctl),
                                                       kind, filters)
+            from lyrion.web import menus as _menus
+            # Perl's window size is the FEED's total, never a recursive one:
+            # ``my $count = $subFeed->{'total'};; $count ||= defined $items ?
+            # scalar @$items : 0;`` (``Slim/Control/XMLBrowser.pm:792-793``)
+            # for the bmf feed = the direct children of the browsed directory
+            # (``Queries.pm:2361`` ``$count = scalar @$items`` after
+            # ``readDirectory``, ``Slim/Utils/Misc.pm:973-1043``).
+            total = int(total or len(rows))
+            if not total:
+                # Bug 7024 (``XMLBrowser.pm:841-846``): an empty menu answers
+                # the ``Empty`` placeholder row instead of an empty list, and
+                # reports it as its single item.  Live Perl 9.1.1
+                # ``browselibrary items 0 1 menu:1 mode:bmf
+                # folder_id:99999999`` → ``{count: 1, offset: 0, item_loop:
+                # [{'text': 'Leer', 'style': 'itemNoAction', 'action': 'none',
+                # 'type': 'text'}], base: …, window: {text_list}}``; this port
+                # answered ``{count: 0, item_loop: []}``.
+                empty = [_menus.empty_placeholder_item()]
+                return {
+                    "base": {"actions": self._browselibrary_menu_actions(
+                        kind, filters, start, count, False)},
+                    "count": 1,
+                    "offset": start,
+                    "window": _menus.window_style_for_items(empty),
+                    "item_loop": empty,
+                }
+            if start >= total:
+                # A window past the feed's end: Perl's ``normalize()`` marks it
+                # invalid (``Slim/Control/Request.pm:1805-1839`` ``if ($from >
+                # $lastidx) { return ($valid, 0, 0) }``), so the builder emits
+                # neither ``item_loop`` nor ``base``/``title`` and adds only
+                # ``count``, ``offset`` and ``window`` (``XMLBrowser.pm:851``,
+                # ``:1420``, ``:1450``).  Live Perl 9.1.1 ``browselibrary items
+                # 303 100 menu:1 mode:bmf`` → keys ``count``/``offset``/
+                # ``window``.  (Perl's ``count`` *value* decays to 1 out there
+                # — its cached-feed re-fetch answers the ``Empty`` list — while
+                # this port keeps the feed's child count; the client only
+                # needs an item-less window plus the offset to stop paging.)
+                # An empty ``item_loop`` + a defaulted ``offset: 0`` instead
+                # kept Squeeze Client paging forever (see ``is_menu`` above).
+                return {"count": total, "offset": start,
+                        "window": {"windowStyle": "text_list"}}
             menu = self._browselibrary_menu_items(kind, rows, mode, search,
                                                   start)
             # Perl's $presetFavSet: _jivePresetBase runs only when an item
@@ -8199,11 +8256,10 @@ class JSONRPCAPI:
             # for_items.  Live Perl 9.1.1 (2026-09-14): albums icon_list,
             # artists home_menu, genres/years/tracks/bmf text_list; this port
             # answered icon_list for every one of them.
-            from lyrion.web import menus as _menus
             return {
                 "base": {"actions": self._browselibrary_menu_actions(
                     kind, filters, start, count, preset_fav_set)},
-                "count": int(total or len(menu)),
+                "count": total,
                 "offset": start,
                 "window": _menus.window_style_for_items(menu),
                 "item_loop": menu,

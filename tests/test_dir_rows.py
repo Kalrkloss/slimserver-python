@@ -54,6 +54,7 @@ from lyrion.database.schema import Base
 from lyrion.media import dir_rows, folders
 from lyrion.media.importer import ImportConfig, MusicImporter
 from lyrion.web import api as api_mod
+from lyrion.web import menus as menus_mod
 from lyrion.web.api import JSONRPCAPI
 
 ROOT = "/srv/music"
@@ -302,13 +303,22 @@ def test_bmf_lists_directories_without_any_track(tmp_path, monkeypatch,
 
 def test_bmf_unknown_and_non_dir_ids_answer_empty(tmp_path, monkeypatch,
                                                   tracks_schema_sql):
-    """Live Perl: ``folder_id:99999999`` und ``folder_id:1`` → ``count 0``."""
+    """Unbekannte/nicht-Verzeichnis-ids: leere Liste — Perls ``Leer``-Zeile.
+
+    Live Perl 9.1.1 (read-only): die CLI-Query ``musicfolder 0 5
+    folder_id:99999999`` antwortet ``count 0``, die *Menue*-Form derselben
+    Query (``browselibrary items 0 1 menu:1 mode:bmf folder_id:99999999`` —
+    so fragt die App) dagegen ``count 1`` mit der ``Empty``-Zeile
+    (``XMLBrowser.pm:841-846``).
+    """
     db = _db(tmp_path / "lyrion.db", tracks_schema_sql, TREE)
     for token in ("99999999", "1"):
         res = _browse(db, monkeypatch, ROOT,
                       ["items", "0", "50", "menu:1", "mode:bmf",
                        f"folder_id:{token}"])
-        assert res["count"] == 0, token
+        assert res["count"] == 1, token
+        assert [it["text"] for it in res["item_loop"]] == [
+            menus_mod.menu_title("EMPTY")], token
 
 
 def test_folder_tracks_expansion_ignores_dir_rows(tmp_path, monkeypatch,

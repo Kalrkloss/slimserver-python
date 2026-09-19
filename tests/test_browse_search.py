@@ -22,6 +22,7 @@ import asyncio
 import sqlite3
 
 from lyrion.web import api as api_mod
+from lyrion.web import menus as menus_mod
 from lyrion.web.api import JSONRPCAPI
 
 
@@ -117,9 +118,17 @@ def test_search_filter_is_case_insensitive(tmp_path, monkeypatch):
 
 
 def test_no_match_answers_an_empty_loop_not_an_error(tmp_path, monkeypatch):
+    """Kein Treffer → Perls ``Empty``-Zeile, kein Fehler.
+
+    Live Perl 9.1.1 (read-only) ``browselibrary items 0 4 menu:1 mode:genres
+    search:zzzqq`` → ``{count: 1, offset: 0, item_loop: [{'text': 'Leer',
+    'style': 'itemNoAction', 'action': 'none', 'type': 'text', …}]}``
+    (Bug 7024, ``Slim/Control/XMLBrowser.pm:841-846``) — auch bei
+    ``menu:browselibrary`` (der Form, die die App sendet).
+    """
     empty = _rows(tmp_path, monkeypatch, "genres", "search:zzz")
-    assert empty["count"] == 0
-    assert empty["item_loop"] == []
+    assert empty["count"] == 1
+    assert [it["text"] for it in empty["item_loop"]] == [menus_mod.menu_title("EMPTY")]
 
 
 def test_genres_falls_back_to_the_track_text_table(tmp_path, monkeypatch):

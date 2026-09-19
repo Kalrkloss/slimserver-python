@@ -59,7 +59,12 @@ import pytest
 
 from lyrion.media import folders
 from lyrion.web import api as api_mod
+from lyrion.web import menus as menus_mod
 from lyrion.web.api import JSONRPCAPI
+
+#: Perls ``Empty``-Platzhalterzeile (``menu_title('EMPTY')``): "Leer" auf dem
+#: deutschen Live-Perl, "Empty" im Testlauf ohne Sprach-Tabelle.
+EMPTY_TEXT = menus_mod.menu_title("EMPTY")
 
 # ---------------------------------------------------------------------------
 # R0.6-B fixtures
@@ -325,10 +330,21 @@ def test_bmf_non_audio_only_dirs_are_absent(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 def test_bmf_empty_library_empty_folder(tmp_path, monkeypatch):
+    """Leere Bibliothek: die Menue-Form antwortet Perls ``Empty``-Zeile.
+
+    Live Perl 9.1.1 (read-only) ``browselibrary items 0 1 menu:1 mode:bmf
+    folder_id:99999999`` → ``{count: 1, offset: 0, window {windowStyle:
+    text_list}, item_loop: [{'text': 'Leer', 'style': 'itemNoAction',
+    'action': 'none', 'type': 'text'}]}`` — Bug 7024,
+    ``Slim/Control/XMLBrowser.pm:841-846``: ``if ($menuMode && !$count &&
+    !$xmlBrowseInterimCM) { $items = [ { type => 'text', name =>
+    $request->string('EMPTY') } ]; $totalCount = $count = 1; }``.  Die
+    *modellose* (flache) Form bleibt ``count 0`` mit leerer Liste.
+    """
     _setup(tmp_path, monkeypatch, [], ROOT)
     res = _browse(["items", "0", "50", "menu:1", "mode:bmf"])
-    assert res["count"] == 0
-    assert res["item_loop"] == []
+    assert res["count"] == 1
+    assert [it["text"] for it in res["item_loop"]] == [EMPTY_TEXT]
 
     plain = _browse(["items", "0", "50", "mode:bmf"])
     assert plain["count"] == 0
@@ -336,11 +352,11 @@ def test_bmf_empty_library_empty_folder(tmp_path, monkeypatch):
 
 
 def test_bmf_empty_library_without_pref(tmp_path, monkeypatch):
-    """Kein Pref, keine Tracks → keine Wurzel, kein Fehler."""
+    """Kein Pref, keine Tracks → keine Wurzel, Perls ``Leer``-Zeile."""
     _setup(tmp_path, monkeypatch, [], "")
     res = _browse(["items", "0", "50", "menu:1", "mode:bmf"])
-    assert res["count"] == 0
-    assert res["item_loop"] == []
+    assert res["count"] == 1
+    assert [it["text"] for it in res["item_loop"]] == [EMPTY_TEXT]
 
 
 # ---------------------------------------------------------------------------
@@ -386,16 +402,16 @@ def test_bmf_fallback_root_single_tree(tmp_path, monkeypatch):
 
 
 def test_bmf_fallback_requires_more_than_one_track(tmp_path, monkeypatch):
-    """Ein einzelner Track darf keine Wurzel definieren."""
+    """Ein einzelner Track darf keine Wurzel definieren → Perls ``Leer``."""
     _setup(tmp_path, monkeypatch,
            [(1, "file:///home/keiner/Music/lonely.mp3")], "")
     res = _browse(["items", "0", "50", "menu:1", "mode:bmf"])
-    assert res["count"] == 0
-    assert res["item_loop"] == []
+    assert res["count"] == 1
+    assert [it["text"] for it in res["item_loop"]] == [EMPTY_TEXT]
 
 
 def test_bmf_missing_url_column_does_not_raise(tmp_path, monkeypatch):
-    """Schlanke/abweichende DBs (tracks ohne url) → leerer Ordner."""
+    """Schlanke/abweichende DBs (tracks ohne url) → Perls ``Leer``-Zeile."""
     db = _db(tmp_path, LIB_URLS, with_title=False)
     monkeypatch.setattr(api_mod, "_library_db_path", lambda: db)
     monkeypatch.setattr(api_mod, "_bmf_musicdir_pref", lambda: "")
@@ -406,7 +422,8 @@ def test_bmf_missing_url_column_does_not_raise(tmp_path, monkeypatch):
     con.commit()
     con.close()
     res = _browse(["items", "0", "50", "menu:1", "mode:bmf"])
-    assert res["count"] == 0
+    assert res["count"] == 1
+    assert [it["text"] for it in res["item_loop"]] == [EMPTY_TEXT]
 
 
 # ---------------------------------------------------------------------------
@@ -472,3 +489,112 @@ def test_bmf_folder_id_expands_to_folder_tracks(tmp_path, monkeypatch):
     _setup(tmp_path, monkeypatch, LIB_URLS, ROOT)
     assert api_mod._expand_track_ids({"folder_id": f"{ROOT}/Metal"}) == [1, 2, 3]
     assert api_mod._expand_track_ids({"folder_id": f"{ROOT}/Ambient"}) == [4]
+
+
+# ---------------------------------------------------------------------------
+# (g) Der Tap der App: ``menu:browselibrary`` + ``folder_id``/``url``/``item_id``
+#
+# Squeeze Client sendet den Tap als ``browselibrary items <start> <count>
+# useContextMenu:1 mode:bmf menu:browselibrary item_id:<n> isContextMenu:1
+# folder_id:<id> url:<pfad>`` — ``menu:browselibrary`` kommt aus unserer
+# eigenen ``base.actions.go`` (Perls ``params {mode: bmf, menu:
+# browselibrary}``), ``folder_id``/``url``/``item_id`` aus den
+# Item-``params``.  Perl schaltet bei JEDEM ``menu``-Parameter in den
+# Jive-Modus (``Slim/Control/XMLBrowser.pm:313``), liefert also
+# ``item_loop``/``offset``/``count``/``window``/``base``.
+# ---------------------------------------------------------------------------
+
+#: Die Tap-Form aus dem Live-Log der App (MAC 1C:87:2C:47:FC:36), für den
+#: Ordner ``Metal`` der Test-Bibliothek.
+def _app_tap(metal: dict, start: int, count: int) -> list[str]:
+    return ["items", str(start), str(count), "useContextMenu:1", "mode:bmf",
+            "menu:browselibrary", "item_id:0", "isContextMenu:1",
+            f"folder_id:{metal['id']}", f"url:{ROOT}/Metal"]
+
+
+def test_bmf_app_tap_answers_the_jive_window(tmp_path, monkeypatch):
+    """``menu:browselibrary`` ist Menue-Modus — kein flaches ``loop_loop``.
+
+    Die Extra-Parameter (item_id/isContextMenu/folder_id/url) dürfen den
+    Zweig nicht verdrängen: der Tap liefert die Kinder des Ordners im
+    Jive-Fenster (Perl-Form).
+    """
+    _setup(tmp_path, monkeypatch, LIB_URLS, ROOT)
+    metal = next(it for it in _items(["items", "0", "50", "menu:1", "mode:bmf"])
+                 if it["text"] == "Metal")
+    res = _browse(_app_tap(metal, 0, 300))
+    assert "loop_loop" not in res, res
+    assert res["count"] == 2                    # direkte Kinder, nicht rekursiv
+    assert res["offset"] == 0
+    assert [it["text"] for it in res["item_loop"]] == ["Accept", "Iron Maiden"]
+    assert res["window"] == {"windowStyle": "text_list"}
+    # die Basis-Aktion der Antwort ist wieder der eigene Feed (Perl)
+    go = res["base"]["actions"]["go"]
+    assert go["params"] == {"mode": "bmf", "menu": "browselibrary"}
+    assert go["itemsParams"] == "params"
+    # Live Perl 9.1.1, gleiche Anfrageform gegen den Aerosmith-Ordner:
+    # ``{count: 10, offset: 0, item_loop: [… 10 Dateien …], window, base,
+    # title}`` (10 = ``readDirectory``-Kinder, nicht die rekursive Gesamtzahl)
+
+
+def test_bmf_window_past_the_end_has_no_item_loop(tmp_path, monkeypatch):
+    """``start`` jenseits der Kinderzahl: Perls ungültiges Fenster.
+
+    Perl ``normalize`` (``Slim/Control/Request.pm:1805-1839``) verwirft das
+    Fenster (``if ($from > $lastidx) { return ($valid, 0, 0) }``), der
+    Builder fügt dann nur ``count``/``offset``/``window`` an
+    (``XMLBrowser.pm:851,1420,1450``).  Live Perl 9.1.1 ``browselibrary items
+    303 100 menu:1 mode:bmf`` → keys ``count``/``offset``/``window``.
+    """
+    _setup(tmp_path, monkeypatch, LIB_URLS, ROOT)
+    metal = next(it for it in _items(["items", "0", "50", "menu:1", "mode:bmf"])
+                 if it["text"] == "Metal")
+    res = _browse(_app_tap(metal, 119100, 100))
+    assert res["count"] == 2                    # die Kinderzahl bleibt stehen
+    assert res["offset"] == 119100
+    assert "item_loop" not in res, res          # kein (leerer) Loop
+    assert "loop_loop" not in res, res
+    assert "base" not in res
+    assert res["window"] == {"windowStyle": "text_list"}
+
+
+def test_bmf_app_pager_terminates(tmp_path, monkeypatch):
+    """Der Pager der App läuft nicht mehr endlos (Regression Endlos-Blättern).
+
+    Squeeze Client lädt ``PagingConfig(100)`` mit ``initialLoadSize`` 300 und
+    hängt die nächste Seite an, solange ``items.size + offset < count``
+    (``ui/common/BasePagingListFragment.kt:124-133`` →
+    ``model/ListResponse.kt:27``; ``offset`` ist dort 0, wenn die Antwort
+    keines schickt).  Vor dem Fix hatte der Tap-Antwort kein ``item_loop``
+    und kein ``offset`` → ``0 + 0 < 2`` blieb wahr, der Client fragte
+    ``start = 100, 200, 300, …`` ohne Ende (Live-Log: bis 318300).
+    """
+    _setup(tmp_path, monkeypatch, LIB_URLS, ROOT)
+    metal = next(it for it in _items(["items", "0", "50", "menu:1", "mode:bmf"])
+                 if it["text"] == "Metal")
+
+    page_size, initial = 100, 300
+    page, requested, loaded = 0, [], []
+    for _ in range(50):                        # der Client-Loop
+        start = page * (initial if page == 0 else page_size)
+        res = _browse(_app_tap(metal, start, initial if page == 0 else page_size))
+        items = res.get("item_loop") or []
+        offset = res.get("offset", 0)
+        requested.append(start)
+        loaded += [it["text"] for it in items]
+        if not (items and len(items) + offset < res.get("count", 0)):
+            break                              # serverHasMoreData == false
+        page += 1
+    assert requested == [0], requested         # genau EINE Seite, dann Ende
+    assert loaded == ["Accept", "Iron Maiden"]
+
+
+def test_bmf_flat_form_keeps_the_opensqueeze_shape(tmp_path, monkeypatch):
+    """Ohne ``menu:``-Parameter bleibt die modelose Form (kein Umbau)."""
+    _setup(tmp_path, monkeypatch, LIB_URLS, ROOT)
+    metal = next(it for it in _items(["items", "0", "50", "menu:1", "mode:bmf"])
+                 if it["text"] == "Metal")
+    res = _browse(["items", "0", "300", "mode:bmf", f"folder_id:{metal['id']}"])
+    assert "item_loop" not in res
+    assert res["count"] == 2
+    assert [it["text"] for it in res["loop_loop"]] == ["Accept", "Iron Maiden"]
