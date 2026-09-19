@@ -10346,6 +10346,57 @@ class WebAPIHandler:
         # images/``): without them SqueezePlay's first level under Radio drew
         # no symbols ("GET /plugins/TuneIn/html/images/radiopresets_40x40_m
         # .png" → 404, client log ``SocketHttp.lua:186``).
+        #
+        # Systematischer Nachzug derselben Klasse (27 Dateien, 2026-09-19):
+        # ein Abgleich *aller* Template-Roots (``HTML/`` + jedes
+        # ``Slim/Plugin/*/HTML/``, je Skin-Unterverzeichnis) gegen unser
+        # ``html/`` ergab 664 web-sichtbare Perl-Pfade; davon fehlten uns
+        # genau 27 *Plugin*-Bilder, die Perl mit 200 und wir mit 404
+        # beantworteten (roh per curl gegen 192.168.1.90 verglichen).  Sie
+        # liegen jetzt unter
+        # ``html/EN/plugins/<Plugin>/...`` (md5-identisch zu Perls Datei, in
+        # ``tests/test_plugin_assets.py`` gepinnt):
+        #   Sounds/html/images/{icon,icon_40x40_m}.png,
+        #   RemoteLibrary/html/{icon,lms}.png,
+        #   DigitalInput/html/images/{icon,icon_40x40_m}.png,
+        #   DontStopTheMusic/html/images/icon.png,
+        #   ExtendedBrowseModes/html/{icon,icon_charts,icon_folder,composers,
+        #     conductors,jazzcomposers,randomalbums,
+        #     newartists_MTL_svg_artistnew,recentartists_MTL_svg_artistrecent,
+        #     topartists_MTL_svg_artistpopular,
+        #     popularalbums_MTL_svg_popularalbum}.png,
+        #   InfoBrowser/html/images/{icon,icon_40x40_m}.png,
+        #   LineIn/html/images/{icon,icon_40x40_m}.png,
+        #   MyApps/html/images/{icon,icon_40x40_m}.png,
+        #   RandomPlay/html/images/{icon,icon_40x40_m}.png,
+        #   Favorites → ``html/EN/html/images/favorites_remove.png``
+        #   (Perl: ``Slim/Plugin/Favorites/HTML/EN/html/images/…``).
+        # Die ``_40x40_m``-Namen fragt SqueezePlay selbst ab
+        # ``SlimServer.lua:1227``/``SocketHttp.lua:186``; wo Perl *kein*
+        # solches File hat, skaliert unser ``_serve_static``-Fallback die
+        # Basisdatei (perl-gleich: ``Slim/Web/HTTP.pm:78-81`` schickt jeden
+        # ``_<N>x<N>_<m>``-Pfad in ``Slim::Web::Graphics::artworkRequest``,
+        # ``HTTP.pm:1199-1245``, also auch *neben* einem vorhandenen
+        # gleichnamigen File).
+        #
+        # Bewusst NICHT angelegt (jeweils mit rohem Gegenbeweis):
+        # * Die 15 Bilder von Plugins, deren ``HTML/``-Root Perl **nicht**
+        #   registriert (Plugin ungeladen: ``PluginManager.pm:366-380`` hängt
+        #   ein Plugin-``HTML/`` nur für geladene Plugins an; ohne Root findet
+        #   ``fixHttpPath`` nichts → ``HTTP.pm:1128-1131`` RC_NOT_FOUND).
+        #   Live-Perl 404t dieselben URLs (z. B.
+        #   ``/plugins/Podcast/html/images/icon.png`` 404, ``/plugins/
+        #   Analytics/html/icon.png`` 404) — wer sie anlegt, weicht von Perl ab.
+        # * 89 Bilder der Skins ``Default``/``Classic``
+        #   (``/html/images/b_play.gif``, ``slim-ext/*.gif``, ``lightbox/*``…):
+        #   sie liegen in Perls ``HTML/Default`` (bzw. ``HTML/Classic``), es
+        #   gibt dafür **keinen** ``EN/``-Pfad — unser statischer Root spiegelt
+        #   Perls ``HTML/EN``-Baum, ein Ablegen unter ``html/EN/html/images/``
+        #   würde den Pfad erfinden, den Perl für den EN-Skin 404t.
+        # * ``*.html``-Templates der Plugins (settings/*.html,
+        #   MusicMagic/docs/*.html, …): Perl behandelt sie nie statisch
+        #   (``HTTP.pm:1119-1123`` — nur Nicht-``text/html`` wird ``$isStatic``),
+        #   sie laufen durch die Template-Engine bzw. Page-Funktionen.
         for rel in _static_path_variants(path):
             file_path = _resolve(rel)
             if file_path is not None:
