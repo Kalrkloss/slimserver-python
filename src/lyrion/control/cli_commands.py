@@ -4523,12 +4523,21 @@ async def _fav_items(
     except Exception:  # noqa: BLE001
         items = []
     loop = []
+    # Perl's ``image`` of a favourites row is ``proxiedImage($item->{icon})``
+    # (``XMLBrowser.pm:1386-1387``; the entry has no ``image`` of its own) —
+    # a stored ``/imageproxy/…`` path stays as it is, a raw ``http…`` logo
+    # becomes the same proxied route the JSON shapes hand out.
+    from lyrion.web.radiobrowser import proxied_image
+
     for item in items:
         is_folder = item.get("type") == "folder"
         loop.append({
             "id": item["id"],
             "name": item["title"],
-            "image": "html/images/favorites.png",
+            # The OPML ``icon`` of the entry (``OpmlFavorites.pm:133-136``);
+            # live Perl answers it for folders over the CLI too (docstring).
+            "image": proxied_image(item.get("icon")
+                                   or "html/images/favorites.png"),
             "isaudio": 0 if is_folder else 1,
             "hasitems": 1 if is_folder else 0,
         })
