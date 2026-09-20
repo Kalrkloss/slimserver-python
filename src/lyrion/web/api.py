@@ -1992,6 +1992,45 @@ def _register_feed_row_images(player: object, rows: object) -> None:
         JSONRPCAPI._set_stream_image(player, url, image)
 
 
+def _register_favorites_row_images(player: object, items: object) -> None:
+    """``XMLBrowser.pm:1043-1049`` for the favourites list's own rows.
+
+    The cache write ``$cache->set("remote_image_$url", $cover, 86400)`` sits in
+    the item loop of ``Slim::Web::XMLBrowser`` — the one loop that serves BOTH
+    the CLI list query and the jive/JSON-RPC list query:
+
+    * CLI: ``addDispatch(['favorites','items',…], […, \\&cliBrowse])``
+      (``Slim/Plugin/Favorites/Plugin.pm:75``) → ``cliBrowse``
+      (:763) → ``Slim::Control::XMLBrowser::cliQuery('favorites', …)``;
+    * jive: the same ``XMLBrowser::_cliQuery_done`` item loop the controllers'
+      ``favorites items … menu:…`` request runs through.
+
+    So a favourites row that has been rendered ONCE has its logo filed under
+    its URL — that is what makes a playlist entry which was only ADDED (never
+    played) answer the row logo instead of the handler's
+    ``html/images/radio.png`` placeholder: ``_songData``/status read the key
+    back (``Queries.pm:5618-5633`` → ``Slim/Player/Protocols/HTTP.pm:1092``).
+
+    Both render paths call this one helper — the resolution is not duplicated.
+    The icon is the row's own (``OpmlFavorites.pm:133-136``: the OPML value,
+    else the derived default); Perl's ``proxiedImage`` is applied by
+    :func:`JSONRPCAPI._set_stream_image`.  Rows without a logo (the handler's
+    radio placeholder) file nothing — the caller keeps Perl's default.
+    """
+    if player is None or not items:
+        return
+    for it in items if isinstance(items, (list, tuple)) else []:
+        if not isinstance(it, dict) or it.get("type") == "folder":
+            continue
+        url = str(it.get("url") or "")
+        if not url:
+            continue
+        icon = str(it.get("icon") or "")
+        if not icon or icon.endswith(("/images/radio.svg", "/images/radio.png")):
+            continue
+        JSONRPCAPI._set_stream_image(player, url, icon)
+
+
 def _stream_live_title(player: object, url: str) -> str:
     """The in-stream (ICY) title cached for ``url`` — Perl ``%currentTitles``.
 
@@ -3303,6 +3342,13 @@ class JSONRPCAPI:
             items = await fm.list_items(parent)
         except Exception:
             return []
+        # Perl's feed cache: every rendered playable row with an image is filed
+        # as ``remote_image_<row url>`` (``XMLBrowser.pm:1043-1049``).  That is
+        # what makes the logo available for the SAME url later — for every
+        # playlist entry (``Queries.pm:5618-5633`` → ``HTTP.pm:1092``), not only
+        # for the running one.  One helper, both render paths (see
+        # :func:`_register_favorites_row_images`).
+        _register_favorites_row_images(player, items)
         loop: list[dict] = []
         path = parent_path  # hierarchical prefix for the item ids
         for i, it in enumerate(items):
@@ -3312,13 +3358,6 @@ class JSONRPCAPI:
             # the row's ``icon``/``icon-id`` (``XMLBrowser.pm:1160-1166``) and
             # in the flat shape as ``image`` (:1386-1387).
             icon = it.get("icon") or _favorites_icon(it.get("url") or "")
-            # Perl's feed cache: every rendered playable row with an image is
-            # filed as ``remote_image_<row url>`` (``XMLBrowser.pm:1043-1049``).
-            # That is what makes the logo available for the SAME url later —
-            # for every playlist entry (``Queries.pm:5618-5633`` →
-            # ``HTTP.pm:1092``), not only for the running one.
-            if player is not None and not is_folder and it.get("url"):
-                JSONRPCAPI._set_stream_image(player, str(it["url"]), icon)
             hier = path + f".{i}"
             if menu_mode:
                 from lyrion.web import favorites_menu

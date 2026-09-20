@@ -1703,7 +1703,10 @@ async def cmd_status(
                     results=[("error", "invalid player")],
                 )
             ]
-        # tags: t=title a=artist l=album d=duration u=url g=genre y=year n=tracknum
+        # tags: a=artist l=album d=duration u=url g=genre y=year t=tracknum
+        # n=modificationTime i=disc c=coverid K=artwork_url N=remote_title
+        # x=remote (Perl's %tagMap, Queries.pm:5660-5700) — `id`/`title` are
+        # added unconditionally (:5971-5972), see _status_playlist_loop.
         tags = ""
         subscribe_interval = 0
         for a in args:
@@ -1820,110 +1823,163 @@ async def cmd_status(
 
 
 async def _status_playlist_loop(player: Any, tags: str) -> list[dict[str, Any]]:
-    """Build the ``playlist_loop`` items of the status answer.
+    """Build the ``playlist_loop`` items of the status answer — Perl ``_songData``.
 
-    Perl builds these entries with ``_addSong`` and starts every item with
-    ``'playlist index'`` (Queries.pm:4410-4414); the included tags depend on
-    the tags: code (t=title, a=artist, l=album, d=duration, u=url, g=genre,
-    y=year, n=tracknum).  With an empty code every known field is added.
+    Perl builds every entry with ``_addSong`` → ``_songData`` and starts it with
+    ``'playlist index'`` (unshifted, Queries.pm:5461-5479 + :4410-4414).  The
+    field set is *one* code path for local tracks and URL entries
+    (``RemoteTrack``): ``id`` and ``title`` are added BEFORE the tag loop and
+    are NOT gated by any tag letter (Queries.pm:5971-5972)::
 
-    A URL entry (radio/favorite) is Perl's ``RemoteTrack``: ``_songData``
-    walks the SAME tag map (Queries.pm:5964-6108) and fills the artwork
-    fields from the stream's own metadata — ``K`` → ``artwork_url``
-    (``'K' => ['artwork_url', '', 'coverurl']``, :5714, value proxied at
-    :6101) and ``c`` → ``coverid`` (``RemoteTrack::coverid`` is the track id,
-    ``Slim/Schema/RemoteTrack.pm:496``).  Live Perl 9.1.1 (read-only
-    2026-09-20, ``<mac> status 0 3`` on the playing stream)::
+        $returnHash{'id'}    = $track->id;
+        $returnHash{'title'} = $remoteMeta->{title} || $track->title;
+        for my $tag (split (//, $tags)) { … $tagMap{$tag} … }
 
-        tags:K    → playlist index:0 id:… title:A-Frame
-                    artwork_url:/imageproxy/http%3A%2F%2Fcdn-radiotime-logos
-                    .tunein.com%2Fs111987q.png/image.png
-        tags:c    → … coverid:-94115167819792
-        (no tags) → playlist index:0 id:… title:A-Frame
+    Everything else follows the tag letters **in the order the client sent
+    them** (``split //, $tags``, ``next if $seen{$tag}++``) and is omitted when
+    the value is undefined/empty (``:6103-6108``).  Live Perl 9.1.1, read-only
+    2026-09-20 — ``<mac> status 0 5 <tags>`` on the playing stream
+    (``http://hirschmilch.de:7000/chillout.mp3``)::
 
-    The logo resolution is the JSON-RPC status' own
+        (no tags)   → playlist index:0 id:-94115167819792 title:A-Frame
+        tags:a      → … title:A-Frame artist:Unknown Reality
+        tags:d      → … title:A-Frame duration:0
+        tags:u      → … title:A-Frame url:http://hirschmilch.de:7000/chillout.mp3
+        tags:o      → … title:A-Frame type:MP3 Radio
+        tags:N      → … title:A-Frame remote_title:Hirschmilch Chillout
+        tags:K      → … title:A-Frame artwork_url:/imageproxy/http%3A%2F%2F
+                      cdn-radiotime-logos.tunein.com%2Fs111987q.png/image.png
+        tags:c      → … title:A-Frame coverid:-94115167819792
+        tags:al     → … title:A-Frame artist:Unknown Reality   (no album)
+
+    and, for a LOCAL track (same ``%tagMap``/``_songData`` path, live via
+    ``titles 0 1 <tags>`` — ``id``/``title`` again unconditional)::
+
+        tags:t → id:201214 title:… tracknum:7        ('t' => tracknum!)
+        tags:n → id:201214 title:… modificationTime:1723554429
+        tags:i → disc:1      tags:o → type:mp3       tags:d → duration:1195.075
+
+    ``tags`` is Perl's ``$request->getParam('tags') || ''`` (Queries.pm:4008):
+    an EMPTY code adds nothing beyond ``id``/``title`` — there is no
+    "everything" mode (the former ``want_all`` here was this port's invention).
+
+    Numeric fields keep Perl's ``defined $value && $value ne ''`` rule
+    (:6103), so a stream answers ``duration:0`` and ``year:0`` (RemoteTrack's
+    numeric defaults — live), while ``tracknum``/``disc`` stay absent for it
+    (undef there, live ``tags:t``/``tags:i`` → nothing).
+
+    The stream logo resolution is the JSON-RPC status' own
     (:func:`lyrion.web.api._stream_artwork_url`) — one resolution, both
     protocols — with Perl's ``html/images/radio.png`` fallback
     (``Protocols/HTTP.pm:1140-1147`` ``cover => $cover || $icon`` → the
-    handler's ``cover`` becomes ``$remoteMeta->{K}``, Queries.pm:5928).
+    handler's ``cover`` becomes ``$remoteMeta->{K}``, Queries.pm:5928), and
+    ``coverid`` the RemoteTrack id (``Slim/Schema/RemoteTrack.pm:317``
+    ``id => -int($self)``).
+
+    Not served here (measured live, unchanged): ``o`` (type — the stream's
+    ``MP3 Radio``, the ICY content type), ``n`` for a stream (Perl answers a
+    formatted date, ``Sonntag, 20. September 2026, 20:49``), ``r``/``f``/
+    ``T``/``I``/``H`` (bitrate/filesize/samplerate/…), ``e``/``s``/``b``/``h``/
+    ``z``/``A``/``S``, ``B``/``L``/``E``/``V``.
     """
     playlist = getattr(player, "playlist", []) or []
     if not playlist:
         return []
     items: list[dict[str, Any]] = []
-    want_all = not tags
     for i, item in enumerate(playlist):
         entry: dict[str, Any] = {"playlist index": i}
         if isinstance(item, int):
             rows = await _query_db(
-                "SELECT id, title, url, duration, genre, year, tracknum "
-                "FROM tracks WHERE id = ?",
+                "SELECT id, title, url, duration, genre, year, tracknum, "
+                "modtime, disc, remote FROM tracks WHERE id = ?",
                 (item,),
             )
             if not rows:
                 items.append(entry)
                 continue
             r = rows[0]
-            if want_all or "t" in tags:
-                entry["title"] = r["title"] or ""
-            if want_all or "d" in tags:
-                entry["duration"] = int(r["duration"] or 0)
-            if want_all or "u" in tags:
-                entry["url"] = r["url"] or ""
-            if want_all or "g" in tags:
-                if r["genre"]:
-                    entry["genre"] = r["genre"]
-            if want_all or "y" in tags:
-                if r["year"]:
-                    entry["year"] = r["year"]
-            if want_all or "n" in tags:
-                if r["tracknum"]:
-                    entry["tracknum"] = r["tracknum"]
-            if want_all or "a" in tags:
-                rows_a = await _query_db(
-                    "SELECT c.name FROM contributors c JOIN tracks_contributors tc "
-                    "ON tc.contributor = c.id AND tc.role = 1 "
-                    "WHERE tc.track = ? ORDER BY c.name LIMIT 1",
-                    (item,),
-                )
-                if rows_a and rows_a[0]["name"]:
-                    entry["artist"] = rows_a[0]["name"]
-            if want_all or "l" in tags:
-                rows_al = await _query_db(
-                    "SELECT al.title FROM albums al JOIN tracks_albums ta "
-                    "ON ta.album = al.id WHERE ta.track = ? LIMIT 1",
-                    (item,),
-                )
-                if rows_al and rows_al[0]["title"]:
-                    entry["album"] = rows_al[0]["title"]
+            entry["id"] = int(r["id"] or item)
+            entry["title"] = r["title"] or ""
+            for code in dict.fromkeys(tags):
+                if code == "u":                     # 'u' => url
+                    entry["url"] = r["url"] or ""
+                elif code == "d":                   # 'd' => secs
+                    entry["duration"] = int(r["duration"] or 0)
+                elif code == "g":                   # 'g' => genre.name
+                    if r["genre"]:
+                        entry["genre"] = r["genre"]
+                elif code == "y":                   # 'y' => year (0 is emitted:
+                    if r["year"] is not None:       # Perl's `$value ne ''`)
+                        entry["year"] = r["year"]
+                elif code == "t":                   # 't' => tracknum
+                    if r["tracknum"] is not None:
+                        entry["tracknum"] = r["tracknum"]
+                elif code == "i":                   # 'i' => disc
+                    if r["disc"] is not None:
+                        entry["disc"] = r["disc"]
+                elif code == "n":                   # 'n' => modificationTime
+                    if r["modtime"] is not None:
+                        entry["modificationTime"] = int(r["modtime"])
+                elif code == "x":                   # 'x' => remote (only if set)
+                    if r["remote"]:
+                        entry["remote"] = 1
+                elif code == "a":                   # 'a' => artistName
+                    rows_a = await _query_db(
+                        "SELECT c.name FROM contributors c JOIN tracks_contributors tc "
+                        "ON tc.contributor = c.id AND tc.role = 1 "
+                        "WHERE tc.track = ? ORDER BY c.name LIMIT 1",
+                        (item,),
+                    )
+                    if rows_a and rows_a[0]["name"]:
+                        entry["artist"] = rows_a[0]["name"]
+                elif code == "l":                   # 'l' => albumname
+                    rows_al = await _query_db(
+                        "SELECT al.title FROM albums al JOIN tracks_albums ta "
+                        "ON ta.album = al.id WHERE ta.track = ? LIMIT 1",
+                        (item,),
+                    )
+                    if rows_al and rows_al[0]["title"]:
+                        entry["album"] = rows_al[0]["title"]
         else:
-            # URL item (radio/favorite) — Perl's RemoteTrack branch.
-            entry["url"] = item
-            # Artwork fields, in Perl's tag order (`for my $tag (split //,
-            # $tags)`, Queries.pm:5964): the same resolution the JSON-RPC
-            # status uses, so both protocols answer the same logo for the
-            # same entry (live Perl `tags:galdK` on the playing stream →
-            # `/imageproxy/http%3A%2F%2Fcdn-radiotime-logos.tunein.com
-            # %2Fs111987q.png/image.png`).  A logo-less stream keeps Perl's
-            # `html/images/radio.png` (Protocols/HTTP.pm:1147).
-            codes = "Kc" if want_all else tags
-            if "K" in codes or "c" in codes:
-                # One import for both fields — the resolution itself lives in
-                # web/api.py (JSON-RPC status), never a second copy here.
-                from lyrion.web.api import (
-                    REMOTE_ART_FALLBACK,
-                    _perl_proxied_image,
-                    _remote_track_id,
-                    _stream_artwork_url,
-                )
-                for code in codes:
-                    if code == "K" and "artwork_url" not in entry:
-                        art = _stream_artwork_url(player, item)
-                        entry["artwork_url"] = (
-                            _perl_proxied_image(art) if art
-                            else REMOTE_ART_FALLBACK)
-                    elif code == "c" and "coverid" not in entry:
-                        entry["coverid"] = _remote_track_id(item)
+            # URL item (radio/favourite) — the SAME ``_songData`` over Perl's
+            # ``RemoteTrack``: ``$remoteMeta`` comes from the URL's protocol
+            # handler (``Protocols/HTTP.pm:1031-1085``), ``$track`` from
+            # ``objectForUrl($url)`` (Queries.pm:5888-5901).
+            from lyrion.web.api import (
+                REMOTE_ART_FALLBACK,
+                _perl_proxied_image,
+                _remote_track_id,
+                _stream_artwork_url,
+                _stream_entry_title,
+                _stream_registered_name,
+            )
+
+            url = str(item)
+            stream_title, stream_artist = _stream_entry_title(player, url)
+            entry["id"] = _remote_track_id(url)
+            entry["title"] = stream_title or url
+            for code in dict.fromkeys(tags):
+                if code == "u":                     # 'u' => RemoteTrack::url
+                    entry["url"] = url
+                elif code == "a":                   # $remoteMeta->{a} (ICY artist)
+                    if stream_artist:
+                        entry["artist"] = stream_artist
+                elif code == "d":                   # (duration||secs||0) + 0
+                    entry["duration"] = 0
+                elif code == "y":                   # RemoteTrack::year is 0 —
+                    entry["year"] = 0               # Perl emits `year:0` (live)
+                elif code == "x":                   # 'x' => remote (isRemote)
+                    entry["remote"] = 1
+                elif code == "N":                   # 'N' => remote_title
+                    name = _stream_registered_name(player, url)
+                    if name:
+                        entry["remote_title"] = name
+                elif code == "K":                   # 'K' => artwork_url, proxied
+                    art = _stream_artwork_url(player, url)
+                    entry["artwork_url"] = (
+                        _perl_proxied_image(art) if art else REMOTE_ART_FALLBACK)
+                elif code == "c":                   # 'c' => RemoteTrack::coverid
+                    entry["coverid"] = _remote_track_id(url)
         items.append(entry)
     return items
 
@@ -4581,6 +4637,28 @@ async def _fav_items(
     # a stored ``/imageproxy/…`` path stays as it is, a raw ``http…`` logo
     # becomes the same proxied route the JSON shapes hand out.
     from lyrion.web.radiobrowser import proxied_image
+
+    # Perl files the logo of every rendered playable row under the row's URL
+    # while the list is built (``XMLBrowser.pm:1043-1049``); the CLI list goes
+    # through the same ``Slim::Control::XMLBrowser::cliQuery`` item loop
+    # (``Plugin/Favorites/Plugin.pm:75``/``:763``).  Without it a favourite that
+    # is only ADDED to the playlist (never played) answered the handler's
+    # ``html/images/radio.png`` placeholder instead of its row logo.  One
+    # helper, shared with the jive/JSON-RPC list (``web/api.py``).
+    player = None
+    if ctx.player_id:
+        try:
+            from lyrion.player.manager import PlayerManager
+
+            player = PlayerManager().get_player(ctx.player_id)
+        except Exception:  # noqa: BLE001 — ohne Player bleibt die Liste ungecacht
+            player = None
+    try:
+        from lyrion.web.api import _register_favorites_row_images
+
+        _register_favorites_row_images(player, items)
+    except Exception:  # noqa: BLE001
+        pass
 
     for item in items:
         is_folder = item.get("type") == "folder"
