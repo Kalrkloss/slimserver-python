@@ -1835,6 +1835,57 @@ def _stream_registered_name(player: object, url: str) -> str:
     return ""
 
 
+def _stream_artwork_url(player: object, url: str) -> str:
+    """The station logo of the stream playing as ``url`` — Perl's ``remote_image_``.
+
+    Perl files a feed/favourites row's logo under the URL the play STARTS from
+    — ``setRemoteMetadata($url, {cover => …})`` (``Slim/Music/Info.pm:485-489``)
+    plus the feed renderer's own cache write
+    (``Slim/Control/XMLBrowser.pm:1043-1049``) — and reads it back with that
+    same URL: ``getMetadataFor`` opens with ``my $cover =
+    $cache->get("remote_image_$url")``
+    (``Slim/Player/Protocols/HTTP.pm:1092``) and only THEN resolves a playlist
+    URL for the icon branch (``:1095-1098``).  ``_songData`` is handed the
+    PLAYLIST ENTRY (``Playlist::track($client, $playlist_cur_index)``,
+    ``Queries.pm:4386``) and swaps in the playing track only afterwards
+    (``:5942-5949``) — that swap changes the reported ``url``, never the
+    artwork lookup.  Perl also carries the icon across a redirect
+    (``Slim/Utils/Scanner/Remote.pm:307-308``).
+
+    This port rewrites the playlist entry to the RESOLVED URL when the strm
+    goes out (``networking/protocol.py:3044-3053``), so the start URL only
+    survives in ``stream_images``/``stream_titles``.  The registration that
+    belongs to the RUNNING stream is the one whose name is this stream's name
+    (:func:`_stream_registered_name`); the most recent such registration wins,
+    because it is written immediately before the play.  A stream started
+    without a registration (bare ``playlist play <url>``) therefore keeps
+    Perl's ``html/images/radio.png`` default instead of inheriting the previous
+    station's logo.
+
+    Published exactly as Perl's cache echo: ``proxiedImage`` is applied where
+    Perl applies it — at the cache write for a feed row's image
+    (``Slim/Control/XMLBrowser.pm:1043-1049`` caches the already-proxied
+    ``$item->{image}``, see :func:`JSONRPCAPI._set_stream_image`) and on the
+    jive ``icon`` field (``Queries.pm:5626``).
+    """
+    images = getattr(player, "stream_images", None) or {}
+    url = str(url or "")
+    if not url:
+        return ""
+    art = str(images.get(url, "") or "")
+    if art:
+        return art
+    name = _stream_registered_name(player, url)
+    if not name:
+        return ""
+    titles = getattr(player, "stream_titles", None) or {}
+    for key in reversed(list(titles)):
+        if str(key) == url or str(titles.get(key) or "") != name:
+            continue
+        return str(images.get(str(key), "") or "")
+    return ""
+
+
 def _stream_live_title(player: object, url: str) -> str:
     """The in-stream (ICY) title cached for ``url`` — Perl ``%currentTitles``.
 
@@ -2003,7 +2054,7 @@ async def jive_now_playing_display(player: object) -> dict | None:
         # with 'icon-id' (:623-626).
         url = str(getattr(player, "current_url", "")
                   or (entry if isinstance(entry, str) else "") or "")
-        art = str((getattr(player, "stream_images", {}) or {}).get(url, "") or "")
+        art = _stream_artwork_url(player, url)
         if art:
             jive["icon"] = _perl_proxied_image(art)          # :594-596
         else:
@@ -2995,7 +3046,7 @@ class JSONRPCAPI:
                     # SENDENAME des Eintrags, die URL als letzter Rueckfall —
                     # nie ein Platzhalter wie „Radio Stream“ und nie der Host.
                     stream_title = _stream_entry_title(player, entry)[0] or entry
-                    art = getattr(player, "stream_images", {}).get(entry, "")
+                    art = _stream_artwork_url(player, entry)
                     out.append({
                         "index": i,
                         "url": entry,
@@ -5796,8 +5847,7 @@ class JSONRPCAPI:
                 # `"coverid": "-94115161401160"`) and `artwork_url` is
                 # `$track->coverurl`: the stored station logo, else the
                 # skin-relative default `html/images/radio.png`.
-                _simg = str(getattr(player, "stream_images", {}).get(str(tid), "")
-                            or "")
+                _simg = _stream_artwork_url(player, str(tid))
                 if _simg.startswith("/") and not _simg.startswith("/imageproxy/"):
                     # A skin-relative value (Perl's default coverurl is
                     # `html/images/radio.png`, live) is published WITHOUT the
@@ -5905,7 +5955,12 @@ class JSONRPCAPI:
             # icon-id first (JiveItem.java:250).
             if tid_local is None:
                 if _simg:
-                    item["icon"] = _simg
+                    # ``_addJiveSong``: ``if (defined($songData->{artwork_url}))
+                    # { addResultLoop(…, 'icon', proxiedImage($songData->
+                    # {artwork_url})) }`` — Queries.pm:5625-5627.  Perl wraps an
+                    # external logo here (``ImageProxy.pm:443-461``); a
+                    # skin-relative path passes through unchanged.
+                    item["icon"] = _perl_proxied_image(_simg)
                 else:
                     # "send radio placeholder art for remote tracks with no
                     # art" — Queries.pm:5631-5633.  The *playlist* item keeps
@@ -6002,7 +6057,7 @@ class JSONRPCAPI:
             # the skin-relative default Perl's `$track->coverurl` yields
             # (html/images/radio.png / favorites.png — data of the stored
             # entry, not a constant).
-            _stream_img = getattr(player, "stream_images", {}).get(cur_url, "") or ""
+            _stream_img = _stream_artwork_url(player, cur_url)
             if _stream_img.startswith("html/"):
                 _stream_img = _stream_img[len("html/"):]
             # Live Perl sends the stream duration as a STRING ("0", "7").
@@ -7636,6 +7691,15 @@ class JSONRPCAPI:
         path is normalized to a URL relative to static_dir (which already
         contains 'html/') — an 'html/...' prefix would otherwise be doubled
         and 404 when the path is re-composed.
+
+        What lands here is what Perl's ``remote_image_$url`` cache holds for a
+        feed/favourites row: the row's ``image``, which the feed builder has
+        already passed through ``proxiedImage``
+        (``Slim/Control/XMLBrowser.pm:1043-1049`` caches ``$item->{image}``;
+        ``:1386-1387``/``:1160-1166`` proxied it, ``ImageProxy.pm:443-461``).
+        ``Slim/Music/Info.pm:485-489`` (``setRemoteMetadata``) files the same
+        value for 30 days.  A skin-relative path (``html/images/favorites.png``)
+        is not touched by ``proxiedImage`` (``ImageProxy.pm:447``).
         """
         if not url or not image:
             return
@@ -7648,7 +7712,7 @@ class JSONRPCAPI:
             if images is None:
                 images = {}
                 player.stream_images = images
-            images[url] = image
+            images[url] = str(_perl_proxied_image(image))
         except Exception:
             pass
 

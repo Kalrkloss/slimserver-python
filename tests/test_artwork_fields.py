@@ -225,12 +225,21 @@ def test_menu_status_keeps_a_stored_stream_logo(monkeypatch):
     the metadata handler delivered (``_simg``, ``Queries.pm:5619-5627``);
     the default only applies when there is none (Perl's
     ``if (defined $songData->{artwork_url})`` branch).
+
+    That logo is published through ``proxiedImage`` on the jive ``icon`` field
+    (``Queries.pm:5626``); ``ImageProxy.pm:443-461`` wraps an external URL and
+    leaves every other path alone (which is why the already-proxied value of a
+    feed row survives unchanged).  Live Perl 9.1.1 (read-only 2026-09-20, the
+    playing Hirschmilch stream, ``status - 1 menu:menu``) answers exactly the
+    proxied form: ``item_loop[0].icon =
+    "/imageproxy/http%3A%2F%2Fcdn-radiotime-logos.tunein.com%2Fs111987q.png/image.png"``.
     """
     player = _install_player([STREAM_URL])
     player.stream_images = {STREAM_URL: "http://logos.example/station.png"}
     res = _status(_current(), ["-", 10, "menu:menu", "tags:ABdejJKlrStTuxy"])
     item = res["item_loop"][0]
-    assert item["icon"] == "http://logos.example/station.png"
+    assert item["icon"] == (
+        "/imageproxy/http%3A%2F%2Flogos.example%2Fstation.png/image.png")
     assert "icon-id" not in item
 
 
