@@ -54,7 +54,7 @@ FAVORITES_ICON = "html/images/favorites.png"
 STREAM_ICON = "html/images/radio.png"
 
 
-def favorite_icon(url: object) -> str:
+def favorite_icon(url: object, player: object = None) -> str:
     """``$favs->icon($url)`` — the icon of a favourites entry.
 
     ``Slim/Plugin/Favorites/OpmlFavorites.pm:83-88``::
@@ -71,7 +71,23 @@ def favorite_icon(url: object) -> str:
     138-153``); an http(s) stream answers ``HTTP.pm:1138-1148`` →
     ``'html/images/radio.png'``.  Everything else (no URL, a file URL, a
     folder) has no handler and gets the favourites icon.
+
+    The handler's *own* logo wins over the generic placeholder — that is what
+    ``ProtocolHandlers.pm:138-153`` answers first (``getMetadataFor``'s
+    ``cover``, then ``$handler->getIcon($url)``; for the port's radio feeds
+    the handler logo is the station image the feed row registered under the
+    URL, the ``remote_image_$url`` analogue, ``XMLBrowser.pm:1043-1049``).
+    Without a registered logo the placeholder of the handler's class stands:
+    ``HTTP.pm:1148`` for a stream, ``OpmlFavorites.pm:87`` otherwise.
     """
+    registered = ""
+    try:
+        from lyrion.web.api import _registered_stream_image
+        registered = _registered_stream_image(player, str(url or ""))
+    except Exception:  # noqa: BLE001 — ohne api bleibt der Platzhalter
+        registered = ""
+    if registered:
+        return registered
     if str(url or "").lower().startswith(("http://", "https://")):
         return STREAM_ICON
     return FAVORITES_ICON

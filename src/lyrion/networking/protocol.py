@@ -3043,14 +3043,27 @@ class SlimProtoClient:
         # Keep the player playlist in sync: the proxy endpoint resolves
         # the track from player.playlist, so it must hold the RESOLVED
         # URL — otherwise it would re-fetch the raw M3U/redirect URL and
-        # stream playlist text as audio (silence).
+        # stream playlist text as audio (silence).  Perl scans the entry the
+        # same way (``scanURL`` stores the final URL), and because the
+        # entry's URL is what ``_songData`` hands to the protocol handler it
+        # carries the station icon over: ``remote_image_<track url>`` is
+        # copied onto ``remote_image_<canonical final uri>``
+        # (``Slim/Utils/Scanner/Remote.pm:307-308`` "Keep track of artwork or
+        # station icon across redirects").  Without that alias the logo is
+        # lost for EVERY entry whose URL gets rewritten, not just this one.
         try:
             from lyrion.player.manager import PlayerManager
             player = PlayerManager().get_player(mac)
             if player is not None and player.playlist:
                 pos = player.playlist_position or 0
                 if 0 <= pos < len(player.playlist) and isinstance(player.playlist[pos], str):
+                    original = player.playlist[pos]
                     player.playlist[pos] = url
+                    if original != url:
+                        from lyrion.web.api import \
+                            _carry_stream_image_across_redirect
+                        _carry_stream_image_across_redirect(player, original,
+                                                            url)
             # Keep state consistent regardless of the calling path
             # (play_url vs _play_playlist_item): this is a live stream.
             if player is not None:

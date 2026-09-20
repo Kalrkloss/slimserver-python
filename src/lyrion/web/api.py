@@ -1875,6 +1875,12 @@ def _stream_artwork_url(player: object, url: str) -> str:
     art = str(images.get(url, "") or "")
     if art:
         return art
+    # Perl's cache key is the URL the play STARTS from; a client that kept the
+    # original entry (``playlist add`` of the un-scanned URL, ``favorites
+    # playlist add``) asks with exactly that URL, so the plain lookup above
+    # already answers.  A rewritten entry (see
+    # :func:`_carry_stream_image_across_redirect`) asks with the RESOLVED URL
+    # and is answered by the alias the same helper files under it.
     name = _stream_registered_name(player, url)
     if not name:
         return ""
@@ -1884,6 +1890,106 @@ def _stream_artwork_url(player: object, url: str) -> str:
             continue
         return str(images.get(str(key), "") or "")
     return ""
+
+
+def _registered_stream_image(player: object, url: str) -> str:
+    """``Slim::Utils::Cache->get("remote_image_$url")`` — the URL's station logo.
+
+    Perl's cache is **server-global** (``Slim::Utils::Cache``, one key per URL,
+    ``Slim/Music/Info.pm:487``), so a lookup must not depend on the player that
+    happens to be asking: ``$favs->icon($url)``
+    (``Slim/Plugin/Favorites/OpmlFavorites.pm:83-88`` →
+    ``ProtocolHandlers::iconForURL``, ``Slim/Player/ProtocolHandlers.pm:138-153``)
+    and ``_songData`` (``Slim/Control/Queries.pm:5913`` → ``HTTP::getMetadataFor``,
+    ``Slim/Player/Protocols/HTTP.pm:1092``) both read the same key.  The port
+    stores the cache per player (``player.stream_images``), so every player is
+    consulted — the one passed in first.
+    """
+    u = str(url or "")
+    if not u:
+        return ""
+    candidates: list = []
+    if player is not None:
+        candidates.append(player)
+    try:
+        from lyrion.player.manager import PlayerManager
+        candidates.extend(PlayerManager().get_all_players())
+    except Exception:  # noqa: BLE001 — ohne PlayerManager bleibt es beim uebergebenen
+        pass
+    for cand in candidates:
+        art = str((getattr(cand, "stream_images", None) or {}).get(u, "") or "")
+        if art:
+            return art
+    return ""
+
+
+def _carry_stream_image_across_redirect(player: object, original: str,
+                                        resolved: str) -> None:
+    """``Slim/Utils/Scanner/Remote.pm:307-308`` — keep the logo over a redirect.
+
+    Perl's redirect callback (``addHeader``, run for the request that resolved
+    the URL) copies the icon it holds for the URL the play STARTED from onto the
+    canonical URL the request ended on::
+
+        # Keep track of artwork or station icon across redirects
+        my $cache = Slim::Utils::Cache->new();
+        if ( my $icon = $cache->get("remote_image_" . $track->url) ) {
+            $cache->set("remote_image_" . $request->uri->canonical->as_string, $icon, '30 days');
+        }
+
+    ``getMetadataFor`` reads the cache under the URL of the playlist entry it is
+    handed (``Slim/Player/Protocols/HTTP.pm:1092``; the entry is
+    ``Playlist::track($client, $playlist_cur_index)``, ``Queries.pm:4386``), and
+    that entry URL is the RESOLVED one once Perl has scanned it — the alias is
+    what keeps the station logo reachable for EVERY entry, not just the running
+    one.  Only ``original`` loses nothing: its own key stays in place.
+    """
+    if player is None:
+        return
+    src = str(original or "")
+    dst = str(resolved or "")
+    if not src or not dst or src == dst:
+        return
+    images = getattr(player, "stream_images", None)
+    if not images:
+        return
+    icon = str(images.get(src, "") or "")
+    if icon and not str(images.get(dst, "") or ""):
+        images[dst] = icon
+
+
+def _register_feed_row_images(player: object, rows: object) -> None:
+    """``Slim/Control/XMLBrowser.pm:1043-1049`` — cache every row's station logo.
+
+    Perl files a feed row's image under the row's own URL while it renders the
+    feed::
+
+        # keep track of station icons
+        if ( $isPlayable && $item->{url} && $item->{url} =~ /^http/
+             && (my $cover = ($item->{image} || $item->{cover}))
+             && !Slim::Utils::Cache->new->get("remote_image_" . $item->{url}) ) {
+            $cache->set("remote_image_" . $item->{url}, $cover, 86400);
+        }
+
+    That entry is what ``$favs->icon($url)``
+    (``Slim/Plugin/Favorites/OpmlFavorites.pm:83-88``) and ``getMetadataFor``
+    (``Slim/Player/Protocols/HTTP.pm:1092``) answer with, so a station saved as
+    a favourite or put on the playlist carries the logo the row showed.
+    """
+    if player is None or not rows:
+        return
+    for row in rows if isinstance(rows, (list, tuple)) else []:
+        if not isinstance(row, dict):
+            continue
+        params = row.get("presetParams") or {}
+        url = str(params.get("favorites_url") or row.get("url") or "")
+        if not url.lower().startswith(("http://", "https://")):
+            continue
+        image = str(row.get("icon") or row.get("image")
+                    or params.get("icon") or "")
+        if not image or image.endswith(("/images/radio.svg", "/images/radio.png")):
+            continue
+        JSONRPCAPI._set_stream_image(player, url, image)
 
 
 def _stream_live_title(player: object, url: str) -> str:
@@ -3172,7 +3278,8 @@ class JSONRPCAPI:
                               parent_path: str, feed_mode: bool,
                               menu_mode: bool = False,
                               use_play_control: bool = False,
-                              menu: str = "favorites") -> list[dict]:
+                              menu: str = "favorites",
+                              player: object = None) -> list[dict]:
         """Build the favorites loop with Perl's session item ids.
 
         Two shapes, mirroring Perl's ``XMLBrowser::_cliQuery_done``:
@@ -3205,6 +3312,13 @@ class JSONRPCAPI:
             # the row's ``icon``/``icon-id`` (``XMLBrowser.pm:1160-1166``) and
             # in the flat shape as ``image`` (:1386-1387).
             icon = it.get("icon") or _favorites_icon(it.get("url") or "")
+            # Perl's feed cache: every rendered playable row with an image is
+            # filed as ``remote_image_<row url>`` (``XMLBrowser.pm:1043-1049``).
+            # That is what makes the logo available for the SAME url later —
+            # for every playlist entry (``Queries.pm:5618-5633`` →
+            # ``HTTP.pm:1092``), not only for the running one.
+            if player is not None and not is_folder and it.get("url"):
+                JSONRPCAPI._set_stream_image(player, str(it["url"]), icon)
             hier = path + f".{i}"
             if menu_mode:
                 from lyrion.web import favorites_menu
@@ -3257,7 +3371,7 @@ class JSONRPCAPI:
             if feed_mode and is_folder:
                 item["items"] = await self._fav_items_loop(
                     fm, int(it["id"]), hier, feed_mode, menu_mode,
-                    use_play_control)
+                    use_play_control, menu=menu, player=player)
             loop.append(item)
         return loop
 
@@ -3376,7 +3490,8 @@ class JSONRPCAPI:
                     return _menus.leaf_info_menu(name, url)
             loop = await self._fav_items_loop(fm, parent, parent_path,
                                               feed_mode, menu_mode,
-                                              use_play_control)
+                                              use_play_control,
+                                              player=player)
             if menu_mode:
                 from lyrion.web import favorites_menu
                 # XMLBrowser.pm:805-830 — the tap on a touch-to-play row
@@ -3480,8 +3595,23 @@ class JSONRPCAPI:
             # Perl stores ``type`` (default 'audio', :854) and the icon
             # (``'icon' => $icon || $favs->icon($url)``, :855) with the entry —
             # that stored icon is what every later row and the status show.
-            new_id = await fm.add(str(title), url, parent,
-                                  icon=tagged.get("icon"))
+            # ``$favs->icon($url)`` (``OpmlFavorites.pm:83-88``) is the
+            # protocol handler's logo, and the handler answers it from the
+            # graphic registered for the URL (``ProtocolHandlers.pm:138-153``
+            # → ``HTTP.pm:1092`` ``remote_image_$url`` / ``getIcon``,
+            # ``HTTP.pm:1138-1148``) — for a station the client saved from a
+            # radio feed that is the row's own logo, not the radio
+            # placeholder.  The placeholder only stands when no logo is known.
+            icon = tagged.get("icon")
+            if not str(icon or "").strip():
+                from lyrion.music.favorites import favorite_icon
+                try:
+                    from lyrion.player.manager import PlayerManager
+                    fav_player = PlayerManager().get_player(pid) if pid else None
+                except Exception:  # noqa: BLE001
+                    fav_player = None
+                icon = favorite_icon(url, fav_player) or None
+            new_id = await fm.add(str(title), url, parent, icon=icon)
         except Exception as exc:  # noqa: BLE001
             logger.warning("favorites add failed: %s", exc)
             return {}
@@ -8153,6 +8283,17 @@ class JSONRPCAPI:
 
         level = await radiobrowser.level_for(
             node, start=start, qty=qty, use_play_control=use_play_control)
+        # Perl files the logo of every rendered playable row under the row's
+        # URL (``XMLBrowser.pm:1043-1049``) — that is where a later
+        # ``favorites add`` (``Favorites/Plugin.pm:855`` →
+        # ``OpmlFavorites.pm:83-88``) and the playlist/status artwork
+        # (``HTTP.pm:1092``) find it.
+        try:
+            from lyrion.player.manager import PlayerManager
+            feed_player = PlayerManager().get_player(pid) if pid else None
+        except Exception:  # noqa: BLE001
+            feed_player = None
+        _register_feed_row_images(feed_player, level.items)
         # ``count`` is the feed's total, ``offset`` the requested window — the
         # pair Perl's ``normalize()``/``dynamicAutoQuery`` answers with
         # (``Slim/Control/Request.pm:1805-1839``, ``XMLBrowser.pm:851``).  The
