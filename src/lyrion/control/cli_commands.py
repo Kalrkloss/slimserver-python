@@ -1789,9 +1789,17 @@ async def cmd_status(
         if remote_meta:
             for k, v in remote_meta.items():
                 results.append((f"remoteMeta.{k}", v))
-        # Playlist loop: always unless tags explicitly omit it (no 'l')
-        if "l" in tags or not tags:
-            results.append(("playlist_loop", await _status_playlist_loop(player, tags)))
+        # Playlist loop: Perl adds it whenever the playlist is non-empty —
+        # the tag letters do NOT gate it (``statusQuery`` picks the loop name
+        # from ``$menuMode`` alone and runs ``_addSong`` per entry,
+        # ``Slim/Control/Queries.pm:4348-4353`` + ``:4405-4420``).  Live Perl
+        # 9.1.1 (read-only 2026-09-20): ``<mac> status 0 3 tags:K`` answers
+        # ``playlist index:0 id:… title:… artwork_url:…``.  The former
+        # ``'l' in tags`` gate (``l`` is Perl's ALBUM tag) swallowed the whole
+        # loop — and with it every artwork field — for a client asking with
+        # ``tags:K``/``tags:c`` only, while this port's own JSON-RPC status
+        # answers it (same state, same request).
+        results.append(("playlist_loop", await _status_playlist_loop(player, tags)))
 
         return [
             render_line(
@@ -1818,6 +1826,26 @@ async def _status_playlist_loop(player: Any, tags: str) -> list[dict[str, Any]]:
     ``'playlist index'`` (Queries.pm:4410-4414); the included tags depend on
     the tags: code (t=title, a=artist, l=album, d=duration, u=url, g=genre,
     y=year, n=tracknum).  With an empty code every known field is added.
+
+    A URL entry (radio/favorite) is Perl's ``RemoteTrack``: ``_songData``
+    walks the SAME tag map (Queries.pm:5964-6108) and fills the artwork
+    fields from the stream's own metadata — ``K`` → ``artwork_url``
+    (``'K' => ['artwork_url', '', 'coverurl']``, :5714, value proxied at
+    :6101) and ``c`` → ``coverid`` (``RemoteTrack::coverid`` is the track id,
+    ``Slim/Schema/RemoteTrack.pm:496``).  Live Perl 9.1.1 (read-only
+    2026-09-20, ``<mac> status 0 3`` on the playing stream)::
+
+        tags:K    → playlist index:0 id:… title:A-Frame
+                    artwork_url:/imageproxy/http%3A%2F%2Fcdn-radiotime-logos
+                    .tunein.com%2Fs111987q.png/image.png
+        tags:c    → … coverid:-94115167819792
+        (no tags) → playlist index:0 id:… title:A-Frame
+
+    The logo resolution is the JSON-RPC status' own
+    (:func:`lyrion.web.api._stream_artwork_url`) — one resolution, both
+    protocols — with Perl's ``html/images/radio.png`` fallback
+    (``Protocols/HTTP.pm:1140-1147`` ``cover => $cover || $icon`` → the
+    handler's ``cover`` becomes ``$remoteMeta->{K}``, Queries.pm:5928).
     """
     playlist = getattr(player, "playlist", []) or []
     if not playlist:
@@ -1869,8 +1897,33 @@ async def _status_playlist_loop(player: Any, tags: str) -> list[dict[str, Any]]:
                 if rows_al and rows_al[0]["title"]:
                     entry["album"] = rows_al[0]["title"]
         else:
-            # URL item (radio/favorite)
+            # URL item (radio/favorite) — Perl's RemoteTrack branch.
             entry["url"] = item
+            # Artwork fields, in Perl's tag order (`for my $tag (split //,
+            # $tags)`, Queries.pm:5964): the same resolution the JSON-RPC
+            # status uses, so both protocols answer the same logo for the
+            # same entry (live Perl `tags:galdK` on the playing stream →
+            # `/imageproxy/http%3A%2F%2Fcdn-radiotime-logos.tunein.com
+            # %2Fs111987q.png/image.png`).  A logo-less stream keeps Perl's
+            # `html/images/radio.png` (Protocols/HTTP.pm:1147).
+            codes = "Kc" if want_all else tags
+            if "K" in codes or "c" in codes:
+                # One import for both fields — the resolution itself lives in
+                # web/api.py (JSON-RPC status), never a second copy here.
+                from lyrion.web.api import (
+                    REMOTE_ART_FALLBACK,
+                    _perl_proxied_image,
+                    _remote_track_id,
+                    _stream_artwork_url,
+                )
+                for code in codes:
+                    if code == "K" and "artwork_url" not in entry:
+                        art = _stream_artwork_url(player, item)
+                        entry["artwork_url"] = (
+                            _perl_proxied_image(art) if art
+                            else REMOTE_ART_FALLBACK)
+                    elif code == "c" and "coverid" not in entry:
+                        entry["coverid"] = _remote_track_id(item)
         items.append(entry)
     return items
 
