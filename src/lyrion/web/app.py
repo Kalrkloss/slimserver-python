@@ -903,6 +903,17 @@ def _resize_skin_image(data: bytes, size: tuple[int, int]) -> bytes | None:
 #                  resizer, 9.1)
 #   * TuneIn logos ``Slim/Plugin/InternetRadio/TuneIn/Metadata.pm:44-62``
 #                  (``registerHandler``) + ``:507-559`` (``artworkUrl``)
+#
+# Bewusste, abschaltbare Abweichung von Perl — Variante B (User-Freigabe
+# 2026-09-20), Schalter ``imageProxyFollowRedirects`` (``web/settings.py``):
+# ``ImageProxy.pm:145-155`` antwortet auf ``/imageproxy/<url>/image.jpg`` mit
+# **301** und lässt den Client selbst laden.  SqueezePlay folgt dem 301, hat
+# aber kein TLS — der Sprung http→https (imgur-Logos von 1.FM u. a.) scheitert,
+# das Logo bleibt klein (Squeezer/Browser zeigen es).  Ist der Schalter AN,
+# holt der Server das Bild selbst, verfolgt Weiterleitungen serverseitig und
+# liefert es als **200**; alles danach (Content-Type, Größen-Varianten,
+# Polsterregel) sind die unveränderten Perl-Regeln in
+# :func:`_imageproxy_proxied`.  Bei AUS kommt exakt Perls 301 zurück.
 # ---------------------------------------------------------------------------
 
 #: ``ImageProxy.pm:136`` — ``my ($url) = $path =~ m|imageproxy/(.*)/[^/]*|``.
@@ -980,6 +991,55 @@ def _imageproxy_cache_put(key: str, fmt: str, data: bytes) -> None:
     _imageproxy_cache.move_to_end(key)
     while len(_imageproxy_cache) > _IMAGEPROXY_CACHE_MAX:
         _imageproxy_cache.popitem(last=False)
+
+
+# ── Weiterleitungen serverseitig verfolgen (bewusste Abweichung, Variante B) ─
+#
+# Perl kennt das nicht: es schickt den Client mit 301 los
+# (``ImageProxy.pm:145-155``).  SqueezePlay folgt zwar, hat aber kein TLS, so
+# dass der übliche http→https-Sprung (imgur-Logos von 1.FM u. a.) scheitert.
+# Der Schalter ``imageProxyFollowRedirects`` (``web/settings.py``, Vorbelegung
+# AN) lässt den Server die Kette selbst ablaufen; AUS = Perls 301.
+
+#: Sprungtiefe der Kette (Perl kennt keine — die Frist ist der Ersatz dafür,
+#: dass hier niemand endlos nachfragt).
+_IMAGEPROXY_FOLLOW_MAX_HOPS = 5
+#: Frist je Einzelabruf und für die ganze Kette.
+_IMAGEPROXY_FOLLOW_TIMEOUT = 10.0
+_IMAGEPROXY_FOLLOW_TOTAL_TIMEOUT = 30.0
+#: Die Status, die eine Weiterleitung sind (Perl folgt 301/302/303/307/308).
+_IMAGEPROXY_REDIRECT_CODES = frozenset((301, 302, 303, 307, 308))
+
+#: Negativ-Cache (Zutat dieses Ports, kein Perl-Fund): eine tote Quelle wird
+#: kurz gemerkt, damit dieselbe URL nicht bei jedem Abruf erneut angefragt wird
+#: — ``_artworkError`` setzt nur ``no-cache`` und kennt keinen Negativ-Cache.
+_IMAGEPROXY_NEGATIVE_TTL = 300.0
+_imageproxy_negative: dict[str, float] = {}
+
+
+def _imageproxy_negative_get(url: str) -> bool:
+    """Steht ``url`` im Negativ-Cache (tote Quelle, Frist läuft noch)?"""
+    until = _imageproxy_negative.get(url)
+    if until is None:
+        return False
+    if until <= _time.monotonic():
+        _imageproxy_negative.pop(url, None)
+        return False
+    return True
+
+
+def _imageproxy_negative_put(url: str, reason: str) -> None:
+    """``url`` kurz als tot merken (begrenzt, damit der Cache nicht wächst)."""
+    _imageproxy_negative[url] = _time.monotonic() + _IMAGEPROXY_NEGATIVE_TTL
+    logger.info("imageproxy: %s ist tot (%s) — Platzhalter und %.0fs "
+                "Negativ-Cache (kein erneuter Netzaufruf)",
+                url, reason, _IMAGEPROXY_NEGATIVE_TTL)
+    if len(_imageproxy_negative) > _IMAGEPROXY_CACHE_MAX:
+        now = _time.monotonic()
+        for key in [k for k, until in _imageproxy_negative.items() if until <= now]:
+            _imageproxy_negative.pop(key, None)
+        while len(_imageproxy_negative) > _IMAGEPROXY_CACHE_MAX:
+            _imageproxy_negative.pop(next(iter(_imageproxy_negative)), None)
 
 
 def _imageproxy_parse_spec(spec: str) -> tuple[str, str, str, str, str]:
@@ -1065,6 +1125,93 @@ def _imageproxy_handler_for(url: str):
 
 def _imageproxy_is_http(url: str) -> bool:
     return bool(_re.match(r"^https?:", url, _re.I))
+
+
+def _imageproxy_follow_redirects() -> bool:
+    """Pref ``imageProxyFollowRedirects`` (``web/settings.py``, Vorbelegung AN).
+
+    Lazy-Import wie beim Settings-Handler: ``lyrion.web.settings`` zieht
+    ``player``/``media`` mit, der Bildproxy braucht sie nur an dieser Stelle.
+    """
+    from .settings import imageproxy_follow_redirects
+
+    return imageproxy_follow_redirects()
+
+
+async def _imageproxy_target_allowed(url: str) -> bool:
+    """Weiterleitungsziel: nur http/https, nie ins lokale Netz (SSRF-Schutz).
+
+    Geprüft wird jede Station der Kette — das ist die neue Fähigkeit, also auch
+    die neue Angriffsfläche: Perl schickt den Client los, hier holt der Server
+    selbst.  Die *Start-URL* bleibt ungeprüft wie in Perls Proxy (sie kam schon
+    vorher aus dem Client, und ``_imageproxy_proxied`` holt sie für jede
+    Größen-Variante ohnehin).  Hostnamen werden aufgelöst und **jede**
+    aufgelöste Adresse muss außerhalb liegen (DNS-Rebinding).
+    """
+    import asyncio as _asyncio
+    import socket
+    from urllib.parse import urlparse
+
+    from lyrion.utils.network import is_private_addr
+
+    parsed = urlparse(url)
+    scheme = (parsed.scheme or "").lower()
+    if scheme not in ("http", "https"):
+        return False
+    host = parsed.hostname or ""
+    if not host:
+        return False
+    try:
+        infos = await _asyncio.get_running_loop().getaddrinfo(
+            host, parsed.port or (443 if scheme == "https" else 80),
+            type=socket.SOCK_STREAM)
+    except (OSError, _asyncio.CancelledError):
+        return False
+    return bool(infos) and all(
+        not is_private_addr(str(info[4][0])) for info in infos)
+
+
+async def _imageproxy_fetch_following_redirects(url: str, headers: dict[str, str]):
+    """``url`` holen und Weiterleitungen selbst verfolgen (bewusste Abweichung).
+
+    ``httpx`` kann ``follow_redirects=True``, aber nicht die Regeln dieser
+    Datei: jede Station muss http/https sein und außerhalb des lokalen Netzes
+    liegen, und die Kette ist begrenzt (Sprungtiefe + Gesamtfrist) — kein
+    Endlos-Retry.  Eine noch offene Weiterleitung wird zurückgegeben und vom
+    Aufrufer als Fehlschlag behandelt (Platzhalter + Negativ-Cache).
+    """
+    import httpx
+    from urllib.parse import urljoin
+
+    deadline = _time.monotonic() + _IMAGEPROXY_FOLLOW_TOTAL_TIMEOUT
+    async with httpx.AsyncClient(follow_redirects=False,
+                                 timeout=_IMAGEPROXY_FOLLOW_TIMEOUT) as client:
+        target = url
+        resp = await client.get(target, headers=headers)
+        for _hop in range(_IMAGEPROXY_FOLLOW_MAX_HOPS):
+            if resp.status_code not in _IMAGEPROXY_REDIRECT_CODES:
+                return resp
+            location = resp.headers.get("location") or ""
+            if not location:
+                return resp
+            target = urljoin(target, location)
+            if _time.monotonic() >= deadline:
+                logger.warning(
+                    "imageproxy: Gesamtfrist %.0fs überschritten — Weiterleitung "
+                    "nach %s nicht mehr verfolgt",
+                    _IMAGEPROXY_FOLLOW_TOTAL_TIMEOUT, target)
+                return resp
+            if not await _imageproxy_target_allowed(target):
+                logger.warning(
+                    "imageproxy: Weiterleitungsziel abgelehnt (nur http/https, "
+                    "nicht ins lokale Netz): %s", target)
+                return resp
+            resp = await client.get(target, headers=headers)
+        if resp.status_code in _IMAGEPROXY_REDIRECT_CODES:
+            logger.warning("imageproxy: Sprungtiefe %d erreicht — Weiterleitung "
+                           "nicht weiter verfolgt (%s)",
+                           _IMAGEPROXY_FOLLOW_MAX_HOPS, target)
+        return resp
 
 
 def _imageproxy_magic_type(data: bytes) -> str | None:
@@ -1186,11 +1333,16 @@ def _imageproxy_read_file_url(url: str) -> tuple[bytes, str] | None:
 
 
 async def _imageproxy_proxied(url: str, spec: str, cache_path: str,
-                             original_url: str | None = None
+                             original_url: str | None = None,
+                             follow_redirects: bool = False
                              ) -> tuple[int, dict[str, str], bytes]:
     """Perl ``$handleProxiedUrl`` + ``_gotArtwork`` + ``_resizeFromFile``.
 
     ``ImageProxy.pm:157-236``, ``:238-261``, ``:297-360``.
+
+    ``follow_redirects=True`` ist die bewusste Abweichung (Variante B, siehe
+    Dateikopf): dann laufen Weiterleitungen serverseitig über
+    :func:`_imageproxy_fetch_following_redirects` statt per 301 zum Client.
     """
     if not url or not (_imageproxy_is_http(url) or url.lower().startswith("file:")):
         # :160-165 — "No artwork found, returning 404"
@@ -1207,35 +1359,52 @@ async def _imageproxy_proxied(url: str, spec: str, cache_path: str,
         url = _IMAGEPROXY_CLOUD_RESIZER + quote(url, safe="~")
         headers["X-LMS-Plugin-ID"] = "Slim::Web::ImageProxy"
 
+    async def _fail(reason: str) -> tuple[int, dict[str, str], bytes]:
+        """Tote Quelle: Platzhalter + kurzer Negativ-Cache (Zutat dieses Ports)."""
+        _imageproxy_negative_put(url, reason)
+        return await _imageproxy_placeholder(spec)
+
     if url.lower().startswith("file:"):
         got = _imageproxy_read_file_url(url)
         if got is None:
             return await _imageproxy_placeholder(spec)   # → _gotArtworkError
         data, ctype = got
     else:
+        # Negativ-Cache: dieselbe tote URL nicht bei jedem Abruf erneut holen.
+        if _imageproxy_negative_get(url):
+            logger.info("imageproxy: %s steht im Negativ-Cache (tote Quelle) — "
+                        "kein erneuter Netzaufruf", url)
+            return await _imageproxy_placeholder(spec)
+
         import httpx
 
         try:
-            async with httpx.AsyncClient(follow_redirects=True,
-                                         timeout=30.0) as client:
-                resp = await client.get(url, headers=headers)
-        except Exception:  # noqa: BLE001 - network failures end in the placeholder
-            return await _imageproxy_placeholder(spec)
+            if follow_redirects:
+                resp = await _imageproxy_fetch_following_redirects(url, headers)
+            else:
+                async with httpx.AsyncClient(follow_redirects=True,
+                                             timeout=30.0) as client:
+                    resp = await client.get(url, headers=headers)
+        except Exception as exc:  # noqa: BLE001 - network failures → placeholder
+            return await _fail(f"{type(exc).__name__}: {exc}")
         ctype = (resp.headers.get("content-type") or "").split(";")[0].strip().lower()
         data = resp.content
-        if resp.status_code >= 400 or not data:
-            return await _imageproxy_placeholder(spec)
+        if (resp.status_code >= 400
+                or resp.status_code in _IMAGEPROXY_REDIRECT_CODES
+                or not data):
+            return await _fail(f"HTTP {resp.status_code}")
 
         if "text" in ctype:
             # :246-258 — many servers lie about playlists/images; guess from
             # the magic bytes and error out when that fails too.
             ctype = _imageproxy_magic_type(data) or ""
             if not ctype:
-                return await _imageproxy_placeholder(spec)
+                return await _fail("kein Bild (Content-Type %s)" % (
+                    resp.headers.get("content-type") or ""))
         elif "webp" in ctype:
             # :269-288 — one conversion attempt via the cloud resizer, then 500.
             if original_url is not None:
-                return await _imageproxy_placeholder(spec)
+                return await _fail("WebP ohne Konvertierung")
             from urllib.parse import quote
             return await _imageproxy_proxied(
                 _IMAGEPROXY_CLOUD_RESIZER + quote(url, safe="~"), spec,
@@ -1298,15 +1467,29 @@ async def _serve_imageproxy(path: str) -> tuple[int, dict[str, str], bytes]:
         # :138-143 — "Artwork ID not found" → _artworkError
         return await _imageproxy_placeholder(spec)
 
+    follow = False
     handler = _imageproxy_handler_for(url)
     if handler is None and (
             _IMAGEPROXY_SVG_RE.search(url)
             or (_IMAGEPROXY_NO_RESIZE_RE.match(spec) and _imageproxy_is_http(url))):
         # :145-155 — a ``.png``/``.jpg`` spec asks for the untouched original:
         # 301 to the source URL (live 9.1.1: 301, Location, Content-Length 0).
-        return 301, {"Location": url,
-                     "Content-Type": "application/octet-stream",
-                     "Content-Length": "0"}, b""
+        #
+        # Bewusste Abweichung (Variante B, ``imageProxyFollowRedirects``): bei
+        # AN holen und liefern wir das Bild selbst (200) statt den Client mit
+        # 301 loszuschicken — SqueezePlay folgt zwar, hat aber kein TLS, so dass
+        # der http→https-Sprung der imgur-Logos (1.FM u. a.) scheitert.  Ein
+        # SVG bleibt immer beim 301: Perls Regel dafür ist die SVG-Endung
+        # (:145), und ein SVG kann diese Kette nicht in ein Rasterbild wandeln.
+        # AUS = Perls 301, unverändert.
+        follow = (_IMAGEPROXY_SVG_RE.search(url) is None
+                  and _IMAGEPROXY_NO_RESIZE_RE.match(spec) is not None
+                  and _imageproxy_is_http(url)
+                  and _imageproxy_follow_redirects())
+        if not follow:
+            return 301, {"Location": url,
+                         "Content-Type": "application/octet-stream",
+                         "Content-Length": "0"}, b""
 
     if handler is not None:
         # :229-233 — a registered handler (TuneIn) may rewrite the URL.
@@ -1326,7 +1509,8 @@ async def _serve_imageproxy(path: str) -> tuple[int, dict[str, str], bytes]:
         if hit is not None:
             fmt, data = hit
             return 200, _imageproxy_headers(fmt), data
-        return await _imageproxy_proxied(url, spec, path)
+        return await _imageproxy_proxied(url, spec, path,
+                                         follow_redirects=follow)
 
 
 def _set_static_root(path: str | Path | None) -> None:

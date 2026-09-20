@@ -405,3 +405,40 @@ def test_radio_country_rejects_an_invalid_value(monkeypatch):
                           "pref_radiobrowser_country": "de"})
     assert "radiobrowser_country|0" in ajax.text.splitlines()           # validated=0
     assert get_prefs().get(radiobrowser.COUNTRY_PREF) == "FR"
+
+
+# ── Bildproxy-Schalter (``imageProxyFollowRedirects``, bewusste Abweichung) ──
+#
+# Perl hat KEINE solche Pref: ``Slim/Web/ImageProxy.pm:145-155`` antwortet auf
+# ``/imageproxy/<url>/image.jpg`` mit 301 und lässt den Client laden.  Der
+# Schalter (Vorbelegung AN) lässt den Server das Bild selbst holen; AUS stellt
+# Perls 301 wieder her.  Die Bildproxy-Tests dazu liegen in
+# ``tests/test_imageproxy.py``.
+
+
+def test_imageproxy_follow_switch_is_on_by_default_and_writable():
+    """Feld auf ``/settings/server/basic.html``: vorbelegt AN, per POST schaltbar."""
+    from lyrion.web.settings import (
+        IMAGEPROXY_FOLLOW_REDIRECTS_PREF as PREF,
+        imageproxy_follow_redirects,
+    )
+
+    store = get_prefs()
+    store._cache.pop(PREF, None)                 # nie gesetzt = frischer Server
+
+    body = _request("GET", "/settings/server/basic.html").text
+    assert f'name="pref_{PREF}" id="{PREF}"' in body
+    assert '<option value="1" selected>' in body          # Vorbelegung AN
+    assert '<option value="0">' in body
+    assert imageproxy_follow_redirects() is True          # Default greift ohne Wert
+
+    res = _request("POST", "/settings/server/basic.html",
+                   data={"saveSettings": "1", f"pref_{PREF}": "0"})
+    assert res.status_code == 200
+    assert store.get(PREF) == "0"
+    assert imageproxy_follow_redirects() is False         # AUS = Perls 301
+
+    _request("POST", "/settings/server/basic.html",
+             data={"saveSettings": "1", f"pref_{PREF}": "1"})
+    assert store.get(PREF) == "1"
+    assert imageproxy_follow_redirects() is True

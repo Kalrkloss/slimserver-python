@@ -41,6 +41,12 @@ Seiten + Feldlisten (je ``page()``/``prefs()``/``handler()``)
  lädt auch ``Slim/Plugin/*/strings.txt``), der Schlüssel ist also global gültig.
  Die Auswahlliste ist eine Zutat dieses Ports (radio-browser statt TuneIn) und
  kommt aus ``lyrion.web.radiobrowser.countries()``.
+ **Zusatzfeld des Bildproxys** (``imageProxyFollowRedirects``, Vorbelegung AN):
+ Perl antwortet auf ``/imageproxy/<url>/image.jpg`` mit 301 und lässt den Client
+ das Logo selbst holen (``Slim/Web/ImageProxy.pm:145-155``); SqueezePlay folgt
+ zwar, hat aber kein TLS, so dass der http→https-Sprung der imgur-Logos (1.FM
+ u. a.) scheitert.  Das Feld schaltet die bewusste Abweichung ab: AUS = Perls
+ 301.  Die Umsetzung steht in ``lyrion/web/app.py``.
  **Zusatzfelder der Online-Cover-Suche** (``artworkOnline*``, siehe
  ``lyrion/media/art_online.py``): Perl hat dafür KEINE Pref und keinen Anbieter —
  seine Kette endet bei Tags/Ordnerbild (``Slim/Music/Artwork.pm:388-400``,
@@ -140,6 +146,28 @@ _MINUTES_TO_SECONDS = {
 #: Die Pref dieses Ports für das Land des ``local``-Radio-Knotens
 #: (``lyrion/web/radiobrowser.py`` ``COUNTRY_PREF``).
 _RADIO_COUNTRY_PREF = "radiobrowser_country"
+
+# ── Bildproxy: Weiterleitungen serverseitig verfolgen (bewusste Abweichung) ──
+#
+# Perl hat dafür KEINE Pref: ``Slim/Web/ImageProxy.pm:145-155`` antwortet auf
+# ``/imageproxy/<url>/image.jpg`` mit **301** und lässt den Client das Bild
+# selbst holen.  SqueezePlay folgt dem 301, hat aber kein TLS — der übliche
+# http→https-Sprung (imgur-Logos von 1.FM u. a.) scheitert, das Logo bleibt
+# klein, obwohl die kleinen Varianten (``_40x40_m``, ``_100x100_m``) da sind
+# (die holt der Server schon immer selbst).  Mit dieser Pref holt der Server
+# auch das große Bild selbst, verfolgt Weiterleitungen serverseitig und liefert
+# es als 200 aus; AUS stellt Perls 301 exakt wieder her.
+#
+# Die Umsetzung steht in ``lyrion/web/app.py`` (``_imageproxy_proxied``,
+# ``_imageproxy_fetch_following_redirects``, ``_imageproxy_negative_put``).
+IMAGEPROXY_FOLLOW_REDIRECTS_PREF = "imageProxyFollowRedirects"
+
+#: Vorbelegung AN — die Abweichung ist gewollt (User-Entscheidung 2026-09-20),
+#: deshalb wirkt sie ohne Einrichtung; abschaltbar bleibt sie über das Feld auf
+#: ``/settings/server/basic.html``.
+IMAGEPROXY_PREF_DEFAULTS: dict[str, str] = {
+    IMAGEPROXY_FOLLOW_REDIRECTS_PREF: "1",
+}
 
 
 def _string(key: str, default: str) -> str:
@@ -307,6 +335,15 @@ _BASIC_SERVER = SettingsPage(
                            "basic.html:81-87 + Podcast/strings.txt PLUGIN_PODCAST_COUNTRY"
                            " (no Perl country pref for TuneIn's local node, TuneIn.pm:38-40)")),
         *_ART_ONLINE_FIELDS,
+        # Zusatzfeld dieses Ports, bewusste Abweichung von Perls ImageProxy
+        # (siehe Block oben): Perl kennt keine solche Einstellung.
+        Field(IMAGEPROXY_FOLLOW_REDIRECTS_PREF, "SETUP_IMAGEPROXY_FOLLOW",
+              "Follow logo redirects (deviates from Perl)",
+              "select",
+              options=(("1", "YES", "Yes"), ("0", "NO", "No")),
+              perl_source=("kein Perl-Fund; bewusste Abweichung von "
+                           "Slim/Web/ImageProxy.pm:145-155 (Perl antwortet dort "
+                           "mit 301 und lässt den Client laden)")),
     ),
 )
 
@@ -601,6 +638,47 @@ def art_online_pref_values() -> dict[str, str]:
 def load_art_online_settings() -> ArtOnlineSettings:
     """Laufzeit-Einstellungen der Online-Suche aus den Prefs bauen."""
     return ArtOnlineSettings.from_mapping(art_online_pref_values())
+
+
+# ── Bildproxy-Prefs (bewusste Abweichung, siehe Block oben) ─────────────────
+
+def imageproxy_pref_values() -> dict[str, str]:
+    """Alle ``imageProxy*``-Prefs dieses Ports mit Vorbelegung (nie ``None``)."""
+    prefs = get_prefs()
+    values: dict[str, str] = {}
+    for name, default in IMAGEPROXY_PREF_DEFAULTS.items():
+        raw = prefs.get(name)
+        values[name] = default if raw is None else str(raw)
+    return values
+
+
+def imageproxy_follow_redirects() -> bool:
+    """Verfolgt der Bildproxy Weiterleitungen serverseitig?  (Vorbelegung AN)
+
+    Gelesen an der Fundstelle wie Perls ``$prefs->get(...)``
+    (``Slim/Web/ImageProxy.pm:145``); fehlt die Pref (frischer Server), gilt
+    ``IMAGEPROXY_PREF_DEFAULTS``.  Leer/``0``/``no``/``off``/``false`` = AUS —
+    dann antwortet ``/imageproxy`` wieder mit Perls 301.
+    """
+    value = imageproxy_pref_values()[IMAGEPROXY_FOLLOW_REDIRECTS_PREF]
+    return value.strip().lower() not in ("", "0", "no", "off", "false")
+
+
+async def register_imageproxy_prefs() -> None:
+    """``imageProxy*``-Prefs mit Default registrieren (idempotent).
+
+    Wie :func:`register_art_online_prefs`: ohne Registrierung zeigte das
+    Formular beim ersten Aufruf einen leeren Wert, obwohl der Bildproxy längst
+    mit dem Default arbeitet.
+    """
+    prefs = get_prefs()
+    for name, default in IMAGEPROXY_PREF_DEFAULTS.items():
+        try:
+            await prefs.init_preference(name, default=default,
+                                        category="imageproxy")
+        except Exception as exc:  # noqa: BLE001 - Settings-Seite darf nicht brechen
+            logger.warning("settings: %s konnte nicht registriert werden (%s)",
+                           name, exc)
 
 
 async def register_art_online_prefs() -> None:
@@ -914,6 +992,10 @@ async def handle_settings_request(scope: dict, receive, send) -> None:
     # registrieren, damit das Formular die wirksamen Werte zeigt.
     if any(f.pref in _ART_PREF_DEFAULTS for f in page.fields):
         await register_art_online_prefs()
+
+    # Und für den Bildproxy-Schalter (bewusste Abweichung, Vorbelegung AN).
+    if any(f.pref in IMAGEPROXY_PREF_DEFAULTS for f in page.fields):
+        await register_imageproxy_prefs()
 
     if method == "POST" and "saveSettings" in params:
         if page.needs_client and player is None:
