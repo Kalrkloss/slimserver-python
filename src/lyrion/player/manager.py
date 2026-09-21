@@ -213,6 +213,51 @@ def jump_target(player: PlayerState, index) -> int | None:
     return int(stripped) % count                        # :1005, :1010-1013
 
 
+def nextsong(player: PlayerState, currsong: int | None = None) -> int | None:
+    """Perl ``nextsong`` — the index the AUTO-ADVANCE plays next.
+
+    ``Slim/Player/StreamingController.pm:847-899``; ``_getNextTrack`` asks for
+    it whenever no explicit index was given (:655-660):
+
+    * ``repeat == 1`` (repeat-song) → the CURRENT index (:871-873);
+    * otherwise ``currsong + 1``, wrapped to 0 at the end of the playlist
+      (:881-893) — with a reshuffle when shuffle is on, ``repeat == 2`` and
+      the ``reshuffleOnRepeat`` pref is set (:885-891);
+    * ``undef`` when the playlist wrapped and repeat is off (:897) — that is
+      what ENDS the playlist: ``_getNextTrack(..., $ifMoreTracks=1)`` returns
+      without streaming (:662-664), so the controller stays stopped
+      (``Stopped`` :224-230) and the status mode becomes ``stop``.
+
+    ``None`` is therefore NOT "nothing to do" for a caller that wants the
+    track to repeat — it is Perl's explicit end-of-playlist answer.
+
+    The shuffle ORDER is Perl's per-player ``shufflelist``
+    (``Playlist.pm:172-178``; ``reshuffle`` :788-…) — not ported, so a
+    shuffled playlist advances in playlist order here (same limitation as
+    :func:`jump_target`). ``consecutiveErrors`` (:862-879) belongs to the
+    song-queue error path and is not part of this port.
+    """
+    playlist = list(getattr(player, "playlist", None) or [])
+    count = len(playlist)
+    if not count:
+        return None                                     # :858
+    if currsong is None:
+        currsong = int(getattr(player, "playlist_position", 0) or 0)
+    if currsong < 0 or currsong >= count:
+        currsong = 0
+    repeat = int(getattr(player, "repeat", 0) or 0)
+    if repeat == 1:
+        return currsong                                 # :871-873
+    nxt = currsong + 1
+    if nxt >= count:
+        # :883-893 — start over at the end of the playlist. The reshuffle of
+        # a shuffle+repeat-all playlist (:885-891) needs Perl's shufflelist.
+        nxt = 0
+    if not repeat and nxt == 0:
+        return None                                     # :897
+    return nxt
+
+
 #: Perl ``$defaultPrefs`` ``powerOnResume`` (``Slim/Player/Player.pm:66``) —
 #: the "Power On Resume" player setting. Its TWO halves are read with a regex
 #: each: ``(.*)Off`` for the power-OFF behaviour (Player.pm:210) and

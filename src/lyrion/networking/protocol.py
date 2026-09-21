@@ -273,6 +273,11 @@ def _after_strm_sent(mac: str, song: Any = None) -> None:
         player.strm_sent_at = time.time()
         if song is not None:
             player.strm_sent_track = song
+        # A new strm frame is a NEW stream: the player has not started THIS
+        # one yet (`streamStartTimestamp(undef)`, Squeezebox.pm:567), so the
+        # previous track's `Started` must not count as "this stream played"
+        # (the end-of-track test in `_track_played_out`).
+        player._track_started_at = None
         # A new strm frame is a new stream: Perl clears the client's metadata
         # title the moment the new stream is opened (``Song::open``,
         # ``Slim/Player/Song.pm:700-702 $client->metaTitle(undef)``) and files
@@ -4418,9 +4423,7 @@ class SlimProtoClient:
                         )
                         if (player.mode == "play" and out_fullness == 0
                                 and stmd_after_start):
-                            player._last_stmd = None  # consume the signal
-                            player.forget_stream()
-                            asyncio.create_task(_advance_after_track(pm, mac_str))
+                            _schedule_track_end(pm, mac_str, player)
                         # NOTE: the heartbeat must NOT set mode=play by itself.
                         # Perl's STAT dispatch (Squeezebox2.pm:150-178) has no
                         # 'STMt' branch — it falls through to the final `else`
@@ -4458,6 +4461,11 @@ class SlimProtoClient:
                         player.mode = _streaming_mode(mac_str, "Started", "play")
                         player.pause_requested = False
                         player._track_started_at = time.time()
+                        # A new track demonstrably started (`playerTrackStarted`,
+                        # Squeezebox2.pm:170-171): re-arm the one-shot track-end
+                        # guard, so the SAME track can end and advance again
+                        # (repeat-song, StreamingController.pm:871-873).
+                        player._track_end_done_for = None
                         # The player demonstrably runs the track we streamed
                         # (Perl `playerStarted`, Squeezebox2.pm:162-163): this
                         # is the handshake-independent "already playing"
@@ -4559,20 +4567,39 @@ class SlimProtoClient:
                         player.mode = _streaming_mode(mac_str, "StreamingFailed", "stop")
                         player.pause_requested = False
                     elif event in ("STMo", "STMu"):
-                        # OUTPUT_UNDERRUN (STMo legacy / STMu current) —
-                        # harmless mid-stream, BUT when the decoder has
-                        # run dry at some point (STMd seen) an underrun
-                        # with an EMPTY output buffer means the buffered
-                        # audio played out completely: natural track end.
+                        # OUTPUT_UNDERRUN (STMo current / STMu legacy) — the
+                        # player's OUTPUT buffer ran dry. Mid-stream that is
+                        # Perl's `_Rebuffer` (StreamingController.pm:2286-2296,
+                        # :1659-1671); at the end of a local file it IS the
+                        # track end, and it is the only end-of-track report
+                        # this client class gives us: measured on squeezelite
+                        # v1.9.9-1449 (raw `sendSTAT`, 2026-09-21) it sends
+                        # STMs at the start and STMo when the output drains,
+                        # but the STMd Perl's auto-next waits for only after
+                        # the stream socket is closed (Squeezebox2.pm:150-152).
+                        #
+                        # Perl's own end-of-track notifications are exactly
+                        # these two codes: `STMu` → playerStopped
+                        # (Squeezebox2.pm:161-163), `STMo` →
+                        # playerOutputUnderrun (:172-173) — both mean "the
+                        # player holds no more audio of this stream". The
+                        # advance they lead to is Perl's
+                        # `_RetryOrNext`/`_NextIfMore` (:912-939, :1003-1014 →
+                        # `_getNextTrack` :629-713 with `nextsong()` :847-899);
+                        # for a player that cannot report the end Perl fires
+                        # the same `playerReadyToStream` from its own stream
+                        # pump when the source is exhausted (Squeezebox1.pm:
+                        # 99-110, SLIMP3.pm:104-118, HTTP.pm:87-95 — "Bug
+                        # 10400 - need to tell the controller to get next
+                        # track ready").
                         logger.debug("STAT %s (underrun) from %s", event, mac_str)
                         # Perl playerOutputUnderrun → `OutputUnderrun` → _Rebuffer
                         # (StreamingController.pm:2286-2296, :1659-1671).
                         _streaming_note(mac_str, "OutputUnderrun")
                         stmd_at = getattr(player, "_last_stmd", None)
-                        if player.mode == "play" and out_fullness == 0 and stmd_at:
-                            player._last_stmd = None  # consume the signal
-                            player.forget_stream()
-                            asyncio.create_task(_advance_after_track(pm, mac_str))
+                        if (player.mode == "play" and out_fullness == 0
+                                and (stmd_at or _track_played_out(player))):
+                            _schedule_track_end(pm, mac_str, player)
                     elif event == "pause":
                         # Player-initiated pause (the user pressed pause on
                         # the device): the output is held, not closed — keep
@@ -4730,37 +4757,108 @@ class SlimProtoClient:
     # ------------------------------------------------------------------
 
 
-async def _advance_after_track(pm, mac_str: str) -> None:
-    """Advance the playlist when the player reports track end (STAT STMd).
+def _track_played_out(player) -> bool:
+    """Did the player PLAY the stream we sent, all the way to its end?
 
-    LMS behaviour: after the last track the player stops; otherwise the
-    next playlist item gets a new strm frame. Do NOT wrap around (LMS
-    default has repeat off).
+    The evidence is the player's own track-start report (``STMs`` →
+    ``playerTrackStarted``, Squeezebox2.pm:170-171) for the stream that is
+    running: ``_track_started_at`` is cleared on every ``strm 's'``
+    (:meth:`_after_strm_sent`) and set again by the player's STMs. A player
+    that never started THIS stream — the start underrun of the
+    STMf → STMc → STMo handshake, or any underrun right after a
+    disconnect/reconnect — therefore cannot be mistaken for a finished track.
 
-    A remote (radio) stream NEVER ends — an underrun there is just a
-    buffer hiccup, not track end. Never advance/stop on it.
+    An underrun with an empty output buffer (the caller checks
+    ``out_fullness == 0``) means the player's buffers are drained; because we
+    deliver the whole local file into those buffers, that only happens once
+    the track has played out completely.
+
+    A remote (radio) stream never ends — Perl re-streams it instead
+    (``_RetryOrNext`` :918-931) — so it is excluded here as well.
+    """
+    if getattr(player, "remote", 0):
+        return False
+    return getattr(player, "_track_started_at", None) is not None
+
+
+def _schedule_track_end(pm, mac_str: str, player) -> None:
+    """Perl's end-of-track path: drop the strm guard, then advance.
+
+    The guard (``strm_sent_track``/``playing_track_id``) is dropped
+    SYNCHRONOUSLY, before the async advance, and even when there is nothing
+    to advance to (empty playlist, remote stream): a replay of the same track
+    must stream again (R0.5-P1). The track whose end this is travels into
+    :func:`_advance_after_track` so its one-shot guard can recognise the
+    duplicate reports of the same end (``STMo`` → ``STMu`` + late ``STMd``).
+    """
+    ended = (player.playing_track_id if player.playing_track_id is not None
+             else player.strm_sent_track)
+    player._last_stmd = None            # the decoder-dry signal is consumed
+    player.forget_stream()
+    asyncio.create_task(_advance_after_track(pm, mac_str, ended))
+
+
+async def _advance_after_track(pm, mac_str: str, ended: Any = None) -> None:
+    """Advance the playlist at the end of the current song — Perl's
+    ``_RetryOrNext``/``_NextIfMore`` (StreamingController.pm:912-939,
+    :1003-1014) → ``_getNextTrack(..., $ifMoreTracks=1)`` (:629-713).
+
+    The index comes from :func:`lyrion.player.manager.nextsong`
+    (``StreamingController.pm:847-899``): repeat-song replays the current
+    index, repeat-all wraps, and at the end of the playlist with repeat off
+    it returns ``None`` — Perl then returns without streaming (:662-664) and
+    the song ends (``Stopped`` :224-230 → status ``mode:stop``).
+
+    A remote (radio) stream NEVER ends — an underrun there is just a buffer
+    hiccup, not track end. Never advance/stop on it.
 
     Called on the end-of-track path only: the player demonstrably does not
     hold the stream we sent any more, so the strm idempotency guard is
     dropped FIRST — even when there is nothing to advance to (empty
     playlist, remote stream), else a replay of the same track is swallowed
     (R0.5-P1).
+
+    One-shot per track: the same end arrives as ``STMo`` and, once the
+    stream socket is closed, as ``STMu`` plus a late ``STMd`` (measured on
+    squeezelite v1.9.9-1449). Perl absorbs those duplicates because its
+    actions are state-gated (`ReadyToStream` in PLAYING-IDLE/TRACKWAIT is a
+    `_NoOp`, :217-223); ``_track_end_done_for`` is the same guard here and is
+    cleared again by the next track's ``Started``.
     """
     try:
         player = pm.get_player(mac_str)
-        if player is not None:
-            player.forget_stream()
-        if player is None or not player.playlist:
+        if player is None:
+            return
+        if ended is None:
+            ended = (player.playing_track_id
+                     if player.playing_track_id is not None
+                     else player.strm_sent_track)
+        done = getattr(player, "_track_end_done_for", None)
+        if done is not None and (ended is None or ended == done):
+            logger.debug("Track end for %s already handled (track=%s)", mac_str, done)
+            return
+        player._track_end_done_for = ended
+        player._last_stmd = None          # the decoder-dry signal is consumed
+        player.forget_stream()
+        if not player.playlist:
             return
         if getattr(player, "remote", 0):
             logger.info("Underrun on remote stream %s — not a track end, "
                         "keeping playback", mac_str)
             return
-        if player.playlist_position < len(player.playlist) - 1:
-            logger.info("Track finished on %s — advancing playlist", mac_str)
-            await pm.playlist_next(mac_str)
-        else:
-            logger.info("Last track finished on %s — stopping", mac_str)
+        from lyrion.player.manager import nextsong
+
+        index = nextsong(player)
+        if index is None:
+            # End of the playlist with repeat off: Perl's `_getNextTrack`
+            # returns without streaming (:662-664) and the controller ends
+            # stopped (`Stopped`, :224-230) — the player holds no audio any
+            # more, so the stream is closed the way Perl's `stop` does it
+            # (stream 'q', Squeezebox.pm:206-216).
+            logger.info("Last track finished on %s — playlist ends, stopping", mac_str)
             await pm.stop_player(mac_str)
+        else:
+            logger.info("Track finished on %s — Perl nextsong → index %d", mac_str, index)
+            await pm.playlist_jump(mac_str, index)
     except Exception as exc:
         logger.warning("advance after track failed for %s: %s", mac_str, exc)

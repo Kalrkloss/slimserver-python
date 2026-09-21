@@ -225,6 +225,16 @@ class PlayerState:
     _track_started_at: Optional[float] = None  # last STMs time
     _last_stmd_codec: str = ""                # codec of the last STMd
     _stat: Optional[dict] = None              # last decoded STAT struct
+    # Track id whose END was already acted on (the one-shot guard of the
+    # track-end path). The same end can be reported by several frames
+    # (STMo + STMu + the late STMd of the closed stream), and Perl's state
+    # machine absorbs the duplicates because the actions are state-gated
+    # (`ReadyToStream` in PLAYING-IDLE/TRACKWAIT is a `_NoOp`,
+    # StreamingController.pm:217-223). Cleared again when the NEXT track
+    # demonstrably starts (`Started`, Squeezebox2.pm:170-171) — so a
+    # repeat-song (``repeat == 1``, StreamingController.pm:871-873) can end
+    # again and advance again.
+    _track_end_done_for: Optional[int] = None
 
     def update_activity(self) -> None:
         """Mark the last activity timestamp to now."""
