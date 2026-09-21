@@ -528,8 +528,11 @@ def test_defeat_pref_semantics_match_perl():
     # 4 = "playing and the current item is not a radio stream" (:1977)
     assert _defeat_destructive_touch_to_play([], playing) is True
     assert _defeat_destructive_touch_to_play([], idle) is False
-    # ... but a playlist container is excluded by !isPlaylist()
+    # ... but a playlist *container* is excluded by !isPlaylist() — Perl asks
+    # the *playing item* (``Song.pm:764``/``:125``), and a remote stream
+    # carries no duration anyway (:1977), so its URL never decides:
     listy = _install_player("play", url="http://host/radio.m3u")
+    listy.remote = 1
     assert _defeat_destructive_touch_to_play([], listy) is False
     # 2/3 need a playlist longer than one entry (:1978-1980)
     assert _defeat_destructive_touch_to_play(
@@ -552,6 +555,75 @@ def test_defeat_pref_semantics_match_perl():
             ["defeatDestructiveTouchToPlay:0"], idle) is False
     finally:
         api_mod._defeat_pref_default = prev
+
+
+def test_defeat_uses_the_playing_item_not_the_stale_remote_url(monkeypatch):
+    """``playingSong()->duration()`` / ``isPlaylist()`` ask the *playing* item.
+
+    The port used to read ``PlayerState.duration``/``current_url``, which
+    ``manager.play_track``/``play_url`` write — and nothing else does.  A
+    track started with ``playlist play`` (or by the player's own next-track
+    advance) therefore kept ``duration == 0.0`` although ``status`` reports
+    the playlist entry's length (live 2026-09-21: ``duration 265.217`` vs
+    ``player.duration 0.0``), and a preceding station left its URL behind —
+    both suppressed the play-control menu.  Perl reads the playing song
+    (``Slim/Player/Song.pm:809-815``/``:764``).
+    """
+    import lyrion.web.api as api_mod
+
+    player = _install_player("play")
+    player.remote = 0
+    player.playlist = [51102]                 # a local track is playing
+    player.playlist_position = 0
+    player.current_url = "http://host/old-station.m3u"        # stale
+    monkeypatch.setattr(
+        api_mod, "_db_query",
+        lambda sql, params=(): [{"duration": 257.5,
+                                 "url": "file:///srv/music/x.mp3"}])
+    assert _defeat_destructive_touch_to_play([], player) is True
+    # ... a playlist *container* in the library is excluded (Perl's
+    # ``isPlaylist()`` = the content type, ``Song.pm:125``)
+    monkeypatch.setattr(
+        api_mod, "_db_query",
+        lambda sql, params=(): [{"duration": 257.5,
+                                 "url": "file:///srv/music/x.m3u"}])
+    assert _defeat_destructive_touch_to_play([], player) is False
+    # ... the entry's length counts even when ``player.duration`` is 0.0
+    # (``playlist play``): this is the state the blind ``play`` row came from
+    player.duration = 0.0
+    monkeypatch.setattr(
+        api_mod, "_db_query",
+        lambda sql, params=(): [{"duration": 265.217,
+                                 "url": "file:///srv/music/1.mp3"}])
+    assert _defeat_destructive_touch_to_play([], player) is True
+    # ... a stream URL in the playlist is a remote item: no duration (:1977)
+    player.playlist = ["http://host/radio.mp3"]
+    assert _defeat_destructive_touch_to_play([], player) is False
+
+
+def test_defeat_isplaying_matches_perls_streaming_controller():
+    """``!isStopped() && !isPaused()`` — ``StreamingController.pm:1676-1679``.
+
+    ``$client->isPlaying()`` is called *without* the ``$really`` argument, so
+    it answers 1 in BUFFERING/WAITING_TO_SYNC/PLAYING and 0 only for
+    STOPPED/PAUSED — not ``mode eq 'play'``.  The port's ``loading`` mode is
+    the STAT ``load`` state (``networking/protocol.py:4600``), i.e. Perl's
+    BUFFERING (``_Stream``, ``:1351``), and must defeat like ``play``.
+    """
+    for mode in ("play", "loading"):
+        player = _install_player(mode)
+        assert _defeat_destructive_touch_to_play([], player) is True, mode
+    for mode in ("pause", "stop"):
+        player = _install_player(mode)
+        assert _defeat_destructive_touch_to_play([], player) is False, mode
+    # pref 3 asks the very same query (:1980 `!$client->isPlaying()`)
+    player = _install_player("loading")
+    player.playlist_total = 3
+    assert _defeat_destructive_touch_to_play(
+        ["defeatDestructiveTouchToPlay:3"], player) is True
+    player.mode = "pause"
+    assert _defeat_destructive_touch_to_play(
+        ["defeatDestructiveTouchToPlay:3"], player) is False
 
 
 def test_client_less_request_gets_perls_play_control_row(favs):

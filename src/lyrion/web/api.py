@@ -440,6 +440,92 @@ _PLAYLIST_EXT_RE = re.compile(r"\.(?:m3u8?|pls|asx|b4s|wpl)(?:$|[?#])",
                               re.IGNORECASE)
 
 
+def _perl_is_playing(player) -> bool:
+    """Perl ``$client->isPlaying()`` — **not** ``mode eq 'play'``.
+
+    ``Slim/Player/Client.pm:1351`` delegates to the streaming controller, and
+    the no-argument form of that query is (``Slim/Player/StreamingController.pm
+    :1676-1679``)::
+
+        sub isPlaying {
+            my ($self, $really) = @_;
+            return $really ? $self->{'playingState'} == PLAYING
+                           : (!isStopped($self) && !isPaused($self));
+        }
+
+    ``_defeatDestructiveTouchToPlay`` calls it *without* the ``$really``
+    argument, so it answers 1 in every playing state except STOPPED and PAUSED
+    — BUFFERING (the state a starting stream is put in, ``:1351``),
+    WAITING_TO_SYNC and PLAYING all count as playing.
+
+    The port's modes are ``stop``/``play``/``pause``/``loading``
+    (``networking/protocol.py:147``, ``player/state.py:36``); ``loading`` is
+    the STAT ``load`` code, i.e. Perl's BUFFERING, and therefore *is* playing
+    for :1977/:1980.
+    """
+    return str(getattr(player, "mode", "") or "") not in ("stop", "pause")
+
+
+def _local_entry_id(entry: object) -> int | None:
+    """The DB track id of a local playlist entry, else ``None``.
+
+    The playlist holds DB ids (``int``) and stream URLs (``str``,
+    ``PlayerState.playlist``); the status builder splits them the same way
+    (``api.py`` ``_local_id`` in the status path).
+    """
+    if isinstance(entry, bool):
+        return None
+    if isinstance(entry, int):
+        return entry
+    text = str(entry)
+    return int(text) if text.isdigit() else None
+
+
+def _playing_item(player) -> tuple[float, str, bool]:
+    """Perl's ``playingSong()`` — the **playing playlist entry**.
+
+    Returns ``(duration, url, is_remote)`` of the item at
+    ``playlist[playlist_position]``, read from the library the way Perl's
+    ``$song->duration()``/``$song->isPlaylist()`` read the *playing* song
+    (``Slim/Player/Song.pm:809-815``/``:764``, ``Queries.pm:4100-4102`` for
+    the status field).
+
+    Why not the port's loaded-track fields: ``PlayerState.duration`` and
+    ``current_url`` are written by ``manager.play_track``/``play_url`` alone,
+    so they are *stale* (or 0) whenever the item was started any other way —
+    ``playlist play``, the player's own next-track advance, a resume.  Live
+    2026-09-21 (squeezelite test client, local track playing, started with
+    ``playlist play 0``): ``status`` reports ``duration 265.217`` (from the
+    playlist entry) while ``player.duration`` is ``0.0`` — the play-control
+    menu stayed away although Perl's :1977 sees a duration.  A stream URL in
+    the playlist is a remote item: ``RemoteTrack::duration`` has no ``secs``
+    then (``Slim/Schema/RemoteTrack.pm:483-489``) → ``(0.0, url, True)``.
+    """
+    playlist = getattr(player, "playlist", None) or []
+    try:
+        pos = int(getattr(player, "playlist_position", 0) or 0)
+    except (TypeError, ValueError):
+        pos = -1
+    if 0 <= pos < len(playlist):
+        entry = playlist[pos]
+        local_id = _local_entry_id(entry)
+        if local_id is None:
+            return 0.0, str(entry), True          # stream URL in the playlist
+        try:
+            rows = _db_query(
+                "SELECT duration, url FROM tracks WHERE id = ?", (int(local_id),))
+        except Exception:  # noqa: BLE001 — no library DB / no such track
+            rows = []
+        if rows:
+            return (float(rows[0].get("duration") or 0),
+                    str(rows[0].get("url") or ""), False)
+    # No playlist entry (or no library row): the loaded-track fields, with the
+    # port's ``remote`` flag as the "is a stream" signal.
+    return (float(getattr(player, "duration", 0) or 0),
+            str(getattr(player, "current_url", "") or ""),
+            bool(getattr(player, "remote", 0)))
+
+
 def _defeat_destructive_touch_to_play(rest: list, player=None,
                                       *, client_named: bool | None = None
                                       ) -> bool:
@@ -459,6 +545,40 @@ def _defeat_destructive_touch_to_play(rest: list, player=None,
     Values (``:1968-1973``): ``0`` never, ``1`` always, ``2`` playlist length
     > 1, ``3`` playing and length > 1, ``4`` playing and the current item is
     not a radio stream.
+
+    **The playlist is not part of Perl's default rule.**  With the shipped
+    default ``4`` the branch hangs on the *playing item* only — ``isPlaying()
+    && playingSong()->duration() && !playingSong()->isPlaylist()`` — the
+    playlist length is read by ``2``/``3`` alone (``:1978-1980``).  The
+    expectation "the menu should always come when something is in the
+    playlist" is therefore *not* Perl's default behaviour; it is what ``1``
+    (always) or ``2`` (> 1 entry) produce, and both are selectable
+    (``pref defeatDestructiveTouchToPlay 1|2``, ``playerpref`` per client —
+    this port honours both, see :func:`_defeat_pref_default`).
+
+    Live matrix against the reference server (read-only, 2026-09-21;
+    ``favorites items 0 200 menu:favorites item_id:<sid>.0``, the station
+    level of the ``Chill`` folder):
+
+    ===================================  =========================
+    request / state                      Perl row (server pref 4)
+    ===================================  =========================
+    no player token                      ``playControl``
+    unknown mac                          ``playControl``
+    known client, stopped, 1 track       ``play`` + ``touchToPlay``
+    known client, stopped, 2 tracks      ``play``
+    known client, ``pref 2``, 2 tracks   ``playControl``
+    known client, ``pref 0`` / ``1``     ``play`` / ``playControl``
+    ===================================  =========================
+
+    ``playerpref defeatDestructiveTouchToPlay ?`` answers ``null`` for all
+    four connected clients, i.e. the server pref ``4`` is in force everywhere
+    (``Slim/Control/Queries.pm:3009-3046``).  A *playing* client cannot be
+    produced on the reference server read-only; its branch is Perl's own
+    expression (:1977, ``StreamingController.pm:1676-1679``,
+    ``Song.pm:809-815``) plus the earlier live probe quoted below — this port
+    was measured in both states with the same client (playing a local track →
+    ``playControl``, playing a radio stream → ``play``).
 
     ``client_named`` is ``$request->client``: ``False`` for a request that
     names no player at all, ``None`` (default) derives it from ``player``.
@@ -533,33 +653,35 @@ def _defeat_destructive_touch_to_play(rest: list, player=None,
         # :1977 `$client->isPlaying() && $client->playingSong()->duration()
         #        && !$client->playingSong()->isPlaylist()`
         #
-        # ``duration()`` is the CURRENT song's duration, and a remote stream
-        # has none: ``RemoteTrack::duration`` answers undef unless ``secs``
-        # is set (``Slim/Schema/RemoteTrack.pm:483-489``), so Perl's live
-        # answer for a playing radio stream carries ``"duration": "0"``.  A
-        # live stream is therefore NOT a reason to defeat the tap — only a
-        # loaded local track is.
-        #
-        # ``player.duration`` is the port's field of the *loaded* track
-        # (``manager.load_track``) and is not cleared when a stream starts
-        # (``manager.play_url`` sets ``current_url``/``remote`` only), so it
-        # still holds the previous local track's length.  Reading it while
-        # ``remote`` is set would defeat every radio row of a client that
-        # last played a local track — Perl's row shape is the plain one
-        # (measured: a SqueezePlay client with a running radio stream gets
-        # ``goAction: "play"`` + ``touchToPlay``, and the tap then sends
-        # ``<feed> playlist play …``).
-        if getattr(player, "remote", 0):
-            return False                 # remote stream: duration() == 0
-        url = str(getattr(player, "current_url", "") or "")
-        return bool(getattr(player, "mode", "") == "play"
-                    and float(getattr(player, "duration", 0) or 0) > 0
-                    and not _PLAYLIST_EXT_RE.search(url))
+        # ``isPlaying()`` is the controller's no-argument query — every state
+        # but STOPPED/PAUSED (``StreamingController.pm:1676-1679``, see
+        # :func:`_perl_is_playing`), *not* ``mode eq 'play'``: a starting
+        # stream sits in BUFFERING and is playing for this clause.
+        if not _perl_is_playing(player):
+            return False
+        # ``playingSong()->duration() && !playingSong()->isPlaylist()`` — both
+        # read the *playing item*: its library row's length and URL, never the
+        # stale ``PlayerState.duration``/``current_url`` of the last
+        # ``play_track``/``play_url`` (see :func:`_playing_item`).  A remote
+        # stream has no duration (``RemoteTrack::duration`` answers undef
+        # without ``secs``, ``Slim/Schema/RemoteTrack.pm:483-489``;
+        # ``Song::duration`` only falls back to ``Slim::Music::Info::
+        # getDuration``, ``Song.pm:809-815``), which is also why Perl's own
+        # ``status`` omits the field for a playing stream
+        # (``if (my $dur = $song->duration())``, ``Queries.pm:4099``) — so a
+        # live stream is NOT a reason to defeat the tap, only a playing local
+        # track is.  Measured: a SqueezePlay client with a running radio
+        # stream gets ``goAction: "play"`` + ``touchToPlay`` and the tap then
+        # sends ``<feed> playlist play …``.
+        duration, url, is_remote = _playing_item(player)
+        if is_remote:
+            return False                 # remote item: duration() is falsy
+        return bool(duration > 0 and not _PLAYLIST_EXT_RE.search(url))
     length = int(getattr(player, "playlist_total", 0) or 0)
     if length < 2:
         return False                     # :1979
-    if num == 3 and getattr(player, "mode", "") != "play":
-        return False                     # :1980
+    if num == 3 and not _perl_is_playing(player):
+        return False                     # :1980 `!$client->isPlaying()`
     return True
 
 
