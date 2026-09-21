@@ -1770,12 +1770,36 @@ class PlayerManager:
         return await self.playlist_play(player_id, target)
 
     async def seek_to(self, player_id: str, seconds: int) -> bool:
-        """Seek within the current stream.
+        """``time <n>`` — Perl's ``gototime`` → ``jumpToTime`` → ``_JumpToTime``.
 
-        A forward seek is a SlimProto ``strm 'a'`` skip-ahead (the replay-gain
-        field carries the interval in milliseconds). A backwards or
-        out-of-range seek restarts the current item instead (the real LMS
-        re-streams the track too).
+        Perl does NOT skip within the player's buffers: it re-opens the
+        source at the requested position.
+
+          * ``timeCommand`` → ``Slim::Player::Source::gototime``
+            (``Slim/Control/Commands.pm:3069-3086``; ``Source.pm:216-221``)
+            → ``controller->jumpToTime`` (``StreamingController.pm:2214-2217``)
+            → ``_JumpToTime`` (``StreamingController.pm:1092-1141``).
+          * ``newtime == 0`` (absolute) or an unknown duration → restart the
+            current item (``_Stop`` + ``resetSeekdata`` + ``_Stream`` without
+            seekdata, :1097-1111);
+          * ``newtime > duration`` → ``_Skip`` (:1127-1130);
+          * otherwise ``getSeekData(newtime)`` → ``{timeOffset => newtime}``
+            (``File.pm:372-380``) and ``_Stop`` + ``_Stream(seekdata)``
+            (:1132-1141). ``File.pm:194-202`` seeks the file to the byte
+            offset of that position and sets ``$song->startOffset(timeOffset)``,
+            so the song clock counts on from there: ``playingSongElapsed`` =
+            ``startOffset + player elapsed`` (``StreamingController.pm:1719-1743``)
+            → ``Source::songTime`` (``Source.pm:51-53``) → the status ``time``
+            field (``Queries.pm:4093-4094``).
+
+        ``strm 'a'`` is a DIFFERENT command — Perl's ``skipAhead``
+        (``Squeezebox2.pm:1120-1127``), sent only by the sync correction
+        (``_CheckSync``, ``StreamingController.pm:566-568``). The player
+        applies it to its OUTPUT buffer, so the position moves by at most the
+        buffered few seconds and the song clock keeps its old base — the
+        requested position is lost and the status ``time`` never reaches it
+        (live 2026-09-21: click at 324 s of a 519 s track → status ``time``
+        only went 49 s → 132 s, then counted on from there).
         """
         player = self.get_player(player_id)
         if player is None:
@@ -1784,19 +1808,37 @@ class PlayerManager:
         if handler is None:
             return False
 
-        if seconds <= getattr(player, "elapsed", 0) or seconds > 100000:
-            # Backwards / out-of-range: restart the current item instead.
-            pos = player.playlist_position or 0
-            items = player.playlist or []
-            if 0 <= pos < len(items):
-                item = items[pos]
-                if isinstance(item, int):
-                    return await self.play_track(player_id, item)
-                return await self.play_url(player_id, str(item))
+        pos = player.playlist_position or 0
+        items = player.playlist or []
+        if not (0 <= pos < len(items)):
             return False
-        return await handler.send_skip_to_player(
-            player.mac, seconds - int(getattr(player, "elapsed", 0) or 0)
-        )
+        item = items[pos]
+        is_track = isinstance(item, int)
+        duration = float(getattr(player, "duration", 0) or 0)
+
+        # Perl _JumpToTime :1097-1111 — restart the current item from 0. A
+        # remote (radio) stream has no duration either (``canSeek`` false,
+        # File.pm:403-415 / HTTP.pm:1186-1188), so it takes this branch too.
+        if seconds <= 0 or not duration or not is_track:
+            # Perl ``_Stop`` closes the stream before the restart, so the
+            # re-stream of the SAME track must not be swallowed by the
+            # idempotency guard (protocol.py ``send_strm_to_player``).
+            player.forget_stream()
+            if is_track:
+                return await self.play_track(player_id, item, 0.0)
+            return await self.play_url(player_id, str(item))
+
+        # Perl :1127-1130 — past the end of the song: ``_Skip`` advances.
+        if seconds > duration:
+            return await self.playlist_next(player_id)
+
+        # Perl :1132-1141 — ``_Stop`` + ``_Stream`` with the seekdata of the
+        # position. The player's own clock restarts at 0 with the new stream
+        # and ``stream_start_offset`` (the protocol layer's ``startOffset``)
+        # carries the position, so the status ``time`` jumps to ``seconds``
+        # and counts on from there.
+        player.forget_stream()
+        return await self.play_track(player_id, item, float(seconds))
 
     async def playlist_next(self, player_id: str) -> bool:
         """Skip to the next track in the playlist (wraps to start).
