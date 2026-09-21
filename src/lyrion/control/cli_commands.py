@@ -4877,7 +4877,42 @@ async def _fav_playlist(
     ctx: CLIContext,
     args: list[str],
 ) -> list[str]:
-    """favorites playlist <play|load|insert|add> item_id:<id> [player:<mac>] — ONE line."""
+    """favorites playlist <play|load|insert|add> item_id:<id> [player:<mac>] — ONE line.
+
+    Perl registers ``['favorites','playlist','_method']`` on ``cliBrowse``
+    (``Slim/Plugin/Favorites/Plugin.pm:81`` → :746-764) and hands the request to
+    ``Slim::Control::XMLBrowser::cliQuery`` (:763).  There the item id is a
+    **path through the whole feed tree**: ``@index = split /\\./, $item_id`` with
+    the browse-session handle shifted off (``Slim/Control/XMLBrowser.pm:331-340``),
+    then one descent per crumb —
+
+        $subFeed = $subFeed->{'items'}->[$in - $subFeed->{'offset'}];   (:384)
+
+    — so the *last* crumb selects the row at ANY depth, root or folder
+    (:373-405).  For every ``_method`` in add/insert/play the row's URL is the
+    same and only the playlist verb differs (:667-702)::
+
+        $client->execute([ 'playlist', $method, $url ]);
+
+    ``play``/``load`` clear the playlist and start the stream
+    (``Slim/Control/Commands.pm:1483-1491``), ``add`` appends it (:1495-1503 →
+    ``Slim/Player/Playlist.pm:239``) and ``insert`` appends it and then moves the
+    new block behind the running song (``Playlist.pm:265-284`` ``_insert_done``).
+    Before the verb Perl files the row's name and logo under the URL for all
+    three methods alike (:693-700 ``setRemoteMetadata``).
+
+    Our former ``add``/``insert`` branch searched ``fm.list_items(None)`` — the
+    ROOT list only — so the row of a favourite inside a folder was never found
+    and the verb stayed a silent no-op (``play`` was unaffected: it takes the DB
+    id straight from ``resolve_path``).
+
+    Not ported here: Perl's *folder* branch, which collects the direct children
+    of a non-audio item and runs ``playlist addtracks|inserttracks|loadtracks``
+    on that list (``Slim/Control/XMLBrowser.pm:710-779``).  No client offers the
+    play-control menu for a folder row (``_playlistControlContextMenu`` is
+    reached from the leaf branch only, :543-639/:805-830), and the
+    ``listref``-form of the ``playlist`` command has no equivalent in this port.
+    """
     if not args:
         return _command_echo(["favorites", "playlist"], args, [], has_tags=True)
     action = str(args[0]).lower()
@@ -4903,13 +4938,38 @@ async def _fav_playlist(
         if action in ("play", "load"):
             await fm.play(player_id, fav_id)
         elif action in ("insert", "add"):
-            items = await fm.list_items(None)
-            target = next((i for i in items if int(i["id"]) == fav_id), None)
-            if target and target["url"]:
+            # The row the item id points at — ``resolve_path`` walks the index
+            # path over the WHOLE tree (Perl ``XMLBrowser.pm:331-405``), the
+            # former root-only ``list_items(None)`` scan found no row inside a
+            # folder and the verb died silently.
+            row = await fm.get(fav_id) or {}
+            url = str(row.get("url") or "")
+            if url:
                 player = PlayerManager().get_player(player_id)
                 if player is not None:
-                    player.playlist.append(target["url"])
+                    # Perl files the row's name AND logo under the URL before
+                    # the playlist verb — for add/insert/play alike
+                    # (``XMLBrowser.pm:693-700`` setRemoteMetadata).
+                    from lyrion.web.api import JSONRPCAPI
+
+                    JSONRPCAPI._set_stream_title(player, url,
+                                                 str(row.get("title") or ""))
+                    JSONRPCAPI._set_stream_image(player, url,
+                                                 str(row.get("icon") or ""))
+                    if action == "add":
+                        # Commands.pm:1495-1503 → Playlist.pm:239 (append).
+                        player.playlist.append(url)
+                    else:
+                        # Commands.pm:1535-1560 → Playlist.pm:265-284
+                        # ``_insert_done``: appended, then moved to
+                        # ``playingSongIndex + 1``.
+                        playlist = list(player.playlist or [])
+                        pos = int(player.playlist_position or 0) + 1
+                        pos = max(0, min(pos, len(playlist)))
+                        playlist[pos:pos] = [url]
+                        player.playlist = playlist
                     player.playlist_total = len(player.playlist)
+                    player.last_activity = time.time()
     except Exception:  # noqa: BLE001
         pass
     return _command_echo(["favorites", "playlist"], args, [], has_tags=True)
