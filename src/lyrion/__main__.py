@@ -239,6 +239,7 @@ async def _run_server(
             from lyrion.web.app import create_config
             from lyrion.web.api import JSONRPCAPI
             from lyrion.web.cometd import CometdManager
+            from lyrion.web.lifecycle import run_web_server_until_shutdown
 
             # Shared JSON-RPC + Cometd manager (uvicorn AND the native
             # streaming server must see the same clients/subscriptions).
@@ -267,62 +268,56 @@ async def _run_server(
             # again and binds 0.0.0.0, exactly as before.
             from lyrion.config import asgi_bind
             asgi_host, asgi_port = asgi_bind(cfg)
-            config_uvicorn = create_config(
-                host=asgi_host,
-                port=asgi_port,
-                static_dir=static_dir,
-                jsonrpc=jsonrpc_api,
-                cometd=cometd_mgr,
-            )
-            _uvicorn_server = uvicorn.Server(config=config_uvicorn)
-            log.info("Web server (intern) starting on http://%s:%d",
-                     asgi_host, asgi_port)
-            # Run uvicorn as a background task so our shutdown loop below can
-            # observe both `_running` (our SIGTERM handler) and uvicorn's own
-            # should_exit. A plain `await serve()` blocks forever because
-            # uvicorn's signal handlers conflict with ours (systemd restart
-            # would hang in "deactivating").
-            uvicorn_task = asyncio.create_task(_uvicorn_server.serve())
+            def _make_asgi_server():
+                """Frische interne ASGI-Instanz (erster Start und Neustart)."""
+                log.info("Web server (intern) starting on http://%s:%d",
+                         asgi_host, asgi_port)
+                return uvicorn.Server(config=create_config(
+                    host=asgi_host,
+                    port=asgi_port,
+                    static_dir=static_dir,
+                    jsonrpc=jsonrpc_api,
+                    cometd=cometd_mgr,
+                ))
 
             # The native server is the FRONTEND on the public port: Perl
             # serves its one HTTP port itself and pipelines requests on it
             # (Slim/Web/HTTP.pm:2065-2072), which uvicorn cannot
             # (h11_impl.py:191-197). It answers /cometd natively and relays
-            # every other request to the internal ASGI port above.
-            try:
-                if frontend:
-                    from lyrion.networking.cometd_stream import start_cometd_server
-                    asyncio.create_task(start_cometd_server(
-                        cometd_mgr, "0.0.0.0", public_port, asgi_port))
-                else:
-                    log.info("Native frontend disabled (public=%d internal=%d) "
-                             "— uvicorn serves the public port alone",
-                             public_port, internal_port)
-            except Exception as exc:
-                log.warning("Could not start native frontend: %s", exc)
+            # every other request to the internal ASGI port above. Started as
+            # soon as that ASGI app has bound its socket.
+            async def _start_native_frontend() -> None:
+                try:
+                    if frontend:
+                        from lyrion.networking.cometd_stream import start_cometd_server
+                        asyncio.create_task(start_cometd_server(
+                            cometd_mgr, "0.0.0.0", public_port, asgi_port))
+                    else:
+                        log.info("Native frontend disabled (public=%d internal=%d) "
+                                 "— uvicorn serves the public port alone",
+                                 public_port, internal_port)
+                except Exception as exc:
+                    log.warning("Could not start native frontend: %s", exc)
 
-            # Wait for shutdown signal or uvicorn stopping itself.
-            # Active SIGTERM/SIGINT handler is bootstrap.request_shutdown,
-            # which only sets the _shutdown_requested flag (no loop.stop()).
-            while _running and not _bootstrap_mod._shutdown_requested and not _uvicorn_server.should_exit:
-                await asyncio.sleep(0.5)
+            # Serve until a shutdown is requested (SIGTERM/SIGINT →
+            # controlled, logged shutdown; see lyrion.web.lifecycle). The ASGI
+            # server must never end this process on its own: it used to stop
+            # after uvicorn captured the signal without setting our flag, and
+            # the process stayed behind with a dead ASGI app and bound ports —
+            # every web request answered 502 until SIGKILL (live 2026-09-22
+            # 16:14:14, and 15:53:12 / 14:12:32 the same day).
+            _uvicorn_server = await run_web_server_until_shutdown(
+                _make_asgi_server,
+                request_shutdown=_bootstrap_mod.request_shutdown,
+                is_running=lambda: _running,
+                is_shutdown_requested=lambda: _bootstrap_mod._shutdown_requested,
+                log=log,
+                on_server_ready=_start_native_frontend,
+            )
             log.info("Web wait loop exited (running=%s shutdown=%s should_exit=%s)",
                      _running, _bootstrap_mod._shutdown_requested,
-                     _uvicorn_server.should_exit)
-
-            # Graceful uvicorn shutdown with a hard timeout
-            _uvicorn_server.should_exit = True
-            try:
-                await asyncio.wait_for(uvicorn_task, timeout=10)
-            except (asyncio.TimeoutError, asyncio.CancelledError):
-                uvicorn_task.cancel()
-                try:
-                    # An active /stream request (player is streaming) can make
-                    # uvicorn's shutdown hang — bound the await, then os._exit
-                    # in main() guarantees the process terminates anyway.
-                    await asyncio.wait_for(uvicorn_task, timeout=5)
-                except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
-                    pass
+                     None if _uvicorn_server is None
+                     else _uvicorn_server.should_exit)
         except ImportError:
             log.warning("uvicorn not installed — web interface disabled")
             noweb = True
