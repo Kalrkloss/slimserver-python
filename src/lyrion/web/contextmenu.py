@@ -470,6 +470,38 @@ def _playlist_item(player: Any, token: str) -> tuple[bool, Any]:
     return False, None
 
 
+def _playlist_entry_title(player: Any, url: str) -> str:
+    """Perl ``$track->title`` of the playlist entry (``Menu/TrackInfo.pm:1391-1406``).
+
+    A ``playlist_index`` context is resolved through
+    ``Slim::Player::Playlist::track($client, $playlist_index)`` — the *playlist
+    entry*.  For a stream its title is the NAME registered for the URL
+    (``Slim/Control/XMLBrowser.pm:693-700`` → ``Slim/Music/Info.pm:395-478``),
+    **not** the ICY song title: that one is only the Now-Playing display
+    (``$remoteMeta->{title} || $track->title``, ``Queries.pm:5972``).
+
+    That title is what the client echoes back — the row's ``params`` carry it
+    (``XMLBrowser.pm:1928-1929`` ``favorites_title || title || name``) and the
+    client turns it into ``jivefavorites add title:<t>`` → ``favorites add
+    title:<t>`` (``Plugin/Favorites/Plugin.pm:851-856`` stores it verbatim) —
+    so the ICY title used to become the FAVOURITE's name.  With nothing
+    registered Perl answers the URL (``Slim/Music/Info.pm:669-673``
+    ``plainTitle``, what a bare ``playlist play <url>`` entry carries).
+
+    Returns ``""`` for a non-remote URL: a library file already resolved
+    through the DB above, and Perl's local-track branch needs no registration.
+    """
+    if not url:
+        return ""
+    try:
+        from lyrion.web.api import _is_remote_url, _stream_registered_name
+    except Exception:  # noqa: BLE001 — ohne api bleibt der bisherige Titel
+        return ""
+    if not _is_remote_url(str(url)):
+        return ""
+    return _stream_registered_name(player, str(url)) or str(url)
+
+
 async def handle_contextmenu(api: Any, pm: Any, pid: str | None,
                              args: list[Any]) -> dict:
     """Entry point for ``JSONRPCAPI._slim_request`` (``cmd == contextmenu``).
@@ -539,8 +571,14 @@ async def _track_menu(api: Any, pm: Any, pid: str | None, index: int,
         title = track.get("title") or params.get("title") or ""
         track_id = track.get("id", track_id)
     else:
-        title = str(params.get("title") or "") or (
-            getattr(player, "current_title", "") or "" if playlist_hit else "")
+        # Perl's title of the playlist ENTRY (see :func:`_playlist_entry_title`)
+        # — for a stream the registered station name.  ``current_title`` (the
+        # running ICY song) is only the last resort for an entry with no
+        # library row and no registration.
+        title = _playlist_entry_title(player, url) if playlist_hit else ""
+        if not title:
+            title = str(params.get("title") or "") or (
+                getattr(player, "current_title", "") or "" if playlist_hit else "")
 
     # Perl's cliQuery adds `url` to the feed params for playlist/URL contexts
     # (never for a plain track_id lookup) and XMLBrowser copies the request's

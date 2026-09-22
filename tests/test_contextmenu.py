@@ -166,9 +166,13 @@ def _lib_db(tmp_path, monkeypatch):
 
 
 class _FakePlayer:
-    def __init__(self, playlist, current_title=""):
+    def __init__(self, playlist, current_title="", stream_titles=None):
         self.playlist = list(playlist)
         self.current_title = current_title
+        #: URL → the NAME registered for that stream (``_set_stream_title``);
+        #: Perl's ``setRemoteMetadata($url, {title => …})``
+        #: (``Slim/Control/XMLBrowser.pm:693-700``).
+        self.stream_titles = dict(stream_titles or {})
 
 
 class _FakePM:
@@ -182,9 +186,10 @@ class _FakePM:
         return [self._player]
 
 
-def _run(args: list, *, playlist=(), current_title="", api=None) -> dict:
+def _run(args: list, *, playlist=(), current_title="", stream_titles=None,
+         api=None) -> dict:
     api = api or JSONRPCAPI()
-    pm = _FakePM(_FakePlayer(playlist, current_title))
+    pm = _FakePM(_FakePlayer(playlist, current_title, stream_titles))
     return asyncio.run(
         contextmenu.handle_contextmenu(api, pm, PLAYER, args))
 
@@ -476,12 +481,18 @@ def test_playlist_index_menu_playcontrol_carries_url_and_index(_lib_db):
 
 def test_remote_stream_menu_core_and_base(_lib_db):
     """A playlist row with no library match (a radio URL): the core entries
-    and the (preset-less) base actions match Perl's remote menu."""
+    and the (preset-less) base actions match Perl's remote menu.
+
+    Perl's fixture row carries the *registered station name*
+    (``title: "Hirschmilch Chillout"`` for the chillout URL) — the playlist
+    entry's title, see :func:`test_remote_stream_row_title_is_the_registered_name`.
+    """
     perl = _perl_result("perl_contextmenu_track_playlist_index0",
                         PROBES["perl_contextmenu_track_playlist_index0"])
+    url = "http://hirschmilch.de:7000/chillout.mp3"
     res = _run(_track_args(["playlist_index:0", "menu:track"]),
-               playlist=["http://hirschmilch.de:7000/chillout.mp3"],
-               current_title="Hirschmilch Chillout")
+               playlist=[url], current_title="Hirschmilch Chillout",
+               stream_titles={url: "Hirschmilch Chillout"})
 
     assert set(res) == set(perl)
     assert res["window"] == perl["window"]
@@ -496,6 +507,58 @@ def test_remote_stream_menu_core_and_base(_lib_db):
     # the remote item id is a string, as in Perl
     assert isinstance(res["item_loop"][0]["actions"]["go"]["params"]
                       ["track_id"], str)
+
+
+def test_remote_stream_row_title_is_the_registered_name(_lib_db):
+    """``Menu/TrackInfo.pm:1391-1406`` + ``XMLBrowser.pm:1928-1929``.
+
+    The ``playlist_index`` context resolves through the PLAYLIST ENTRY
+    (``Slim::Player::Playlist::track``) — a stream's title there is the NAME
+    registered for its URL (``XMLBrowser.pm:693-700`` → ``Music/Info.pm:395-478``),
+    **not** the running ICY song title: that one is only the Now-Playing
+    display (``$remoteMeta->{title} || $track->title``, ``Queries.pm:5972``).
+
+    The client echoes this row's ``title`` back as ``jivefavorites add
+    title:<t>`` → ``favorites add title:<t>``, and ``Plugin.pm:851-856``
+    stores it verbatim — with the ICY title in the row the FAVOURITE was named
+    after the song that happened to be playing (live 2026-09-22: a new
+    favourite called ``"Madonna - Like a Virgin"`` for the 80s80s stream).
+    """
+    url = "http://regiocast.streamabc.net/regc-80s80smweb.mp3"
+    res = _run(_track_args(["playlist_index:0", "menu:track"]),
+               playlist=[url],
+               current_title="Madonna - Like a Virgin",
+               stream_titles={url: "80s80s Digital Web"})
+    row = [it for it in res["item_loop"]
+           if "jivefavorites" in json.dumps(it)][0]
+    assert row["actions"]["go"]["params"]["title"] == "80s80s Digital Web"
+    assert res["title"] == "80s80s Digital Web"
+    # die Anzeige bleibt der ICY-Titel: der Status baut den Titel weiter aus
+    # ``_stream_live_title``/``remote_title`` (api.py, hier unberuehrt)
+    assert "Madonna" not in json.dumps(res)
+
+
+def test_remote_stream_without_a_registration_answers_the_url(_lib_db):
+    """Perl's last fallback: an entry with nothing registered answers its own
+    URL (``Slim/Music/Info.pm:669-673`` ``plainTitle``) — never the ICY title."""
+    url = "http://example.org/live.mp3"
+    res = _run(_track_args(["playlist_index:0", "menu:track"]),
+               playlist=[url], current_title="Some Song - Some Artist")
+    row = [it for it in res["item_loop"]
+           if "jivefavorites" in json.dumps(it)][0]
+    assert row["actions"]["go"]["params"]["title"] == url
+    assert "Some Song" not in json.dumps(res)
+
+
+def test_library_playlist_row_keeps_its_library_title(_lib_db):
+    """A library row keeps the DB title — the registration path is only for
+    remote URLs (Perl's RemoteTrack branch, ``Menu/TrackInfo.pm:1394-1404``)."""
+    res = _run(_track_args(["playlist_index:0", "menu:track"]),
+               playlist=[10], current_title="Some Song - Some Artist")
+    row = [it for it in res["item_loop"]
+           if "jivefavorites" in json.dumps(it)][0]
+    assert row["actions"]["go"]["params"]["title"] == "Track One"
+    assert res["title"] == "Track One"
 
 
 def test_usecontextmenu_and_tagged_index_do_not_change_the_menu(_lib_db):
