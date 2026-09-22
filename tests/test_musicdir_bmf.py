@@ -171,17 +171,62 @@ def _setup(tmp_path, monkeypatch, rows, pref: str, with_title: bool = True,
     return db
 
 
-def _browse(args: list[str]) -> dict:
-    """Run ``_json_browselibrary`` in-process (SqueezePlay wire form)."""
+#: Der Player der Live-Fixtures (``perl_bmf_folder_files_menu.json``): ein
+#: bekannter, GESTOPPTER Client.  ``_defeatDestructiveTouchToPlay`` liest den
+#: Zustand des *anfragenden* Players (``XMLBrowser.pm:1951-1983``), deshalb
+#: braucht jeder Test, der eine touch-to-play-Zeile erwartet, genau diesen
+#: Zustand — sonst antwortet der Port (wie Perl ohne Client) mit der
+#: ``playControl``-Zeile.
+IDLE_MAC = "24:0a:c4:29:77:90"
+IDLE_MAC_CLEAN = "240AC4297790"
+
+
+@pytest.fixture(autouse=True)
+def _idle_client():
+    """Bekannter, gestoppter Client für alle Tests dieses Moduls.
+
+    Ohne installierten Player wäre jeder Request ein ``!$client``-Request
+    (Perl ``XMLBrowser.pm:1976``) und damit defeated — die Zeilen wären
+    ``playControl`` statt touch-to-play.  Tests, die diesen Zweig prüfen,
+    übergeben ``pid=None`` (siehe :func:`_browse`).
+    """
+    from lyrion.player.manager import PlayerManager
+    from lyrion.player.state import PlayerState
+
+    prev = getattr(PlayerManager, "_instance", None)
+    player = PlayerState(mac=IDLE_MAC, name="Schlafzimmer",
+                         ip="192.168.1.154", port=61499)
+    player.mode = "stop"
+    player.playlist = []
+    player.playlist_total = 0
+    pm = object.__new__(PlayerManager)
+    pm._initialized = True
+    pm.players = {IDLE_MAC_CLEAN: player}
+    pm._protocol_handler = None
+    PlayerManager._instance = pm
+    yield player
+    PlayerManager._instance = prev
+
+
+def _browse(args: list[str], pid: str | None = IDLE_MAC) -> dict:
+    """Run ``_json_browselibrary`` in-process (SqueezePlay wire form).
+
+    ``pid`` ist der Player-Token des Requests: die Live-Fixtures
+    (``perl_bmf_*``) wurden mit einem *bekannten, gestoppten* Client
+    aufgenommen — Perl ``XMLBrowser.pm:1977`` ist dann falsch, die Zeilen
+    sind touch-to-play.  Ohne Token antwortet Perl immer mit der
+    ``playControl``-Zeile (``:1976`` ``|| !$client``) — dafür ``pid=None``
+    übergeben.
+    """
     async def run():
         api = JSONRPCAPI()
-        return await api._json_browselibrary("browselibrary", args)
+        return await api._json_browselibrary("browselibrary", args, pid)
 
     return asyncio.run(run())
 
 
-def _items(args: list[str]) -> list[dict]:
-    return _browse(args).get("item_loop") or []
+def _items(args: list[str], pid: str | None = IDLE_MAC) -> list[dict]:
+    return _browse(args, pid).get("item_loop") or []
 
 
 def _texts(args: list[str]) -> set[str]:
@@ -632,9 +677,9 @@ ONLY_FILES_ROWS = [
 ]
 
 
-def _only_files_browse():
+def _only_files_browse(pid: str | None = IDLE_MAC):
     return _browse(["items", "0", "50", "menu:1", "mode:bmf",
-                    f"folder_id:{ROOT}/{ONLY_FILES_DIR}"])
+                    f"folder_id:{ROOT}/{ONLY_FILES_DIR}"], pid)
 
 
 def test_bmf_audio_file_item_is_perl_shaped(tmp_path, monkeypatch):
@@ -997,27 +1042,65 @@ def test_bmf_folder_item_matches_the_live_perl_row(tmp_path, monkeypatch):
     assert {"folder_id", "url"} <= set(ours["params"])
 
 
-def test_bmf_file_row_is_always_the_touch_to_play_form(tmp_path, monkeypatch):
-    """Dokumentierte Abweichung: Perl schaltet je nach Player-Zustand um.
+def test_bmf_file_row_follows_the_playing_state(tmp_path, monkeypatch):
+    """Die Dateizeile schaltet wie Perl zwischen Popup und Direktstart.
 
-    ``_defeatDestructiveTouchToPlay`` (XMLBrowser.pm:1951-1983) gibt für den
-    Vorgabe-Pref 4 ``isPlaying``-abhängig 1 zurück — und ohne Client SOGAR
-    immer (``:1976`` ``return 1 if $pref == 1 || !$client``); dann trägt die
-    Zeile ``goAction: 'playControl'`` + ``playControlParams``
-    (:1268-1272) und der Tap öffnet Perls Play-Control-Kontextmenü.  Dieses
-    Port liefert immer die touch-to-play-Form (der Fall der Live-App:
-    gestoppt), d.h. ein Tap spielt direkt — ohne den CM-Zwischenschritt.
+    Die Bedingung ist Perls ``_defeatDestructiveTouchToPlay``
+    (XMLBrowser.pm:1951-1983), gelesen im touch-to-play-Zweig (:1259-1272):
+    für den Vorgabe-Pref 4 fragt sie ``isPlaying() && playingSong()->duration()
+    && !playingSong()->isPlaylist()`` (:1977) — bei laufendem lokalem Titel
+    ergo ``goAction: 'playControl'`` + ``playControlParams``, ohne Client
+    ``:1976`` ``|| !$client`` ⇒ ebenfalls playControl (:1268-1272); ein
+    gestoppter/streamender Client bekommt die touch-to-play-Form (:1259-1267).
     """
+    # 1. Perl-Fixaturen links: ohne Client (defeated) vs. gestoppter Client
     playing = _fixture_item(PERL_FILE_PLAYING_FIXTURE)
     assert playing["goAction"] == "playControl"
     assert playing["playControlParams"] == {"xmlbrowserPlayControl": "0"}
     assert "touchToPlay" not in playing["params"]
+    idle = _fixture_item(PERL_FILE_FIXTURE)
+    assert idle["goAction"] == "play"
+    assert idle["params"]["touchToPlay"] == idle["params"]["item_id"]
 
     _setup(tmp_path, monkeypatch, ONLY_FILES_ROWS, ROOT)
+
+    # 2. unser Port ohne Client: Perls defeated Zeile (kein ``style``, kein
+    #    ``touchToPlay``, ``playControlParams``) + base.go = playControl
+    defeated = _only_files_browse(pid=None)
+    ours = defeated["item_loop"][0]
+    assert ours["goAction"] == "playControl"
+    assert ours["playControlParams"] == {"xmlbrowserPlayControl": "0"}
+    assert "style" not in ours
+    assert "touchToPlay" not in ours["params"]
+    assert defeated["base"]["actions"]["go"] == \
+        defeated["base"]["actions"]["playControl"]
+
+    # 3. unser Port mit bekanntem, gestopptem Client: die touch-to-play-Zeile
     ours = _only_files_browse()["item_loop"][0]
     assert ours["goAction"] == "play"
     assert "playControlParams" not in ours
     assert ours["params"]["touchToPlay"] == "0"
+
+    # 4. und mit laufendem lokalem Titel: wieder Perls Popup-Zeile.  Das
+    #    Test-Schema legt seine ``tracks``-Zeilen mit ``duration = 0`` an
+    #    (Perls ``playingSong()->duration()`` liest dort die Bibliothekszeile,
+    #    Song.pm:809-815), deshalb steht hier der geladene Titeldatensatz des
+    #    Players ein — die Dauer/URL, die ``_playing_item`` ohne Playlist-
+    #    Eintrag liest.
+    from lyrion.player.manager import PlayerManager
+
+    pm = PlayerManager._instance
+    player = pm.players[IDLE_MAC_CLEAN]
+    player.mode = "play"
+    player.playlist = []
+    player.playlist_total = 0
+    player.duration = 240.0
+    player.current_url = f"file://{ROOT}/{ONLY_FILES_DIR}/01-hard_attack.mp3"
+    player.remote = 0
+    playing_ours = _only_files_browse()      # dieselbe DB (ONLY_FILES_ROWS)
+    assert playing_ours["item_loop"][0]["goAction"] == "playControl"
+    assert playing_ours["item_loop"][0]["playControlParams"] == {
+        "xmlbrowserPlayControl": "0"}
 
 
 
