@@ -146,6 +146,21 @@ class PlayerState:
     stream_baseline_title: str = ""
     shuffle: int = 0              # playlist shuffle mode (0/1/2)
     repeat: int = 0               # playlist repeat mode (0/1/2)
+    # Perl's per-player ``shufflelist`` (``Slim/Player/Client.pm:246``
+    # ``shufflelist => []``, accessor ``Playlist.pm:172-178``): a permutation
+    # of the playlist indices — QUEUE POSITION i plays
+    # ``playlist[shufflelist[i]]`` (``Playlist::track``, :78-84). With shuffle
+    # off it is the identity ``(0 .. $#playlist)``, which every ``reshuffle``
+    # rebuilds (``Playlist.pm:826``), so ``playlist`` itself keeps the order
+    # the tracks were added in and ``playlist shuffle 0`` returns to it.
+    shufflelist: list[int] = field(default_factory=list)
+    #: The ``shuffle`` mode the current ``shufflelist`` was built for (Perl has
+    #: no such field: its command handlers call ``reshuffle`` right after every
+    #: shuffle/repeat/playlist change — ``Commands.pm:1195``, ``:1766``). The
+    #: port rebuilds the list lazily when the mode differs (see
+    #: ``player.manager.shufflelist``), so a mode change made by a path that
+    #: cannot call ``reshuffle`` still yields Perl's list.
+    shufflelist_mode: int = -1
     playlist_position: int = 0
     playlist_total: int = 0
     # SqueezePlay/controller parity fields (Perl status emits these):

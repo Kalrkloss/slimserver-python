@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
 import time
 from datetime import datetime
 from typing import Optional
@@ -169,6 +170,388 @@ def _formats_for_model(model: str) -> set[str]:
     return _perl_model_formats(model) or set(_COMMON_FORMATS)
 
 
+# ── Perl's shuffle list (``shufflelist``) ─────────────────────────────────
+# ``Slim/Player/Playlist.pm:788-1000`` (``reshuffle``) is THE function that
+# builds and maintains the per-player ``shufflelist``; ``:172-178`` is only
+# its accessor (``$client->master()->shufflelist``, the field itself is
+# ``Client.pm:246``).  Perl calls ``reshuffle`` after EVERY change that can
+# move tracks around:
+#
+#   * ``playlist shuffle <n>``  → ``Commands.pm:1195``
+#   * ``playlist load``/``add``/``play`` → ``Commands.pm:1766`` (:1799 again
+#     after the jump, to get the playing song/album to the top)
+#   * ``playlist insert``       → ``Playlist::_insert_done``, ``:268-296``
+#     (splices the new positions right after the playing one, :277-281)
+#   * ``playlist delete``       → ``Playlist::removeTrack``, ``:380-400``
+#   * ``playlist move``         → ``Playlist::moveSong``, ``:580-637``
+#     (moves INSIDE the shufflelist while shuffle is on, ``:597-601``)
+#   * end of the playlist with shuffle + repeat-all +
+#     ``reshuffleOnRepeat``   → ``StreamingController.pm:883-893`` /
+#     ``Commands.pm:990-1002`` (``reshuffle($client, 1)``)
+#   * ``explodeSong`` (cue/playlist files), ``Source.pm:262-275``
+#
+# ``reshuffle`` is idempotent in the sense that it always starts from
+# ``(0 .. $#playlist)`` and only the shuffle branches (:831-958) reorder it,
+# so with ``shuffle == 0`` the list is the identity again — the raw playlist
+# order the user built.  Our port therefore keeps ``player.playlist`` exactly
+# as Perl keeps ``playlist`` (add order) and plays ``playlist[shufflelist[i]]``
+# for queue position ``i``.
+
+#: Perl ``preferences('server')->get('useBalancedShuffle')`` — the default is
+#: ``$os->canDBHighMem() ? 1 : 0`` (``Slim/Utils/Prefs.pm:224``), i.e. 1 on a
+#: server with enough RAM.  Live Perl 9.1.1 (read-only, 2026-09-22):
+#: ``pref useBalancedShuffle ?`` → ``pref useBalancedShuffle 1``.
+USE_BALANCED_SHUFFLE_DEFAULT = 1
+
+#: Perl ``reshuffleOnRepeat`` — ``Slim/Utils/Prefs.pm:184`` default 0 (live
+#: 2026-09-22: ``pref reshuffleOnRepeat ?`` → ``pref reshuffleOnRepeat 0``).
+RESHUFFLE_ON_REPEAT_DEFAULT = 0
+
+
+def _server_pref(name: str, default):
+    """``preferences('server')->get($name)`` (``Slim/Utils/Prefs.pm:346-361``)."""
+    try:
+        from lyrion.config import get_prefs
+
+        return get_prefs().get(name, default)
+    except Exception as exc:  # noqa: BLE001 — a pref lookup must never break playback
+        logger.debug("pref %s unavailable: %s", name, exc)
+        return default
+
+
+def _use_balanced_shuffle() -> bool:
+    """Perl ``$prefs->get('useBalancedShuffle')`` (``Playlist.pm:833``)."""
+    return bool(_server_pref("useBalancedShuffle", USE_BALANCED_SHUFFLE_DEFAULT))
+
+
+def _reshuffle_on_repeat() -> bool:
+    """Perl ``$prefs->get('reshuffleOnRepeat')`` (``StreamingController.pm:887``)."""
+    return bool(_server_pref("reshuffleOnRepeat", RESHUFFLE_ON_REPEAT_DEFAULT))
+
+
+def fischer_yates_shuffle(items: list, rng=None) -> None:
+    """Perl ``Playlist::fischer_yates_shuffle`` — ``Playlist.pm:728-740``.
+
+    ``for (my $i = ($#$listRef + 1); --$i;) { my $a = int(rand($i + 1));
+    @$listRef[$i,$a] = @$listRef[$a,$i]; }`` — the pre-decrement in the loop
+    condition makes the body run for ``i = n-1 … 1`` (a one-element list
+    returns immediately, :731-733), and the partner is uniform in ``0 … i``.
+    """
+    rng = rng or random
+    n = len(items)
+    if n <= 1:
+        return                                          # :731-733
+    for i in range(n - 1, 0, -1):                        # :735
+        a = rng.randrange(i + 1)                         # :737 int(rand($i+1))
+        items[i], items[a] = items[a], items[i]          # :738
+
+
+def balanced_shuffle(pairs: list[tuple[int, str]], alpha: bool = True,
+                     rng=None) -> list[int]:
+    """Perl ``Playlist::balancedShuffle`` — ``Playlist.pm:748-786``.
+
+    ``pairs`` are ``(key, group)`` tuples — Perl's ``[$_, $artist]``
+    (``:836-848``): the item key (the playlist index) and the group it belongs
+    to (the artist name; ``''`` when unknown).  The groups are spread evenly
+    over the whole list (Spotify-style, see the comment at ``:744-747``):
+    every group is shuffled internally, gets a random offset inside one
+    ``spacer`` slot and a jitter of ±``itemsCount/10``.
+
+    ``alpha`` is Perl's ``$sortAlphabetically`` (``:766-768``): the weights are
+    then compared as STRINGS (``cmp``), exactly as Perl compares the
+    stringified floats (``%.15g``), instead of numerically.  Perl's ``sort``
+    breaks ties by hash order (``keys %weighed``), the port's ``sorted`` by
+    insertion order — the only deviation, and it is irrelevant for a random
+    draw.
+    """
+    rng = rng or random
+    grouped: dict[str, list[int]] = {}
+    for key, group in pairs:                             # :750-754
+        grouped.setdefault(str(group), []).append(key)
+    count = len(pairs)                                   # :756
+    weighed: dict[int, float] = {}
+    for group_items in grouped.values():                 # :759 each %grouped
+        items_count = len(group_items)                   # :760
+        fischer_yates_shuffle(group_items, rng)          # :763
+        # :766 - rand(1/$itemsCount)*$count, i.e. a random offset within the
+        # first slot of this group's spacing.
+        offset = rng.random() * (1.0 / items_count) * count
+        spacer = count / items_count                     # :767
+        for i, key in enumerate(group_items):            # :770-774
+            jitter = -(items_count / 10) + rng.random() * (items_count / 10 * 2)
+            weighed[key] = offset + i * spacer + jitter  # :772
+    if alpha:                                            # :777-779
+        return sorted(weighed, key=lambda k: f"{weighed[k]:.15g}")
+    return sorted(weighed, key=lambda k: weighed[k])
+
+
+def _entry_artists(entries: list) -> dict[int, str]:
+    """``$track->artistName`` for the local entries of a playlist.
+
+    ``Slim/Schema/Track.pm:152-161``: ``SELECT name FROM contributors WHERE id
+    = ?`` for the track's artist (role 1, ``tracks_contributors``).  Perl's
+    playlist holds Track OBJECTS for local tracks, so ``reshuffle`` gets the
+    name for free; our playlist holds the ids, hence one read-only query.
+    """
+    ids = [int(e) for e in entries if isinstance(e, int)]
+    if not ids:
+        return {}
+    out: dict[int, str] = {}
+    try:
+        import sqlite3
+
+        con = sqlite3.connect(f"file:{_library_db_path()}?mode=ro",
+                              uri=True, timeout=30)
+        try:
+            placeholders = ",".join("?" * len(ids))
+            for track_id, name in con.execute(
+                f"SELECT tc.track, c.name FROM tracks_contributors tc "
+                f"JOIN contributors c ON c.id = tc.contributor "
+                f"WHERE tc.track IN ({placeholders}) AND tc.role = 1", ids):
+                out.setdefault(int(track_id), str(name or ""))
+        finally:
+            con.close()
+    except Exception as exc:  # noqa: BLE001 — shuffle must not fail on a DB hiccup
+        logger.debug("artist lookup for balanced shuffle failed: %s", exc)
+    return out
+
+
+def _entry_album_ids(entries: list) -> dict[int, int]:
+    """``$track->albumid`` (``Slim/Schema/Track.pm:134-138``) per track id."""
+    ids = [int(e) for e in entries if isinstance(e, int)]
+    if not ids:
+        return {}
+    out: dict[int, int] = {}
+    try:
+        import sqlite3
+
+        con = sqlite3.connect(f"file:{_library_db_path()}?mode=ro",
+                              uri=True, timeout=30)
+        try:
+            placeholders = ",".join("?" * len(ids))
+            for track_id, album_id in con.execute(
+                f"SELECT track, album FROM tracks_albums "
+                f"WHERE track IN ({placeholders})", ids):
+                out.setdefault(int(track_id), int(album_id or 0))
+        finally:
+            con.close()
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("album lookup for album shuffle failed: %s", exc)
+    return out
+
+
+def _album_shuffle(player: PlayerState, preserve: int | None) -> list[int]:
+    """The ``shuffle == 2`` branch of ``reshuffle`` — ``Playlist.pm:880-958``.
+
+    Albums are shuffled (not tracks), the album of the currently playing track
+    goes to the front (``:945-955``) and the tracks inside an album keep their
+    order (``:956-961``).  Perl SKIPS remote URLs in this branch (``:889``) and
+    never adds them to the new list — they leave the queue (their ``%weighed``
+    slot is simply never pushed); the same happens for an entry without an
+    album id (``:903-906`` logs a backtrace and skips).  The port reproduces
+    that: only local entries with a DB row end up in the list.
+
+    ``preserve`` is Perl's ``$realsong`` — the playlist index of the playing
+    track, or ``None`` for "not known / do not preserve".
+    """
+    playlist = list(getattr(player, "playlist", None) or [])
+    album_of = _entry_album_ids(playlist)
+    album_tracks: dict[int, list[int]] = {}              # album id -> positions
+    track_to_position: dict[int, int] = {}               # raw index -> position
+    i = 0
+    for raw, entry in enumerate(playlist):
+        if not isinstance(entry, int):                   # :889 remote URL
+            continue
+        album_id = album_of.get(int(entry), 0) or 0      # :898 (|| 0)
+        album_tracks.setdefault(album_id, []).append(raw)
+        track_to_position[raw] = i                       # :900 (only counted here)
+        i += 1
+    if preserve is None:                                 # :908-917
+        index = (getattr(player, "playerprefs", None) or {}).get("currentSong")
+        try:
+            index = int(index) if index is not None else None
+        except (TypeError, ValueError):
+            index = None
+        old = list(getattr(player, "shufflelist", None) or [])
+        if index is not None and 0 <= index < len(old):
+            preserve = old[index]
+    current_album = 0
+    if preserve is not None and 0 <= preserve < len(playlist):
+        entry = playlist[preserve]
+        if isinstance(entry, int):
+            current_album = album_of.get(int(entry), 0) or 0   # :919-931
+    albums = list(album_tracks)                          # :934
+    fischer_yates_shuffle(albums)                        # :936
+    for idx, album in enumerate(albums):                 # :939-949
+        if preserve is not None and album == current_album:
+            albums.insert(0, albums.pop(idx))
+            break
+    new: list[int] = []                                  # :952-961
+    for album in albums:
+        for raw in album_tracks[album]:
+            new.append(track_to_position[raw])
+    return new
+
+
+def reshuffle(player: PlayerState, dont_preserve_current: bool = False) -> list[int]:
+    """Perl ``Playlist::reshuffle`` — ``Slim/Player/Playlist.pm:788-1000``.
+
+    Rebuilds ``player.shufflelist`` from scratch: ``(0 .. $#playlist)``
+    (``:826``), then the mode branch — Fisher-Yates for ``shuffle == 1``
+    (``:855``) or the balanced shuffle when ``useBalancedShuffle`` is set
+    (``:833-854``), album grouping for ``shuffle == 2`` (``:880-958``) — and
+    finally the currently playing track (or album) is moved to the front
+    (``:857-877`` / ``:939-949``) unless ``dont_preserve_current`` is set
+    (``$dontpreservecurrsong``, ``:792``).
+
+    Perl then renumbers the song QUEUE entries to their new positions
+    (``:963-980``): the entry that was at queue position *j* keeps playing the
+    same track and its index becomes the position that track now has.  The
+    port keeps one such entry — the playing song, ``playlist_position`` — so
+    that is what gets remapped (Perl's ``streaming``/``next`` entries are
+    transient here).  Returns the new list.
+    """
+    playlist = list(getattr(player, "playlist", None) or [])
+    count = len(playlist)
+    mode = int(getattr(player, "shuffle", 0) or 0)
+    old = list(getattr(player, "shufflelist", None) or [])
+    # :806 ``my $realsong = ${$listRef}[playingSongIndex($client)]`` — the
+    # PLAYLIST index of the track that is playing now. Perl's list is always a
+    # valid permutation (every mutation path reshuffles); where the port has
+    # none yet (first use, or a playlist that was filled by a path that cannot
+    # maintain it), the identity is what Perl's list would have been — the
+    # position IS the playlist index then.
+    pos = int(getattr(player, "playlist_position", 0) or 0)
+    if 0 <= pos < len(old):
+        playing = old[pos]
+    elif 0 <= pos < count:
+        playing = pos
+    else:
+        playing = None
+    if playing is None or playing > count:               # :808-812
+        playing = None
+
+    if not count:                                        # :795-802
+        player.shufflelist = []
+        player.shufflelist_mode = mode
+        return []
+
+    preserve = None if dont_preserve_current else playing
+    new = list(range(count))                             # :826
+    if mode == 1:                                        # :831 shuffle by song
+        if _use_balanced_shuffle():                      # :833
+            artists = _entry_artists(playlist)
+            pairs = [(raw, artists.get(entry, "") if isinstance(entry, int) else "")
+                     for raw, entry in enumerate(playlist)]
+            new = balanced_shuffle(pairs, True)
+        else:
+            fischer_yates_shuffle(new)                   # :855
+        if preserve is not None and preserve in new:     # :857-877
+            idx = new.index(preserve)
+            new[0], new[idx] = new[idx], new[0]
+    elif mode == 2:                                      # :880 shuffle by album
+        new = _album_shuffle(player, preserve)
+
+    player.shufflelist = new
+    player.shufflelist_mode = mode
+
+    # :963-980 — renumber the queue entries; and :982-986, an entry whose index
+    # ran past the end of the list restarts at 0.
+    if playing is not None and playing in new:
+        player.playlist_position = new.index(playing)
+    elif int(getattr(player, "playlist_position", 0) or 0) >= count:
+        player.playlist_position = 0
+    return new
+
+
+def shufflelist(player: PlayerState) -> list[int]:
+    """Perl ``$client->shufflelist`` — ``Playlist.pm:172-178`` (+ maintenance).
+
+    The list is Perl's own field (``Client.pm:246``); Perl rebuilds it with
+    ``reshuffle`` whenever the playlist, the shuffle mode or the repeat mode
+    changes (see the table above).  Our port cannot see every such change:
+    ``player.playlist``/``player.shuffle`` are written in ``web/api.py`` and
+    ``control/cli_commands.py`` too, and those files belong to other agents.
+    The list is therefore rebuilt HERE, lazily, whenever it does not match the
+    current playlist and shuffle mode — same function, same rules, just at the
+    moment it is needed instead of at the moment of the change.  The invariant
+    checked is exactly Perl's: a permutation of ``0 .. count-1`` built for the
+    current ``shuffle`` mode.
+    """
+    count = len(getattr(player, "playlist", None) or [])
+    mode = int(getattr(player, "shuffle", 0) or 0)
+    current = list(getattr(player, "shufflelist", None) or [])
+    built_for = int(getattr(player, "shufflelist_mode", -1))
+    if built_for != mode or len(current) != count or sorted(current) != list(range(count)):
+        reshuffle(player)
+        current = list(getattr(player, "shufflelist", None) or [])
+    return current
+
+
+def queue_playlist_index(player: PlayerState, position) -> int | None:
+    """The PLAYLIST index a queue position plays — ``Playlist.pm:78-84``.
+
+    ``$useShuffled && defined ${shuffleList($client)}[$index] ? ${playList(
+    $client)}[${shuffleList($client)}[$index]] : ${playList($client)}[$index]``
+    (``Playlist::track``, :62-100): the mapping from the index a client/CLI
+    command talks about (the queue position) to the entry in ``playlist``.
+    ``None`` when the position is outside the queue.
+    """
+    try:
+        pos = int(position)
+    except (TypeError, ValueError):
+        return None
+    items = list(getattr(player, "playlist", None) or [])
+    if not items:
+        return None
+    if pos < 0 or pos >= len(items):
+        return None
+    lst = shufflelist(player)
+    return lst[pos] if pos < len(lst) else pos
+
+
+def playlist_item(player: PlayerState, position) -> object | None:
+    """The item at a queue position — Perl ``Playlist::track($client, $index)``."""
+    raw = queue_playlist_index(player, position)
+    if raw is None:
+        return None
+    items = list(getattr(player, "playlist", None) or [])
+    return items[raw] if 0 <= raw < len(items) else None
+
+
+def playlist_queue_position(player: PlayerState, item) -> int | None:
+    """The queue position of a playlist entry — ``Commands.pm:1784-1790``.
+
+    Bug 14662: playing a specific track while track shuffle is on must play
+    THAT track, so Perl converts the track's playlist index to its position in
+    the shufflelist (``for (my $i = 0; $i < scalar @$shuffleList; $i++) { if
+    ($shuffleList->[$i] == $jumpToIndex) { $jumpToIndex = $i; last; } }``).
+    """
+    items = list(getattr(player, "playlist", None) or [])
+    try:
+        raw = items.index(item)
+    except ValueError:
+        return None
+    lst = shufflelist(player)
+    return lst.index(raw) if raw in lst else None
+
+
+def queue_order(player: PlayerState) -> list:
+    """The playlist in QUEUE order — Perl ``Playlist::songs($client, 0, n)``.
+
+    ``Playlist.pm:104-118``: ``(@{ playList($client) }[ @{shuffleList($client)
+    } ])[$start .. $end]`` — the order every playlist view, ``playlisttracks``
+    and ``status ... playlist_loop`` are built in, and the order the queue
+    positions in those answers refer to.  With shuffle off this is exactly
+    ``player.playlist`` (the identity list).
+    """
+    items = list(getattr(player, "playlist", None) or [])
+    lst = shufflelist(player)
+    if len(lst) != len(items):
+        return items
+    return [items[raw] for raw in lst]
+
+
 def jump_target(player: PlayerState, index) -> int | None:
     """``playlistJumpCommand`` target index — ``Slim/Control/Commands.pm:937-1014``.
 
@@ -231,16 +614,21 @@ def nextsong(player: PlayerState, currsong: int | None = None) -> int | None:
     ``None`` is therefore NOT "nothing to do" for a caller that wants the
     track to repeat — it is Perl's explicit end-of-playlist answer.
 
-    The shuffle ORDER is Perl's per-player ``shufflelist``
-    (``Playlist.pm:172-178``; ``reshuffle`` :788-…) — not ported, so a
-    shuffled playlist advances in playlist order here (same limitation as
-    :func:`jump_target`). ``consecutiveErrors`` (:862-879) belongs to the
-    song-queue error path and is not part of this port.
+    The index is a QUEUE position: what it plays is
+    ``playlist[shufflelist[index]]`` (``Playlist::track``, :78-84), so with
+    shuffle on the advance follows Perl's shuffle list — see
+    :func:`shufflelist`/:func:`reshuffle` (``Playlist.pm:788-1000``).
+    ``consecutiveErrors`` (:862-879) belongs to the song-queue error path and
+    is not part of this port.
     """
     playlist = list(getattr(player, "playlist", None) or [])
     count = len(playlist)
     if not count:
         return None                                     # :858
+    # Perl reads ``playingSongIndex`` here (:858-860) — i.e. the position the
+    # CURRENT shufflelist gives. A stale/mode-changed list is rebuilt first
+    # (Perl rebuilt it in the command that changed it, :885-891/Commands.pm:1195).
+    shufflelist(player)
     if currsong is None:
         currsong = int(getattr(player, "playlist_position", 0) or 0)
     if currsong < 0 or currsong >= count:
@@ -250,8 +638,13 @@ def nextsong(player: PlayerState, currsong: int | None = None) -> int | None:
         return currsong                                 # :871-873
     nxt = currsong + 1
     if nxt >= count:
-        # :883-893 — start over at the end of the playlist. The reshuffle of
-        # a shuffle+repeat-all playlist (:885-891) needs Perl's shufflelist.
+        # :883-893 — start over at the end of the playlist. With shuffle on,
+        # repeat-all and the ``reshuffleOnRepeat`` pref set, Perl reshuffles
+        # WITHOUT preserving the current song (``reshuffle($client, 1)``,
+        # :889) — the whole list is drawn again and playback restarts at 0.
+        if int(getattr(player, "shuffle", 0) or 0) and repeat == 2 \
+                and _reshuffle_on_repeat():
+            reshuffle(player, dont_preserve_current=True)
         nxt = 0
     if not repeat and nxt == 0:
         return None                                     # :897
@@ -317,6 +710,12 @@ def status_signature(player: PlayerState) -> tuple:
         player.current_title,
         player.current_url,
         _hashable(player.playlist),
+        # The shuffle list is part of what the status reports: the playlist
+        # ORDER a client sees is ``playlist[shufflelist]`` (``Playlist::songs``,
+        # :104-118) and ``playlist_cur_index`` is a position in it — a
+        # reshuffle changes both without touching ``playlist`` (Perl pushes a
+        # status after ``reshuffle``, ``Commands.pm:1196-1200``).
+        _hashable(getattr(player, "shufflelist", None)),
         player.playlist_position,
         player.playlist_total,
         player.playlist_timestamp,
@@ -521,14 +920,20 @@ class PlayerManager:
 
     @staticmethod
     def _playing_track_id(player: PlayerState) -> Optional[int]:
-        """Track-ID des laufenden Songs (Perl ``Playlist::track($client)``)."""
+        """Track-ID des laufenden Songs (Perl ``Playlist::track($client)``).
+
+        Der Index des laufenden Songs ist eine QUEUE-Position; welcher Eintrag
+        der Playlist dazu gehoert, sagt die Shuffle-Liste
+        (``Playlist::track``, ``Playlist.pm:78-84``: ``playList[shuffleList[
+        index]]``).
+        """
         track_id = getattr(player, "current_track_id", None)
         if isinstance(track_id, int):
             return track_id
-        playlist = getattr(player, "playlist", None) or []
         position = getattr(player, "playlist_position", 0) or 0
-        if 0 <= position < len(playlist) and isinstance(playlist[position], int):
-            return int(playlist[position])
+        item = playlist_item(player, position)
+        if isinstance(item, int):
+            return int(item)
         return None
 
     async def _current_song_title(self, player: PlayerState) -> str:
@@ -1057,6 +1462,11 @@ class PlayerManager:
             return index
         track_id = getattr(player, "current_track_id", None)
         if track_id is not None and track_id in items:
+            # ``items.index`` is the PLAYLIST index; the resume jump needs the
+            # QUEUE position (bug 14662, Commands.pm:1784-1790).
+            position = playlist_queue_position(player, track_id)
+            if position is not None:
+                return position
             return items.index(track_id)
         return 0
 
@@ -1392,10 +1802,16 @@ class PlayerManager:
         # Squeezelite can connect immediately after receiving the strm frame.
         if not player.playlist:
             player.playlist = [track_id]
+            player.shufflelist = [0]
+            player.shufflelist_mode = int(getattr(player, "shuffle", 0) or 0)
             player.playlist_position = 0
             player.playlist_total = 1
         elif track_id in player.playlist:
-            player.playlist_position = player.playlist.index(track_id)
+            # ``playlist.index`` is the PLAYLIST index; the state's position is
+            # the QUEUE position (bug 14662, Commands.pm:1784-1790).
+            position = playlist_queue_position(player, track_id)
+            player.playlist_position = (position if position is not None
+                                        else player.playlist.index(track_id))
         else:
             # Track not yet in playlist: append it (LMS 'playlist play'
             # semantics = clear + load + play of that track, but keeping
@@ -1481,7 +1897,11 @@ class PlayerManager:
         # connection before this coroutine gets another scheduling point.
         old_playlist = player.playlist
         old_position = player.playlist_position
+        old_shufflelist = list(getattr(player, "shufflelist", None) or [])
+        old_shufflelist_mode = int(getattr(player, "shufflelist_mode", -1))
         player.playlist = [url]
+        player.shufflelist = [0]
+        player.shufflelist_mode = int(getattr(player, "shuffle", 0) or 0)
         player.playlist_position = 0
         player.playlist_total = 1
         # Determine the source codec the way Perl does: ONE GET scan of the
@@ -1509,6 +1929,8 @@ class PlayerManager:
                 player_id, url[:70], scan.error)
             player.playlist = old_playlist
             player.playlist_position = old_position
+            player.shufflelist = old_shufflelist
+            player.shufflelist_mode = old_shufflelist_mode
             return False
         # Perl's format byte comes from the scanned content type
         # (`$song->wantFormat`); the URL suffix ("getFormatForURL") and 'mp3'
@@ -1570,6 +1992,8 @@ class PlayerManager:
         else:
             player.playlist = old_playlist
             player.playlist_position = old_position
+            player.shufflelist = old_shufflelist
+            player.shufflelist_mode = old_shufflelist_mode
         return ok
 
     async def stop_player(self, player_id: str) -> bool:
@@ -1663,33 +2087,71 @@ class PlayerManager:
     # ------------------------------------------------------------------
 
     def playlist_add(self, player_id: str, track_id: int) -> bool:
-        """Append a track id to the player's playlist."""
+        """Append a track id to the player's playlist.
+
+        Perl pushes the new tracks onto the END of ``playlist``
+        (``Playlist::addTracks``, ``:200-260``) and then reshuffles, so with
+        shuffle on the new entries get their positions in the shuffle list
+        (``Commands.pm:1766`` ``reshuffle($client, undef)`` — the current song
+        is preserved and ends up at the top of the list, ``Playlist.pm:857-877``).
+        """
         player = self.get_player(player_id)
         if player is None:
             return False
         if track_id not in player.playlist:
             player.playlist.append(track_id)
         player.playlist_total = len(player.playlist)
+        if int(getattr(player, "shuffle", 0) or 0):
+            reshuffle(player)                            # Commands.pm:1766
+        else:
+            player.shufflelist = list(range(len(player.playlist)))
+            player.shufflelist_mode = 0
         player.last_activity = time.time()
         return True
 
     def playlist_clear(self, player_id: str) -> bool:
-        """Clear the player's playlist."""
+        """Clear the player's playlist.
+
+        Perl ``Playlist::stopAndClear`` (``:711-725``) empties the playlist and
+        ends with ``reshuffle($client)`` — which for an empty playlist sets the
+        shuffle list to ``()`` (``:795-802``).
+        """
         player = self.get_player(player_id)
         if player is None:
             return False
         player.playlist.clear()
+        player.shufflelist = []                          # Playlist.pm:711-725
+        player.shufflelist_mode = int(getattr(player, "shuffle", 0) or 0)
         player.playlist_position = 0
         player.playlist_total = 0
         player.last_activity = time.time()
         return True
 
     def playlist_remove(self, player_id: str, index: int) -> bool:
-        """Remove a track at a playlist index (0-based)."""
+        """Remove the track at QUEUE position ``index`` — ``Playlist.pm:349-450``.
+
+        Perl's ``removeTrack($client, $tracknum, $nTracks)`` works on the index
+        the caller sees, i.e. the position in the SHUFFLE list (``:380-400``):
+        with shuffle on, the playlist entry behind that position is removed
+        (``my @playlistIndexes = @{$shufflelist}[$tracknum .. …]``, :386), every
+        higher shuffle index is decremented (:390-394) and the position itself
+        is dropped (:396); with shuffle off the playlist entry at the position
+        is spliced out and the shuffle list is reset to the identity (:398-400).
+        """
         player = self.get_player(player_id)
         if player is None or index < 0 or index >= len(player.playlist):
             return False
-        player.playlist.pop(index)
+        lst = shufflelist(player)
+        if int(getattr(player, "shuffle", 0) or 0):
+            raw = lst[index] if index < len(lst) else index
+            player.playlist.pop(raw)                     # :387
+            player.shufflelist = [v - 1 if v > raw else v
+                                  for v in lst if v != raw]  # :388-396
+            player.shufflelist_mode = int(getattr(player, "shuffle", 0) or 0)
+        else:
+            player.playlist.pop(index)                   # :399
+            player.shufflelist = list(range(len(player.playlist)))
+            player.shufflelist_mode = 0
         player.playlist_total = len(player.playlist)
         if player.playlist_position > index:
             player.playlist_position -= 1
@@ -1763,7 +2225,15 @@ class PlayerManager:
 
     async def playlist_play(self, player_id: str, index: int,
                             start_seconds: float = 0.0) -> bool:
-        """Play the track at a playlist index (0-based).
+        """Play the track at a playlist QUEUE position (0-based).
+
+        The index is what a client/CLI command talks about — Perl's
+        ``playingSongIndex`` — and what it plays is
+        ``playlist[shufflelist[index]]`` (``Playlist::track``,
+        ``Playlist.pm:78-84``); ``playlist jump``/``next`` therefore follow the
+        shuffle list while shuffle is on.  ``Commands.pm:1784-1790`` (bug 14662)
+        maps a *track* back to its queue position when a specific track was
+        asked for.
 
         A playlist entry is either a DB track id (``int``) or a remote stream
         URL (``str``, radio/favorites); Perl streams both through one path — a
@@ -1780,7 +2250,9 @@ class PlayerManager:
         if index < 0 or index >= len(player.playlist):
             return False
         player.playlist_position = index
-        item = player.playlist[index]
+        item = playlist_item(player, index)              # :78-84
+        if item is None:
+            return False
         if not isinstance(item, int):
             # Stream URL entry — send the strm frame for the remote source.
             handler = self._protocol_handler
@@ -1920,7 +2392,9 @@ class PlayerManager:
         items = player.playlist or []
         if not (0 <= pos < len(items)):
             return False
-        item = items[pos]
+        # The playing entry: the position is a QUEUE position, the item comes
+        # from the shuffle list (``Playlist::track``, ``Playlist.pm:78-84``).
+        item = playlist_item(player, pos)
         is_track = isinstance(item, int)
         state_duration = float(getattr(player, "duration", 0) or 0)
         # Perl resolves the length of the PLAYING song at seek time
@@ -2053,6 +2527,11 @@ class PlayerManager:
             return False
         player.playlist = track_ids
         player.playlist_total = len(track_ids)
+        player.playlist_position = 0
+        # ``playlist load`` reshuffles WITHOUT preserving the current song
+        # (``reshuffle($client, 1)``, Commands.pm:1766 — ``$load ? 1 : undef``),
+        # so the new queue is a fresh draw over the whole list.
+        reshuffle(player, dont_preserve_current=True)
         player.playlist_position = 0
         logger.info("Loaded playlist '%s' (%d tracks) for %s",
                     name, len(track_ids), player_id)

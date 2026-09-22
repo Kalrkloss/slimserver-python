@@ -3057,18 +3057,20 @@ class SlimProtoClient:
         # station icon across redirects").  Without that alias the logo is
         # lost for EVERY entry whose URL gets rewritten, not just this one.
         try:
-            from lyrion.player.manager import PlayerManager
+            from lyrion.player.manager import PlayerManager, playlist_item
             player = PlayerManager().get_player(mac)
             if player is not None and player.playlist:
-                pos = player.playlist_position or 0
-                if 0 <= pos < len(player.playlist) and isinstance(player.playlist[pos], str):
-                    original = player.playlist[pos]
+                # ``playlist_position`` is a QUEUE position; the entry that is
+                # playing is ``playlist[shufflelist[position]]``
+                # (``Playlist::track``, ``Playlist.pm:78-84``).
+                original = playlist_item(player, player.playlist_position or 0)
+                if isinstance(original, str):
+                    pos = player.playlist.index(original)
                     player.playlist[pos] = url
-                    if original != url:
-                        from lyrion.web.api import \
-                            _carry_stream_image_across_redirect
-                        _carry_stream_image_across_redirect(player, original,
-                                                            url)
+                    from lyrion.web.api import \
+                        _carry_stream_image_across_redirect
+                    _carry_stream_image_across_redirect(player, original,
+                                                        url)
             # Keep state consistent regardless of the calling path
             # (play_url vs _play_playlist_item): this is a live stream.
             if player is not None:
@@ -4006,6 +4008,11 @@ class SlimProtoClient:
         response headers after connecting for a direct stream (Squeezelite
         sendRESP). Extract icy-metaint and resolve the pending cont waiter
         (or send 'cont' directly if the server restarted in between).
+
+        The headers also carry the station's own name — Perl reads it here
+        (``ic[ey]-name``/``x-audiocast-name``, ``Protocols/HTTP.pm:729-731``)
+        and files it as the stream's title (``Squeezebox2.pm:592-601``, see
+        :meth:`_apply_stream_header_title`).
         """
         try:
             text = payload.decode("latin1", errors="replace")
@@ -4022,6 +4029,9 @@ class SlimProtoClient:
                 _p = PlayerManager().get_player(mac_str)
                 if _p is not None:
                     _p.note_source_ready()
+                    title = self._icy_header_title(text)
+                    if title:
+                        self._apply_stream_header_title(_p, title)
             except Exception:  # noqa: BLE001
                 pass
             fut = self._resp_waiters.get(mac_key)
@@ -4039,6 +4049,100 @@ class SlimProtoClient:
             logger.info("RESP from %s: metaint=%d", mac_str, metaint)
         except Exception as exc:
             logger.warning("RESP parse failed for %s: %s", mac_str, exc)
+
+    #: Perl ``parseDirectHeaders`` (``Protocols/HTTP.pm:729-731``): the station's
+    #: own name in the source's response headers — ``ic[ey]-name`` or
+    #: ``x-audiocast-name``, case-insensitive (``/^(?:ic[ey]-name|
+    #: x-audiocast-name):\s*(.+)/i``).
+    _RE_ICY_NAME = re.compile(
+        r"(?im)^(?:ic[ey]-name|x-audiocast-name):\s*([^\r\n]+)")
+
+    @staticmethod
+    def _icy_header_title(text: str) -> str:
+        """The station name from the response headers — ``HTTP.pm:729-731``.
+
+        Perl stores the header value verbatim, only decoded with
+        ``Slim::Utils::Unicode::utf8decode_guess`` (:731) — the RESP frame was
+        read as latin-1, so the original bytes are recovered by re-encoding.
+        """
+        m = SlimProtoClient._RE_ICY_NAME.search(text or "")
+        if not m:
+            return ""
+        raw = m.group(1).strip()
+        try:
+            return raw.encode("latin-1").decode("utf-8")
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            return raw
+
+    @staticmethod
+    def _apply_stream_header_title(player, title: str) -> None:
+        """Perl's handling of a header title — ``Squeezebox2.pm:592-601``.
+
+        ``Squeezebox2::directHeaders`` ends its header parsing with::
+
+            # Always prefer the title returned in the headers of a radio station
+            if ( $title ) {
+                Slim::Music::Info::setCurrentTitle( $url, $title );
+
+                # Bug 7979, Only update the database title if this item doesn't
+                # already have a title
+                my $curTitle = Slim::Music::Info::title($url);
+                if ( !$curTitle || $curTitle =~ /^(?:http|mms)/ ) {
+                    Slim::Music::Info::setTitle( $url, $title );
+                }
+            }
+
+        (identical in ``Protocols/HTTP.pm:851-861`` for the PROXIED stream.)
+        Two consequences, and both are what the status then reports:
+
+        * ``setCurrentTitle`` files the name under the stream's URL
+          (``%currentTitles{$url}``, ``Info.pm:513-552``) — ``getCurrentTitle``
+          answers it while it is truthy (:572-574), so the *display* title of a
+          station that sends no ``StreamTitle`` is its own name.  The port's
+          store for that is ``current_title``/``remote_meta['streamtitle']``,
+          exactly the fields the STMu (``StreamTitle``) path writes.
+        * ``setTitle`` writes the URL's DB title (``Info.pm:290-304``) unless
+          the URL already has one of its own — ``Info::title($url)`` is the
+          URL itself for an unregistered stream (``plainTitle``, ``:669-673``),
+          which starts with ``http`` and therefore passes the guard.  That
+          title is what tag ``N`` (``remote_title``) reports
+          (``Queries.pm:5981-5988``): ``$track->title``.  The port's store for
+          the URL's title is ``player.stream_titles`` (the map
+          ``web/api._stream_registered_name`` reads); a feed row's name
+          (``setRemoteMetadata``, ``Control/XMLBrowser.pm:693-700``) lives
+          there too and is NOT overwritten — Perl's guard blocks it as well.
+        """
+        url = str(getattr(player, "current_url", "") or "")
+        if not url:
+            return
+        # ``setCurrentTitle($url, $title)`` — the 2-argument form Perl's header
+        # path uses: it does NOT notify ``playlist newsong`` (that needs the
+        # client argument, Info.pm:526-546), it only caches the title.
+        player.current_title = title
+        epoch = int(getattr(player, "stream_epoch", 0) or 0)
+        meta = dict(getattr(player, "remote_meta", {}) or {})
+        meta["streamtitle"] = title
+        meta["url"] = url
+        if not meta.get("title"):
+            meta["title"] = title
+        player.remote_meta = meta
+        player.stream_meta_epoch = epoch
+        player.stream_meta_url = url
+        # Bug 7979 — ``my $curTitle = Slim::Music::Info::title($url)``.
+        try:
+            from lyrion.web.api import _stream_registered_name
+
+            current = str(_stream_registered_name(player, url) or "")
+        except Exception:  # noqa: BLE001 — ohne Titel bleibt es beim Alten
+            current = ""
+        if not current or current.startswith(("http", "mms")):
+            titles = dict(getattr(player, "stream_titles", {}) or {})
+            titles[url] = title
+            player.stream_titles = titles
+            # ``setTitle`` makes this the URL's standard title — the fallback
+            # the status shows when the stream sends no (truthy) StreamTitle
+            # (``standardTitle``, Info.pm:556-583).
+            player.stream_baseline_title = title
 
     def _handle_meta_frame(self, mac_str: str, payload: bytes) -> None:
         """Handle a 'meta' frame from the player carrying the stream title.
