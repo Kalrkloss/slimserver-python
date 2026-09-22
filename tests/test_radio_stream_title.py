@@ -44,6 +44,11 @@ from lyrion.web.api import JSONRPCAPI
 MAC = "1C:87:2C:47:FC:36"
 RADIO_URL = ("http://regiocast.streamabc.net/regc-80s80smweb2517500-mp3-192-"
              "1672667?sABC=6nn9pn5r%230%23r30o443r1929r059s085628511796n57%23")
+# Die AUFGELÖSTE (Redirect-)URL des 1Mix-Streams: der Playlist-Eintrag trägt
+# nach dem Scan diese URL (``networking/protocol.py:3048-3075``), die
+# Registrierung des Senders liegt unter der URL der Zeile (RADIO_URL oben).
+RESOLVED_URL = "https://fr2.1mix.co.uk:8000/320h"
+STATION = "1Mix Radio EDM Stream"
 NO_ICY_URL = "https://st01.sslstream.dlf.de/dlf/01/low/opus/stream.opus"
 ICY = "The Cure - Lullaby"
 
@@ -60,7 +65,10 @@ def _db(tmp_path) -> str:
     con.executescript(
         """
         CREATE TABLE tracks (id INTEGER PRIMARY KEY, title TEXT, url TEXT,
-            duration REAL, remote INTEGER, content_type TEXT);
+            duration REAL, year INTEGER, tracknum INTEGER, bitrate INTEGER,
+            samplerate INTEGER, bitspersample INTEGER, genre TEXT, cover TEXT,
+            remote INTEGER, disc INTEGER, filesize INTEGER, comment TEXT,
+            lyrics TEXT, content_type TEXT);
         CREATE TABLE contributors (id INTEGER PRIMARY KEY, name TEXT);
         CREATE TABLE tracks_contributors (track INTEGER, contributor INTEGER,
             role INTEGER);
@@ -272,3 +280,192 @@ def test_foreign_queue_entry_keeps_the_registered_name():
                      remote=1, current_title="Läuft", stream_titles={
                          other: "Anderer Sender"})
     assert api_mod._stream_entry_title(player, other) == ("Anderer Sender", "")
+
+
+# ---------------------------------------------------------------------------
+# Der Name zieht über den Redirect mit (Perl Remote.pm:417) — der Fehler
+# ---------------------------------------------------------------------------
+def test_registered_name_follows_the_url_over_the_redirect():
+    """``$redirTrack->title( $track->title )`` — der SENDENAME zieht mit.
+
+    ``Slim/Utils/Scanner/Remote.pm:412-419`` legt für die AUFGELÖSTE URL eine
+    neue Zeile an und kopiert den Titel der Original-Zeile hinein (danach
+    ``$track->delete``, ``:425``).  Ohne diese Kopie kennt Perl den Sendernamen
+    nur unter der Start-URL — mit ihr antwortet ``songinfo``/``_songData``
+    (``Queries.pm:5972``/``:5982-5988``) auch für die aufgelöste URL mit dem
+    Namen (live 2026-09-22: ``songinfo url:https://fr2.1mix.co.uk:8000/256h``
+    → ``{"title":"1Mix Radio EDM Stream"}``).
+    """
+    player = _player([RESOLVED_URL], 0, current_url=RESOLVED_URL, remote=1,
+                     stream_titles={RADIO_URL: STATION})
+    assert api_mod._stream_registered_name(player, RESOLVED_URL) == ""
+
+    api_mod._carry_stream_image_across_redirect(player, RADIO_URL,
+                                                RESOLVED_URL)
+
+    assert api_mod._stream_registered_name(player, RESOLVED_URL) == STATION
+    # Die Original-URL verliert nichts (wie beim Icon, Remote.pm:307-308).
+    assert player.stream_titles[RADIO_URL] == STATION
+
+
+def test_carry_does_not_overwrite_a_name_already_registered():
+    """Perl schreibt nur die frische Redirect-Zeile (``updateOrCreate``)."""
+    player = _player([RESOLVED_URL], 0, current_url=RESOLVED_URL, remote=1,
+                     stream_titles={RADIO_URL: STATION,
+                                    RESOLVED_URL: "Anderer Sender"})
+    api_mod._carry_stream_image_across_redirect(player, RADIO_URL,
+                                                RESOLVED_URL)
+    assert player.stream_titles[RESOLVED_URL] == "Anderer Sender"
+
+
+class _FakeHandler:
+    """Mimics the tail of ``SlimProtoClient.send_remote_stream``.
+
+    ``networking/protocol.py:3074-3081`` sets ``current_url`` to the RESOLVED
+    URL and ``current_track_id = None`` after the rewrite, and
+    ``_after_strm_sent`` drops the replaced stream's metadata
+    (``player.forget_metadata()`` — Perl ``Song::open``, Song.pm:700-702).
+    """
+
+    def __init__(self, player) -> None:
+        self.player = player
+        self.streams: list[tuple[str, str]] = []
+
+    async def send_remote_stream(self, mac, url, codec="m", **kw) -> bool:
+        self.streams.append((url, codec))
+        self.player.current_url = url
+        self.player.current_track_id = None
+        self.player.forget_metadata()
+        return True
+
+
+class _FakePM:
+    """Nur so viel ``PlayerManager``, wie ``_play_playlist_item`` braucht."""
+
+    def __init__(self, player) -> None:
+        self.player = player
+        self._protocol_handler = _FakeHandler(player)
+        self.modes: list[str] = []
+
+    def get_player(self, mac=None):
+        return self.player
+
+    async def power_on_for_playback(self, player) -> None:
+        player.power = True
+
+    def set_mode(self, mac, mode) -> None:
+        self.modes.append(mode)
+
+
+def test_queue_replay_sets_the_station_name_as_the_streams_title(
+        tmp_path, monkeypatch):
+    """``playlist jump``/next: der neue Stream hat Perls ``standardTitle``.
+
+    Gemessen live 2026-09-22 (Favorit 1Mix abgespielt, dann ``playlist jump
+    0``): Perl antwortete ``remoteMeta.remote_title: "1Mix Radio EDM Stream"``
+    und ``current_title: "1Mix Radio EDM Stream"``; unser Status ließ
+    ``remote_title`` weg, weil ``_after_strm_sent`` → ``forget_metadata()``
+    (Perl ``Song::open`` → ``metaTitle(undef)``, ``Song.pm:700-702``) die
+    Baseline leert und der Eintrag die AUFGELÖSTE URL trägt.
+    """
+    monkeypatch.setattr(api_mod, "_library_db_path", lambda: _db(tmp_path))
+    player = _player([RESOLVED_URL], 0, mode="stop", remote=1,
+                     current_url=RESOLVED_URL,
+                     stream_titles={RADIO_URL: STATION,
+                                    RESOLVED_URL: STATION})
+    pm = _FakePM(player)
+
+    asyncio.run(JSONRPCAPI()._play_playlist_item(pm, player, 0))
+
+    assert pm._protocol_handler.streams == [(RESOLVED_URL, "m")]
+    assert player.stream_baseline_title == STATION
+    assert player.current_title == STATION
+
+    res = _status(player, ["-", "1", "tags:alduxyNK"])
+    item = res["playlist_loop"][0]
+    assert item["title"] == STATION
+    assert item["track"] == STATION
+    assert item["remote_title"] == STATION
+    assert item["remote"] == 1
+    assert res["remoteMeta"]["remote_title"] == STATION
+
+
+def test_queue_replay_without_registration_falls_back_to_the_url(
+        tmp_path, monkeypatch):
+    """Gegenprobe: nichts registriert ⇒ URL, KEIN ``remote_title`` (Perl live).
+
+    Perl 9.1.1 (read-only 2026-09-19): der Eintrag
+    ``http://192.168.1.90/alarm.mp3`` antwortet mit der URL als ``title`` und
+    ohne ``remote_title`` (``Info.pm:669-673`` ``plainTitle``).
+    """
+    monkeypatch.setattr(api_mod, "_library_db_path", lambda: _db(tmp_path))
+    bare = "http://192.168.1.90/alarm.mp3"
+    player = _player([bare], 0, mode="stop", remote=1)
+    pm = _FakePM(player)
+
+    asyncio.run(JSONRPCAPI()._play_playlist_item(pm, player, 0))
+
+    assert player.stream_baseline_title == bare
+    res = _status(player, ["-", "1", "tags:alduxyNK"])
+    assert res["playlist_loop"][0]["title"] == bare
+    assert "remote_title" not in res["remoteMeta"]
+
+
+def test_icy_title_still_wins_over_the_station_name(tmp_path, monkeypatch):
+    """Gegenprobe: der ICY-Titel bleibt in ``title``, der Name in ``N``.
+
+    ``$returnHash{'title'} = $remoteMeta->{title} || $track->title``
+    (``Queries.pm:5972``) bei ``remote_title`` = Name (``:5982-5988``) — live
+    Perl 2026-09-22: ``title: "Scorchin’ Radio 309 [Replay]"``,
+    ``artist: "Oleg Farrier"``, ``remote_title: "1Mix Radio EDM Stream"``.
+    """
+    monkeypatch.setattr(api_mod, "_library_db_path", lambda: _db(tmp_path))
+    player = _player([RESOLVED_URL], 0, mode="play", elapsed=300.0,
+                     current_url=RESOLVED_URL, current_title=ICY,
+                     stream_baseline_title=STATION,
+                     stream_meta_url=RESOLVED_URL, remote=1,
+                     stream_titles={RADIO_URL: STATION,
+                                    RESOLVED_URL: STATION},
+                     remote_meta={"streamtitle": ICY, "title": "Lullaby",
+                                  "artist": "The Cure", "url": RESOLVED_URL})
+
+    res = _status(player, ["-", "1", "tags:alduxyNK"])
+    item = res["playlist_loop"][0]
+
+    assert item["title"] == "Lullaby"
+    assert item["artist"] == "The Cure"
+    assert item["remote_title"] == STATION
+    assert res["remoteMeta"]["remote_title"] == STATION
+
+
+def test_local_track_is_untouched_by_the_stream_registration(
+        tmp_path, monkeypatch):
+    """Gegenprobe: eine lokale Zeile bleibt die DB-Zeile, kein Stream-Feld."""
+    db = _db(tmp_path)
+    con = sqlite3.connect(db)
+    con.executescript(
+        """
+        INSERT INTO tracks (id, title, url, duration, remote, content_type)
+            VALUES (7, 'Lokaler Titel', 'file:///music/x.flac', 215, 0, 'flc');
+        INSERT INTO albums (id, title, artwork) VALUES (3, 'Album', 'abc');
+        INSERT INTO tracks_albums (track, album) VALUES (7, 3);
+        INSERT INTO contributors (id, name) VALUES (9, 'Interpret');
+        INSERT INTO tracks_contributors (track, contributor, role)
+            VALUES (7, 9, 1);
+        """
+    )
+    con.commit()
+    con.close()
+    monkeypatch.setattr(api_mod, "_library_db_path", lambda: db)
+    player = _player([7], 0, mode="play", elapsed=30.0, remote=0,
+                     stream_titles={RESOLVED_URL: STATION})
+
+    res = _status(player, ["-", "1", "tags:alduxyNK"])
+    item = res["playlist_loop"][0]
+
+    assert item["title"] == "Lokaler Titel"
+    assert item["artist"] == "Interpret"
+    assert item["album"] == "Album"
+    assert item["duration"] == 215
+    assert "remote_title" not in item
+    assert "remoteMeta" not in res

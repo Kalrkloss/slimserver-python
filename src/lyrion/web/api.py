@@ -2134,24 +2134,45 @@ def _registered_stream_image(player: object, url: str) -> str:
 
 def _carry_stream_image_across_redirect(player: object, original: str,
                                         resolved: str) -> None:
-    """``Slim/Utils/Scanner/Remote.pm:307-308`` — keep the logo over a redirect.
+    """Perl's redirect carry — station NAME and icon (``Remote.pm:307-308``/``:417``).
 
-    Perl's redirect callback (``addHeader``, run for the request that resolved
-    the URL) copies the icon it holds for the URL the play STARTED from onto the
-    canonical URL the request ended on::
+    ``Slim/Utils/Scanner/Remote.pm:320-427`` (``readRemoteHeaders``): the scan
+    ended on a different URL (``if ( $track->url ne $url )``, ``:395``), so Perl
+    creates the row for the FINAL url and copies the original's metadata onto it
+    before dropping the original::
 
-        # Keep track of artwork or station icon across redirects
-        my $cache = Slim::Utils::Cache->new();
-        if ( my $icon = $cache->get("remote_image_" . $track->url) ) {
-            $cache->set("remote_image_" . $request->uri->canonical->as_string, $icon, '30 days');
-        }
+        my $redirTrack = Slim::Schema->updateOrCreate( { url => $url } );   # :412
+        # Copy values from original track
+        $redirTrack->title( $track->title );            # :417  <- der SENDENAME
+        $redirTrack->content_type( $track->content_type );
+        $redirTrack->bitrate( $track->bitrate );
+        $redirTrack->redir( $track->redir || $track->url );
+        $redirTrack->update;
+        # Delete original track
+        $track->delete;                                # :425
+
+    ``$track->title`` is the name ``setRemoteMetadata`` filed for the URL the
+    play STARTED from (``Slim/Control/XMLBrowser.pm:693-700`` →
+    ``Slim/Music/Info.pm:395-478``), so Perl answers it for the RESOLVED url too
+    — as ``remote_title`` (tag ``N``, ``Slim/Control/Queries.pm:5982-5988``) and
+    as ``standardTitle`` (``Info.pm:556-583``/``:701-739``, the fallback while
+    the stream reports no ``StreamTitle``).  The station icon rides along in the
+    same redirect step (``addHeader``, ``:307-308``).
 
     ``getMetadataFor`` reads the cache under the URL of the playlist entry it is
     handed (``Slim/Player/Protocols/HTTP.pm:1092``; the entry is
     ``Playlist::track($client, $playlist_cur_index)``, ``Queries.pm:4386``), and
     that entry URL is the RESOLVED one once Perl has scanned it — the alias is
-    what keeps the station logo reachable for EVERY entry, not just the running
+    what keeps name and logo reachable for EVERY entry, not just the running
     one.  Only ``original`` loses nothing: its own key stays in place.
+
+    Without the NAME half the station name was gone for every later play of the
+    rewritten entry (queue replay / ``playlist jump``, next, restart): the
+    registration sits under the START url, the entry carries the RESOLVED one.
+    Measured live 2026-09-22 (favourites play, then ``playlist jump 0``): Perl
+    answered ``remoteMeta.remote_title: "1Mix Radio EDM Stream"``, the port
+    omitted the field.  (The name ``…image…`` stays because that is how the
+    rewrite site ``networking/protocol.py:3069-3071`` calls it.)
     """
     if player is None:
         return
@@ -2160,11 +2181,19 @@ def _carry_stream_image_across_redirect(player: object, original: str,
     if not src or not dst or src == dst:
         return
     images = getattr(player, "stream_images", None)
-    if not images:
-        return
-    icon = str(images.get(src, "") or "")
-    if icon and not str(images.get(dst, "") or ""):
-        images[dst] = icon
+    if images:
+        icon = str(images.get(src, "") or "")
+        if icon and not str(images.get(dst, "") or ""):
+            images[dst] = icon
+    # ``$redirTrack->title( $track->title )`` (Remote.pm:417): the registered
+    # name follows the URL over the redirect.  Perl only ever writes it once —
+    # the resolved row is fresh (``updateOrCreate``) — so an existing entry for
+    # the resolved URL is never overwritten.
+    titles = getattr(player, "stream_titles", None)
+    if titles:
+        name = str(titles.get(src, "") or "")
+        if name and not str(titles.get(dst, "") or ""):
+            titles[dst] = name
 
 
 def _register_feed_row_images(player: object, rows: object) -> None:
@@ -6188,6 +6217,21 @@ class JSONRPCAPI:
                 url = str(tid)
                 duration = 0
                 info = {"remote": 1, "stream_artist": _entry_artist}
+                # Tag 'N' (``remote_title``): Perl baut auch das PLAYLIST-Item
+                # aus ``_songData`` (``_addSong``, Queries.pm:5473), dessen Tag N
+                # den SENDENAMEN des Eintrags liefert — ``$parentTrack->title``
+                # (der Titel des Eintrags) bzw. ``$track->title`` (:5982-5988).
+                # Live Perl 2026-09-22: ``playlist_loop[0].remote_title =
+                # "1Mix Radio EDM Stream"``, und ``playlist name ?``
+                # (Queries.pm:2766-2767) antwortet denselben Wert.  Nichts
+                # registriert ⇒ Perls Zeilentitel (icy-name, Playlist-Eintrags-
+                # Name oder die URL selbst); einen solchen Zeilentitel fuehrt
+                # dieser Port fuer einen nicht importierten Stream nicht, das
+                # Feld bleibt dann weg (live Perl: ``alarm.mp3`` ohne
+                # ``remote_title``).
+                _entry_name = _stream_registered_name(player, str(tid))
+                if _entry_name:
+                    info["remote_title"] = _entry_name
             item: dict = {
                 # Perl `_addSong` → `$returnHash{'id'} = $track->id`
                 # (Queries.pm:5971/_songData:5880): a DB integer for a local
@@ -8166,6 +8210,7 @@ class JSONRPCAPI:
             # causing the UI icon to flip back momentarily.
             player.mode = "play"
             player.playlist_position = idx
+            _std_title = ""     # only used for a remote (str) entry
             if isinstance(item, int):
                 player.current_track_id = item
                 player.remote = 0  # local track
@@ -8180,6 +8225,19 @@ class JSONRPCAPI:
                         "artwork priority request failed: %s", exc)
             else:
                 player.remote = 1  # live stream: never "track end"
+                # Perl's ``standardTitle($client, $url)`` for the stream that is
+                # about to open — the TITLE of the entry's row, i.e. the name
+                # registered for its URL (``Slim/Music/Info.pm:556-583`` →
+                # ``:701-739`` ``standardTitle`` → ``objectForUrl``/
+                # ``displayText``), and the URL itself when nothing is
+                # registered (``plainTitle``, ``:669-673``).
+                # Read BEFORE the strm frame: ``_after_strm_sent`` drops the
+                # metadata of the stream being replaced
+                # (``player.forget_metadata()`` — Perl's ``Song::open`` →
+                # ``$client->metaTitle(undef)``, ``Slim/Player/Song.pm:700-702``)
+                # and with it ``stream_baseline_title``.
+                _std_title = (_stream_registered_name(player, str(item))
+                              or str(item))
             pm.set_mode(player.mac, "play")
             ok = True
             if isinstance(item, int):
@@ -8201,6 +8259,20 @@ class JSONRPCAPI:
                 player.playlist_position = -1
                 pm.set_mode(player.mac, "stop")
                 return
+            if isinstance(item, str):
+                # The new stream's fallback title (see above) — ``play_url``
+                # sets the same pair after its own strm frame ("New stream, new
+                # metadata", ``manager.py:1531-1551``).  Without it a queue
+                # replay (``playlist jump``/next, or a restart with the station
+                # already in the queue) left ``current_title``/
+                # ``stream_baseline_title`` empty and the status lost the
+                # station name: LIVE 2026-09-22, favourites play then
+                # ``playlist jump 0``, Perl answered
+                # ``remoteMeta.remote_title: "1Mix Radio EDM Stream"`` +
+                # ``current_title: "1Mix Radio EDM Stream"`` while this port
+                # omitted ``remote_title`` and showed the raw URL.
+                player.current_title = _std_title
+                player.stream_baseline_title = _std_title
             logger = __import__("logging").getLogger("lyrion.web.api")
             logger.info("Playing playlist item %d (%r) on %s", idx, item, player.mac)
         except Exception as exc:
