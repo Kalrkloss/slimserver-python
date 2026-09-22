@@ -128,6 +128,21 @@ def _run(coro):
     return asyncio.run(coro)
 
 
+async def _async_add(store, fingerprint: str) -> bool:
+    """Einen offenen Eintrag mit gegebener Kennung eintragen."""
+    return store.add(AlbumQuery(album="Alt", artist="A", year=2000),
+                     fingerprint=fingerprint)
+
+
+def set_pref(name: str, value: str) -> None:
+    """Pref schreiben wie das Web-GUI (Prefs-Store im Speicher)."""
+
+    async def _do() -> None:
+        await get_prefs().set(name, value)
+
+    _run(_do())
+
+
 @pytest.fixture(scope="module", autouse=True)
 def _prefs_store():
     """Globalen Prefs-Store auf In-Memory-DB hängen (Muster ``test_art_online.py``)."""
@@ -468,6 +483,85 @@ def test_fingerprint_never_contains_the_key(tmp_path):
     assert ArtOnlineSettings(cache_dir=tmp_path, language="de").fingerprint() != base
     assert ArtOnlineSettings(cache_dir=tmp_path,
                              providers=("fanart", "musicbrainz")).fingerprint() != base
+
+
+def test_gui_settings_change_is_picked_up_without_a_restart(tmp_path, monkeypatch):
+    """Ein im GUI gespeicherter Key wirkt sofort — ohne Serverneustart.
+
+    Der Dienst wird beim Serverstart einmal konfiguriert; ``refresh_settings``
+    liest die Prefs bei jedem Durchlauf/Status neu (live gefunden: ohne das
+    blieb ein neuer Key bis zum Neustart wirkungslos).
+    """
+    cache_dir = tmp_path / "cache"
+    set_pref("artworkOnlineCacheDir", str(cache_dir))
+    set_pref("artworkOnlineProviders", "coverartarchive")
+    service, fetch = build_service(
+        tmp_path, [("coverartarchive.org", caa_404())],
+        settings=ArtOnlineSettings(cache_dir=cache_dir,
+                                   providers=("coverartarchive",)))
+    # Der Dienst der Verdrahtung ist der prozessweite (nur er zieht Prefs nach).
+    monkeypatch.setattr(art_online, "_service", service)
+    w, _rows = build_wanted(tmp_path, service,
+                            [(AlbumQuery(album="Kein Treffer", artist="N",
+                                         year=1999, mbid="rg-k"), 2)])
+
+    async def first():
+        await w.backfill()
+        return await w.run_pass(reason="vor der Änderung")
+
+    assert _run(first())["miss"] == 1
+    assert w.status()["settings_changed"] is False
+
+    # Jetzt speichert das GUI einen neuen API-Key und eine andere Sprache.
+    set_pref("artworkOnlineAudioDbKey", "key-aus-dem-gui")
+    set_pref("artworkOnlineLanguage", "de")
+
+    refreshed = w.refresh_from_prefs()
+    status = w.status()
+    summary = _run(w.run_pass(reason="nach der Änderung"))
+
+    assert refreshed is True
+    assert w.service.settings.audiodb_key == "key-aus-dem-gui"
+    assert w.service.settings.language == "de"
+    assert status["settings_changed"] is True
+    assert summary["settings_changed"] is True and summary["rearmed"] == 1
+    assert summary["checked"] == 1, "der frühere Fehlschlag läuft erneut"
+
+
+def test_note_settings_change_triggers_only_on_a_real_change(tmp_path, monkeypatch):
+    """``note_settings_change``: Anstoss nur bei geänderter Kennung."""
+    cache_dir = tmp_path / "cache"
+    set_pref("artworkOnlineCacheDir", str(cache_dir))
+    set_pref("artworkOnlineProviders", "coverartarchive")
+    service, _fetch = build_service(tmp_path, [], settings=ArtOnlineSettings(
+        cache_dir=cache_dir, providers=("coverartarchive",)))
+    w, _rows = build_wanted(tmp_path, service, [])
+    # Welche Einstellungen der Dienst hat, entscheidet der Prozess-Dienst.
+    set_pref("artworkOnlineLanguage", "en")
+    monkeypatch.setattr(art_online, "_service", service)
+    monkeypatch.setattr(wanted, "_service", w)
+    w.refresh_from_prefs()
+    before = w.service.settings.fingerprint()
+    # Ein Eintrag aus der alten Konfiguration (so sieht eine echte Liste aus).
+    assert _run(_async_add(w.store, before)) is True
+
+    async def call_note() -> tuple[bool, bool]:
+        # Der Settings-Handler ruft das aus der Event-Loop (wie hier).
+        return (wanted.note_settings_change(before), wanted.note_settings_change(before))
+
+    unchanged, _again = _run(call_note())
+    assert unchanged is False, "ohne Änderung kein Anstoss"
+
+    set_pref("artworkOnlineLanguage", "de")
+
+    async def call_note_after() -> bool:
+        return wanted.note_settings_change(before)
+
+    assert _run(call_note_after()) is True
+    assert w.service.settings.language == "de"
+    status = w.status()
+    assert status["settings_changed"] is True
+    assert status["stale_entries"] == 1, "der alte Eintrag stammt aus der alten Konfiguration"
 
 
 # ---------------------------------------------------------------------------

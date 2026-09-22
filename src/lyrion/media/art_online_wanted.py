@@ -53,7 +53,7 @@ import json
 import logging
 import sqlite3
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Iterable
 
@@ -66,6 +66,7 @@ from lyrion.media.art_online import (
     ArtOnlineSettings,
     CacheEntry,
     CoverResult,
+    HttpFetcher,
     configured_service,
 )
 
@@ -411,6 +412,20 @@ class WantedStore:
             ).fetchone()
         return int(row[0] or 0)
 
+    def stale_count(self, fingerprint: str) -> int:
+        """Einträge, deren Kennung nicht die aktuelle ist (andere Konfiguration).
+
+        Nach einer Änderung (z. B. neuer API-Key) sind die früheren
+        Fehlschläge einer solchen Kennung zugeordnet, bis der nächste Versuch
+        sie ersetzt — die Anzeige nennt die Zahl als „Konfiguration geändert“.
+        """
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM artwork_online_wanted WHERE fingerprint <> ?",
+                (fingerprint,),
+            ).fetchone()
+        return int(row[0] or 0)
+
     def next_due(self) -> int | None:
         with self._connect() as conn:
             row = conn.execute(
@@ -594,6 +609,90 @@ class WantedService:
         """Läuft der Hintergrund-Task (nicht: läuft gerade ein Durchlauf)?"""
         return self._task is not None and not self._task.done()
 
+    # ---- Konfiguration nachziehen (ohne Serverneustart) ----
+
+    def apply_settings(self, fresh: ArtOnlineSettings) -> bool:
+        """Neue Laufzeit-Einstellungen übernehmen (Änderung im Web-GUI).
+
+        Der Dienst wird beim Serverstart **einmal** konfiguriert; ohne diesen
+        Schritt liefe ein im GUI eingetragener API-Key erst nach einem Neustart
+        los.  Die ausdrückliche Anforderung ist aber „wenn sich etwas ändert,
+        z. B. neuer API-Key hinzugekommen, sollte die Liste erneut abgearbeitet
+        werden“ — deshalb liest jeder Durchlauf und jede Statusabfrage die Prefs
+        neu (:meth:`refresh_settings`, :func:`wanted_status`).
+
+        Übernommen werden die Einstellungen selbst, der echte HTTP-Client (neue
+        Header/Timeout; der alte wird geschlossen) und — falls das
+        Cache-Verzeichnis umgestellt wurde — Plattencache **und** Liste.
+        Liefert ``True``, wenn sich etwas geändert hat.
+        """
+        # Übernommen wird alles Suchrelevante — **nicht** der Speicherort:
+        # Plattencache und Liste gehören diesem Dienst (sie wurden beim Anlegen
+        # aus ``service.settings.cache_dir`` gebaut), und ein Statusabruf darf
+        # sie nicht unter den Füssen wegziehen.  Ein im GUI geänderter
+        # Cache-Ordner greift deshalb mit dem nächsten Serverstart; gesucht und
+        # erneut abgearbeitet wird trotzdem sofort.
+        target = replace(fresh, cache_dir=self.service.settings.cache_dir)
+        old = self.service.settings
+        if target == old:
+            return False
+        self.service.settings = target
+        fresh = target
+        old_fetcher = self.service.fetcher
+        if isinstance(old_fetcher, HttpFetcher):
+            # Nur den echten Client ersetzen: ein Test-Fake bleibt stehen.
+            self.service.fetcher = HttpFetcher(fresh)
+            self._schedule_fetcher_close(old_fetcher)
+        logger.info(
+            "art_online_wanted: Einstellungen neu gelesen (aktiv=%s, Anbieter=%s, "
+            "Key(s) hinterlegt=%s)", fresh.enabled,
+            ",".join(fresh.effective_providers()),
+            ",".join(sorted(name for name in ("audiodb", "fanart")
+                            if fresh.key_for(name))) or "keine")
+        return True
+
+    def _schedule_fetcher_close(self, fetcher: Any) -> None:
+        """Alten HTTP-Client schliessen (ohne laufende Loop: liegen lassen)."""
+        close = getattr(fetcher, "close", None)
+        if close is None:
+            return
+        try:
+            asyncio.get_running_loop().create_task(self._close_quietly(fetcher))
+        except RuntimeError:
+            logger.debug("art_online_wanted: kein Loop — alter HTTP-Client bleibt")
+
+    @staticmethod
+    async def _close_quietly(fetcher: Any) -> None:
+        try:
+            await fetcher.close()
+        except Exception:  # noqa: BLE001 - ein alter Client ist kein Fehler
+            pass
+
+    def is_process_service(self) -> bool:
+        """Ist das der prozessweite Dienst (der aus den Prefs gebaute)?
+
+        Nur der darf seine Einstellungen laufend aus den Prefs nachziehen: ein
+        von aussen gereichter Dienst (Tests, Einbettung) bringt seine eigenen
+        Einstellungen mit, und die dürfen nicht von einem Statusabruf ersetzt
+        werden.  In der Server-Verdrahtung ist ``configured_wanted_service()``
+        genau dieser Dienst (``media/art_online.py`` ``configured_service``).
+        """
+        try:
+            from lyrion.media import art_online
+
+            return self.service is art_online.current_service()
+        except Exception:  # noqa: BLE001 - ohne Modul gilt „nein“
+            return False
+
+    def refresh_from_prefs(self) -> bool:
+        """Prefs neu lesen und übernehmen (Durchlauf- und Anzeigebeginn)."""
+        if not self.is_process_service():
+            logger.debug(
+                "art_online_wanted: eigener Dienst (nicht der Prozess-Dienst) — "
+                "die Prefs bleiben aussen vor")
+            return False
+        return self.apply_settings(load_settings_quietly())
+
     @property
     def active(self) -> bool:
         """Läuft gerade ein Durchlauf?"""
@@ -653,10 +752,20 @@ class WantedService:
         return True
 
     def start_pass_task(self, *, reason: str = "gui") -> bool:
-        """Durchlauf als eigenen Task starten (ohne Hintergrund-Schleife)."""
+        """Durchlauf als eigenen Task starten (ohne Hintergrund-Schleife).
+
+        Ohne laufenden Event-Loop (synchroner Aufrufer) wird nur die Weckmarke
+        gesetzt — ein Task liesse sich hier gar nicht anlegen.
+        """
         if self._active:
             return False
-        self._task = asyncio.ensure_future(self.run_pass(reason=reason))
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            logger.debug("art_online_wanted: kein laufender Loop — %s nur "
+                         "angefordert", reason)
+            return False
+        self._task = loop.create_task(self.run_pass(reason=reason))
         return True
 
     async def _loop(self) -> None:
@@ -711,7 +820,14 @@ class WantedService:
     # ---- Durchlauf ----
 
     async def run_pass(self, *, reason: str = "pass") -> dict[str, Any]:
-        """Einen vollständigen Durchlauf über die fälligen Einträge fahren."""
+        """Einen vollständigen Durchlauf über die fälligen Einträge fahren.
+
+        Am Anfang werden die Prefs neu gelesen (:meth:`refresh_settings`): ein im
+        Web-GUI eingetragener API-Key oder ein anderer Anbieter wirkt damit ohne
+        Serverneustart — und die geänderte Kennung macht frühere Fehlschläge
+        erneut fällig.
+        """
+        self.refresh_from_prefs()
         async with self._lock:
             settings = self.settings
             fingerprint = settings.fingerprint()
@@ -739,7 +855,10 @@ class WantedService:
             except Exception as exc:  # noqa: BLE001
                 logger.debug("art_online_wanted: Backfill im Durchlauf (%s)", exc)
 
-            entries = self.store.due(limit=self.per_pass or 0)
+            # Deckel je Durchlauf: der Konstruktorwert gewinnt (Tests), sonst gilt
+            # die Pref ``artworkOnlineWantedPerPass`` (live änderbar).
+            entries = self.store.due(
+                limit=self.per_pass or _pref_int(PREF_WANTED_PER_PASS, 0))
             started = time.time()
             counts = {OUTCOME_HIT: 0, OUTCOME_MISS: 0, OUTCOME_CACHED_MISS: 0,
                       OUTCOME_DISABLED: 0, OUTCOME_SKIPPED: 0}
@@ -858,7 +977,12 @@ class WantedService:
     # ---- Status (Web-GUI) ----
 
     def status(self) -> dict[str, Any]:
-        """Zustand für Anzeige/JSON — Zähler, letzter Lauf, Fortschritt."""
+        """Zustand für Anzeige/JSON — Zähler, letzter Lauf, Fortschritt.
+
+        Liest die Prefs vorher neu (synchron), damit die Anzeige einen gerade
+        gespeicherten Key sofort als „Konfiguration geändert“ zeigt.
+        """
+        self.refresh_from_prefs()
         counts = self.store.counts()
         settings = self.settings
         fingerprint = settings.fingerprint()
@@ -875,6 +999,7 @@ class WantedService:
         last_run = self.store.meta_get(META_LAST_RUN)
         open_count = counts.get(STATUS_OPEN, 0)
         miss_count = counts.get(STATUS_MISS, 0)
+        stale = self.store.stale_count(fingerprint)
         return {
             "open": open_count,
             "hit": counts.get(STATUS_HIT, 0),
@@ -889,7 +1014,10 @@ class WantedService:
             "last_run": int(last_run) if last_run else None,
             "last_pass": last_pass,
             "last_reason": self.store.meta_get(META_LAST_REASON) or "",
-            "settings_changed": bool(stored) and stored != fingerprint,
+            # „geändert“ heisst: der letzte Durchlauf lief mit einer anderen
+            # Kennung, oder es liegen noch Einträge aus einer anderen vor.
+            "settings_changed": (bool(stored) and stored != fingerprint) or stale > 0,
+            "stale_entries": stale,
             "next_due": self.store.next_due(),
             "enabled": bool(settings.enabled),
             "auto": bool(self.auto),
@@ -1008,9 +1136,44 @@ async def stop_background() -> None:
 
 
 def wanted_status() -> dict[str, Any]:
-    """Status des Dienstes für die Web-GUI (ohne die Liste anzulegen)."""
+    """Status des Dienstes für die Web-GUI (ohne die Liste anzulegen).
+
+    ``status()`` zieht die Prefs nach — die Anzeige zeigt also auch eine soeben
+    gespeicherte Änderung (``settings_changed``).
+    """
     service = configured_wanted_service()
     return service.status()
+
+
+def load_settings_quietly() -> ArtOnlineSettings:
+    """Prefs lesen und bei Fehlern die Vorbelegungen behalten."""
+    try:
+        from lyrion.web.settings import load_art_online_settings
+
+        return load_art_online_settings()
+    except Exception as exc:  # noqa: BLE001 - ohne Prefs gelten die Vorbelegungen
+        logger.debug("art_online_wanted: Prefs nicht lesbar (%s)", exc)
+        return ArtOnlineSettings()
+
+
+def note_settings_change(previous_fingerprint: str) -> bool:
+    """Nach dem Speichern der Einstellungen: bei Änderung erneut anstossen.
+
+    Aufrufer ist ``web/settings.py`` (Handler der Artwork-Seite).  Verglichen
+    wird die Kennung **vor** dem Speichern mit der jetzt gültigen
+    (:meth:`ArtOnlineSettings.fingerprint`); nur eine suchrelevante Änderung
+    löst den Durchlauf aus, ein reines Speichern ohne Änderung nicht.
+    """
+    service = configured_wanted_service()
+    service.refresh_from_prefs()
+    current = service.settings.fingerprint()
+    if current == previous_fingerprint:
+        return False
+    logger.info("art_online_wanted: Konfiguration geändert (%s -> %s) — die Liste "
+                "wird erneut abgearbeitet",
+                previous_fingerprint or "leer", current)
+    trigger_pass(reason="settings")
+    return True
 
 
 def trigger_pass(*, reason: str = "gui") -> dict[str, Any]:
@@ -1035,6 +1198,7 @@ __all__ = [
     "WantedService", "WantedStore", "cache_entry_wait_seconds",
     "configured_wanted_service", "current_wanted_service",
     "library_albums_without_cover", "record_missing_albums", "reset_wanted_service",
-    "retry_delay", "search_artist_for", "start_background", "stop_background",
-    "trigger_pass", "wanted_status",
+    "load_settings_quietly", "note_settings_change", "retry_delay",
+    "search_artist_for", "start_background", "stop_background", "trigger_pass",
+    "wanted_status",
 ]

@@ -1294,6 +1294,13 @@ async def handle_settings_request(scope: dict, receive, send) -> None:
     if any(f.pref in IMAGEPROXY_PREF_DEFAULTS for f in page.fields):
         await register_imageproxy_prefs()
 
+    # Kennung der Online-Suche **vor** dem Speichern: ändert sich etwas
+    # Suchrelevantes (Anbieter, Sprache, Land, API-Key), wird die wanted-Liste
+    # danach erneut abgearbeitet (Aufgaben-Anforderung „neuer API-Key“).
+    fingerprint_before = ""
+    if any(f.pref in _ART_PREF_DEFAULTS for f in page.fields):
+        fingerprint_before = load_art_online_settings().fingerprint()
+
     if method == "POST" and "saveSettings" in params:
         if page.needs_client and player is None:
             # Perl: Player/Display.pm:101-105 — ohne Client keine Einstellungen.
@@ -1318,6 +1325,16 @@ async def handle_settings_request(scope: dict, receive, send) -> None:
                 warning = get_string("SETUP_CHANGES_SAVED",
                                      default="Changes have been saved.")
             logger.info("settings: %s saved %s", page.route, written)
+            if fingerprint_before:
+                # Nur eine suchrelevante Änderung löst den neuen Durchlauf aus
+                # (Anbieter/Sprache/Land/Key); reines Speichern tut nichts.
+                try:
+                    from lyrion.media import art_online_wanted
+
+                    art_online_wanted.note_settings_change(fingerprint_before)
+                except Exception as exc:  # noqa: BLE001 - Speichern ist wichtiger
+                    logger.warning("settings: wanted-Liste nicht neu angestossen (%s)",
+                                   exc)
     elif page.needs_client and player is None:
         warning = get_string("SETUP_NO_PREFS",
                              default="There are no settings for this player on this page")
