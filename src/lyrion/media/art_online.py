@@ -47,7 +47,14 @@ Kodi-UAS als Vorlage (``metadata.album.universal``, v3.1.20, Zip von
 Unser Anbieterteil übernimmt von UAS: MusicBrainz als **Matcher** (Titel +
 Interpret, Treffer-Score), die **Release-Group**-MBID als gemeinsamen Schlüssel
 für die Bildquellen, die abgestufte Kette, Sprache aus der Konfiguration und
-sauberes Verhalten bei 0 Treffern (kein Fallback ins Blaue).  Abweichend:
+sauberes Verhalten bei 0 Treffern (kein Fallback ins Blaue).  Der **Interpret
+gehört immer zum Treffer**: er steht in jeder Suchstufe (UAS' Phrase,
+``albumuniversal.xml:6-10``) *und* wird am Kandidaten geprüft
+(:func:`candidate_matches`) — bei einem mehrdeutigen Albumnamen wie „Greatest
+Hits“ ist er der einzige Unterschied zwischen den Katalog-Einträgen.  Passt
+kein Kandidat mit dem Album-Interpreten zusammen oder widersprechen sich die
+Kandidaten darin, gibt es **kein** Cover statt eines fremden
+(:func:`select_candidate`).  Abweichend:
 
 * **Cover Art Archive zuerst.**  Kodi holt das Vorder-Cover bei fanart.tv /
   TheAudioDB; das CAA (``coverartarchive.org/release-group/<mbid>/front-500``)
@@ -456,6 +463,50 @@ def similarity(a: str, b: str) -> float:
     return difflib.SequenceMatcher(None, na, nb).ratio()
 
 
+#: Führende Artikel, die der Import-Sortierschlüssel abschneidet
+#: (``media/importer.py:91-98``: „The Beatles“ → ``beatles``).
+_ARTICLES = ("the ", "a ", "an ", "der ", "die ", "das ", "le ", "la ", "les ")
+
+
+def artist_key(text: str) -> str:
+    """Vergleichsform des **Interpreten**: normalisiert, ohne führenden Artikel,
+    ohne Leerzeichen.
+
+    Dieselbe Bildung wie der Sortierschlüssel des Imports
+    (``media/importer.py:91-98``), nur zusätzlich ohne Leerzeichen, damit
+    Schreibvarianten desselben Namens zusammenfallen: „The Police“ →
+    ``police``, „BlutEngel“ = „blut engel`` → ``blutengel``.
+    """
+    key = normalize(text)
+    for article in _ARTICLES:
+        if key.startswith(article):
+            key = key[len(article):]
+            break
+    return key.replace(" ", "")
+
+
+def _artist_matches(candidate_artist: str, query_artist: str, *,
+                    artist_min: float = ARTIST_MIN_RATIO) -> bool:
+    """Trägt der Kandidat den gesuchten Interpreten?  (Pflichtprüfung)
+
+    Zuerst die Identität (:func:`artist_key`), dann eine Ähnlichkeitsstufe, die
+    **nur** für Varianten desselben Namens gilt (einer der beiden Schlüssel
+    enthält den anderen: „Nina Hagen“ ⊂ „Nina Hagen Band“).  Reine Ähnlichkeit
+    genügt absichtlich nicht: ``difflib`` hält „The Police“ und „The Cure“ für
+    75 % gleich (``ARTIST_MIN_RATIO`` = 0,66) — und genau solche Verwechslungen
+    sollen nicht mehr passieren.  Ohne gesuchten Interpreten gibt es keinen
+    Treffer: der Titel allein ist bei mehrdeutigen Albumnamen kein Schlüssel.
+    """
+    if not str(candidate_artist or "").strip() or not str(query_artist or "").strip():
+        return False
+    a, b = artist_key(candidate_artist), artist_key(query_artist)
+    if a == b:
+        return True
+    if similarity(candidate_artist, query_artist) < artist_min:
+        return False
+    return bool(a) and bool(b) and (a in b or b in a)
+
+
 def _year_of(text: Any) -> int | None:
     """Jahreszahl aus ``strAlbumThumb``-Umfeld bzw. ``date``-Feldern (``1989-12-06``)."""
     match = re.match(r"\s*(\d{4})", str(text or ""))
@@ -471,20 +522,30 @@ def candidate_matches(
 ) -> bool:
     """Prüft Treffer wie UAS' Suche-plus-``score``: Titel, Interpret, Jahr.
 
+    **Der Interpret ist Pflicht** — UAS' Suchphrase verlangt ihn
+    (``albumuniversal.xml:6-10``: ``release:"<album>" AND (artistname:"<artist>"
+    OR artist:"<artist>")``), und bei mehrdeutigen Albumnamen entscheidet allein
+    er: „Greatest Hits“ gibt es in dieser Sammlung von Fleetwood Mac, Barry
+    Manilow, Janis Joplin, ZZ Top, The Police und Bob Marley.  Ein Album ohne
+    Interpreten hat damit **keinen** prüfbaren Treffer (lieber kein Cover als ein
+    falsches; Perl zeigt dann den generischen Platzhalter,
+    ``Slim/Web/Graphics.pm:275-291``).
+
     Der Titel darf um Klammer-Zusätze abweichen („Point Blank (MMXXIII
     Version)“ vs. „Point Blank MMXXIII“), das Jahr aber höchstens um
     :data:`YEAR_TOLERANCE` — sonst zieht eine Reissue von 1989 das Cover einer
     2023er-Ausgabe (oder umgekehrt).
     """
+    if not normalize(query.artist):
+        return False
     title = max(
         similarity(candidate.title, query.album),
         similarity(candidate.group_title, query.album),
     )
     if title < title_min:
         return False
-    if query.artist:
-        if similarity(candidate.artist, query.artist) < artist_min:
-            return False
+    if not _artist_matches(candidate.artist, query.artist, artist_min=artist_min):
+        return False
     if query.year and candidate.year:
         if abs(query.year - candidate.year) > YEAR_TOLERANCE:
             return False
@@ -500,6 +561,43 @@ def _candidate_rank(candidate: Candidate, query: AlbumQuery) -> tuple[int, float
     return (year_hit, title, candidate.score)
 
 
+def select_candidate(
+    candidates: Iterable[Candidate],
+    query: AlbumQuery,
+    *,
+    title_min: float = TITLE_MIN_RATIO,
+    artist_min: float = ARTIST_MIN_RATIO,
+) -> tuple[Candidate | None, str]:
+    """Besten passenden Treffer wählen — oder sagen, **warum** keiner passt.
+
+    Rückgabe ``(treffer, grund)``; ``grund`` ist leer, wenn ein Treffer gefunden
+    wurde, sonst der Klartext für den ``miss``-Eintrag.
+
+    Mehrdeutigkeit ist ein Fehlschlag **mit Grund**, kein Raten: passen mehrere
+    Kandidaten zum Titel und tragen dabei *verschiedene* Interpreten, von denen
+    keiner genau der gesuchte ist, gibt es keinen Treffer.  UAS nimmt dort den
+    ``score``-besten Treffer seiner Phrase (``albumuniversal.xml:6-10``); unsere
+    Leiter darf aber nur den *Titel* entspannen (:func:`mb_query_variants`), also
+    muss der Interpret den Ausschlag geben — lieber kein Cover als ein fremdes.
+    """
+    valid = [c for c in candidates
+             if candidate_matches(c, query, title_min=title_min, artist_min=artist_min)]
+    if not valid:
+        return None, "kein passender Treffer"
+    wanted = artist_key(query.artist)
+    exact = [c for c in valid if artist_key(c.artist) == wanted]
+    if exact:
+        valid = exact
+    else:
+        artists = {artist_key(c.artist) for c in valid}
+        if len(artists) > 1:
+            names = ", ".join(sorted(a for a in artists if a)[:3])
+            return None, (f"mehrdeutig: {len(artists)} Interpreten zu "
+                          f"{query.album!r} ({names})")
+    valid.sort(key=lambda c: _candidate_rank(c, query), reverse=True)
+    return valid[0], ""
+
+
 def pick_candidate(
     candidates: Iterable[Candidate],
     query: AlbumQuery,
@@ -507,13 +605,12 @@ def pick_candidate(
     title_min: float = TITLE_MIN_RATIO,
     artist_min: float = ARTIST_MIN_RATIO,
 ) -> Candidate | None:
-    """Besten passenden Treffer wählen (Jahr, dann Titelähnlichkeit, dann MB-Score)."""
-    valid = [c for c in candidates
-             if candidate_matches(c, query, title_min=title_min, artist_min=artist_min)]
-    if not valid:
-        return None
-    valid.sort(key=lambda c: _candidate_rank(c, query), reverse=True)
-    return valid[0]
+    """Besten passenden Treffer wählen (Jahr, dann Titelähnlichkeit, dann MB-Score).
+
+    Dünne Hülle um :func:`select_candidate`; der Grund bleibt dort.
+    """
+    return select_candidate(candidates, query, title_min=title_min,
+                            artist_min=artist_min)[0]
 
 
 # ---------------------------------------------------------------------------
@@ -737,11 +834,19 @@ def mb_query_variants(query: AlbumQuery) -> list[str]:
     """Suchterme in Stufen — UAS' ``CreateAlbumSearchUrl`` (``albumuniversal.xml:6-10``)
     mit ``release:"<album>" AND (artistname:"<artist>" OR artist:"<artist>")``.
 
+    **Nur der Titel wird entspannt, nie der Interpret.**  Jede Stufe trägt die
+    Interpreten-Klausel, solange das Album einen Interpreten hat; ohne sie wäre
+    bei mehrdeutigen Albumnamen („Greatest Hits“) der Titel allein der Schlüssel.
     Stufe 2 nimmt Klammer-Zusätze aus dem Albumtitel (MusicBrainz' Lucene-Suche
     findet ``release:"Point Blank (MMXXIII Version)"`` nicht, obwohl die Ausgabe
-    als „Point Blank MMXXIII“ vorhanden ist — live geprüft).  Stufe 3 nimmt die
-    Zusätze auch aus dem Interpreten (UAS kürzt dort an ``Ft.``/``Feat.``/``and``/``/``,
-    ``albumuniversal.xml:11-20``).
+    als „Point Blank MMXXIII“ vorhanden ist — live geprüft).  Stufe 3 kürzt
+    zusätzlich den Interpreten an ``Ft.``/``Feat.``/``and``/``/``
+    (``albumuniversal.xml:11-20``).  Stufe 4 nimmt Sonderzeichen aus dem Titel,
+    die Lucene sonst zerlegt („Sex, Sex, Sex“ → „Sex Sex Sex“).
+
+    Ein Album **ohne** Interpreten bekommt nur die Titel-Stufe; ein Treffer daraus
+    wird nicht akzeptiert (:func:`candidate_matches` verlangt den Interpreten),
+    die Stufe erspart also nur den Fehlversuch ohne Term.
     """
     album = _sanitize_query_term(query.album)
     artist = _sanitize_query_term(query.artist)
@@ -751,25 +856,23 @@ def mb_query_variants(query: AlbumQuery) -> list[str]:
     plain_album = _sanitize_query_term(_BRACKET_RE.sub(" ", query.album))
     plain_artist = _sanitize_query_term(_short_artist(query.artist))
 
+    def with_artist(title: str, who: str) -> str:
+        """Eine Suchstufe — mit Interpreten-Klausel, wie UAS sie immer stellt."""
+        if not who:
+            return f'release:"{title}"'
+        return f'release:"{title}" AND (artistname:"{who}" OR artist:"{who}")'
+
     variants: list[str] = []
-    if full_album and artist:
-        variants.append(f'release:"{full_album}" AND (artistname:"{artist}" OR artist:"{artist}")')
+    if full_album:
+        variants.append(with_artist(full_album, artist))
     if plain_album and plain_album != full_album:
-        if artist:
-            variants.append(
-                f'release:"{plain_album}" AND (artistname:"{artist}" OR artist:"{artist}")')
-        else:
-            variants.append(f'release:"{plain_album}"')
-    if plain_artist and plain_artist != artist and plain_album:
-        variants.append(
-            f'release:"{plain_album}" AND (artistname:"{plain_artist}" '
-            f'OR artist:"{plain_artist}")')
-    if plain_album:
-        variants.append(f'release:"{plain_album}"')
-    if album and album != plain_album:
-        variants.append(f'release:"{album}"')
+        variants.append(with_artist(plain_album, artist))
+    if plain_album and plain_artist and plain_artist != artist:
+        variants.append(with_artist(plain_album, plain_artist))
+    if album and album != full_album and album != plain_album:
+        variants.append(with_artist(album, artist))
     if not variants and album:
-        variants.append(f'release:"{album}"')
+        variants.append(with_artist(album, artist))
     # Duplikate raus, Reihenfolge behalten.
     seen: list[str] = []
     for variant in variants:
@@ -807,15 +910,19 @@ def search_musicbrainz_url(query: str) -> str:
     return f"{MB_BASE}/release"
 
 
-async def search_musicbrainz(fetch: Any, settings: ArtOnlineSettings,
-                             query: AlbumQuery) -> tuple[Candidate | None, int]:
+async def search_musicbrainz_detailed(fetch: Any, settings: ArtOnlineSettings,
+                                      query: AlbumQuery
+                                      ) -> tuple[Candidate | None, int, str]:
     """Release-Suche über die Stufen aus :func:`mb_query_variants`.
 
-    Liefert ``(bester_treffer, anzahl_treffer)``.  Nur die *erste* Stufe, die
-    überhaupt MusicBrainz-Treffer liefert, wird bewertet — sonst zöge ein
-    unspezifischer Suchterm einen falschen Katalog-Treffer herein.
+    Liefert ``(bester_treffer, anzahl_treffer, grund)``; ``grund`` ist leer bei
+    einem Treffer, sonst der Klartext für den ``miss``-Eintrag („kein passender
+    Treffer“ bzw. „mehrdeutig: …“).  Nur die *erste* Stufe, die überhaupt
+    MusicBrainz-Treffer liefert, wird bewertet — sonst zöge ein unspezifischer
+    Suchterm einen falschen Katalog-Treffer herein.
     """
     attempts = 0
+    reason = "kein passender Treffer"
     for term in mb_query_variants(query):
         attempts += 1
         response = await fetch.get(
@@ -834,15 +941,22 @@ async def search_musicbrainz(fetch: Any, settings: ArtOnlineSettings,
         if not candidates:
             logger.debug("art_online: MusicBrainz-Suchterm ohne Treffer: %s", term)
             continue
-        match = pick_candidate(candidates, query)
+        match, reason = select_candidate(candidates, query)
         if match is not None:
-            return match, len(candidates)
+            return match, len(candidates), ""
         logger.info(
             "art_online: MusicBrainz lieferte %d Treffer, keiner passte zu "
-            "%r / %r (%s)", len(candidates), query.album, query.artist,
-            _describe_candidates(candidates))
-        return None, len(candidates)
-    return None, 0
+            "%r / %r — %s (%s)", len(candidates), query.album, query.artist,
+            reason, _describe_candidates(candidates))
+        return None, len(candidates), reason
+    return None, 0, reason
+
+
+async def search_musicbrainz(fetch: Any, settings: ArtOnlineSettings,
+                             query: AlbumQuery) -> tuple[Candidate | None, int]:
+    """Wie :func:`search_musicbrainz_detailed`, aber ohne den Grund."""
+    match, hits, _reason = await search_musicbrainz_detailed(fetch, settings, query)
+    return match, hits
 
 
 def _failure_is_definitive(text: str) -> bool:
@@ -859,6 +973,7 @@ def _failure_is_definitive(text: str) -> bool:
     """
     definitive = (
         "kein passender treffer",        # MusicBrainz kennt das Album nicht
+        "mehrdeutig",                    # Titel mehrdeutig, Interpret nicht eindeutig
         "ohne vorder-cover",             # CAA hat kein Vorder-Cover (404)
         "kennt kein cover",              # TheAudioDB: Treffer ohne Bild
         "kein albumtreffer",             # TheAudioDB: nichts gefunden
@@ -1132,13 +1247,35 @@ class ArtOnlineCache:
 
         Siehe :meth:`ArtOnlineService.read_cached_album` für den Grund: der
         Aufrufer kennt nur die Bibliothekszeile (Titel + Sortierschlüssel +
-        Jahr).  Bewertung: Titel muss passen (in Vergleichsform), dann zählt
-        Interpretengleichheit (2) und Jahresgleichheit (1); der beste Treffer
-        gewinnt, bei Gleichstand der erste.  Ohne Trefferzeile mit vorhandener
-        Bilddatei gibt es ``None`` (der Aufrufer fällt auf den Platzhalter
-        zurück, ``web/app.py`` ``_send_placeholder_cover``).
+        Jahr).
+
+        **Der Interpret ist Pflicht** (UAS-Vorbild ``albumuniversal.xml:6-10``:
+        ``release:"<album>" AND (artistname:"<artist>" OR artist:"<artist>")``).
+        Ohne ihn wäre der Titel allein der Schlüssel — und „Greatest Hits“ gehört
+        in dieser Sammlung zu Fleetwood Mac, Barry Manilow, Janis Joplin, ZZ Top,
+        The Police und Bob Marley.  Live belegt: vor dieser Regel bekam
+        ``albums.id=6794`` (Björk, „Greatest Hits“, 2002) die Datei
+        ``f87a0f981d73159ae138.jpg`` des Bob-Marley-Eintrags
+        (MBID ``035d9663-6997-32d5-abcb-3ba834f6d823``), weil hier der *erste*
+        Treffer mit passendem Titel ohne Interpretenprüfung gewann (Rang 0).
+        Es gilt: lieber **kein** Cover — der Aufrufer fällt dann auf den
+        Perl-Platzhalter zurück (``Slim/Web/Graphics.pm:275-291``) — als ein
+        fremdes.
+
+        Bewertung: Titel muss passen (in Vergleichsform), der Interpret ebenfalls
+        (Vergleichsform oder :data:`ARTIST_MIN_RATIO`-Ähnlichkeit, weil
+        ``albums.albumartist_sort`` der Sortierschlüssel ist: „The Police“ →
+        ``police``); dann zählt Interpretengleichheit (2) und Jahresgleichheit
+        (1); der beste Treffer gewinnt, bei Gleichstand der erste.  Ohne
+        Album-Interpreten gibt es **keinen** Treffer.
         """
-        if not album:
+        wanted_album = normalize(album)
+        wanted_artist = normalize(artist)
+        if not wanted_album or not wanted_artist:
+            # Ohne Interpreten ist der Titel allein kein Schlüssel (UAS sucht
+            # immer mit Interpret) — kein Treffer statt eines fremden Bildes.
+            logger.debug("art_online: Album-Suche ohne Interpreten für %r — kein "
+                         "Treffer (Interpret ist Pflicht)", album)
             return None
         try:
             with self._connect() as conn:
@@ -1149,16 +1286,16 @@ class ArtOnlineCache:
             logger.debug("art_online: Cache-Lesefehler (%s)", exc)
             return None
 
-        wanted_album = normalize(album)
-        wanted_artist = normalize(artist)
         best: sqlite3.Row | None = None
         best_rank = -1
         for row in rows:
             if normalize(str(row["album"] or "")) != wanted_album:
                 continue
-            rank = 0
-            if wanted_artist and normalize(str(row["artist"] or "")) == wanted_artist:
-                rank += 2
+            row_artist = str(row["artist"] or "")
+            if not _artist_matches(row_artist, artist):
+                # Fremder Interpret zum gleichen Titel: nie ausliefern.
+                continue
+            rank = 2 if artist_key(row_artist) == artist_key(artist) else 1
             row_year = row["year"]
             if year is not None and row_year is not None and int(row_year) == int(year):
                 rank += 1
@@ -1358,9 +1495,10 @@ class ArtOnlineService:
 
         # Schritt 1: MusicBrainz-Match (UAS' Suche, albumuniversal.xml:6-40).
         if "musicbrainz" in providers:
+            mb_reason = ""
             try:
-                candidate, _hits = await asyncio.wait_for(
-                    search_musicbrainz(self.fetcher, self.settings, query),
+                candidate, _hits, mb_reason = await asyncio.wait_for(
+                    search_musicbrainz_detailed(self.fetcher, self.settings, query),
                     timeout=self.settings.timeout * 2,
                 )
             except asyncio.TimeoutError:
@@ -1374,7 +1512,10 @@ class ArtOnlineService:
                              candidate.release_group_id, candidate.group_title,
                              candidate.year)
             elif not failures:
-                failures.append("musicbrainz: kein passender Treffer")
+                # Der Grund der Ablehnung gehört in den Cache: „mehrdeutig“ ist
+                # eine definitive Absage (kein Blindflug, kein Ratetreffer).
+                failures.append(
+                    f"musicbrainz: {mb_reason or 'kein passender Treffer'}")
 
         if query.mbid and candidate is None:
             candidate = Candidate(release_group_id=query.mbid, group_title=query.album,
@@ -1453,7 +1594,13 @@ class ArtOnlineService:
         (``media/importer.py:91-98``: kleingeschrieben, ohne führenden Artikel),
         also nicht immer gleich ``normalize(<Albumartist-Tag>)`` („The
         Beatles“ → ``beatles`` gegen ``the beatles``).  Deshalb vergleicht
-        diese Suche die gespeicherten Album-Spalten statt den Schlüssel.
+        diese Suche die gespeicherten Album-Spalten statt den Schlüssel — **und
+        verlangt den Interpreten**: ohne ihn wäre der Titel allein der Schlüssel
+        (siehe :meth:`ArtOnlineCache.find_by_album_sync`).  Der Aufrufer übergibt
+        deshalb den Album-Contributor bzw. ``albumartist_sort``
+        (``web/app.py`` ``_online_cover_for_album``,
+        ``media/importer.py`` ``online_cover_path``); ohne Interpreten gibt es
+        ``None`` und der Aufrufer zeigt den Platzhalter.
         """
         entry = self.cache.find_by_album_sync(album, artist, year)
         return self._result_from_entry(entry)
@@ -1650,9 +1797,11 @@ __all__ = [
     "PREF_ENABLED", "PREF_FANART_KEY", "PREF_LANGUAGE", "PREF_PROVIDERS",
     "PREF_RETRY_DAYS", "PREF_TIMEOUT", "PROVIDER_ALIASES", "PROVIDER_KEY_PREFS",
     "PROVIDER_NEEDS_MBID",
-    "ProviderError", "candidate_matches", "configured_service", "current_service",
+    "ProviderError", "artist_key", "candidate_matches", "configured_service",
+    "current_service",
     "default_cache_dir", "get_service",
     "image_dimensions", "lookup_cover", "mb_query_variants",
     "normalize_provider_list", "pick_candidate", "read_cached_cover",
-    "reset_service", "sniff_mime", "validate_image",
+    "reset_service", "search_musicbrainz", "search_musicbrainz_detailed",
+    "select_candidate", "sniff_mime", "validate_image",
 ]

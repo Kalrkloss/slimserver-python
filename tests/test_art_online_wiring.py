@@ -370,7 +370,14 @@ def test_transient_miss_is_retried_after_six_hours(tmp_path, monkeypatch):
 
 
 def test_read_cached_album_matches_the_sort_key_spelling(tmp_path):
-    """Der Sortierschlüssel („bonfire“) findet den Treffer vom Tag („Bonfire“)."""
+    """Der Sortierschlüssel („bonfire“) findet den Treffer vom Tag („Bonfire“).
+
+    **Fremder Interpret zählt nicht**: der Titel allein ist kein Schlüssel
+    („Greatest Hits“ gibt es von Fleetwood Mac, Barry Manilow, Janis Joplin,
+    ZZ Top, The Police und Bob Marley — UAS sucht immer mit Interpret,
+    ``albumuniversal.xml:6-10``); lieber der Perl-Platzhalter
+    (``Slim/Web/Graphics.pm:275-291``) als ein fremdes Bild.
+    """
     service = ArtOnlineService(ArtOnlineSettings(cache_dir=tmp_path / "cache"))
     query = AlbumQuery(album="Point Blank", artist="Bonfire", year=1989)
     written = service.cache.write_cover_sync(
@@ -378,11 +385,14 @@ def test_read_cached_album_matches_the_sort_key_spelling(tmp_path):
         mime="image/jpeg", source_url="https://coverartarchive.org/x",
         mbid="e104643d", width=500, height=500)
 
-    for artist in ("Bonfire", "bonfire", "BONFIRE", "etwas anderes"):
+    for artist in ("Bonfire", "bonfire", "BONFIRE", "The Bonfire"):
         result = service.read_cached_album("Point Blank", artist, 1989)
         assert result is not None, f"Artist-Variante {artist!r} fand nichts"
         assert result.path == written
     assert service.read_cached_album("Anderes Album", "Bonfire", 1989) is None
+    # Fremder Interpret zum selben Titel: kein Treffer (nicht raten).
+    assert service.read_cached_album("Point Blank", "Accept", 1989) is None
+    assert service.read_cached_album("Point Blank", "", 1989) is None
 
 
 def test_cover_route_serves_the_cached_online_cover(tmp_path, monkeypatch):
