@@ -106,6 +106,47 @@ def _player(pm, **kw):
     return p
 
 
+# ── Dauer der laufenden Nummer: Perls ``$track->secs`` aus der DB ─────────
+#
+# ``seek_to`` holt die Dauer NICHT mehr aus dem Player-Zustand, sondern aus
+# der DB-Zeile des laufenden Eintrags (``$song->duration()``, Song.pm:809-815
+# → ``Info::getDuration($song->currentTrack()->url)``, Info.pm:382-390).
+# Diese Tests modellieren die Zeile, statt die echte Bibliothek zu lesen:
+# ``_FAKE_DB['duration']`` ist das LENGTH-Feld des Titels, ``present=False``
+# eine fehlende Zeile.
+_FAKE_DB = {"duration": 200.0, "present": True}
+
+
+@pytest.fixture(autouse=True)
+def _fake_track_row(monkeypatch):
+    import lyrion.database.sqlite_helper as helper
+
+    class _Row:
+        def __init__(self, duration):
+            self.duration = duration
+
+    class _Result:
+        def scalar_one_or_none(self):
+            if not _FAKE_DB["present"]:
+                return None
+            return _Row(_FAKE_DB["duration"])
+
+    class _Session:
+        async def execute(self, *_a, **_k):
+            return _Result()
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_a):
+            return False
+
+    _FAKE_DB.update(duration=200.0, present=True)
+    monkeypatch.setattr(helper, "db_session", lambda: _Session())
+    yield
+    _FAKE_DB.update(duration=200.0, present=True)
+
+
 # ── Protokoll-Ebene: ``strm 'a'`` bleibt der Sync-Skip (Squeezebox2.pm:1120) ──
 
 def test_send_skip_builds_24_byte_strm_a_frame_with_ms_interval():
@@ -178,12 +219,69 @@ def test_seek_past_the_end_skips_to_the_next_track():
 
 def test_seek_without_duration_restarts_the_track():
     """``!$song->duration()`` (:1099-1100) — ohne Dauer kein Offset."""
+    _FAKE_DB["duration"] = 0.0        # LENGTH des Titels unbekannt/0
     pm = _fresh_pm()
     p = _player(pm, duration=0.0, elapsed=42.0)
 
     assert asyncio.run(pm.seek_to(p.mac, 120)) is True
     assert pm._protocol_handler.started == [(1, 0.0)]
     assert p.elapsed == 0.0
+
+
+def test_first_seek_right_after_a_start_does_not_fall_back_to_zero():
+    """Der Web-UI-Start (``playlist.play`` → ``api._play_playlist_item``)
+    setzt ``player.duration`` nicht: beim ERSTEN Klick steht dort 0, obwohl
+    die Nummer 265 s lang ist (live gemessen 2026-09-22, 0,05 s nach dem
+    Start). Perl liest die Dauer der laufenden Nummer aus der DB
+    (``Song.pm:809-815`` → ``Info.pm:382-390`` → ``$track->secs``) — der
+    erste Klick springt an die Position, statt von vorn zu starten."""
+    _FAKE_DB["duration"] = 265.217
+    pm = _fresh_pm()
+    p = _player(pm, duration=0.0, elapsed=0.2)
+
+    assert asyncio.run(pm.seek_to(p.mac, 120)) is True
+    assert pm._protocol_handler.started == [(1, 120.0)]   # KEIN (1, 0.0)
+    assert p.elapsed == 120.0
+
+
+def test_seek_uses_the_playing_entrys_length_not_a_stale_one():
+    """Zweite Live-Messung: ``player.duration`` trug noch die 265 s der
+    VORIGEN Nummer, die laufende ist 519 s lang. Mit dem Zustandswert war
+    ``$newtime > $song->duration()`` wahr → Perl-``_Skip`` (:1127-1130)
+    schaltete weiter statt an die Position zu springen."""
+    _FAKE_DB["duration"] = 519.3
+    pm = _fresh_pm()
+    p = _player(pm, playlist=[1, 111], duration=265.217)   # stale
+    p.playlist_position = 1
+    p.current_track_id = 111
+
+    assert asyncio.run(pm.seek_to(p.mac, 300)) is True
+    assert pm._protocol_handler.started == [(111, 300.0)]  # kein Weiter-Schalten
+    assert p.playlist_position == 1
+
+
+def test_seek_keeps_the_open_time_length_when_the_row_is_gone():
+    """Perls Kette ist ``$self->_duration() || Info::getDuration(url)``
+    (Song.pm:815): die beim Oeffnen gesetzte Dauer bleibt gueltig, wenn die
+    DB-Zeile nicht mehr da ist (Titel geloescht)."""
+    _FAKE_DB["present"] = False
+    pm = _fresh_pm()
+    p = _player(pm, duration=200.0)
+
+    assert asyncio.run(pm.seek_to(p.mac, 120)) is True
+    assert pm._protocol_handler.started == [(1, 120.0)]
+
+
+def test_seek_refreshes_the_state_duration_from_the_db_row():
+    """Die gelesene Dauer geht in den Zustand zurueck (Perls Song traegt sie,
+    ``Song.pm:809-815``) — der status-``duration``-Wert kann damit nicht auf
+    der vorigen Nummer stehenbleiben (``cli_commands.py:1724-1735``)."""
+    _FAKE_DB["duration"] = 265.217
+    pm = _fresh_pm()
+    p = _player(pm, duration=0.0)
+
+    assert asyncio.run(pm.seek_to(p.mac, 120)) is True
+    assert p.duration == pytest.approx(265.217)
 
 
 def test_seek_on_a_remote_stream_restarts_it(monkeypatch):

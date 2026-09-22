@@ -1814,6 +1814,57 @@ class PlayerManager:
             return False
         return await self.playlist_play(player_id, target)
 
+    async def _playing_duration(self, player, item, is_track: bool) -> float:
+        """``$song->duration()`` of the entry that is PLAYING — the DB row.
+
+        Perl asks the SONG object of the playing entry: ``_duration``, filled
+        when the stream opens from ``$track->secs()`` (``File.pm:72``/:117),
+        and when that is empty ``Slim::Music::Info::getDuration($song->
+        currentTrack()->url)`` (``Info.pm:382-390``: ``Slim::Schema->
+        objectForUrl`` → ``$track->secs``).  Both are the DB row of the CURRENT
+        entry, resolved AT SEEK TIME (``Song.pm:809-815``); ``_JumpToTime``
+        reads it twice (:1097 restart branch, :1127 skip branch).
+
+        A player-level cache must NOT be used here: ``player.duration`` can
+        still be 0 while the entry plays (a play path that does not load the
+        row — live: the web UI's ``playlist play``) or still hold the PREVIOUS
+        entry's length (the row is only written by ``play_track``), and either
+        sends ``time <n>`` into the wrong branch: restart from 0 or ``_Skip``
+        to the next entry (both measured live 2026-09-22).
+
+        A remote (radio) entry has no seekable length: Perl's HTTP handler
+        needs bitrate AND duration for ``canSeek`` (``HTTP.pm:1150-1166``) and
+        takes the restart branch without them.
+        """
+        if not is_track:
+            return 0.0
+        cached = float(getattr(player, "duration", 0) or 0)
+        try:
+            from sqlalchemy import select
+            from lyrion.database.schema import Track
+            from lyrion.database.sqlite_helper import db_session
+            async with db_session() as session:
+                t = (await session.execute(
+                    select(Track).where(Track.id == item)
+                )).scalar_one_or_none()
+        except Exception as exc:  # noqa: BLE001 — Wiedergabe nie stoeren
+            logger.debug("seek_to: DB-Dauer fuer %r nicht lesbar (%s) — "
+                         "Zustandswert %.1f", item, exc, cached)
+            return cached
+        if t is None:
+            # Perls Kette ist ``$self->_duration() || Info::getDuration(url)``
+            # (Song.pm:815): die beim Oeffnen gesetzte Dauer (bei uns der
+            # Zustandswert aus ``play_track``) bleibt gueltig, wenn die
+            # DB-Zeile nicht mehr da ist (Titel geloescht).
+            return cached
+        duration = float(t.duration or 0)
+        # Der Song traegt die Dauer der laufenden Nummer (Song.pm:809-815) —
+        # dieselbe Quelle, aus der auch der Byte-Offset kommt
+        # (protocol.py ``duration_seconds``) und die der status-Handler als
+        # 'duration' heilt (cli_commands.py:1724-1735).
+        player.duration = duration
+        return duration
+
     async def seek_to(self, player_id: str, seconds: int) -> bool:
         """``time <n>`` — Perl's ``gototime`` → ``jumpToTime`` → ``_JumpToTime``.
 
@@ -1859,12 +1910,27 @@ class PlayerManager:
             return False
         item = items[pos]
         is_track = isinstance(item, int)
-        duration = float(getattr(player, "duration", 0) or 0)
+        state_duration = float(getattr(player, "duration", 0) or 0)
+        # Perl resolves the length of the PLAYING song at seek time
+        # (``$song->duration()``, Song.pm:809-815 → Info.pm:382-390 → the DB
+        # row) — never from a player-level cache.
+        duration = await self._playing_duration(player, item, is_track)
+        logger.debug(
+            "seek_to %s: seconds=%s state-duration=%s playing-duration=%s "
+            "pos=%d/%d item=%r mode=%s remote=%s elapsed=%.1f "
+            "stream_start_offset=%.1f",
+            player_id, seconds, state_duration, duration, pos, len(items),
+            item, player.mode, getattr(player, "remote", 0),
+            float(getattr(player, "elapsed", 0) or 0),
+            float(getattr(player, "stream_start_offset", 0.0) or 0.0))
 
         # Perl _JumpToTime :1097-1111 — restart the current item from 0. A
         # remote (radio) stream has no duration either (``canSeek`` false,
         # File.pm:403-415 / HTTP.pm:1186-1188), so it takes this branch too.
         if seconds <= 0 or not duration or not is_track:
+            logger.debug("seek_to %s: branch restart-from-0 (seconds=%s "
+                         "duration=%s is_track=%s)", player_id, seconds,
+                         duration, is_track)
             # Perl ``_Stop`` closes the stream before the restart, so the
             # re-stream of the SAME track must not be swallowed by the
             # idempotency guard (protocol.py ``send_strm_to_player``).
@@ -1875,6 +1941,8 @@ class PlayerManager:
 
         # Perl :1127-1130 — past the end of the song: ``_Skip`` advances.
         if seconds > duration:
+            logger.debug("seek_to %s: branch skip-to-next (seconds=%s > "
+                         "duration=%s)", player_id, seconds, duration)
             return await self.playlist_next(player_id)
 
         # Perl :1132-1141 — ``_Stop`` + ``_Stream`` with the seekdata of the
@@ -1882,6 +1950,8 @@ class PlayerManager:
         # and ``stream_start_offset`` (the protocol layer's ``startOffset``)
         # carries the position, so the status ``time`` jumps to ``seconds``
         # and counts on from there.
+        logger.debug("seek_to %s: branch range-restream at %s s (of %s s)",
+                     player_id, seconds, duration)
         player.forget_stream()
         return await self.play_track(player_id, item, float(seconds))
 
