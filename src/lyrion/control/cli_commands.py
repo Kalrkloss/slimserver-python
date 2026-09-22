@@ -4781,16 +4781,57 @@ async def _fav_delete(
     ctx: CLIContext,
     args: list[str],
 ) -> list[str]:
-    """favorites delete <id> — ONE escaped line."""
+    """favorites delete <item_id>|<url> — ONE escaped line.
+
+    Perl ``cliDelete`` (``Slim/Plugin/Favorites/Plugin.pm:924-964``) reads the
+    **tagged** params of the command::
+
+        my $index  = $request->getParam('item_id');
+        my $url    = $request->getParam('url');
+        ...
+        if (!defined $index || !defined $favs->entry($index)) {
+            if ($url) { $favs->deleteUrl($url); }
+            else { $request->setStatusBadParams(); return; }
+        }
+        else { $favs->deleteIndex($index); }
+
+    so ``favorites delete item_id:ab9c31e0.3`` is the CLI form a controller
+    sends back after ``favorites items`` (Perl's ``id:`` is the session crumb).
+    The bare positional form (``favorites delete 12``) is our documented
+    addition and stays accepted; an id that names no existing entry falls back
+    to the URL exactly like Perl, and a request that names neither is bad
+    params (no result on the wire).
+    """
     if not args:
         return _command_echo(["favorites", "delete"], args, [], has_tags=True)
+    tagged: dict[str, str] = {}
+    positional: list[str] = []
+    for a in args:
+        s = str(a)
+        if ":" in s and s.split(":", 1)[0] in ("item_id", "url", "title"):
+            k, _, v = s.partition(":")
+            tagged[k] = v
+        else:
+            positional.append(s)
+    target = tagged.get("item_id") or (positional[0] if positional else "")
+    url = tagged.get("url") or ""
     try:
         from lyrion.music.favorites import get_favorites_manager
 
         fm = get_favorites_manager()
-        fav_id = await _fav_resolve_id(fm, str(args[0]))
+        fav_id: Optional[int] = None
+        if target:
+            fav_id = await _fav_resolve_id(fm, str(target))
+            if fav_id is not None and await fm.get(fav_id) is None:
+                fav_id = None            # ``!$favs->entry($index)``
         if fav_id is None:
-            return _command_echo(["favorites", "delete"], args, [], has_tags=True)
+            if not url:
+                return _command_echo(["favorites", "delete"], args, [],
+                                     has_tags=True)
+            fav_id = await fm.find_url(url)  # ``$favs->deleteUrl($url)``
+        if fav_id is None:
+            return _command_echo(["favorites", "delete"], args, [],
+                                 has_tags=True)
         await fm.delete(fav_id)
     except Exception:  # noqa: BLE001
         pass

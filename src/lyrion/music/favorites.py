@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -108,6 +109,117 @@ def _opml_path() -> Path | None:
         if c.exists():
             return c
     return None
+
+
+# ── favorites.opml, the storage Perl deletes from ──────────────────────────
+#
+# Perl's favourites *are* the file: ``OpmlFavorites::deleteIndex`` splices the
+# entry out of the loaded outline tree and ``save``s the document back
+# (``Slim/Plugin/Favorites/OpmlFavorites.pm:412-426`` → ``Opml.pm:91-138``),
+# so a deleted favourite is gone from the list *and* from
+# ``favorites.opml``.  Our port keeps the favourites in the DB and merges the
+# file in at start-up (:func:`ensure_opml_imported`) — a delete that only
+# touches the DB is therefore undone by that merge on the next start.  The
+# helpers below drop the deleted row's outline with the *same* match rule the
+# merge uses (URL for a stream, title+parent for a folder), so what the merge
+# would re-add is exactly what disappears here.
+
+
+def _outline_title(outline: ET.Element) -> str:
+    """The entry's name — ``OpmlFavorites.pm:129`` reads ``text``."""
+    return outline.get("text") or outline.get("title") or "???"
+
+
+def _outline_url(outline: ET.Element) -> Optional[str]:
+    """The entry's URL, ``None`` for a folder (``OpmlFavorites.pm:123``)."""
+    return (outline.get("URL") or "").strip() or None
+
+
+def _outline_matches(outline: ET.Element, title: str, url: Optional[str]) -> bool:
+    """``ensure_opml_imported``'s match rule, read in reverse.
+
+    The merge keys a stream by its URL (``known_urls``) and a folder by
+    ``(title, parent)`` (``known_folders``); the removal must use the same
+    keys, otherwise the merge re-adds what the delete just dropped.
+    """
+    if url:
+        return _outline_url(outline) == str(url).strip()
+    return _outline_url(outline) is None and _outline_title(outline) == title
+
+
+def _remove_chain(level: ET.Element, chain: list[tuple[str, Optional[str]]]) -> int:
+    """Remove the outlines *chain* addresses below *level*; returns the count.
+
+    ``chain`` is the deleted row's ancestor path, root entry first — Perl's
+    crumb path (``XMLBrowser.pm:341-353``), which is what ``deleteIndex``
+    walks (``OpmlFavorites.pm:416`` ``$class->level($index, 'contains')``).
+    Every matching outline at the last step goes: with none of them left the
+    start-up merge has nothing to re-add.
+    """
+    title, url = chain[0]
+    last = len(chain) == 1
+    removed = 0
+    for outline in list(level.findall("outline")):
+        if not _outline_matches(outline, title, url):
+            continue
+        if last:
+            level.remove(outline)
+            removed += 1
+        else:
+            removed += _remove_chain(outline, chain[1:])
+    return removed
+
+
+def _write_opml(tree: Any, path: Path) -> None:
+    """``Opml.pm:91-138`` — write the document back to ``favorites.opml``.
+
+    Same wire shape Perl's ``XMLout`` writes (``XMLDecl``
+    ``<?xml version="1.0" encoding="UTF-8"?>``, ``Rootname => 'opml'``,
+    ``NoSort => 0``), and written through a temporary file in the same
+    directory like Perl's ``tempfile`` + ``File::Copy::move`` — a reader never
+    sees a half document.
+    """
+    ET.indent(tree, space="  ")
+    body = ET.tostring(tree.getroot(), encoding="unicode")
+    # Perl's ``XMLout`` closes an empty element as ``…/>`` (no space); Python's
+    # serialiser writes ``… />``.  Normalising keeps the file byte-for-byte in
+    # Perl's shape, so a delete changes *only* the removed line(s).
+    body = re.sub(r"\s*/>", "/>", body)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text('<?xml version="1.0" encoding="UTF-8"?>\n' + body + "\n",
+                   encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def _opml_remove_chain(chain: list[tuple[str, Optional[str]]]) -> int:
+    """Drop a deleted favourite's outline(s) from ``favorites.opml``.
+
+    Synchronous on purpose: the parse → edit → write sequence has no ``await``
+    in it, so it cannot interleave with another coroutine's write on the
+    single-threaded event loop.  A missing file, a missing match or a write
+    error is logged and leaves the DB state untouched (the DB stays the source
+    of truth — only the re-import of a stale outline is prevented here).
+    """
+    if not chain:
+        return 0
+    opml = _opml_path()
+    if opml is None:
+        return 0
+    try:
+        tree = ET.parse(opml)
+        body = tree.getroot().find("body")
+        if body is None:
+            return 0
+        removed = _remove_chain(body, chain)
+        if not removed:
+            return 0
+        _write_opml(tree, opml)
+        logger.info("Removed %d outline(s) for %r from %s",
+                    removed, chain[-1][0], opml)
+        return removed
+    except Exception as exc:  # noqa: BLE001 — a read-only OPML must not
+        logger.warning("favorites.opml update failed: %s", exc)  # break delete
+        return 0
 
 
 class FavoritesManager:
@@ -306,15 +418,49 @@ class FavoritesManager:
             _notify_favorites_changed()
             return fav.id
 
+    async def _ancestor_chain(
+        self, session: Any, fav: Any
+    ) -> list[tuple[str, Optional[str]]]:
+        """``(title, url)`` of *fav* and every parent, root entry first.
+
+        That is Perl's crumb path for the entry (``XMLBrowser.pm:341-353``):
+        the level ``deleteIndex`` splices out of
+        (``OpmlFavorites.pm:416``).
+        """
+        chain: list[tuple[str, Optional[str]]] = []
+        node = fav
+        while node is not None:
+            chain.append((node.title, node.url))
+            node = (await session.get(Favorite, node.parent_id)
+                    if node.parent_id is not None else None)
+        chain.reverse()
+        return chain
+
     async def delete(self, fav_id: int) -> bool:
+        """Delete a favourite from the list **and** from ``favorites.opml``.
+
+        ``OpmlFavorites::deleteIndex`` (``Slim/Plugin/Favorites/
+        OpmlFavorites.pm:412-426``) splices the entry out of the loaded outline
+        tree and ``save``s the whole document back (``Opml.pm:91-138``) — the
+        file is Perl's storage, so the favourite is gone from the list *and*
+        from the file.  Here the DB is the storage and ``favorites.opml`` the
+        migration source that :func:`ensure_opml_imported` merges in at
+        start-up; a delete that only removes the DB row is undone by that
+        merge on the next start (the entry reappears).  The row's ancestor
+        chain is therefore captured before the row (children cascade with it,
+        ``session.delete``) and handed to :func:`_opml_remove_chain`, which
+        drops the outline with the same match rule the merge uses.
+        """
         async with self._db_session() as session:
             fav = await session.get(Favorite, fav_id)
             if fav is None:
                 return False
+            chain = await self._ancestor_chain(session, fav)
             await session.delete(fav)  # children cascade
             await session.commit()
-            _notify_favorites_changed()
-            return True
+        _opml_remove_chain(chain)
+        _notify_favorites_changed()
+        return True
 
     async def rename(self, fav_id: int, title: str, url: str | None = None) -> bool:
         title = (title or "").strip()
