@@ -381,6 +381,79 @@ def test_musicfolder_window_with_a_folder_row_keeps_the_drill_go(
     assert res["base"]["actions"]["go"]["cmd"] == ["browselibrary", "items"]
 
 
+def test_musicfolder_play_control_window_keeps_its_folder_id(
+        lib_db, bmf_seams, local_playing, monkeypatch):
+    """Der Popup-Request bleibt im angetippten Fenster (Perls ``getParamsCopy``).
+
+    Perl beantwortet ``base.actions.playControl`` mit der **Param-Kopie des
+    Requests** (``Slim/Control/XMLBrowser.pm:805-812``), also inklusive des
+    Drill-Tokens des Fensters.  Live Perl 9.1.1 (read-only 2026-09-22)::
+
+        browselibrary items 0 3 menu:1 mode:bmf folder_id:204573
+          → playControl.params {_index:"0", _quantity:"3", menu:"1",
+                               mode:"bmf", folder_id:"204573"}
+        browselibrary items 0 6 menu:1 mode:bmf            (Wurzel)
+          → playControl.params {_index:"0", _quantity:"6", menu:"1",
+                               mode:"bmf"}                 (kein folder_id)
+
+    Ohne das Token nennt der Popup-Request kein Fenster mehr: der Server
+    beantwortet ihn für die **Wurzel**, dort ist Zeile N eine Ordnerzeile, und
+    „Diesen Titel wiedergeben“ startete ein Verzeichnis statt der angetippten
+    Datei (Stream bricht ab, Player bleibt leer/gestoppt) — der gemeldete
+    Fehler „Musikordner-Dateien spielen nicht“.
+    """
+    root, sub = bmf_seams
+    # ``_bmf_window_folder_id`` liefert die ``tracks.id`` des Verzeichnisses
+    # (Perls ``folder_id``); ``_bmf_resolve_dir`` löst sie wie der echte Pfad
+    # über die Verzeichniszeile wieder auf (``_folder_dir_by_id``).
+    monkeypatch.setattr(
+        api_mod, "_bmf_resolve_dir",
+        lambda token, r: (str(token) if str(token).startswith(root)
+                          else sub if str(token) == "999" else None))
+
+    _install("play", [TRACK_ID], 0, 1)           # spielender lokaler Titel
+
+    # 1. das Fenster trägt den Drill-Token in seinen playControl-Params
+    window = browse(BMF_ARGS + [f"folder_id:{sub}"])
+    assert window["base"]["actions"]["playControl"]["params"]["folder_id"] == "999"
+    # die Wurzel trägt keinen (Perl-Parität)
+    assert "folder_id" not in browse(BMF_ARGS)["base"]["actions"]["playControl"]["params"]
+
+    # 2. der Popup-Request MIT Token adressiert die angetippte Datei …
+    popup = browse(["items", "0", "200", "_index:0", "_quantity:200", "menu:1",
+                    "xmlBrowseInterimCM:1", "xmlbrowserPlayControl:0",
+                    "mode:bmf", "folder_id:999"])
+    play_entry = popup["item_loop"][2]["actions"]["go"]["params"]
+    assert play_entry["track_id"] == TRACK_ID          # die Datei, nicht 90
+    # … und der Tap löst genau diesen Titel auf: ``_bmf_playlist`` holt die
+    # Queue über ``ids = _bmf_tap_tracks(tagged)`` (api.py:9913) — derselbe
+    # Aufruf, der hier geprüft wird.  Dass diese Params dann wirklich starten
+    # (Queue = [102], ``mode=play``, ``strm``), pinnt
+    # ``test_musicdir_bmf.test_bmf_file_tap_plays_exactly_the_tapped_track``.
+    assert api_mod._bmf_tap_tracks(play_entry) == [TRACK_ID]
+
+
+def test_musicfolder_folder_row_never_plays_a_directory(
+        lib_db, bmf_seams, local_playing):
+    """Eine Ordnerzeile gibt NIE ihre Verzeichnis-``tracks.id`` als Ziel aus.
+
+    Perls Live-Antwort auf den Tap einer Ordnerzeile (read-only 2026-09-22,
+    Wurzel-Fenster) trägt kein ``track_id`` — sie spielt über
+    ``playlistcontrol {cmd:load, folder_id:…}``.  Die ``id`` einer bmf-
+    Ordnerzeile ist die ``tracks``-Zeile des Verzeichnisses
+    (``_bmf_dir_row_ids``); stand sie als ``track_id`` im Popup, startete
+    „Diesen Titel wiedergeben“ ein Verzeichnis (Stream-Abbruch).
+    """
+    root, sub = bmf_seams
+    _install("play", [TRACK_ID], 0, 1)
+    # Wurzel-Fenster: Zeile 0 ist die Ordnerzeile "Accept" (id 90)
+    popup = browse(["items", "0", "200", "menu:1", "xmlBrowseInterimCM:1",
+                    "xmlbrowserPlayControl:0", "mode:bmf"])
+    folder_entry = popup["item_loop"][2]["actions"]["go"]["params"]
+    assert "track_id" not in folder_entry, folder_entry
+    assert folder_entry["item_id"] == "0"
+
+
 # ── 4. Favoritenzeile ─────────────────────────────────────────────────────
 
 class _Favs:

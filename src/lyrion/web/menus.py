@@ -612,12 +612,28 @@ def base_actions(kind: str, filters: dict | None = None, start: int = 0,
             # client's merge (SlimBrowserApplet.lua:2014-2022), so the drill
             # is unaffected.
             go_params["folder_id"] = str(folder_id)
+        # Perl answers this action's params with the request's WHOLE param
+        # copy (``XMLBrowser.pm:805-812`` — the ``xmlbrowserPlayControl``
+        # branch reads ``$request->getParamsCopy()``), and the copy contains
+        # the WINDOW's own drill token: live Perl 9.1.1 (read-only
+        # 2026-09-22) ``browselibrary items 0 3 menu:1 mode:bmf
+        # folder_id:204573`` → ``playControl.params {_index:"0",
+        # _quantity:"3", menu:"1", mode:"bmf", folder_id:"204573"}``; the root
+        # window (no drill token) answers the same set WITHOUT ``folder_id``.
+        # Without the token the client's play-control request named no window
+        # at all, so the menu was rendered for the ROOT feed's row N — a
+        # folder row there, whose play target is its directory row: „Diesen
+        # Titel wiedergeben“ started a directory instead of the tapped file
+        # (stream aborts, player stops with an empty now-playing window).
+        cm_params: dict = {"mode": "bmf", "_quantity": str(count),
+                           "_index": str(start), "menu": "1"}
+        if folder_id:
+            cm_params["folder_id"] = str(folder_id)
         cm_action: dict = {
             "player": 0, "cmd": ["browselibrary", "items"],
             "itemsParams": "playControlParams",
             "window": {"isContextMenu": 1},
-            "params": {"mode": "bmf", "_quantity": str(count),
-                       "_index": str(start), "menu": "1"},
+            "params": cm_params,
         }
         folder_actions: dict = {
             "go": {"player": 0, "cmd": ["browselibrary", "items"],

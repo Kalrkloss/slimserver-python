@@ -10003,8 +10003,19 @@ class JSONRPCAPI:
             row_index = str(start + pos)
             target = {"menu": 1, "mode": "bmf", "item_id": row_index}
             rid = row.get("id")
-            if isinstance(rid, int):
-                target["track_id"] = rid
+            if str(row.get("type")) == "audio":
+                if isinstance(rid, int):
+                    target["track_id"] = rid
+            elif folder_id:
+                # A *folder* row's ``id`` is the ``tracks`` row of its
+                # directory (``_bmf_dir_row_ids``) — a directory is never a
+                # playable track.  Perl hands out no ``track_id`` for such a
+                # row (live 2026-09-22, root tap → ``playlistcontrol
+                # {cmd:load, folder_id:204573}``); the window's own
+                # ``folder_id`` plus the row index resolves the tapped folder
+                # (``_bmf_tap_tracks`` walks ``_bmf_children``), so a tap on a
+                # folder row loads that folder instead of a directory row.
+                target["folder_id"] = str(folder_id)
 
             def bmf_entry(verb: str, next_window: str) -> dict:
                 return {"player": 0, "cmd": ["browselibrary", "playlist", verb],
