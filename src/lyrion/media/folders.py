@@ -806,6 +806,26 @@ def item_type(path: str) -> str:
     so a suffix ``types.conf`` does not know (``spx``, ``tak``) is ``unknown``
     — and ``fileFilter`` keeps such a file out of the listing in the first
     place.
+
+    Known divergence, measured — the *stored* ``content_type`` wins in Perl.
+    ``_isContentTypeHelper`` (``Slim/Music/Info.pm:1209-1225``) reads
+    ``$item->content_type`` when it is handed a ``Track`` object, so
+    ``isSong``/``isPlaylist``/``isDir`` test the DB column, and only a
+    row-less URL falls back to the suffix (``Slim/Schema.pm:676-697``
+    ``contentType`` → ``Info.pm:1447-1505`` ``typeFromPath``).  This port has
+    no such column read here, so it always takes the suffix branch.  Live
+    192.168.1.90 (read-only 2026-09-22), ``musicfolder 0 50 url:…/1999 -
+    Guitars tags:o``::
+
+        Mike Oldfield - Guitars.ape       type unknown  ct cur   id 190019
+        Mike Oldfield - Guitars.ape.cue   type playlist ct cue   id 190020
+
+    Perl's CUE parser marks the base file of a cue sheet
+    ``CONTENT_TYPE => 'cur', AUDIO => 0`` to hide it from listings
+    (``Slim/Formats/Playlists/CUE.pm:661-675``); ``cur`` has the slim-type
+    ``-``, hence ``unknown``.  Our DB has no ``cur`` rows (CUE sheets are not
+    ported), so the suffix branch answers ``track``.  The *listing* itself is
+    identical (both list the file) — only this one ``type`` field differs.
     """
     if os.path.isdir(path):
         return "folder"
