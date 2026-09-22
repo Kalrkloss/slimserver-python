@@ -191,6 +191,68 @@ def test_tracks_base_actions_carry_more_add_hold_and_set_preset():
     assert len([k for k in actions if k.startswith("set-preset-")]) == 10
 
 
+def test_tracks_drill_base_actions_are_perls_playall_and_addall():
+    """Ein ``mode:tracks``-DRILL trägt Perls ``playall``/``addall``.
+
+    Live Perl 9.1.1 (read-only 2026-09-22,
+    ``browselibrary items 0 100 menu:1 mode:tracks album_id:11289`` —
+    ``artist_id:22759``, ``genre_id:1727``, ``year:2026`` identisch)::
+
+        play = {player:0, cmd:["playlistcontrol"], itemsParams:"playallParams",
+                nextWindow:"nowPlaying",
+                params:{cmd:"load", <drill id>, sort:"albumtrack", menu:1}}
+        add  = {player:0, cmd:["playlistcontrol"], itemsParams:"addallParams",
+                params:{cmd:"add", <drill id>, sort:"albumtrack", menu:1}}
+        add-hold = {player:0, itemsParams:"commonParams",
+                    params:{cmd:"insert", menu:1}}
+
+    Perl-Quellen: ``Slim/Menu/BrowseLibrary.pm:2002-2010`` (``playall``/
+    ``addall`` mit ``variables => [play_index => 'play_index']``),
+    ``Slim/Control/XMLBrowser.pm:954``/``:959`` (die Wahl per ``$playalbum``)
+    und ``:1682-1686`` (``itemsParams`` = Aktionsname + ``Params``).
+    """
+    for filters in ({"album_id": "11289"}, {"artist_id": "22759"},
+                    {"genre_id": "1727"}, {"year": "2026"}):
+        actions = JSONRPCAPI._browselibrary_menu_actions(
+            "tracks", filters, 0, 100, preset_fav_set=True)
+        key, val = next(iter(filters.items()))
+        assert actions["play"] == {
+            "player": 0, "cmd": ["playlistcontrol"],
+            "itemsParams": "playallParams", "nextWindow": "nowPlaying",
+            "params": {"cmd": "load", key: val, "sort": "albumtrack",
+                       "menu": 1},
+        }, filters
+        assert actions["add"] == {
+            "player": 0, "cmd": ["playlistcontrol"],
+            "itemsParams": "addallParams",
+            "params": {"cmd": "add", key: val, "sort": "albumtrack",
+                       "menu": 1},
+        }, filters
+        # add-hold stays the single-item insert (commonParams/track_id)
+        assert actions["add-hold"]["itemsParams"] == "commonParams"
+        assert actions["add-hold"]["params"] == {"cmd": "insert", "menu": 1}
+
+
+def test_tracks_search_list_keeps_the_single_track_play_form():
+    """Ohne Drill-Id (Suchtrefferliste) gibt es kein ``playall``.
+
+    ``BrowseLibrary.pm:1964`` ``if ($search) { $actions{'playall'} =
+    $actions{'play'} }`` — live Perl ``… mode:tracks search:Reprise`` →
+    ``play {cmd:load, commonParams}``, ``itemsParams 'commonParams'``.
+    """
+    actions = JSONRPCAPI._browselibrary_menu_actions(
+        "tracks", {}, 0, 100, preset_fav_set=True)
+    assert actions["play"] == {
+        "player": 0, "cmd": ["playlistcontrol"],
+        "itemsParams": "commonParams", "nextWindow": "nowPlaying",
+        "params": {"cmd": "load", "menu": 1},
+    }
+    assert actions["add"] == {
+        "player": 0, "cmd": ["playlistcontrol"],
+        "itemsParams": "commonParams", "params": {"cmd": "add", "menu": 1},
+    }
+
+
 def test_albums_base_actions_match_live_perl():
     actions = JSONRPCAPI._browselibrary_menu_actions(
         "albums", None, 0, 2, preset_fav_set=True)

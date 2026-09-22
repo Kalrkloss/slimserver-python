@@ -263,7 +263,63 @@ def test_album_track_row_paging_reports_the_absolute_index(lib_db,
     assert it["playallParams"] == {"play_index": 1}
 
 
+def test_album_drill_window_play_is_perls_playall(lib_db, idle_player):
+    """Das Album-Drill-Fenster trägt Perls ``playallParams``/``album_id``.
+
+    Live Perl 9.1.1 (read-only 2026-09-22, ``browselibrary items 0 100
+    menu:1 mode:tracks album_id:16591``)::
+
+        base.go = base.play = {cmd:["playlistcontrol"],
+                               itemsParams:"playallParams", player:0,
+                               nextWindow:"nowPlaying",
+                               params:{album_id:"16591", cmd:"load",
+                                       menu:1, sort:"albumtrack"}}
+        base.add = {… itemsParams:"addallParams", params:{album_id, cmd:"add",
+                                                          menu:1,
+                                                          sort:"albumtrack"}}
+        item[0]  = {goAction:"play", style:"itemplay",
+                    playallParams:{play_index:0}, commonParams:{track_id:…}}
+
+    (``Slim/Control/XMLBrowser.pm:954`` wählt die ``playall``-Aktion für
+    ``play``, ``:1682-1686`` benennt ``itemsParams`` nach ihr,
+    ``Slim/Menu/BrowseLibrary.pm:1871`` liefert den Zeilenindex.)
+    """
+    res = browse(ALBUM_ARGS)
+    acts = res["base"]["actions"]
+    assert acts["play"] == {
+        "player": 0, "cmd": ["playlistcontrol"],
+        "itemsParams": "playallParams", "nextWindow": "nowPlaying",
+        "params": {"cmd": "load", "album_id": "45", "sort": "albumtrack",
+                   "menu": 1}}
+    assert acts["add"] == {
+        "player": 0, "cmd": ["playlistcontrol"],
+        "itemsParams": "addallParams",
+        "params": {"cmd": "add", "album_id": "45", "sort": "albumtrack",
+                   "menu": 1}}
+    # solange der Tap nicht defeated ist, ist ``go`` diese ``play``-Aktion
+    assert acts["go"] == acts["play"]
+    assert row(res)["playallParams"] == {"play_index": 0}
+    assert row(res, 1)["playallParams"] == {"play_index": 1}
+
+
 # ── 2. Suchtreffer (mode:tracks search:) ──────────────────────────────────
+
+def test_search_list_window_has_no_playall_params(lib_db, idle_player):
+    """Suchtrefferliste: ``play`` liest ``commonParams``, keine ``playallParams``.
+
+    ``BrowseLibrary.pm:1964`` ``if ($search) { $actions{'playall'} =
+    $actions{'play'} }`` — live Perl ``… mode:tracks search:Reprise`` →
+    ``play {cmd:load, commonParams}`` und Zeilen mit den Keys
+    ``{commonParams, goAction, style}`` (kein ``playallParams``).
+    """
+    res = browse(SEARCH_ARGS)
+    acts = res["base"]["actions"]
+    assert acts["play"] == {
+        "player": 0, "cmd": ["playlistcontrol"],
+        "itemsParams": "commonParams", "nextWindow": "nowPlaying",
+        "params": {"cmd": "load", "menu": 1}}
+    assert "playallParams" not in row(res)
+
 
 def test_search_hit_row_uses_the_same_decision(lib_db, idle_player):
     assert_live(browse(SEARCH_ARGS))

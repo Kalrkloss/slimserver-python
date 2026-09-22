@@ -515,18 +515,74 @@ def base_actions(kind: str, filters: dict | None = None, start: int = 0,
     go_params: dict = {"mode": go_mode, "menu": 1}
     if kind == "artists":
         go_params["menu_mode"] = "artists"
-    actions: dict = {
-        "go": {"player": 0, "cmd": ["browselibrary", "items"],
-               "itemsParams": "commonParams", "params": go_params},
-        "play": {"player": 0, "cmd": ["playlistcontrol"],
-                 "itemsParams": "commonParams",
-                 "params": {"cmd": "load", "menu": 1},
-                 "nextWindow": "nowPlaying"},
-        "add": {"player": 0, "cmd": ["playlistcontrol"],
-                "itemsParams": "commonParams",
-                "params": {"cmd": "add", "menu": 1}},
-        "add-hold": add_hold_action(kind),
-    }
+    # ── Perl's ``playall``/``addall`` base actions of a ``mode:tracks`` ─────
+    # DRILL feed.  Live Perl 9.1.1 (read-only 2026-09-22,
+    # ``browselibrary items 0 100 menu:1 mode:tracks album_id:11289`` —
+    # identically for ``artist_id:22759``, ``genre_id:1727``, ``year:2026``)
+    # answers::
+    #
+    #   play = {player:0, cmd:["playlistcontrol"], itemsParams:"playallParams",
+    #           nextWindow:"nowPlaying",
+    #           params:{cmd:"load", <drill id>, sort:"albumtrack", menu:1}}
+    #   add  = {player:0, cmd:["playlistcontrol"], itemsParams:"addallParams",
+    #           params:{cmd:"add", <drill id>, sort:"albumtrack", menu:1}}
+    #   add-hold = {player:0, cmd:["playlistcontrol"],
+    #               itemsParams:"commonParams", params:{cmd:"insert", menu:1}}
+    #
+    # Those are the feed's ``playall``/``addall`` actions: ``fixedParams
+    # {cmd => 'load'|'add', %{&_tagsToParams([@searchTags, $sort])}}`` with
+    # ``variables => [play_index => 'play_index']``
+    # (``Slim/Menu/BrowseLibrary.pm:2002-2010``; the parent album feed's
+    # ``passthrough`` supplies ``album_id:<id>`` as searchTag and ``:1806``
+    # defaults the sort to ``sort:albumtrack``, which ``_tagsToParams``
+    # (:1069-1077) splits into ``sort => 'albumtrack'``).
+    # ``Slim/Control/XMLBrowser.pm:954``/``:959`` select ``playall``/``addall``
+    # for the window's ``play``/``add`` (``$playalbum``, the client pref
+    # ``playtrackalbum``) and ``:1682-1686`` names the parameter map after the
+    # ACTION (``itemsParams => 'playallParams'`` / ``'addallParams'``); the
+    # ROW's ``playallParams.play_index`` (``BrowseLibrary.pm:1871``,
+    # ``XMLBrowser.pm:1328-1345``) rides back on the tap, so the load starts
+    # at the tapped row (``Commands.pm:1878`` ``my $jumpIndex =
+    # $request->getParam('play_index')`` → ``:2161``
+    # ``['playlist','loadtracks','listRef',$tracks,undef,$jumpIndex]`` →
+    # ``:1681`` ``_index`` → ``:1796`` ``['playlist','jump',$jumpToIndex]``).
+    #
+    # A TRACK SEARCH list carries NO playall (``BrowseLibrary.pm:1964``
+    # ``if ($search) { $actions{'playall'} = $actions{'play'} }`` — live Perl
+    # ``… mode:tracks search:Reprise`` → ``play {cmd:load, commonParams}``
+    # with ``itemsParams 'commonParams'`` and no per-row ``playallParams``),
+    # so a feed without a drill id keeps the single-track form below.
+    drill: dict = {k: str(v) for k, v in (filters or {}).items()
+                   if k in ("album_id", "artist_id", "genre_id", "year")
+                   and v not in (None, "")}
+    if kind == "tracks" and drill:
+        play_params: dict = {"cmd": "load", **drill, "sort": "albumtrack",
+                             "menu": 1}
+        add_params: dict = {"cmd": "add", **drill, "sort": "albumtrack",
+                            "menu": 1}
+        actions: dict = {
+            "go": {"player": 0, "cmd": ["browselibrary", "items"],
+                   "itemsParams": "commonParams", "params": go_params},
+            "play": {"player": 0, "cmd": ["playlistcontrol"],
+                     "itemsParams": "playallParams", "params": play_params,
+                     "nextWindow": "nowPlaying"},
+            "add": {"player": 0, "cmd": ["playlistcontrol"],
+                    "itemsParams": "addallParams", "params": add_params},
+            "add-hold": add_hold_action(kind),
+        }
+    else:
+        actions: dict = {
+            "go": {"player": 0, "cmd": ["browselibrary", "items"],
+                   "itemsParams": "commonParams", "params": go_params},
+            "play": {"player": 0, "cmd": ["playlistcontrol"],
+                     "itemsParams": "commonParams",
+                     "params": {"cmd": "load", "menu": 1},
+                     "nextWindow": "nowPlaying"},
+            "add": {"player": 0, "cmd": ["playlistcontrol"],
+                    "itemsParams": "commonParams",
+                    "params": {"cmd": "add", "menu": 1}},
+            "add-hold": add_hold_action(kind),
+        }
     if kind == "folder":
         # ── Perl's "Musikordner" feed (mode:bmf) ─────────────────────────
         # Live Perl 9.1.1 (read-only, 2026-09-14):

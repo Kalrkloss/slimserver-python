@@ -7854,8 +7854,33 @@ class JSONRPCAPI:
                             if ids:
                                 player.playlist = list(ids)
                                 player.playlist_total = len(ids)
-                                player.playlist_position = 0
-                                await self._play_playlist_item(pm, player, 0)
+                                # ``play_index`` starts the loaded list at the
+                                # TAPPED row instead of at its first track.
+                                # Perl: the window's ``playall`` base action
+                                # carries ``itemsParams 'playallParams'`` and
+                                # the tapped row's ``playallParams.play_index``
+                                # (= the row's absolute index, BrowseLibrary.pm:
+                                # 1871, XMLBrowser.pm:1328-1345) merges into it,
+                                # so the request reaches the command as
+                                # ``play_index`` (Commands.pm:1878 ``my
+                                # $jumpIndex = $request->getParam('play_index')``),
+                                # is handed to the track loader (:2161
+                                # ``['playlist','loadtracks','listRef',$tracks,
+                                # undef,$jumpIndex]``), read back there as the
+                                # ``_index`` p5 (:1681) and finally jumped to
+                                # (:1796 ``['playlist','jump',$jumpToIndex,
+                                # $fadeIn]`` → playlistJumpCommand :1005/
+                                # :1010-1013 wraps an absolute index into the
+                                # playlist).  No play_index (or a non-numeric
+                                # one) keeps Perl's default: index 0.
+                                from lyrion.player.manager import jump_target
+                                start = 0
+                                if "play_index" in tagged:
+                                    _t = jump_target(player, tagged["play_index"])
+                                    if _t is not None:
+                                        start = _t
+                                player.playlist_position = start
+                                await self._play_playlist_item(pm, player, start)
                                 return
                         except Exception:
                             pass
@@ -9488,7 +9513,17 @@ class JSONRPCAPI:
                 else:
                     item["goAction"] = "play"
                     item["style"] = "itemplay"
-                item["playallParams"] = {"play_index": start + pos}
+                if search:
+                    # A track SEARCH list has no ``playall`` action
+                    # (``BrowseLibrary.pm:1964`` ``if ($search) {
+                    # $actions{'playall'} = $actions{'play'} }``), so Perl
+                    # emits no ``playallParams`` on its rows either — live
+                    # Perl ``… mode:tracks search:Reprise`` item keys:
+                    # ``{commonParams, goAction, style}`` only.  Its base
+                    # ``play`` reads ``commonParams`` (single track).
+                    pass
+                else:
+                    item["playallParams"] = {"play_index": start + pos}
                 item["commonParams"] = {"track_id": int(r["id"])}
                 url = track_urls.get(r["id"])
                 # Perl always ships presetParams on audio items (the

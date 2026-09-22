@@ -2607,6 +2607,15 @@ async def cmd_playlist_play(
       album_id:<n>   play all tracks of an album
       artist_id:<n>  play all tracks of an artist
       index:<n>      jump to a playlist index
+      play_index:<n> Perl's start index OF THE LOADED LIST — the tapped row of
+                     an album/artist drill.  ``playlistXitemCommand`` reads
+                     ``my $jumpToIndex = $request->getParam('play_index')``
+                     (Slim/Control/Commands.pm:1336), defaults it to 0 for
+                     ``play``/``load`` (:1524) and jumps to it once the list is
+                     loaded (:3241-3243 ``$client->execute(['playlist','jump',
+                     $index, $fadeIn])``).  Live Perl's album drill sends it
+                     with every tap: ``playallParams {play_index: <row>}``
+                     (BrowseLibrary.pm:1871, XMLBrowser.pm:1328-1345).
     """
     if not ctx.player_id:
         return _command_echo(["playlist", "play"], args,
@@ -2627,7 +2636,8 @@ async def cmd_playlist_play(
             s = str(a)
             if ":" in s:
                 k, _, v = s.partition(":")
-                if k in ("track_id", "item_id", "album_id", "artist_id", "index"):
+                if k in ("track_id", "item_id", "album_id", "artist_id",
+                         "index", "play_index"):
                     tags[k] = v
                     continue
             positional.append(s)
@@ -2676,7 +2686,21 @@ async def cmd_playlist_play(
                 pm.playlist_clear(ctx.player_id)
                 for tid in ids:
                     pm.playlist_add(ctx.player_id, tid)
-                await pm.play_track(ctx.player_id, ids[0])
+                # The tapped row starts the album: Perl's ``play_index`` is the
+                # jump target of the freshly loaded list (Commands.pm:1336
+                # ``my $jumpToIndex = $request->getParam('play_index')`` →
+                # :3241-3243 ``['playlist','jump',$index,$fadeIn]``, whose
+                # playlistJumpCommand wraps an absolute index into the list,
+                # :1005/:1010-1013).  Without it the list starts at 0
+                # (:1524 ``$jumpToIndex = 0 if !defined $jumpToIndex``).
+                start = 0
+                if "play_index" in tags and player is not None:
+                    from lyrion.player.manager import jump_target
+
+                    target = jump_target(player, tags["play_index"])
+                    if target is not None:
+                        start = target
+                await pm.play_track(ctx.player_id, ids[start])
         elif "index" in tags:
             await pm.playlist_play(ctx.player_id, int(tags["index"]))
         elif positional and str(positional[0]).isdigit():
