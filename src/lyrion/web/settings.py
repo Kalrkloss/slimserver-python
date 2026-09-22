@@ -130,6 +130,11 @@ from lyrion.media.art_online import (
     ArtOnlineSettings,
     normalize_provider_list,
 )
+from lyrion.media.art_online_wanted import (
+    PREF_WANTED_AUTO as _ART_WANTED_AUTO_PREF,
+    PREF_WANTED_PER_PASS as _ART_WANTED_PER_PASS_PREF,
+    WANTED_PREF_DEFAULTS as _ART_WANTED_PREF_DEFAULTS,
+)
 from lyrion.player.manager import PlayerManager
 from lyrion.player.playerprefs import apply_player_pref
 from lyrion.utils.strings import get_string
@@ -266,6 +271,18 @@ def _is_positive_int(value: str) -> bool:
     return text.isdigit() and int(text) >= 0
 
 
+def _is_non_negative_int(value: str) -> bool:
+    """Ganzzahl ≥ 0 — ``artworkOnlineWantedPerPass`` (``0`` = alle fälligen).
+
+    Dieselbe Prüfung wie ``_is_positive_int``, eigener Name, weil die
+    ``0`` hier eine **Bedeutung** hat (unbegrenzt) und nicht nur „erlaubt“.
+    """
+    text = (value or "").strip()
+    if not text:
+        return True
+    return text.isdigit()
+
+
 def _is_positive_number(value: str) -> bool:
     text = (value or "").strip()
     if not text:
@@ -304,6 +321,23 @@ _ART_ONLINE_FIELDS: tuple[Field, ...] = (
           perl_source="kein Perl-Fund; UAS trägt den Key im Addon (tadb.xml:677)"),
     Field(_ART_FANART_KEY_PREF, "SETUP_ART_FANART_KEY", "fanart.tv API key (optional)",
           perl_source="kein Perl-Fund; UAS-Key im Addon (fanarttv.xml:5)"),
+)
+
+#: Felder der wanted-Liste (``media/art_online_wanted.py``).  Perl hat dafür
+#: kein Vorbild: ``Slim/Plugin/RadioArtwork/Plugin.pm:199-201`` cacht Cover
+#: 30 Tage, kennt aber keine persistente Nachlade-Liste — die Arbeit läuft dort
+#: ereignisgetrieben im Titelwechsel (``requestIsQueued``, ``:166-180``).
+_ART_WANTED_FIELDS: tuple[Field, ...] = (
+    Field(_ART_WANTED_AUTO_PREF, "SETUP_ART_WANTED_AUTO",
+          "Background service starts with the server",
+          "select",
+          options=(("1", "SETUP_ART_ONLINE_ON", "On"),
+                   ("0", "SETUP_ART_ONLINE_OFF", "Off")),
+          perl_source="kein Perl-Fund (persistente wanted-Liste dieses Ports)"),
+    Field(_ART_WANTED_PER_PASS_PREF, "SETUP_ART_WANTED_PER_PASS",
+          "Albums per pass (0 = all)",
+          validator=_is_non_negative_int,
+          perl_source="kein Perl-Fund (Drossel des Durchlaufs)"),
 )
 
 #: Öffentlicher Name für Tests/Verdrahtung.
@@ -474,6 +508,23 @@ _INFORMATION = SettingsPage(
     perl_source="Slim/Web/Settings/Server/Status.pm:19-21",
 )
 
+#: Eigene Seite des Artwork-Downloaders (kein Perl-Vorbild: Perl kennt keinen
+#: Online-Cover-Anbieter, siehe ``media/art_online.py`` Modul-Docstring).
+#: Sie zeigt die bestehenden ``artworkOnline*``-Einstellungen, den Zustand der
+#: wanted-Liste und den Knopf für einen erneuten Durchlauf; die Felder auf
+#: ``/settings/server/basic.html`` bleiben unverändert bestehen.
+_ART_ONLINE = SettingsPage(
+    route="/settings/server/artworkonline.html",
+    perl_class="Slim::Web::Settings::Server::ArtworkOnline",
+    page_name="ARTWORK_ONLINE_SETTINGS",
+    title_key="SETUP_ART_ONLINE_TITLE",
+    title_default="Online cover search / Artwork-Downloader",
+    needs_client=False,
+    perl_source=("kein Perl-Fund; Anbietervorbild "
+                 "metadata.album.universal/albumuniversal.xml:122-137"),
+    fields=(*_ART_ONLINE_FIELDS, *_ART_WANTED_FIELDS),
+)
+
 #: Perl-Route → Seite. Schlüssel ist der HTTP-Pfad (ohne Slash am Ende).
 PAGES: dict[str, SettingsPage] = {
     _BASIC_SERVER.route: _BASIC_SERVER,
@@ -481,9 +532,16 @@ PAGES: dict[str, SettingsPage] = {
     _PLAYER_DISPLAY.route: _PLAYER_DISPLAY,
     _PLAYER_ALARM.route: _PLAYER_ALARM,
     _INFORMATION.route: _INFORMATION,
+    _ART_ONLINE.route: _ART_ONLINE,
     # Aufgaben-Alias (kein Perl-Fund, siehe Modul-Docstring „UNKLAR").
     "/settings/information.html": _INFORMATION,
 }
+
+#: Zustand und Anstoss der wanted-Liste als JSON (Knopf/Anzeige der Seite).
+#: Kein Perl-Vorbild — Perl hat keinen Hintergrund-Coverdienst, der Zustand
+#: wäre also nirgends abzufragen (``Slim/Plugin/RadioArtwork/Plugin.pm``).
+ART_WANTED_STATUS_URL = "/settings/artworkonline/status.json"
+ART_WANTED_RUN_URL = "/settings/artworkonline/run"
 
 #: Perl ``Slim/Web/Settings/Server/Basic.pm:106,120``: Liste der ignorierten Pfade.
 _MEDIADIR_IGNORE_PREF = "ignoreInAudioScan"
@@ -640,6 +698,21 @@ def load_art_online_settings() -> ArtOnlineSettings:
     return ArtOnlineSettings.from_mapping(art_online_pref_values())
 
 
+def art_online_wanted_pref_values() -> dict[str, str]:
+    """Die zwei Prefs der wanted-Liste mit Vorbelegung (nie ``None``).
+
+    Eigener Satz, damit ``art_online.PREF_DEFAULTS`` (und damit das Formular auf
+    ``/settings/server/basic.html``) unverändert bleibt; die Felder dieser Prefs
+    stehen auf ``/settings/server/artworkonline.html``.
+    """
+    prefs = get_prefs()
+    values: dict[str, str] = {}
+    for name, default in _ART_WANTED_PREF_DEFAULTS.items():
+        raw = prefs.get(name)
+        values[name] = default if raw is None else str(raw)
+    return values
+
+
 # ── Bildproxy-Prefs (bewusste Abweichung, siehe Block oben) ─────────────────
 
 def imageproxy_pref_values() -> dict[str, str]:
@@ -691,6 +764,14 @@ async def register_art_online_prefs() -> None:
     """
     prefs = get_prefs()
     for name, default in _ART_PREF_DEFAULTS.items():
+        try:
+            await prefs.init_preference(name, default=default, category="artwork")
+        except Exception as exc:  # noqa: BLE001 - Settings-Seite darf nicht brechen
+            logger.warning("settings: %s konnte nicht registriert werden (%s)",
+                           name, exc)
+    # Dieselbe Registrierung für die Prefs der wanted-Liste (Dienst-Schalter,
+    # Deckel je Durchlauf) — ohne sie zeigte die Seite leere Felder.
+    for name, default in _ART_WANTED_PREF_DEFAULTS.items():
         try:
             await prefs.init_preference(name, default=default, category="artwork")
         except Exception as exc:  # noqa: BLE001 - Settings-Seite darf nicht brechen
@@ -865,6 +946,183 @@ def _information_sections() -> str:
     )
 
 
+def _render_art_wanted_panel() -> str:
+    """Zustand der wanted-Liste + Knopf für einen erneuten Durchlauf.
+
+    Die Zahlen kommen beim Rendern **serverseitig** aus der Liste; danach hält
+    ein kleines Skript sie per ``fetch`` aktuell (``ART_WANTED_STATUS_URL``) und
+    stösst den Durchlauf über ``ART_WANTED_RUN_URL`` an.  Die Seite blockiert
+    dabei nie: sie ist fertig gerendert, bevor das Skript läuft, und der Lauf
+    selbst passiert im Server-Hintergrund (``media/art_online_wanted.py``).
+    """
+    try:
+        from lyrion.media import art_online_wanted
+
+        status = art_online_wanted.wanted_status()
+        error = ""
+    except Exception as exc:  # noqa: BLE001 - die Seite darf daran nicht scheitern
+        logger.warning("settings: wanted-Status nicht lesbar (%s)", exc)
+        status = {}
+        error = str(exc)
+
+    def _row(label_key: str, label: str, value: str, span_id: str) -> str:
+        return (f"<tr><td>{_esc(get_string(label_key, default=label))}</td>"
+                f'<td><span id="{_esc(span_id)}">{_esc(value)}</span></td></tr>')
+
+    rows = [
+        _row("SETUP_ART_WANTED_OPEN", "Open / offen",
+             str(status.get("open", 0)), "artWantedOpen"),
+        _row("SETUP_ART_WANTED_HIT", "Found / gefunden",
+             str(status.get("hit", 0)), "artWantedHit"),
+        _row("SETUP_ART_WANTED_MISS", "No match / kein Treffer",
+             str(status.get("miss", 0)), "artWantedMiss"),
+        _row("SETUP_ART_WANTED_LAST", "Last run / letzter Lauf",
+             _format_stamp(status.get("last_run")), "artWantedLastRun"),
+        _row("SETUP_ART_WANTED_PROGRESS", "Progress / Fortschritt",
+             _format_progress(status), "artWantedProgress"),
+        _row("SETUP_ART_WANTED_STATE", "State / Zustand",
+             _format_state(status), "artWantedState"),
+    ]
+    button = get_string("SETUP_ART_WANTED_RUN",
+                        default="Run wanted list again / Wanted-Liste erneut abarbeiten")
+    return (
+        '<div class="settingSection" id="artWantedSection">'
+        '<div class="prefHead">'
+        + _esc(get_string("SETUP_ART_WANTED_TITLE",
+                          default="Artwork downloader: missing covers / fehlende Cover"))
+        + '</div><table border="0" cellspacing="0">'
+        + "".join(rows)
+        + "</table>"
+        + f'<div><input type="button" class="stdclick" id="artWantedRunBtn" '
+          f'value="{_esc(button)}" data-status-url="{_esc(ART_WANTED_STATUS_URL)}" '
+          f'data-run-url="{_esc(ART_WANTED_RUN_URL)}"> '
+          f'<span id="artWantedMsg"></span></div>'
+        + (f'<div id="artWantedError">{_esc(error)}</div>' if error else "")
+        + "<script type=\"text/javascript\">" + _ART_WANTED_JS + "</script></div>"
+    )
+
+
+def _format_stamp(value: Any) -> str:
+    """Zeitstempel als lokale Zeit (``-`` statt leerer Zelle)."""
+    try:
+        stamp = int(value)
+    except (TypeError, ValueError):
+        return "-"
+    if not stamp:
+        return "-"
+    import datetime
+
+    return datetime.datetime.fromtimestamp(stamp).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _format_progress(status: dict) -> str:
+    """„geprüft/gesamt · aktuell <Album>“ — oder der letzte Lauf."""
+    if status.get("running"):
+        return "%s/%s · %s" % (status.get("checked", 0), status.get("pass_total", 0),
+                               status.get("current") or "…")
+    last = status.get("last_pass") or {}
+    if not last:
+        return "-"
+    parts = []
+    if last.get("hit"):
+        parts.append("%s gefunden" % last["hit"])
+    if last.get("miss"):
+        parts.append("%s ohne Treffer" % last["miss"])
+    if "checked" in last:
+        parts.append("%s geprüft" % last["checked"])
+    if last.get("seconds") is not None:
+        parts.append("%ss" % last["seconds"])
+    return ", ".join(parts) or "-"
+
+
+def _format_state(status: dict) -> str:
+    """Kurzer Zustandstext (Dienst, Konfigurationswechsel, letzter Grund)."""
+    if status.get("running"):
+        state = "läuft / running"
+    elif not status.get("enabled"):
+        state = "Suche aus / search off"
+    elif status.get("service_started"):
+        state = "wartet / idle"
+    else:
+        state = "Dienst aus / service off"
+    if status.get("settings_changed"):
+        state += " · Konfiguration geändert / config changed"
+    reason = str(status.get("last_reason") or "")
+    if reason:
+        state += " · " + reason
+    return state
+
+
+#: Aktualisiert die Anzeige (2-s-Takt) und stösst den Durchlauf an.  Reines
+#: ``fetch``/JSON: die Seite bleibt bedienbar, während der Durchlauf im
+#: Hintergrund läuft.
+_ART_WANTED_JS = """
+(function () {
+  var btn = document.getElementById('artWantedRunBtn');
+  var msg = document.getElementById('artWantedMsg');
+  if (!btn) { return; }
+  var statusUrl = btn.getAttribute('data-status-url');
+  var runUrl = btn.getAttribute('data-run-url');
+  var fields = { open: 'artWantedOpen', hit: 'artWantedHit', miss: 'artWantedMiss' };
+  function set(id, text) {
+    var el = document.getElementById(id);
+    if (el) { el.textContent = text; }
+  }
+  function stamp(value) {
+    if (!value) { return '-'; }
+    var d = new Date(value * 1000);
+    return d.toLocaleString();
+  }
+  function render(s) {
+    for (var key in fields) {
+      if (s[key] !== undefined) { set(fields[key], String(s[key])); }
+    }
+    set('artWantedLastRun', stamp(s.last_run));
+    if (s.running) {
+      set('artWantedProgress', String(s.checked || 0) + '/' + String(s.pass_total || 0)
+          + ' \\u00b7 ' + (s.current || '\\u2026'));
+    } else if (s.last_pass && (s.last_pass.checked !== undefined)) {
+      var p = s.last_pass;
+      set('artWantedProgress', String(p.checked) + ' geprueft, '
+          + String(p.hit || 0) + ' gefunden, ' + String(p.miss || 0) + ' ohne Treffer');
+    }
+    var state = s.running ? 'laeuft / running' : (s.enabled ? 'wartet / idle' : 'Suche aus / search off');
+    if (s.settings_changed) { state += ' \\u00b7 Konfiguration geaendert / config changed'; }
+    if (s.last_reason) { state += ' \\u00b7 ' + s.last_reason; }
+    set('artWantedState', state);
+  }
+  function poll() {
+    fetch(statusUrl, {cache: 'no-store'}).then(function (r) { return r.json(); })
+      .then(render).catch(function () {});
+  }
+  if (btn.addEventListener) {
+    btn.addEventListener('click', function () {
+      btn.disabled = true;
+      if (msg) { msg.textContent = 'angestossen / requested \\u2026'; }
+      fetch(runUrl, {method: 'POST', cache: 'no-store'})
+        .then(function (r) { return r.json(); })
+        .then(function (s) {
+          if (msg) {
+            msg.textContent = s.started
+              ? 'neuer Durchlauf gestartet / pass started'
+              : 'laeuft bereits / already running';
+          }
+          render(s);
+          btn.disabled = false;
+          poll();
+        })
+        .catch(function (e) {
+          if (msg) { msg.textContent = 'Fehler: ' + e; }
+          btn.disabled = false;
+        });
+    });
+  }
+  poll();
+  setInterval(poll, 2000);
+})();
+"""
+
+
 def _render_page(page: SettingsPage, params: dict[str, str], player,
                  warning: Optional[str],
                  extra_options: Optional[dict[str, tuple[tuple[str, str, str], ...]]] = None
@@ -911,6 +1169,12 @@ def _render_page(page: SettingsPage, params: dict[str, str], player,
     if page is _BASIC_SERVER:
         parts.append(_render_mediadirs())
 
+    # Zustand der wanted-Liste + Knopf für einen erneuten Durchlauf.  Steht
+    # ausserhalb der Feldliste, weil es kein Pref-Formularfeld ist, sondern
+    # eine Anzeige mit eigenem JSON-Endpunkt (``ART_WANTED_STATUS_URL``).
+    if page is _ART_ONLINE:
+        parts.append(_render_art_wanted_panel())
+
     parts.append("</div>")
     parts.append('<div id="prefsSubmit">'
                  + f'<input name="saveSettings" id="saveSettings" type="submit" '
@@ -953,6 +1217,29 @@ def is_settings_path(path: str) -> bool:
     return path.startswith("/settings/")
 
 
+async def _handle_art_wanted_json(send, path: str) -> None:
+    """``status.json``/``run`` der wanted-Liste beantworten (JSON, kein Blockieren).
+
+    ``run`` stösst nur an: der Durchlauf läuft als Task des Serverprozesses
+    weiter (``media/art_online_wanted.py`` ``request_pass``), die Antwort kommt
+    sofort zurück — die Seite fragt danach den Fortschritt ab.
+    """
+    from lyrion.media import art_online_wanted
+
+    payload: dict[str, Any]
+    try:
+        if path == ART_WANTED_RUN_URL:
+            payload = art_online_wanted.trigger_pass(reason="gui")
+        else:
+            payload = art_online_wanted.wanted_status()
+        payload["ok"] = True
+    except Exception as exc:  # noqa: BLE001 - die Anzeige darf nie 500 werfen
+        logger.warning("settings: wanted-Liste nicht bedienbar (%s)", exc)
+        payload = {"ok": False, "error": str(exc)}
+    body = json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    await _send(send, 200, "application/json", body)
+
+
 async def handle_settings_request(scope: dict, receive, send) -> None:
     """Bedient ``/settings/…`` und schreibt ``pref_*`` bei ``saveSettings``.
 
@@ -964,6 +1251,14 @@ async def handle_settings_request(scope: dict, receive, send) -> None:
     path = scope.get("path", "")
     body = await _read_body(receive)
     params = _parse_params(scope, body)
+
+    # Zustand/Anstoss der wanted-Liste (Knopf und Anzeige der Artwork-Seite).
+    # Kein Perl-Vorbild: Perl kennt keinen Hintergrund-Coverdienst; der Zustand
+    # ist hier also eine Zutat dieses Ports.  Bewusst VOR der Seiten-Suche, weil
+    # beide Pfade unter ``/settings/`` liegen.
+    if path in (ART_WANTED_STATUS_URL, ART_WANTED_RUN_URL):
+        await _handle_art_wanted_json(send, path)
+        return
 
     page = PAGES.get(path)
     if page is None:
@@ -991,6 +1286,8 @@ async def handle_settings_request(scope: dict, receive, send) -> None:
     # Dasselbe für die Online-Cover-Felder dieser Seite: Prefs mit Default
     # registrieren, damit das Formular die wirksamen Werte zeigt.
     if any(f.pref in _ART_PREF_DEFAULTS for f in page.fields):
+        await register_art_online_prefs()
+    if any(f.pref in _ART_WANTED_PREF_DEFAULTS for f in page.fields):
         await register_art_online_prefs()
 
     # Und für den Bildproxy-Schalter (bewusste Abweichung, Vorbelegung AN).

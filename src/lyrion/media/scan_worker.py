@@ -202,6 +202,10 @@ async def _run(source: Path, args: argparse.Namespace,
         # verloren.  Begrenzt (``ONLINE_DRAIN_TIMEOUT``) — der Import hat nicht
         # auf das Netz gewartet, das Prozessende darf es auch nicht endlos tun.
         await _drain_online_lookups()
+        # Alben ohne Cover in die persistente wanted-Liste aufnehmen: ab hier
+        # sucht der Server sie im Hintergrund weiter, auch ohne neuen Scan
+        # (``media/art_online_wanted.py``).
+        await _record_wanted_albums()
         if SCAN_STATE.abort_requested:
             # Perl stores SCAN_ABORTED as the failure info
             # (Slim/Control/Queries.pm:6250-6252, SQLiteHelper.pm:436-441).
@@ -293,6 +297,24 @@ async def _drain_online_lookups() -> None:
             "Online-Cover: %d Suche(n) nach %.0fs offen gelassen — der nächste "
             "Scan holt sie nach (Queue %d)", pending, ONLINE_DRAIN_TIMEOUT,
             service.queue_capacity)
+
+
+async def _record_wanted_albums() -> None:
+    """Alben ohne Cover in die persistente wanted-Liste aufnehmen (Import-Ende).
+
+    Der Scan-Prozess legt **keinen** Hintergrund-Dienst an: er endet nach dem
+    Import (``Slim/Music/Import.pm:206-230``); die Liste selbst liegt in SQLite
+    und wird vom Server weiter abgearbeitet (``media/art_online_wanted.py``).
+    """
+    try:
+        from lyrion.media.art_online_wanted import record_missing_albums
+
+        added = await record_missing_albums(source="scan")
+        if added:
+            logger.info("Online-Cover: %d Album/Alben in die wanted-Liste "
+                        "aufgenommen", added)
+    except Exception as exc:  # noqa: BLE001 - Listenpflege ist kein Scanfehler
+        logger.debug("wanted-Liste nicht gefüllt (%s)", exc)
 
 
 if __name__ == "__main__":  # pragma: no cover - entry point

@@ -774,6 +774,10 @@ class MediaScanner:
         # laufen in der Queue, damit der Scan nie auf das Netz wartet.  Hier
         # werden sie eingesammelt, bevor ``scan()`` zurückkehrt.
         await self._drain_online_lookups()
+        # Und die Alben ohne Cover in die persistente wanted-Liste aufnehmen:
+        # der Scan muss nicht mehr laufen, damit die fehlenden Cover gesucht
+        # werden (``media/art_online_wanted.py``).
+        await self._record_wanted_albums()
 
     # ------------------------------------------------------------------
     # Online-Cover (media/art_online.py) — angestossen, nie im Scan gewartet
@@ -821,6 +825,25 @@ class MediaScanner:
             logger.warning(
                 "Online-Cover: %d Suche(n) blieben nach %.0fs offen "
                 "(nächster Scan holt sie nach)", pending, ONLINE_DRAIN_TIMEOUT)
+
+    async def _record_wanted_albums(self) -> None:
+        """Alben ohne Cover in die persistente wanted-Liste aufnehmen (Scan-Ende).
+
+        Perl hat keine solche Liste (``media/art_online_wanted.py``
+        Modul-Docstring); der Scan trägt hier nur ein, das Abarbeiten übernimmt
+        der Dienst des Serverprozesses — auch ohne weiteren Scan.  Ein Fehler
+        dabei ist kein Scanfehler.
+        """
+        try:
+            from lyrion.media.art_online_wanted import record_missing_albums
+
+            added = await record_missing_albums(source="scan")
+            if added:
+                logger.info(
+                    "Online-Cover: %d Album/Alben ohne Cover in die wanted-Liste "
+                    "aufgenommen", added)
+        except Exception as exc:  # noqa: BLE001 - Listenpflege ist kein Scanfehler
+            logger.debug("wanted-Liste nach dem Scan nicht gefüllt (%s)", exc)
 
 
 def _online_service_if_configured() -> Any | None:

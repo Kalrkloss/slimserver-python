@@ -240,6 +240,37 @@ class ArtOnlineSettings:
             return (self.fanart_key or "").strip()
         return ""
 
+    def fingerprint(self) -> str:
+        """Kennung der **suchrelevanten** Einstellungen (für die wanted-Liste).
+
+        Ändert sich diese Kennung, ist ein früherer Fehlschlag nicht mehr
+        bindend: ein neuer API-Key (``PROVIDER_KEY_PREFS``), ein anderer
+        Anbieter, eine andere Sprache/ein anderes Land oder ein anderer
+        Schalter — ``media/art_online_wanted.py`` arbeitet die Liste dann erneut
+        ab (ausdrückliche Anforderung „neuer API-Key hinzugekommen“).
+
+        Die Keys selbst werden **nicht** gespeichert, nur ihr SHA1-Abdruck:
+        eine Kennung darf keinen Geheimwert in eine Datei schreiben.  Die
+        Reihenfolge kommt aus :meth:`effective_providers`, damit ein Key, der
+        einen Anbieter erst aktiviert, die Kennung ebenfalls ändert.
+        """
+        def _key_digest(value: str) -> str:
+            value = (value or "").strip()
+            if not value:
+                return ""
+            return hashlib.sha1(value.encode("utf-8")).hexdigest()[:12]
+
+        parts = (
+            "1" if self.enabled else "0",
+            ",".join(self.effective_providers()),
+            str(self.providers),
+            self.language.strip().casefold(),
+            self.country.strip().casefold(),
+            _key_digest(self.audiodb_key),
+            _key_digest(self.fanart_key),
+        )
+        return hashlib.sha1("|".join(parts).encode("utf-8")).hexdigest()[:16]
+
     @classmethod
     def from_mapping(cls, values: Mapping[str, Any]) -> "ArtOnlineSettings":
         """Einstellungen aus gelesenen Pref-Werten bauen (``web/settings.py``)."""

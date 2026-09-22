@@ -1882,6 +1882,31 @@ def _load_sync_factory(album_id: int):
     return _run
 
 
+async def _wanted_background_startup() -> bool:
+    """Artwork-Downloader als Hintergrund-Dienst starten (Serverstart).
+
+    Perl-Beleg für die *Struktur* (Queue → Cache mit Ablauf → Fortschritt
+    veröffentlichen): ``Slim/Plugin/RadioArtwork/Plugin.pm:61-76`` hängt sich an
+    den Artwork-Handler und plant Arbeit per ``setTimer``; ``:166-201``
+    entdoppelt die Suche und cacht Treffer 30 Tage.  Eine **persistente** Liste
+    kennt Perl nicht — sie ist die Zutat dieses Ports
+    (``media/art_online_wanted.py``, Modul-Docstring).
+    """
+    from lyrion.media.art_online_wanted import start_background
+
+    started = await start_background()
+    logger.info("Artwork-Downloader: Hintergrund-Dienst gestartet=%s", started)
+    return started
+
+
+async def _wanted_background_shutdown() -> None:
+    """Hintergrund-Dienst anhalten (der Zustand liegt in SQLite)."""
+    from lyrion.media.art_online_wanted import stop_background
+
+    await stop_background()
+    logger.info("Artwork-Downloader: Hintergrund-Dienst angehalten")
+
+
 def create_app(
     host: str = "0.0.0.0",
     port: int = 9000,
@@ -1902,8 +1927,37 @@ def create_app(
         api_handler.set_static_dir(static_dir)
         _set_static_root(static_dir)
 
+    async def lifespan(scope: dict, receive, send) -> None:
+        """Lifespan der ASGI-App — Start/Stopp des Artwork-Downloaders.
+
+        Nur der echte Serverlauf schickt ``lifespan``-Events (uvicorn,
+        ``create_config``); Tests, die die App direkt über einen ASGI-Transport
+        aufrufen, lösen hier also nichts aus und machen keine Netzabrufe.
+        """
+        while True:
+            message = await receive()
+            if message.get("type") == "lifespan.startup":
+                # Ein Fehler im Cover-Dienst darf den Server NIE am Start
+                # hindern (wie im Scan: ``media/scan_worker.py`` fängt ihn ab).
+                try:
+                    await _wanted_background_startup()
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("Artwork-Downloader nicht gestartet: %s", exc)
+                await send({"type": "lifespan.startup.complete"})
+            elif message.get("type") == "lifespan.shutdown":
+                try:
+                    await _wanted_background_shutdown()
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("Artwork-Downloader nicht sauber angehalten: %s",
+                                   exc)
+                await send({"type": "lifespan.shutdown.complete"})
+                return
+
     async def app(scope: dict, receive, send) -> None:
         """ASGI application entry point."""
+        if scope.get("type") == "lifespan":
+            await lifespan(scope, receive, send)
+            return
         method = scope.get("method", "GET")
         path = scope.get("path", "/")
 
@@ -2051,7 +2105,11 @@ def create_config(
         log_level=log_level,
         access_log=True,
         loop="asyncio",
-        lifespan="off",
+        # ``on`` (statt ``off``): der Artwork-Downloader startet/stoppt mit dem
+        # Server über den Lifespan-Handler in ``create_app``.  Ohne diese Events
+        # liefe der Hintergrunddienst nur beim ersten Aufruf an — und ein
+        # Testlauf über einen ASGI-Transport (ohne Lifespan) würde ihn starten.
+        lifespan="on",
     )
 
 
