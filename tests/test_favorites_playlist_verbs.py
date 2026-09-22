@@ -56,6 +56,8 @@ SID = "98ed1835"
 STREAM_URL = "http://hirschmilch.de:7000/chillout.mp3"
 
 F1, F2, S1, S2, S3 = 11, 13, 12, 14, 15
+F3, S4, S5 = 16, 17, 18
+F4 = 19
 
 
 class _Favs:
@@ -74,6 +76,12 @@ class _Favs:
             {"id": S1, "title": "1Mix EDM Radio", "url": STREAM_URL,
              "type": "stream", "parent_id": None, "position": 1,
              "icon": "html/images/radio.png"},
+            {"id": F3, "title": "Trance", "url": None, "type": "folder",
+             "parent_id": None, "position": 2,
+             "icon": "html/images/favorites.png"},
+            {"id": F4, "title": "Leer", "url": None, "type": "folder",
+             "parent_id": None, "position": 3,
+             "icon": "html/images/favorites.png"},
         ],
         F1: [
             {"id": F2, "title": "Unterordner", "url": None, "type": "folder",
@@ -89,6 +97,16 @@ class _Favs:
              "url": "https://liveradio.swr.de/sw282p3/swr3/",
              "type": "stream", "parent_id": F2, "position": 0,
              "icon": "html/images/favorites.png"},
+        ],
+        F3: [
+            {"id": S4, "title": "Hirschmilch Progressive",
+             "url": "http://hirschmilch.example:7000/progressive.mp3",
+             "type": "stream", "parent_id": F3, "position": 0,
+             "icon": "html/images/radio.png"},
+            {"id": S5, "title": "Hirschmilch Psytrance",
+             "url": "http://hirschmilch.example:7000/psytrance.mp3",
+             "type": "stream", "parent_id": F3, "position": 1,
+             "icon": "html/images/radio.png"},
         ],
     }
 
@@ -275,14 +293,72 @@ def test_unknown_item_id_changes_nothing(favs):
     assert player.playlist == []
 
 
-def test_a_folder_row_itself_is_not_a_stream(favs):
-    """Documented gap: Perl's folder branch (XMLBrowser.pm:710-779) collects the
-    folder's children and runs ``playlist addtracks``; no client offers the
-    play-control menu for a folder row and this port has no ``listref`` form of
-    the ``playlist`` command, so a folder id stays untouched (never a wrong
-    stream)."""
+def test_a_folder_row_takes_its_children_as_the_list(favs):
+    """Perl's folder branch (XMLBrowser.pm:709-779) — ``playlist addtracks``.
+
+    ``<sid>.0`` is F1: no URL of its own, its children are F2 (a folder, no
+    URL → skipped, :727) and S2 (a stream).  ``@urls`` is therefore S2's URL
+    and ``$client->execute(['playlist','addtracks','listref',\\@urls,…])``
+    appends exactly that one entry — the former branch left the queue
+    untouched because a folder is not a stream.
+    """
     player = _install_player()
     _cli(["playlist", "add", f"item_id:{SID}.0", "menu:1"])
+    assert player.playlist == ["https://absolut-relax.example/stream/mp3"]
+
+
+def test_folder_row_add_appends_the_whole_block_in_order(favs):
+    """``<sid>.2`` = F3 with two stream children — the block, in OPML order."""
+    player = _install_player()
+    _cli(["playlist", "add", f"item_id:{SID}.2", "menu:1"])
+    assert player.playlist == [
+        "http://hirschmilch.example:7000/progressive.mp3",
+        "http://hirschmilch.example:7000/psytrance.mp3",
+    ]
+    assert player.playlist_total == 2
+
+
+def test_folder_row_insert_puts_the_whole_block_behind_the_song(favs):
+    """``inserttracks``: append, then move the block to playingSongIndex + 1."""
+    player = _install_player(["a.mp3", "b.mp3"], position=0)
+    _cli(["playlist", "insert", f"item_id:{SID}.2", "menu:1"])
+    assert player.playlist == [
+        "a.mp3",
+        "http://hirschmilch.example:7000/progressive.mp3",
+        "http://hirschmilch.example:7000/psytrance.mp3",
+        "b.mp3",
+    ]
+
+
+def test_folder_row_play_loads_the_block_and_starts_at_the_first(favs):
+    """``loadtracks``: clear + load + ``playlist jump`` (undefined → 0)."""
+    player = _install_player(["a.mp3"], position=0)
+    _cli(["playlist", "play", f"item_id:{SID}.2", "menu:1"])
+    assert player.playlist == [
+        "http://hirschmilch.example:7000/progressive.mp3",
+        "http://hirschmilch.example:7000/psytrance.mp3",
+    ]
+    assert player.playlist_position == 0
+    assert favs.played == []          # the folder is not handed to fm.play
+
+
+def test_folder_children_register_their_titles_and_logos(favs):
+    """XMLBrowser.pm:734-742 — setRemoteMetadata per child URL."""
+    player = _install_player()
+    _cli(["playlist", "add", f"item_id:{SID}.2", "menu:1"])
+    assert player.stream_titles[
+        "http://hirschmilch.example:7000/psytrance.mp3"] \
+        == "Hirschmilch Psytrance"
+    assert player.stream_images[
+        "http://hirschmilch.example:7000/progressive.mp3"] \
+        == "images/radio.png"        # ``_set_stream_image`` strips the
+                                     # static_dir prefix ('html/')
+
+
+def test_an_empty_folder_changes_nothing(favs):
+    """Perl: ``@urls`` stays empty → "No valid URL found for: …" (:775-776)."""
+    player = _install_player()
+    _cli(["playlist", "add", f"item_id:{SID}.3", "menu:1"])
     assert player.playlist == []
 
 

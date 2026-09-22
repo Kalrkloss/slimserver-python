@@ -555,6 +555,78 @@ def base_actions(kind: str, filters: dict | None = None, start: int = 0,
     drill: dict = {k: str(v) for k, v in (filters or {}).items()
                    if k in ("album_id", "artist_id", "genre_id", "year")
                    and v not in (None, "")}
+    # ── Perl's ``_playlistTracks`` feed (a SAVED playlist's tracks) ────────
+    # The same playall/addall form, only the searchTags differ: the feed's
+    # passthrough is ``[@searchTags, 'playlist_id:' . $row->{id}]``
+    # (``BrowseLibrary.pm:2219``) and ``_playlistTracks`` (:2224-2307) adds NO
+    # sort — so ``_tagsToParams`` (:1069-1077) yields ``playlist_id => <id>``
+    # alone.  Live Perl 9.1.1 (read-only 2026-09-22,
+    # ``browselibrary items 0 10 menu:1 mode:playlistTracks playlist_id:1``)::
+    #
+    #   play = {player:0, cmd:["playlistcontrol"], itemsParams:"playallParams",
+    #           nextWindow:"nowPlaying",
+    #           params:{cmd:"load", playlist_id:"1", menu:1}}      # no sort!
+    #   add  = {player:0, cmd:["playlistcontrol"], itemsParams:"addallParams",
+    #           params:{cmd:"add", playlist_id:"1", menu:1}}
+    #   add-hold = {player:0, cmd:["playlistcontrol"],
+    #               itemsParams:"commonParams", params:{cmd:"insert", menu:1}}
+    #   go   = {player:0, cmd:["trackinfo","items"], itemsParams:"commonParams",
+    #           params:{menu:1}}
+    #   more = {player:0, cmd:["trackinfo","items"], itemsParams:"commonParams",
+    #           window:{isContextMenu:1}, params:{menu:1}}
+    #   playControl = {player:0, cmd:["browselibrary","items"],
+    #                  itemsParams:"playControlParams",
+    #                  window:{isContextMenu:1},
+    #                  params:{_index:"0", _quantity:"10", menu:"1",
+    #                          mode:"playlistTracks", playlist_id:"1"}}
+    #
+    # ``go``/``more`` are the feed's ``info`` action (``$actions{'items'} =
+    # $actions{'info'}``, :2308; ``info => {command => ['trackinfo','items']}``,
+    # :2280) with ``itemsParams 'commonParams'`` from the feed's
+    # ``commonVariables`` (:2276) and no ``fixedParams`` — hence ``{menu:1}``
+    # WITHOUT the playlist id.  Our rows already carry the absolute
+    # ``playallParams.play_index`` (``BrowseLibrary.pm:2263``
+    # ``$_->{'play_index'} = $offset++``); with the playall form above a tap
+    # now loads the whole playlist starting at the tapped row instead of
+    # loading a single track with an id-less ``cmd:load``.
+    playlist_id = str((filters or {}).get("playlist_id") or "")
+    if kind == "tracks" and playlist_id:
+        play_params = {"cmd": "load", "playlist_id": playlist_id, "menu": 1}
+        add_params = {"cmd": "add", "playlist_id": playlist_id, "menu": 1}
+        actions: dict = {
+            "go": {"player": 0, "cmd": ["trackinfo", "items"],
+                   "itemsParams": "commonParams", "params": {"menu": 1}},
+            "play": {"player": 0, "cmd": ["playlistcontrol"],
+                     "itemsParams": "playallParams", "params": play_params,
+                     "nextWindow": "nowPlaying"},
+            "add": {"player": 0, "cmd": ["playlistcontrol"],
+                    "itemsParams": "addallParams", "params": add_params},
+            "add-hold": add_hold_action(kind),
+        }
+        more = {"player": 0, "cmd": ["trackinfo", "items"],
+                "itemsParams": "commonParams", "window": {"isContextMenu": 1},
+                "params": {"menu": 1}}
+        actions["more"] = more
+        # Perl answers this action's params with the request's WHOLE param
+        # copy (``XMLBrowser.pm:975-984`` — ``$request->getParamsCopy()``), so
+        # every value is the STRING the client sent (live: ``_index:"0"``,
+        # ``_quantity:"10"``, ``menu:"1"``) — unlike the ``fixedParams`` of the
+        # playall/addall actions above, whose ``menu`` is Perl's numeric 1
+        # (``_makeAction``, :1672 ``$params->{'menu'} ||= 1``).  No
+        # ``useContextMenu``: the live answer carries none, and this port's
+        # play-control path keys on ``xmlbrowserPlayControl`` alone
+        # (``XMLBrowser.pm:805``).
+        cm_params: dict = {"mode": PLAYLIST_TRACKS_MODE, "menu": "1",
+                           "_index": str(start), "_quantity": str(count),
+                           "playlist_id": playlist_id}
+        cm_action: dict = {"player": 0, "cmd": ["browselibrary", "items"],
+                           "itemsParams": "playControlParams",
+                           "window": {"isContextMenu": 1},
+                           "params": cm_params}
+        actions["playControl"] = cm_action
+        if preset_fav_set:
+            actions.update(set_preset_actions())
+        return actions
     if kind == "tracks" and drill:
         play_params: dict = {"cmd": "load", **drill, "sort": "albumtrack",
                              "menu": 1}

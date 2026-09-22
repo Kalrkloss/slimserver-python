@@ -1653,6 +1653,53 @@ async def cmd_button(
 # ---------------------------------------------------------------------------
 
 
+async def _current_song_duration(player: Any) -> Any:
+    """Length of the song playing NOW — Perl ``$song->duration()``.
+
+    ``Slim/Player/Song.pm:809-816``::
+
+        sub duration {
+            my $self = shift;
+            if (scalar @_) { return $self->_duration($_[0]); }
+            return $self->_duration()
+                || Slim::Music::Info::getDuration($self->currentTrack()->url);
+        }
+
+    The length belongs to the *current song*: the ``LENGTH`` of the playlist
+    entry that plays, or the parsed length of a remote stream — 0/undef when
+    there is none (a radio stream has no length of its own; live Perl
+    9.1.1 reports 0 in ``remoteMeta.duration`` and omits the status token).
+
+    This port tracks a length only for local entries (``PlayerState.duration``,
+    written when a local track loads), so the length is read from the CURRENT
+    playlist entry: a stream entry (``str`` URL) has no length — never the
+    length of the local number that played before it — while a local entry
+    (``int`` track id) takes the DB ``duration`` of that id, with the cached
+    state value as fallback when the row is gone (Perl's
+    ``$self->_duration() || …`` chain).  Returns 0 when nothing plays.
+    """
+    items = list(getattr(player, "playlist", None) or [])
+    pos = getattr(player, "playlist_position", None)
+    entry = items[pos] if isinstance(pos, int) and 0 <= pos < len(items) else None
+    if entry is None:
+        # No playing entry: Perl has no ``playingSong()`` and publishes no
+        # duration at all.  ``current_track_id`` of a stopped player must not
+        # resurrect a length either.
+        return 0
+    if not isinstance(entry, int):
+        return 0                      # stream URL entry: no known length
+    rows_d = await _query_db(
+        "SELECT duration FROM tracks WHERE id = ?", (entry,))
+    if rows_d:
+        dur = rows_d[0]["duration"] or 0
+        try:
+            player.duration = float(dur)
+        except Exception:
+            pass
+        return dur
+    return getattr(player, "duration", 0) or 0
+
+
 @register_command("status")
 async def cmd_status(
     handler: CLIHandler,
@@ -1678,9 +1725,10 @@ async def cmd_status(
     The playlist loop is appended inline as ``playlist_loop`` tokens when the
     playlist is exposed (Perl: ``$loop = $menuMode ? 'item_loop' :
     'playlist_loop'``, Queries.pm:4353; unrolled by Request.pm:2264-2281).
-    Field semantics that we still differ on (duration/subscribe handling, the
-    remoteMeta hashref Perl prints as ``HASH(0x…)``, Queries.pm:4391) are
-    unchanged — this rewrite is about the wire format.
+    Field semantics: ``duration`` follows Perl's rule now (token only for a
+    truthy length of the song playing NOW, Queries.pm:4099-4102 — see
+    :func:`_current_song_duration`).  Still different: the subscribe handling
+    and the remoteMeta hashref Perl prints as ``HASH(0x…)`` (Queries.pm:4391).
     """
     if _is_query_echo(args):
         # 'status' has no '?' entry (Request.pm:618) → Perl echoes the request
@@ -1719,20 +1767,29 @@ async def cmd_status(
                 except ValueError:
                     subscribe_interval = 0
         elapsed = int(getattr(player, "elapsed", 0) or 0)
-        # Duration: prefer the live player state (filled on track load),
-        # fall back to the DB row of the current track.
-        duration = int(getattr(player, "duration", 0) or 0)
-        if not duration and player.current_track_id is not None:
-            rows_d = await _query_db(
-                "SELECT duration FROM tracks WHERE id = ?",
-                (player.current_track_id,),
-            )
-            if rows_d:
-                duration = int(rows_d[0]["duration"] or 0)
-                try:
-                    player.duration = float(duration)
-                except Exception:
-                    pass
+        # Perl publishes ``duration`` for the song that is playing NOW, and
+        # only when its length is truthy — ``Slim/Control/Queries.pm``::
+        #
+        #     :4099  if (my $dur = $song->duration()) {
+        #     :4100      $dur += 0;
+        #     :4101      $request->addResult('duration', $dur);
+        #     :4102  }
+        #
+        # ``$song->duration()`` is the length of the *current* song
+        # (``$self->_duration() || Slim::Music::Info::getDuration(
+        # $song->currentTrack()->url)``, ``Slim/Player/Song.pm:809-816``): the
+        # DB length of the local entry that plays, the parsed length of a
+        # remote stream — and NOTHING for a radio stream, which has no length
+        # of its own.  The former code read ``player.duration``, a
+        # player-level cache that a stream start does not reset, so a stream
+        # entry inherited the length of the LOCAL number played before it.
+        # Live Perl 9.1.1 (read-only 2026-09-14, player ``00:04:20:2b:88:c8``,
+        # stream "Dj Fada 2 - Life Breath (oct12)", ``status - 1 tags:cdltoK``)
+        # carries **no** ``duration`` token; the same rule is applied by the
+        # JSON-RPC path (``api._perl_status_duration``).
+        from lyrion.web.api import _perl_status_duration
+
+        duration = _perl_status_duration(await _current_song_duration(player))
         remote = getattr(player, "remote", 0)
         current_title = getattr(player, "current_title", None)
         sync_master = getattr(player, "sync_master", None)
@@ -1758,9 +1815,12 @@ async def cmd_status(
         results.extend([
             ("time", elapsed),
             ("rate", 1),
-            ("duration", duration),
-            ("volume", player.volume),          # EXTRA (not in Perl)
         ])
+        # Perl adds the token only for a truthy song length (Queries.pm:4099);
+        # the key is ABSENT for a radio stream.
+        if duration is not None:
+            results.append(("duration", duration))
+        results.append(("volume", player.volume))   # EXTRA (not in Perl)
         if sync_master:
             results.append(("sync_master", sync_master))
         if sync_slaves:
@@ -4937,6 +4997,80 @@ async def _fav_exists(
                          results=results)
 
 
+async def _fav_folder_children(fm: Any, fav_id: int) -> list[dict[str, Any]]:
+    """Direct children of a favourite FOLDER, in OPML order.
+
+    Perl's folder branch walks ``$subFeed->{'items'}`` — the rows of the
+    opened feed, i.e. exactly the direct children (``XMLBrowser.pm:712``) —
+    and skips every item without a URL (:727 ``if (!$url …) { next; }``).
+    Only a folder (``url`` undefined, ``_fav_to_dict`` type 'folder') has
+    children worth collecting: a leaf with a URL is the file branch.
+    """
+    getter = getattr(fm, "get", None)
+    if getter is not None:
+        row = await getter(fav_id) or {}
+        if row.get("url"):
+            return []
+    kids = await fm.list_items(fav_id)
+    return [k for k in kids if str(k.get("url") or "")]
+
+
+async def _fav_playlist_children(player_id: str, children: list[dict[str, Any]],
+                                 action: str) -> bool:
+    """Perl's folder branch: the children as ONE ``listref``.
+
+    ``Slim/Control/XMLBrowser.pm:749-766`` builds the URL list and runs
+    ``playlist loadtracks|addtracks|inserttracks listref <urls>`` — the whole
+    block, not one entry at a time:
+
+    * ``loadtracks`` (``play|load``): clear the queue, load the block, start
+      at index 0 (``$playIndex`` is undefined here, ``Commands.pm:1681-1796``
+      jumps to 0);
+    * ``addtracks`` (``add``): append the block
+      (``Slim/Player/Playlist.pm:239``);
+    * ``inserttracks`` (else, i.e. ``insert``): append the block and move it
+      behind the running song (``Playlist.pm:265-284`` ``_insert_done``).
+
+    Before the verb every child's name and logo is filed under its URL
+    (``XMLBrowser.pm:734-742`` ``setRemoteMetadata``), like the file branch
+    does for its single row.  Returns False when the player is gone.
+    """
+    from lyrion.player.manager import PlayerManager
+    from lyrion.web.api import JSONRPCAPI
+
+    pm = PlayerManager()
+    player = pm.get_player(player_id)
+    if player is None:
+        return False
+    urls = [str(k["url"]) for k in children]
+    if not urls:
+        return False
+    for k in children:
+        u = str(k["url"])
+        JSONRPCAPI._set_stream_title(player, u, str(k.get("title") or ""))
+        JSONRPCAPI._set_stream_image(player, u, str(k.get("icon") or ""))
+    if action in ("play", "load"):
+        player.playlist = list(urls)
+        player.playlist_total = len(urls)
+        player.playlist_position = 0
+        player.last_activity = time.time()
+        # ``playlist jump`` to the (undefined → 0) ``$playIndex``: this is the
+        # path that actually opens the stream (``_play_playlist_item`` for a
+        # URL entry / ``manager.playlist_play``).
+        return await pm.playlist_play(player_id, 0)
+    playlist = list(player.playlist or [])
+    if action == "add":
+        playlist.extend(urls)
+    else:
+        pos = int(player.playlist_position or 0) + 1
+        pos = max(0, min(pos, len(playlist)))
+        playlist[pos:pos] = urls
+    player.playlist = playlist
+    player.playlist_total = len(playlist)
+    player.last_activity = time.time()
+    return True
+
+
 async def _fav_playlist(
     handler: CLIHandler,
     ctx: CLIContext,
@@ -4971,12 +5105,34 @@ async def _fav_playlist(
     and the verb stayed a silent no-op (``play`` was unaffected: it takes the DB
     id straight from ``resolve_path``).
 
-    Not ported here: Perl's *folder* branch, which collects the direct children
-    of a non-audio item and runs ``playlist addtracks|inserttracks|loadtracks``
-    on that list (``Slim/Control/XMLBrowser.pm:710-779``).  No client offers the
-    play-control menu for a folder row (``_playlistControlContextMenu`` is
-    reached from the leaf branch only, :543-639/:805-830), and the
-    ``listref``-form of the ``playlist`` command has no equivalent in this port.
+    FOLDER rows (a favourite *folder*, ``url`` undefined) take Perl's **folder
+    branch** (``Slim/Control/XMLBrowser.pm:709-779``): the row is no single
+    stream, so the feed's direct children are collected —
+
+        :712  for my $item ( @{ $subFeed->{'items'} } ) {
+        :715      if ( $item->{'type'} eq 'audio' && $item->{'url'} ) { … }
+        :727      if (!$url || …) { next; }          # no URL → no entry
+        :735      Slim::Music::Info::setRemoteMetadata( $url, { title => …,
+        :736          cover => $subFeed->{'image'} || … } );
+
+    — and handed to the playlist as one ``listref``:
+
+        :752  if ( $method =~ /play|load/i ) { $cmd = 'loadtracks'; }
+        :754  elsif ($method =~ /add/)       { $cmd = 'addtracks'; }
+        :758  else                           { $cmd = 'inserttracks'; }
+        :766  $client->execute([ 'playlist', $cmd, 'listref', \@urls, undef,
+        :767                       $playIndex ]);
+
+    ``loadtracks`` clears the queue and starts at the first child
+    (``Commands.pm:1681-1796`` ``playlist jump`` with an undefined index → 0),
+    ``addtracks`` appends the block (``Slim/Player/Playlist.pm:239``),
+    ``inserttracks`` appends it and moves it behind the running song
+    (``Playlist.pm:265-284`` ``_insert_done``).  Perl also renders
+    ``_addingToPlaylist`` (a showBriefly) for add/insert (:769-773) — not part
+    of the file branch of this port either, so it stays out here.
+
+    The FILE branch (a row with its own URL) is untouched: its single URL is
+    still the whole queue entry (``XMLBrowser.pm:667-702``).
     """
     if not args:
         return _command_echo(["favorites", "playlist"], args, [], has_tags=True)
@@ -5000,41 +5156,56 @@ async def _fav_playlist(
         fav_id = await _fav_resolve_id(fm, fav_id_raw)
         if fav_id is None or not player_id:
             return _command_echo(["favorites", "playlist"], args, [], has_tags=True)
-        if action in ("play", "load"):
+        # A favourite FOLDER has no URL of its own (``url`` undefined,
+        # ``_fav_to_dict`` type 'folder'): Perl's folder branch takes its
+        # CHILDREN as the list (``XMLBrowser.pm:709-779``).  A row WITH a URL
+        # keeps the untouched file branch below.  ``fm.get`` is optional so a
+        # stand-in without it keeps working (it then has no folder rows).
+        getter = getattr(fm, "get", None)
+        row: dict[str, Any] = {}
+        if getter is not None:
+            row = await getter(fav_id) or {}
+        url = str(row.get("url") or "")
+        children: list[dict[str, Any]] = []
+        # ``XMLBrowser.pm:667``: the branch runs for
+        # add|addall|play|playall|insert|load only — a verb outside that set
+        # stays a no-op (the CLI registers play/load/insert/add).
+        if not url and action in ("play", "load", "add", "insert"):
+            children = await _fav_folder_children(fm, fav_id)
+        if children:
+            await _fav_playlist_children(player_id, children, action)
+        elif action in ("play", "load"):
             await fm.play(player_id, fav_id)
-        elif action in ("insert", "add"):
+        elif action in ("insert", "add") and url:
             # The row the item id points at — ``resolve_path`` walks the index
             # path over the WHOLE tree (Perl ``XMLBrowser.pm:331-405``), the
             # former root-only ``list_items(None)`` scan found no row inside a
             # folder and the verb died silently.
-            row = await fm.get(fav_id) or {}
-            url = str(row.get("url") or "")
-            if url:
-                player = PlayerManager().get_player(player_id)
-                if player is not None:
-                    # Perl files the row's name AND logo under the URL before
-                    # the playlist verb — for add/insert/play alike
-                    # (``XMLBrowser.pm:693-700`` setRemoteMetadata).
-                    from lyrion.web.api import JSONRPCAPI
+            player = PlayerManager().get_player(player_id)
+            if player is not None:
+                # Perl files the row's name AND logo under the URL before
+                # the playlist verb — for add/insert/play alike
+                # (``XMLBrowser.pm:693-700`` setRemoteMetadata).
+                from lyrion.web.api import JSONRPCAPI
 
-                    JSONRPCAPI._set_stream_title(player, url,
-                                                 str(row.get("title") or ""))
-                    JSONRPCAPI._set_stream_image(player, url,
-                                                 str(row.get("icon") or ""))
-                    if action == "add":
-                        # Commands.pm:1495-1503 → Playlist.pm:239 (append).
-                        player.playlist.append(url)
-                    else:
-                        # Commands.pm:1535-1560 → Playlist.pm:265-284
-                        # ``_insert_done``: appended, then moved to
-                        # ``playingSongIndex + 1``.
-                        playlist = list(player.playlist or [])
-                        pos = int(player.playlist_position or 0) + 1
-                        pos = max(0, min(pos, len(playlist)))
-                        playlist[pos:pos] = [url]
-                        player.playlist = playlist
-                    player.playlist_total = len(player.playlist)
-                    player.last_activity = time.time()
+                JSONRPCAPI._set_stream_title(player, url,
+                                             str(row.get("title") or ""))
+                JSONRPCAPI._set_stream_image(player, url,
+                                             str(row.get("icon") or ""))
+                if action == "add":
+                    # Commands.pm:1495-1503 → Playlist.pm:239 (append).
+                    player.playlist.append(url)
+                else:
+                    # Commands.pm:1535-1560 → Playlist.pm:265-284
+                    # ``_insert_done``: appended, then moved to
+                    # ``playingSongIndex + 1``.
+                    playlist = list(player.playlist or [])
+                    pos = int(player.playlist_position or 0) + 1
+                    pos = max(0, min(pos, len(playlist)))
+                    playlist[pos:pos] = [url]
+                    player.playlist = playlist
+                player.playlist_total = len(player.playlist)
+                player.last_activity = time.time()
     except Exception:  # noqa: BLE001
         pass
     return _command_echo(["favorites", "playlist"], args, [], has_tags=True)
