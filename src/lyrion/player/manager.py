@@ -1413,6 +1413,18 @@ class PlayerManager:
             player.mode = "play"
             player.current_track_id = track_id
             player.remote = 0  # local track: never a "live stream" flag
+            # Vorrang für den Artwork-Downloader: hat dieses Album noch kein
+            # Cover, soll der Dienst es als Naechstes suchen und die Anzeige
+            # danach von selbst nachziehen.  Der Aufruf ist bewusst synchron und
+            # ohne I/O (Flag + Weckmarke, ``media/art_online_wanted.py``
+            # ``request_priority``) — die Wiedergabe wartet nie darauf; ist der
+            # Dienst nicht angelegt, passiert gar nichts.
+            try:
+                from lyrion.media.art_online_wanted import request_priority_for
+
+                request_priority_for(player.mac, track_id)
+            except Exception as exc:  # noqa: BLE001 - Wiedergabe nie stören
+                logger.debug("artwork priority request failed: %s", exc)
             # Perl counts the song clock from the offset the stream starts at
             # (`$song->startOffset($seekdata->{timeOffset})`, File.pm:196-223);
             # the protocol layer adds the SAME value to every STAT elapsed.

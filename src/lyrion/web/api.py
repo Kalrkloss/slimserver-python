@@ -8169,6 +8169,15 @@ class JSONRPCAPI:
             if isinstance(item, int):
                 player.current_track_id = item
                 player.remote = 0  # local track
+                # Vorrang für den Artwork-Downloader (Flag + Weckmarke, kein
+                # I/O — ``media/art_online_wanted.py`` ``request_priority_for``).
+                try:
+                    from lyrion.media.art_online_wanted import request_priority_for
+
+                    request_priority_for(player.mac, item)
+                except Exception as exc:  # noqa: BLE001 - Wiedergabe nie stören
+                    logging.getLogger("lyrion.web.api").debug(
+                        "artwork priority request failed: %s", exc)
             else:
                 player.remote = 1  # live stream: never "track end"
             pm.set_mode(player.mac, "play")

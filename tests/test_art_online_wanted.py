@@ -106,14 +106,25 @@ def build_service(tmp_path, routes=None, *, settings: ArtOnlineSettings | None =
     return service, fetch
 
 
-def build_wanted(tmp_path, service, library, **kwargs):
-    """Dienst auf der Liste dieses Verzeichnisses; sammelt Albumzeilen-Rückrufe."""
+def build_wanted(tmp_path, service, library, *, write_rows: bool = False, **kwargs):
+    """Dienst auf der Liste dieses Verzeichnisses; sammelt Albumzeilen-Rückrufe.
+
+    ``write_rows=True`` lässt den Rückruf die Albumzeile **wirklich** setzen
+    (``media/importer.py`` ``store_online_cover``, wie ``wire_online_artwork``
+    im Server).  Ohne das meldet der Rückruf nur „1 Zeile“ — richtig für die
+    Tests, die nur die Reihenfolge prüfen; alles, was die Anzeige-Aktualisierung
+    nach einem echten Nachtrag prüft, braucht die echte Zeile.
+    """
     store = kwargs.pop("store", None) or wanted.WantedStore(service.settings.cache_dir)
     rows: list[tuple[str, str, str]] = []
 
     async def on_row(query, cover):
         rows.append((query.album, cover.provider, str(cover.path)))
-        return 1
+        if not write_rows:
+            return 1
+        from lyrion.media.importer import store_online_cover
+
+        return int(await store_online_cover(query, cover) or 0)
 
     # Wie ``media/importer.py`` ``wire_online_artwork``: ein neuer Treffer hängt
     # sofort an der Albumzeile (Perl ``Slim/Utils/Scanner/Local.pm:1086-1091``).
@@ -942,3 +953,514 @@ def test_status_uses_stored_last_run_after_a_restart(tmp_path):
     assert status["last_run"] == 1700000000
     assert status["last_pass"] == {"checked": 5, "hit": 2}
     assert status["running"] is False
+
+
+# ---------------------------------------------------------------------------
+# 7. Vorrang: das Album des gerade laufenden Titels
+# ---------------------------------------------------------------------------
+
+PLAYER_MAC = "1c:87:2c:47:fc:36"
+
+
+@pytest.fixture(autouse=True)
+def _library_engine_after_each_test():
+    """Die Bibliotheks-Engine nach jedem Test schliessen (sie bleibt offen).
+
+    ``_track_album_library`` legt die Bibliothek an und lässt sie **offen** —
+    der Vorrang liest sie während des Durchlaufs über ``db_session()``; ein
+    vorher geschlossener Motor liesse ``albums_for_tracks`` leer laufen.
+    """
+    yield
+    asyncio.run(close_db())
+
+
+def _track_album_library(tmp_path):
+    """Bibliothek: ein Album **ohne** Cover und eines mit, je ein Track.
+
+    Track und Album hängen wie in der echten Bibliothek über ``tracks_albums``
+    zusammen (``lyrion/database/schema.py`` — ``tracks`` hat keine
+    ``album``-Spalte, Perls ``tracks.album`` heisst hier die Verknüpfung).
+    Die Engine bleibt offen (Aufräumen: ``_library_engine_after_each_test``).
+    """
+    from lyrion.database.schema import Track, tracks_albums
+
+    async def run():
+        await init_db(tmp_path / "lyrion.db")
+        async with db_session() as session:
+            bonfire = Contributor(namespell="bonfire", name="Bonfire",
+                                  sortname="bonfire")
+            session.add(bonfire)
+            await session.flush()
+            without = Album(titlesort="point blank", title="Point Blank",
+                            albumartist_sort="bonfire", year=1989,
+                            musicbrainz_id="rg-point")
+            with_cover = Album(titlesort="hat cover", title="Hat Cover",
+                               albumartist_sort="bonfire", year=1990,
+                               artwork="/tmp/cover.jpg",
+                               musicbrainz_id="rg-hat")
+            session.add_all([without, with_cover])
+            await session.flush()
+            await session.execute(albums_contributors.insert(), [
+                {"album": without.id, "contributor": bonfire.id, "role": 1},
+                {"album": with_cover.id, "contributor": bonfire.id,
+                 "role": 1},
+            ])
+            t_without = Track(titlesort="point blank", title="Point Blank",
+                              url="file:///music/pb/01.flac")
+            t_with = Track(titlesort="hat cover", title="Hat Cover",
+                           url="file:///music/hc/01.flac")
+            session.add_all([t_without, t_with])
+            await session.flush()
+            await session.execute(tracks_albums.insert(), [
+                {"track": t_without.id, "album": without.id},
+                {"track": t_with.id, "album": with_cover.id},
+            ])
+            await session.commit()
+            return {"album_without": int(without.id),
+                    "album_with": int(with_cover.id),
+                    "track_without": int(t_without.id),
+                    "track_with": int(t_with.id)}
+
+    return _run(run())
+
+
+def _playing_player(track_id, *, mac=PLAYER_MAC, mode="play"):
+    """Einen laufenden Spieler in den Prozess-Manager setzen (kein Netzzugang)."""
+    from lyrion.player.manager import PlayerManager
+    from lyrion.player.state import PlayerState
+
+    player = PlayerState(mac=mac, name="Taverne", ip="192.168.1.130",
+                         port=57536, model="squeezeplay", model_name="SB Player",
+                         connected=True, power=True, mode=mode,
+                         current_track_id=track_id,
+                         playlist=[track_id], playlist_position=0,
+                         playlist_total=1)
+    manager = PlayerManager()
+    manager.players = {mac: player}
+    return manager, player
+
+
+def _album_artwork(album_id: int) -> str:
+    """``albums.artwork`` einer Zeile lesen — roher Beleg des Nachtrags."""
+    from sqlalchemy import text
+
+    async def _do() -> str:
+        async with db_session() as session:
+            return str((await session.execute(
+                text("SELECT artwork FROM albums WHERE id = :i"),
+                {"i": int(album_id)})).scalar() or "")
+
+    return _run(_do())
+
+
+def _capture_newmetadata():
+    """``playlist newmetadata``-Meldungen mitschneiden (Perls Notify-Weg)."""
+    from lyrion.control import notifications
+
+    # Ein Pump-Task aus einem früheren Test hängt an dessen (geschlossenem)
+    # Loop; ``notify_from_array`` legt dann keinen neuen an und die Warteschlange
+    # bliebe stehen.  ``reset()`` räumt Warteschlange, Zuhörer und Task auf.
+    notifications.reset()
+    seen: list[tuple] = []
+
+    def _capture(note):
+        seen.append((note.client_id, list(note.verbs)))
+
+    notifications.subscribe(_capture)
+    return notifications, seen, _capture
+
+
+def test_playing_album_is_searched_first_and_the_queue_keeps_going(tmp_path):
+    """Vorrang wirkt: das laufende Album zuerst, die übrigen danach.
+
+    Perl-Beleg für den Anzeige-Weg: ``Slim/Plugin/RadioArtwork/Plugin.pm:337``
+    (``notifyFromArray($c, ['newmetadata'])``, sobald ein Cover nachträglich
+    eintrifft).
+    """
+    ids = _track_album_library(tmp_path)
+    service, fetch = build_service(
+        tmp_path, [("coverartarchive.org", caa_hit())],
+        settings=ArtOnlineSettings(cache_dir=tmp_path / "cache",
+                                   providers=("coverartarchive",)))
+    library = [
+        (AlbumQuery(album="Zuerst", artist="A", year=2001, mbid="rg-a"), 101),
+        (AlbumQuery(album="Point Blank", artist="Bonfire", year=1989,
+                    mbid="rg-point"), ids["album_without"]),
+        (AlbumQuery(album="Zuletzt", artist="Z", year=2002, mbid="rg-z"), 103),
+    ]
+    w, rows = build_wanted(tmp_path, service, library, write_rows=True)
+    _manager, _player = _playing_player(ids["track_without"])
+    notes, seen, capture = _capture_newmetadata()
+
+    async def run():
+        summary = await w.run_pass(reason="playing")
+        await asyncio.sleep(0.05)          # Notify-Pumpe laufen lassen
+        return summary
+
+    try:
+        summary = _run(run())
+    finally:
+        notes.unsubscribe(capture)
+
+    assert summary["checked"] == 3, "der Vorrang darf die übrigen nicht verdrängen"
+    assert summary["hit"] == 3
+    # Reihenfolge: das laufende Album stand NICHT vorne, wurde aber zuerst bearbeitet.
+    assert rows and rows[0][0] == "Point Blank"
+    assert w.status()["priority"] == ["Point Blank"]
+    # Die gespielte Albumzeile trägt das Cover wirklich (roher Beleg, dass die
+    # Anzeige danach ein neues ``artwork_track_id`` liefert).
+    assert _album_artwork(ids["album_without"]) == rows[0][2]
+    # Anzeige: 'newmetadata' an genau den laufenden Spieler — Perl schickt die
+    # einverbige Form (``notifyFromArray($c, ['newmetadata'])``,
+    # ``Slim/Plugin/RadioArtwork/Plugin.pm:337``); ``[['playlist','newmetadata']]``
+    # ist Perls *Filter* (eine Gruppe, zwei Alternativen, ``Request.pm:2381-2395``)
+    # und trifft sie mit.
+    assert (PLAYER_MAC, ["newmetadata"]) in seen
+    assert [n for n in seen if n[1] == ["newmetadata"]] == [
+        (PLAYER_MAC, ["newmetadata"])], \
+        "nur das laufende Album meldet die Anzeige nach"
+    # Kein Aushungern: die beiden anderen Alben wurden ebenfalls gesucht.
+    assert len([c for c in fetch.calls if "coverartarchive" in c]) == 3
+
+
+def test_playing_album_with_cover_is_not_prioritised(tmp_path):
+    """„Nur bei echtem Bedarf“: ein Album mit Cover bekommt keinen Vorrang."""
+    ids = _track_album_library(tmp_path)
+    service, fetch = build_service(
+        tmp_path, [("coverartarchive.org", caa_hit())],
+        settings=ArtOnlineSettings(cache_dir=tmp_path / "cache",
+                                   providers=("coverartarchive",)))
+    w, rows = build_wanted(tmp_path, service, [
+        (AlbumQuery(album="Anderes", artist="A", year=2001, mbid="rg-a"), 1)])
+    _manager, _player = _playing_player(ids["track_with"])
+    notes, seen, capture = _capture_newmetadata()
+
+    async def run():
+        summary = await w.run_pass(reason="playing")
+        await asyncio.sleep(0.05)
+        return summary
+
+    try:
+        summary = _run(run())
+    finally:
+        notes.unsubscribe(capture)
+
+    assert summary["checked"] == 1 and w.status()["priority"] == []
+    assert [r[0] for r in rows] == ["Anderes"]
+    assert seen == [], "ohne laufendes Album ohne Cover keine Meldung"
+
+
+def test_priority_request_is_synchronous_and_does_no_io(tmp_path):
+    """Der Wiedergabepfad blockiert nie: kein Netz, kein Bibliotheks-Zugriff."""
+    service, fetch = build_service(tmp_path, [("coverartarchive.org", caa_hit())])
+    w, _rows = build_wanted(tmp_path, service, [])
+
+    def _no_db(*_a, **_k):        # jeder Bibliotheks-Zugriff wäre ein Fehler
+        raise AssertionError("der Vorrang darf die Bibliothek nicht anfassen")
+
+    w._library = _no_db
+    started = time.time()
+    assert w.request_priority(PLAYER_MAC, 4711) is True
+    assert time.time() - started < 0.05
+    assert fetch.calls == [], "kein Netzaufruf im Wiedergabepfad"
+    assert w.status()["priority_pending"] is True
+
+
+def test_same_track_played_again_does_not_search_twice(tmp_path):
+    """Derselbe Titel mehrfach ⇒ ein Eintrag, ein Netzaufruf."""
+    ids = _track_album_library(tmp_path)
+    service, fetch = build_service(
+        tmp_path, [("coverartarchive.org", caa_hit())],
+        settings=ArtOnlineSettings(cache_dir=tmp_path / "cache",
+                                   providers=("coverartarchive",)))
+    w, _rows = build_wanted(tmp_path, service, [], write_rows=True)
+    _manager, _player = _playing_player(ids["track_without"])
+
+    async def run():
+        first = await w.run_pass(reason="playing")
+        calls_after_first = len(fetch.calls)
+        # Nochmal „abspielen“ (derselbe Titel) — kein zweiter Netzaufruf.
+        w.request_priority(PLAYER_MAC, ids["track_without"])
+        second = await w.run_pass(reason="playing-again")
+        return first, second, calls_after_first
+
+    first, second, calls_after_first = _run(run())
+    assert first["hit"] == 1 and first["checked"] == 1
+    assert second["checked"] == 0, "das Album hat jetzt ein Cover — nichts zu tun"
+    assert len(fetch.calls) == calls_after_first
+    assert len(w.store.all_entries()) == 1
+
+
+def test_playing_album_with_a_cached_hit_but_empty_row_gets_the_cover(tmp_path):
+    """Treffer im Plattencache, Album-Zeile leer (zweite Zeile, gleicher Schlüssel).
+
+    Der Listenstatus ``hit`` heisst „Cover liegt im Plattencache“ — **nicht**
+    „diese Album-Zeile hat es schon“.  Genau das passiert in der echten
+    Bibliothek, wenn zwei Album-Zeilen denselben (normalisierten) Schlüssel
+    bilden: die gespielte Zeile ist leer, der Eintrag ein Treffer.  Sie darf
+    deshalb nicht übersprungen werden; ``_process`` trägt das Cover **ohne
+    Netz** aus dem Plattencache nach und meldet die Anzeige nach.
+    """
+    from sqlalchemy import text
+
+    ids = _track_album_library(tmp_path)
+    service, fetch = build_service(
+        tmp_path, [("coverartarchive.org", caa_hit())],
+        settings=ArtOnlineSettings(cache_dir=tmp_path / "cache",
+                                   providers=("coverartarchive",)))
+    w, _rows = build_wanted(tmp_path, service, [], write_rows=True)
+    _run(w.run_pass(reason="erster Durchlauf"))   # sucht und trägt ein
+
+    async def _clear() -> None:
+        async with db_session() as session:
+            await session.execute(text(
+                "UPDATE albums SET artwork = '', artwork_front = '' WHERE id = :i"),
+                {"i": ids["album_without"]})
+            await session.commit()
+
+    assert _album_artwork(ids["album_without"]), \
+        "erster Durchlauf hat die Albumzeile gesetzt"
+    _run(_clear())                                # „zweite Zeile“: leer, Treffer im Cache
+    calls = len(fetch.calls)
+    _manager, _player = _playing_player(ids["track_without"])
+    notes, seen, capture = _capture_newmetadata()
+
+    async def run():
+        summary = await w.run_pass(reason="playing")
+        await asyncio.sleep(0.05)
+        return summary
+
+    try:
+        summary = _run(run())
+    finally:
+        notes.unsubscribe(capture)
+
+    assert summary["hit"] == 1 and w.status()["priority"] == ["Point Blank"]
+    assert len(fetch.calls) == calls, "Treffer aus dem Plattencache — kein Netz"
+    assert _album_artwork(ids["album_without"]), \
+        "die gespielte Albumzeile trägt jetzt das Cover"
+    assert seen == [(PLAYER_MAC, ["newmetadata"])]
+
+
+def _add_twin_album(title: str = "Point Blank !") -> dict:
+    """Zweite Album-Zeile mit demselben normalisierten Titel (gleicher Schlüssel).
+
+    Genau der Fall der gewachsenen Bibliothek: „Kill em All“ und „Kill 'em all“
+    sind zwei Zeilen, aber ein Suchschlüssel (``AlbumQuery.key`` normalisiert).
+    """
+    from lyrion.database.schema import Track, tracks_albums
+
+    async def run():
+        async with db_session() as session:
+            album = Album(titlesort=title.lower(), title=title,
+                          albumartist_sort="bonfire", year=1989,
+                          musicbrainz_id="rg-point")
+            track = Track(titlesort=title.lower(), title=title,
+                          url="file:///music/pb/02.flac")
+            session.add_all([album, track])
+            await session.flush()
+            await session.execute(tracks_albums.insert(),
+                                  [{"track": track.id, "album": album.id}])
+            await session.commit()
+            return {"album_twin": int(album.id), "track_twin": int(track.id)}
+
+    return _run(run())
+
+
+def test_duplicate_album_rows_share_the_key_and_still_notify(tmp_path):
+    """Zwei Album-Zeilen, ein Schlüssel: die gespielte leere Zeile bekommt das
+    Cover und die Anzeige wird gemeldet.
+
+    Der Eintrag gehört der **anderen** Zeile (``entry.album_id``), das Cover
+    liegt schon im Plattencache.  Gespielt wird die leere Zeile: sie ist das
+    Album ohne Cover, ihr Cover ist das gesetzte — die Meldung darf deshalb
+    nicht an der abweichenden Album-ID scheitern.
+    """
+    ids = _track_album_library(tmp_path)
+    service, fetch = build_service(
+        tmp_path, [("coverartarchive.org", caa_hit())],
+        settings=ArtOnlineSettings(cache_dir=tmp_path / "cache",
+                                   providers=("coverartarchive",)))
+    w, _rows = build_wanted(tmp_path, service, [
+        (AlbumQuery(album="Point Blank", artist="Bonfire", year=1989,
+                    mbid="rg-point"), ids["album_without"])], write_rows=True)
+    _run(w.run_pass(reason="erster Durchlauf"))       # Eintrag + Plattencache
+    twin = _add_twin_album()
+    assert twin["album_twin"] != ids["album_without"]
+    assert _album_artwork(ids["album_without"]), "erste Zeile hat das Cover"
+    assert not _album_artwork(twin["album_twin"]), "die zweite Zeile ist leer"
+    entry = w.store.get(AlbumQuery(album="Point Blank", artist="Bonfire",
+                                   year=1989).key())
+    assert entry is not None and entry.album_id == ids["album_without"], \
+        "der Eintrag gehört der ersten Zeile"
+
+    calls = len(fetch.calls)
+    _manager, _player = _playing_player(twin["track_twin"])
+    notes, seen, capture = _capture_newmetadata()
+
+    async def run():
+        summary = await w.run_pass(reason="playing")
+        await asyncio.sleep(0.05)
+        return summary
+
+    try:
+        summary = _run(run())
+    finally:
+        notes.unsubscribe(capture)
+
+    assert summary["hit"] == 1
+    assert len(fetch.calls) == calls, "Cover liegt im Plattencache — kein Netz"
+    assert _album_artwork(twin["album_twin"]), \
+        "die gespielte zweite Zeile trägt jetzt das Cover"
+    assert seen == [(PLAYER_MAC, ["newmetadata"])]
+
+
+def test_radio_stream_never_gets_priority(tmp_path):
+    """Radio unverändert: ein Strom hat keine Track-ID.
+
+    Also kein Vorrang (die Liste läuft normal weiter) und keine Anzeige-Meldung
+    über ein Album-Cover — die Anzeige eines Streams hängt an den Metadaten des
+    Stroms (``STMu``/``httpCover``), nicht an ``albums.artwork``.
+    """
+    ids = _track_album_library(tmp_path)
+    service, fetch = build_service(
+        tmp_path, [("coverartarchive.org", caa_hit())],
+        settings=ArtOnlineSettings(cache_dir=tmp_path / "cache",
+                                   providers=("coverartarchive",)))
+    w, rows = build_wanted(tmp_path, service, [
+        (AlbumQuery(album="Point Blank", artist="Bonfire", year=1989,
+                    mbid="rg-point"), ids["album_without"])])
+    _manager, player = _playing_player(None)
+    player.remote = 1
+    player.current_url = "http://regiocast.streamabc.net/x.mp3"
+    notes, seen, capture = _capture_newmetadata()
+
+    async def run():
+        summary = await w.run_pass(reason="radio")
+        await asyncio.sleep(0.05)
+        return summary
+
+    try:
+        summary = _run(run())
+    finally:
+        notes.unsubscribe(capture)
+
+    assert summary["checked"] == 1 and summary["hit"] == 1
+    assert w.status()["priority"] == []
+    assert [r[0] for r in rows] == ["Point Blank"]
+    assert seen == [], "ein Radio-Strom bekommt keine Album-Cover-Meldung"
+
+
+def test_track_change_mid_pass_is_inserted_next(tmp_path):
+    """Ein Titelwechsel während des Durchlaufs wird sofort eingeschoben."""
+    ids = _track_album_library(tmp_path)
+    service, fetch = build_service(
+        tmp_path, [("coverartarchive.org", caa_hit())],
+        settings=ArtOnlineSettings(cache_dir=tmp_path / "cache",
+                                   providers=("coverartarchive",)))
+    library = [
+        (AlbumQuery(album="Eins", artist="A", year=2001, mbid="rg-1"), 101),
+        (AlbumQuery(album="Point Blank", artist="Bonfire", year=1989,
+                    mbid="rg-point"), ids["album_without"]),
+        (AlbumQuery(album="Drei", artist="C", year=2003, mbid="rg-3"), 103),
+    ]
+    w, rows = build_wanted(tmp_path, service, library)
+    _manager, player = _playing_player(None, mode="stop")
+    seen: list[str] = []
+    original = w._process
+
+    async def _spy(entry, fingerprint, **kwargs):
+        seen.append(entry.album)
+        if entry.album == "Eins":            # Titel startet mitten im Durchlauf
+            player.current_track_id = ids["track_without"]
+            player.mode = "play"
+        return await original(entry, fingerprint, **kwargs)
+
+    w._process = _spy
+
+    async def run():
+        return await w.run_pass(reason="mid")
+
+    summary = _run(run())
+    assert len(seen) == 3 and seen[0] != "Point Blank"
+    assert seen[1] == "Point Blank", \
+        "der Titelwechsel muss als Nächstes eingeschoben werden"
+    assert summary["checked"] == 3
+
+
+def test_cover_arrival_for_another_album_pushes_nothing(tmp_path):
+    """Ein Cover für ein fremdes Album meldet der Anzeige nichts.
+
+    Der laufende Titel gehört hier zu einem Album, das **schon** ein Cover hat
+    — es gibt also keinen Vorrang und keinen zweiten Cover-Eingang, der die
+    Meldung erklären könnte.  Geprüft wird damit die Album-Bindung der Meldung:
+    ein Cover für ein fremdes Album darf *nicht* an den laufenden Spieler
+    gehen (sonst würde jede Suche jede Anzeige neu laden).
+    """
+    ids = _track_album_library(tmp_path)
+    service, fetch = build_service(
+        tmp_path, [("coverartarchive.org", caa_hit())],
+        settings=ArtOnlineSettings(cache_dir=tmp_path / "cache",
+                                   providers=("coverartarchive",)))
+    w, _rows = build_wanted(tmp_path, service, [
+        (AlbumQuery(album="Fremd", artist="A", year=2001, mbid="rg-a"), 99)])
+    _manager, _player = _playing_player(ids["track_with"])
+    notes, seen, capture = _capture_newmetadata()
+
+    async def run():
+        summary = await w.run_pass(reason="other")
+        await asyncio.sleep(0.05)
+        return summary
+
+    try:
+        summary = _run(run())
+    finally:
+        notes.unsubscribe(capture)
+
+    assert summary["hit"] == 1 and seen == []
+    assert w.status()["priority"] == [], "ein Album mit Cover bekommt keinen Vorrang"
+
+
+def test_cover_arrival_reexecutes_the_playing_clients_status(tmp_path, monkeypatch):
+    """Nach dem Treffer läuft das Status-Abonnement des Spielers neu — das ist
+    die Anzeige-Aktualisierung.
+
+    Perl-Kette: ``notifyFromArray`` (:838-853) → ``notify`` (:2005-2053, der
+    Client hört mit) → ``%subscribers``/``autoExecuteFilter``
+    (``Slim/Control/Queries.pm:3925-3993``, ``statusQuery_filter`` liefert 1.3)
+    → ``__autoexecute`` (:2055-2102) führt die Anfrage des Clients neu aus.
+    Im Port ist das der Weg über :func:`_reexecute_status`
+    (CLI-``status subscribe:n`` **und** Cometd/Jive-``playerstatus``).
+    """
+    ids = _track_album_library(tmp_path)
+    service, fetch = build_service(
+        tmp_path, [("coverartarchive.org", caa_hit())],
+        settings=ArtOnlineSettings(cache_dir=tmp_path / "cache",
+                                   providers=("coverartarchive",)))
+    w, _rows = build_wanted(tmp_path, service, [
+        (AlbumQuery(album="Point Blank", artist="Bonfire", year=1989,
+                    mbid="rg-point"), ids["album_without"])], write_rows=True)
+    _manager, _player = _playing_player(ids["track_without"])
+    notes, seen, capture = _capture_newmetadata()
+    reexecuted: list[str] = []
+    monkeypatch.setattr(notes, "_reexecute_status", reexecuted.append)
+
+    async def run():
+        summary = await w.run_pass(reason="playing")
+        await asyncio.sleep(0.45)          # Perl: relevant(1.3) - 1 Sekunde
+        return summary
+
+    try:
+        summary = _run(run())
+    finally:
+        notes.unsubscribe(capture)
+
+    assert summary["hit"] == 1
+    assert seen == [(PLAYER_MAC, ["newmetadata"])]
+    # Die Meldung trifft Perls Filter (``[['playlist','newmetadata']]`` = eine
+    # Gruppe, zwei Alternativen) und löst damit die Neuausteilung aus.
+    assert notes.status_query_filter(
+        notes.Notification.from_array(PLAYER_MAC, ["newmetadata"]),
+        PLAYER_MAC) > 0
+    assert reexecuted == [PLAYER_MAC], \
+        "der Status des laufenden Spielers muss neu ausgeführt werden"

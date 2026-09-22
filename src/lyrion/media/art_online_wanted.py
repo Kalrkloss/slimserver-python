@@ -96,6 +96,10 @@ FIRST_PASS_DELAY = 20.0
 #: (1/s), die Cover-Art-Archive-Abrufe daneben sollen nicht in einer Salve laufen.
 ENTRY_PAUSE = 0.25
 
+#: Wie viele Titel der Warteschlangen-Kopf im Protokoll nennt (roher Nachweis
+#: der Reihenfolge vor/nach dem Vorrang).
+QUEUE_HEAD = 3
+
 STATUS_OPEN = "open"
 STATUS_HIT = "hit"
 STATUS_MISS = "miss"
@@ -106,6 +110,11 @@ OUTCOME_MISS = "miss"
 OUTCOME_CACHED_MISS = "waiting"      # Negativ-Cache noch frisch, kein Netz
 OUTCOME_DISABLED = "disabled"
 OUTCOME_SKIPPED = "skipped"          # abgebrochen (Stopp/Scan)
+
+#: Herkunft eines Eintrags, der aus dem **laufenden Titel** entstanden ist
+#: (``WantedEntry.source``).  Vorrang: das Album des gerade abgespielten Titels
+#: wird als Nächstes gesucht.
+PRIORITY_SOURCE = "playing"
 
 
 # ---------------------------------------------------------------------------
@@ -555,6 +564,114 @@ async def library_albums_without_cover() -> list[tuple[AlbumQuery, int | None]]:
 
 
 # ---------------------------------------------------------------------------
+# Laufender Titel (nur lesen — der Wiedergabepfad wird hier nie angefasst)
+# ---------------------------------------------------------------------------
+
+#: Album-Zeilen zu einer Menge von Track-IDs, **ohne** die „ohne Cover“-Bedingung
+#: (die braucht der Vorrang, die Anzeige-Aktualisierung dagegen muss das Album
+#: auch nach dem Eintreffen des Covers noch wiedererkennen).  Dieselben Felder
+#: wie ``_LIBRARY_SQL``, damit beide Wege dieselbe ``AlbumQuery`` bilden.
+_TRACK_ALBUM_SQL = """
+SELECT t.id AS track_id,
+       a.id AS album_id,
+       a.title AS title,
+       a.albumartist_sort AS artist_sort,
+       a.year AS year,
+       a.musicbrainz_id AS mbid,
+       a.artwork AS artwork,
+       (SELECT c.name FROM albums_contributors ac
+          JOIN contributors c ON c.id = ac.contributor
+         WHERE ac.album = a.id AND c.sortname = a.albumartist_sort
+         LIMIT 1) AS named,
+       (SELECT c.name FROM albums_contributors ac
+          JOIN contributors c ON c.id = ac.contributor
+         WHERE ac.album = a.id
+         ORDER BY c.id LIMIT 1) AS first_named
+  FROM tracks t
+  JOIN tracks_albums ta ON ta.track = t.id
+  JOIN albums a ON a.id = ta.album
+ WHERE t.id IN ({placeholders})
+"""
+
+
+def album_row_from_row(row: Any) -> dict[str, Any]:
+    """Eine ``_TRACK_ALBUM_SQL``-Zeile als Suchdaten + Album-ID."""
+    artist = search_artist_for(str(row["artist_sort"] or ""), row["named"],
+                               row["first_named"])
+    return {
+        "track_id": int(row["track_id"]),
+        "album_id": int(row["album_id"]),
+        "artwork": str(row["artwork"] or ""),
+        "query": AlbumQuery(
+            album=str(row["title"] or ""),
+            artist=artist,
+            year=int(row["year"]) if row["year"] is not None else None,
+            mbid=str(row["mbid"]) if row["mbid"] else None,
+        ),
+    }
+
+
+async def albums_for_tracks(track_ids: Iterable[int]) -> dict[int, dict[str, Any]]:
+    """Album je Track-ID lesen — reine Lesebefehle, kein Schreiben, kein Netz.
+
+    Ohne initialisierte Bibliotheks-DB (Einzelscript, Test) gibt es ein leeres
+    Ergebnis.  Doppelte IDs werden einmal gelesen (ein Sync-Gruppen-Master und
+    seine Slaves teilen den Titel).
+    """
+    ids = sorted({int(t) for t in track_ids if t})
+    if not ids:
+        return {}
+    from lyrion.database.sqlite_helper import db_session
+    from sqlalchemy import text
+
+    names = [f"t{i}" for i in range(len(ids))]
+    params = {name: value for name, value in zip(names, ids)}
+    sql = _TRACK_ALBUM_SQL.format(
+        placeholders=", ".join(f":{name}" for name in names))
+    out: dict[int, dict[str, Any]] = {}
+    try:
+        async with db_session() as session:
+            rows = (await session.execute(text(sql), params)).mappings().all()
+    except Exception as exc:  # noqa: BLE001 - ohne Bibliothek gibt es nichts zu tun
+        logger.debug("art_online_wanted: Track-Alben nicht lesbar (%s)", exc)
+        return out
+    for row in rows:
+        album = album_row_from_row(row)
+        out[album["track_id"]] = album
+    return out
+
+
+def playing_track_ids() -> list[tuple[str, int]]:
+    """``(mac, track_id)`` der gerade laufenden lokalen Titel — rein aus dem Speicher.
+
+    ``player.current_track_id`` trägt die Track-ID **nur** für einen lokalen
+    Titel; ein Radiostrom setzt es auf ``None`` (``player/manager.py``, beim
+    Umschalten auf eine Stream-URL).  „Gerade abgespielt“ heisst hier ``play``
+    **oder** ``pause``: die Anzeige eines pausierten Titels zeigt dasselbe
+    Cover, und Perl lässt die Metadaten eines pausierten Titels stehen.
+    """
+    try:
+        from lyrion.player.manager import PlayerManager
+
+        players = PlayerManager().get_connected_players()
+    except Exception as exc:  # noqa: BLE001 - ohne Spieler gibt es keinen Vorrang
+        logger.debug("art_online_wanted: Spieler nicht lesbar (%s)", exc)
+        return []
+    out: list[tuple[str, int]] = []
+    for player in players:
+        if str(getattr(player, "mode", "") or "") not in ("play", "pause"):
+            continue
+        track_id = getattr(player, "current_track_id", None)
+        if not track_id:
+            continue
+        try:
+            out.append((str(getattr(player, "mac", "") or ""), int(track_id)))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Dienst
 # ---------------------------------------------------------------------------
 
@@ -592,6 +709,17 @@ class WantedService:
         self._current: str | None = None
         self._last_pass: dict[str, Any] = {}
         self._last_stop_reason = ""
+        # ---- Vorrang für den laufenden Titel -------------------------------
+        # Der Wiedergabepfad meldet einen Titelwechsel nur an
+        # (:meth:`request_priority`): ein Flag + eine Weckmarke, kein I/O, kein
+        # ``await`` — die Wiedergabe wartet nie auf die Cover-Suche.  Aufgelöst
+        # (Bibliotheks-Lesebefehl) wird der Vorrang hier, asynchron.
+        self._priority_requested = False
+        self._playing_hint: tuple[str, int | None] = ("", None)
+        self._priority_last: list[str] = []
+        #: Zuletzt gesehene laufende Titel — ein Wechsel schiebt den Vorrang
+        #: auch dann ein, wenn kein Haken im Wiedergabepfad greift.
+        self._playing_seen: tuple[tuple[str, int], ...] = ()
 
     # ---- Einstellungen ----
 
@@ -735,6 +863,27 @@ class WantedService:
         self._active = False
         self._current = None
 
+    def request_priority(self, mac: str = "", track_id: int | None = None) -> bool:
+        """Vorrang für den gerade laufenden Titel anfordern — **nicht blockierend**.
+
+        Aufrufer ist der Wiedergabepfad (``player/manager.py``, sobald ein
+        lokaler Titel läuft).  Hier passiert bewusst nichts ausser einem Flag
+        und der Weckmarke: kein Netz, kein Bibliotheks-Zugriff, kein ``await``
+        — die Wiedergabe wartet nie auf die Cover-Suche.  Das Album wird im
+        Durchlauf aufgelöst (:meth:`_priority_entries`).
+
+        Mehrfaches Anfordern desselben Titels ist wirkungslos (dasselbe Flag);
+        ein bereits gefundenes Cover wird nicht erneut gesucht (der Eintrag
+        steht dann auf ``hit`` und die Bibliotheks-Abfrage liefert das Album
+        wegen ``artwork`` nicht mehr).
+        """
+        self._priority_requested = True
+        self._playing_hint = (str(mac or ""),
+                              int(track_id) if track_id is not None else None)
+        # ``asyncio.Event.set`` ist synchron — auch ohne laufenden Loop sicher.
+        self._wake.set()
+        return True
+
     def request_pass(self, *, reason: str = "gui") -> bool:
         """Einen weiteren Durchlauf anstossen (Web-GUI, Tests).
 
@@ -864,22 +1013,75 @@ class WantedService:
                       OUTCOME_DISABLED: 0, OUTCOME_SKIPPED: 0}
             self._active = True
             self._checked = 0
-            self._pass_total = len(entries)
+            # ---- Vorrang: das Album des gerade laufenden Titels zuerst -----
+            # Anforderung: „Wenn ein gerade abgespieltes Lied kein Cover hat,
+            # soll der Artwork-Downloader es als Naechstes herunterladen.“  Der
+            # Titelwechsel hat nur ein Flag gesetzt (:meth:`request_priority`);
+            # aufgelöst wird er hier — asynchron, ausserhalb der Wiedergabe.
+            priority = await self._priority_entries(fingerprint)
+            self._priority_requested = False
+            self._priority_last = [e.album for e, _q in priority]
+            self._playing_seen = tuple(playing_track_ids())
+            priority_keys = {e.album_key for e, _q in priority}
+            queue = [e for e, _q in priority] + [e for e in entries
+                                                 if e.album_key not in priority_keys]
+            # Suchdaten des **laufenden** Albums je Eintrag: die Zeile, die
+            # gerade läuft, ist die massgebliche (sie trägt das leere
+            # ``artwork``), nicht die im Eintrag gespeicherte Schreibweise —
+            # zwei Zeilen können denselben Schlüssel haben („Kill em All“ /
+            # „Kill 'em all“), und der Nachtrag muss die gespielte treffen.
+            overrides = {e.album_key: q for e, q in priority}
+            queued = {e.album_key for e in queue}
+            self._pass_total = len(queue)
             logger.info(
                 "art_online_wanted: Durchlauf startet (%s, %d fällige Einträge, "
                 "Konfiguration %s%s)", reason, len(entries), fingerprint,
                 " GEÄNDERT" if changed else "")
+            logger.info("art_online_wanted: Warteschlange Kopf%s: %s (+%d)",
+                        " (Vorrang vorangestellt)" if priority else "",
+                        _queue_head(queue, overrides=overrides),
+                        max(0, len(queue) - QUEUE_HEAD))
             try:
-                for entry in entries:
+                index = 0
+                while index < len(queue):
+                    entry = queue[index]
+                    index += 1
                     if self._stop.is_set():
                         counts[OUTCOME_SKIPPED] += 1
                         break
-                    outcome = await self._process(entry, fingerprint)
+                    outcome = await self._process(
+                        entry, fingerprint, query=overrides.get(entry.album_key))
                     counts[outcome] = counts.get(outcome, 0) + 1
                     self._checked += 1
                     self._current = None
                     if self.entry_pause and outcome in (OUTCOME_HIT, OUTCOME_MISS):
                         await asyncio.sleep(self.entry_pause)
+                    # Ein Titelwechsel WÄHREND des Durchlaufs wird sofort
+                    # eingeschoben — nicht erst im nächsten Durchlauf.  Die
+                    # übrigen Einträge rücken dahinter nach (kein Aushungern).
+                    # Erkannt wird er auf zwei Wegen: an der Anforderung aus dem
+                    # Wiedergabepfad (:meth:`request_priority`, weckt auch die
+                    # ruhende Schleife) **und** am reinen Speicher-Vergleich der
+                    # laufenden Titel — damit zählt jeder Weg, auf dem ein Titel
+                    # startet (CLI, Web, Auto-Advance, Wecker), ohne dass jeder
+                    # davon einen Haken braucht.
+                    now_playing = tuple(playing_track_ids())
+                    if self._priority_requested or now_playing != self._playing_seen:
+                        self._priority_requested = False
+                        self._playing_seen = now_playing
+                        fresh = await self._priority_entries(fingerprint,
+                                                             skip=queued)
+                        if fresh:
+                            queue[index:index] = [e for e, _q in fresh]
+                            overrides.update({e.album_key: q for e, q in fresh})
+                            queued.update(e.album_key for e, _q in fresh)
+                            self._pass_total = len(queue)
+                            logger.info(
+                                "art_online_wanted: Vorrang eingeschoben — "
+                                "Warteschlange ab Position %d: %s (+%d)",
+                                index + 1,
+                                _queue_head(queue[index:], overrides=overrides),
+                                max(0, len(queue) - index - QUEUE_HEAD))
             finally:
                 self._active = False
                 self._current = None
@@ -904,10 +1106,19 @@ class WantedService:
                     reason, json.dumps(summary, ensure_ascii=False))
             return summary
 
-    async def _process(self, entry: WantedEntry, fingerprint: str) -> str:
-        """Einen Eintrag bearbeiten — Cache lesen, sonst suchen, dann stempeln."""
+    async def _process(self, entry: WantedEntry, fingerprint: str,
+                       *, query: AlbumQuery | None = None) -> str:
+        """Einen Eintrag bearbeiten — Cache lesen, sonst suchen, dann stempeln.
+
+        ``query`` überschreibt die im Eintrag gespeicherten Suchdaten.  Der
+        Vorrang nutzt das: massgeblich ist die **laufende** Album-Zeile (sie
+        trägt das leere ``artwork``), nicht die Schreibweise des Eintrags —
+        zwei Zeilen können denselben Schlüssel tragen, und der Nachtrag muss die
+        gespielte treffen.  Der Schlüssel ist in beiden Fällen derselbe (der
+        Eintrag wurde über ihn gefunden), Cache und Liste bleiben also eins.
+        """
         service = self.service
-        query = entry.query()
+        query = query or entry.query()
         self._current = query.album
         if not service.settings.enabled:
             return OUTCOME_DISABLED
@@ -921,9 +1132,10 @@ class WantedService:
             if cover is not None:
                 # Treffer liegt schon im Plattencache (z. B. aus einem früheren
                 # Scan) — nur die Albumzeile nachtragen, kein Netz.
-                await self._write_album_row(query, cover)
+                rows = await self._write_album_row(query, cover)
                 self.store.mark_hit(key, provider=cover.provider,
                                     fingerprint=fingerprint, attempt=False)
+                await self._after_cover_stored(entry, query, rows)
                 return OUTCOME_HIT
             # Trefferzeile ohne Datei: wieder offen und wirklich suchen.
             self.store.set_open(key, reason="Cache-Datei fehlt")
@@ -950,6 +1162,10 @@ class WantedService:
         if cover is not None:
             self.store.mark_hit(key, provider=cover.provider,
                                 fingerprint=fingerprint)
+            # Der Albumzeilen-Rückruf des Dienstes (``on_cover`` →
+            # ``importer.store_online_cover``) hat ``albums.artwork`` gesetzt;
+            # ``rows=None`` heisst „vom Rückruf gesetzt, Zahl unbekannt“.
+            await self._after_cover_stored(entry, query, None)
             return OUTCOME_HIT
 
         fresh = service.cache.read_sync(key)
@@ -959,20 +1175,146 @@ class WantedService:
                                                        service.settings.retry_days))
         return OUTCOME_MISS
 
-    async def _write_album_row(self, query: AlbumQuery, cover: CoverResult) -> None:
+    async def _priority_entries(self, fingerprint: str, *,
+                                skip: set[str] | None = None
+                                ) -> list[tuple[WantedEntry, AlbumQuery]]:
+        """Wanted-Einträge der **gerade laufenden** Alben ohne Cover + ihre Suchdaten.
+
+        Zurückgegeben wird das Paar ``(Eintrag, AlbumQuery der laufenden
+        Zeile)``: der Eintrag liefert Status und Zähler, die Zeile die
+        massgeblichen Suchdaten (siehe ``run_pass`` — zwei Zeilen können
+        denselben Schlüssel tragen).
+
+        „Nur bei echtem Bedarf“: die Bibliotheks-Abfrage liefert ausschliesslich
+        Alben mit leerem ``artwork`` — ein Album, dessen Cover schon vorliegt
+        (auch wenn dieses Modul es gerade gesetzt hat), ist damit draussen.
+        Massgeblich ist also die **Album-Zeile**, nicht der Listenstatus: der
+        Status ``hit`` heisst „Cover liegt im Plattencache“, nicht „diese Zeile
+        hat es schon“.  Beides fällt auseinander, wenn zwei Album-Zeilen
+        denselben Schlüssel bilden (gleicher Titel in anderer Schreibweise nach
+        einem Neu-Import — der Schlüssel ist normalisiert,
+        :meth:`AlbumQuery.key`): die gespielte Zeile ist dann leer, der Eintrag
+        aber ein Treffer.  Sie wird deshalb mitgenommen; ``_process`` trägt das
+        Cover in diesem Fall **ohne Netz** aus dem Plattencache nach („Treffer
+        liegt schon im Plattencache“) und meldet die Anzeige nach.
+
+        Kein Aushungern: es sind höchstens so viele Einträge wie laufende
+        Spieler, und sie werden der Warteschlange **vorangestellt**, nicht statt
+        ihrer.
+
+        Doppelarbeit: derselbe Titel mehrfach gespielt ⇒ derselbe
+        ``album_key`` ⇒ derselbe Eintrag; ein schon in diesem Durchlauf
+        eingeplanter Eintrag kommt über ``skip`` nicht noch einmal.
+        """
+        skip = skip or set()
+        playing = playing_track_ids()
+        if not playing:
+            return []
+        albums = await albums_for_tracks(track_id for _mac, track_id in playing)
+        out: list[tuple[WantedEntry, AlbumQuery]] = []
+        seen: set[str] = set()
+        for mac, track_id in playing:
+            album = albums.get(int(track_id))
+            if album is None or album["artwork"]:
+                continue                      # unbekannt oder hat schon ein Cover
+            query: AlbumQuery = album["query"]
+            key = query.key()
+            if key in skip or key in seen:
+                continue
+            seen.add(key)
+            entry = self.store.get(key)
+            if entry is None:
+                # Nach dem Backfill hinzugekommen (oder nie erfasst): aufnehmen.
+                self.store.add(query, album_id=album["album_id"],
+                               source=PRIORITY_SOURCE, fingerprint=fingerprint)
+                entry = self.store.get(key)
+            if entry is None:
+                continue
+            out.append((entry, query))
+            logger.info(
+                "art_online_wanted: Vorrang für den laufenden Titel — %r "
+                "(Album %s, Player %s, Titel %s) wird als Nächstes gesucht",
+                query.album, album["album_id"], mac or "?", track_id)
+        return out
+
+    async def _after_cover_stored(self, entry: WantedEntry, query: AlbumQuery,
+                                  rows: int | None) -> int:
+        """Anzeige der Spieler aktualisieren, die dieses Album gerade zeigen.
+
+        Perl schickt genau dann ``newmetadata``, wenn ein Cover **nachträglich**
+        eintrifft und eine Steuerung darauf wartet:
+
+            ``sub gotArtwork {`` …
+            ``# called when we have artwork to set - will update all clients``
+            ``# waiting for the same artwork``
+            ``$song->pluginData( httpCover => $imageUrl );`` …
+            ``Slim::Control::Request::notifyFromArray( $c, [ 'newmetadata' ] );``
+            — ``Slim/Plugin/RadioArtwork/Plugin.pm:315-337``
+
+        Dieselbe Meldung ist der Weg für ein lokales Album: sie geht an den
+        Client, dessen Abonnement dann neu ausgeführt wird
+        (``statusQuery_filter``, ``Slim/Control/Queries.pm:3925-3993``) und der
+        im Menü-Modus ohnehin die Tags ``aAlKNcxJ`` bekommt
+        (``Slim/Control/Queries.pm:4358``) — darunter ``J`` =
+        ``artwork_track_id`` aus ``albums.artwork`` (``:5731``).  Der Client
+        sieht also den neuen ``icon-id`` und lädt das Bild neu.
+
+        Gesendet wird die **einverbige** Form ``[ 'newmetadata' ]``, genau wie
+        in Perl — nicht ``[ 'playlist', 'newmetadata' ]``.  Beides trifft
+        dieselbe Meldung, aber nur die einverbige hat eine Entsprechung im
+        Dispatch-Baum (``addDispatch(['newmetadata'], …)``,
+        ``Slim/Control/Request.pm:661``); ``isCommand([['playlist',
+        'newmetadata']])`` ist **eine** Gruppe mit zwei Alternativen
+        (:2381-2395) und trifft damit beide Schreibweisen.  Die zweitokenige
+        Form hätte keinen Verb und ``notify`` (:2010) würde sie verwerfen —
+        der Client bliebe auf dem alten Cover stehen.
+
+        ``rows`` ist die Zahl der gesetzten Albumzeilen (``None`` = der
+        ``on_cover``-Rückruf des Dienstes hat sie gesetzt).  Nur wenn wirklich
+        etwas gesetzt wurde, geht eine Meldung raus.
+        """
+        if rows == 0:
+            return 0
+        playing = playing_track_ids()
+        if not playing:
+            return 0
+        albums = await albums_for_tracks(track_id for _mac, track_id in playing)
+        sent = 0
+        for mac, track_id in playing:
+            album = albums.get(int(track_id))
+            if album is None:
+                continue
+            if not _same_album(album, entry, query):
+                continue
+            try:
+                from lyrion.control.notifications import notify_from_array
+
+                notify_from_array(mac, ["newmetadata"])
+            except Exception as exc:  # noqa: BLE001 - Anzeige darf nie stören
+                logger.debug("art_online_wanted: newmetadata für %s nicht "
+                             "abgesetzt (%s)", mac, exc)
+                continue
+            sent += 1
+            logger.info(
+                "art_online_wanted: Cover für das laufende Album %r da — "
+                "'newmetadata' an %s (Anzeige lädt neu)", query.album, mac or "?")
+        return sent
+
+    async def _write_album_row(self, query: AlbumQuery, cover: CoverResult) -> int:
         """``albums.artwork`` auf das gefundene Cover setzen (Perl-Nachtrag)."""
         try:
             if self._on_album_cover is not None:
                 outcome = self._on_album_cover(query, cover)
                 if asyncio.iscoroutine(outcome):
-                    await outcome
-                return
+                    outcome = await outcome
+                return int(outcome or 0)
             from lyrion.media.importer import store_online_cover
 
-            await store_online_cover(query, cover)
+            return int(await store_online_cover(query, cover) or 0)
         except Exception as exc:  # noqa: BLE001 - ein Cover ist nie ein Fehler
             logger.debug("art_online_wanted: Albumzeile für %r nicht gesetzt (%s)",
                          query.album, exc)
+            return 0
 
     # ---- Status (Web-GUI) ----
 
@@ -1011,6 +1353,10 @@ class WantedService:
             "current": self._current,
             "checked": self._checked,
             "pass_total": self._pass_total,
+            # Vorrang des laufenden Titels: was zuletzt vorangestellt wurde und
+            # ob gerade eine neue Anforderung aus dem Wiedergabepfad offen ist.
+            "priority": list(self._priority_last),
+            "priority_pending": bool(self._priority_requested),
             "last_run": int(last_run) if last_run else None,
             "last_pass": last_pass,
             "last_reason": self.store.meta_get(META_LAST_REASON) or "",
@@ -1057,6 +1403,53 @@ def _pref_int(name: str, default: int) -> int:
         return default
 
 
+def _queue_head(queue: list[WantedEntry], count: int = QUEUE_HEAD,
+                overrides: dict[str, AlbumQuery] | None = None) -> list[str]:
+    """Die ersten ``count`` Albumnamen der Warteschlange (roher Reihenfolge-Beleg).
+
+    ``overrides`` nennt je ``album_key`` die Suchdaten der **laufenden** Zeile
+    (Vorrang): der Kopf soll dasselbe Album nennen, das die Vorrang-Zeile
+    ausweist — zwei Zeilen desselben Albums tragen verschiedene Schreibweisen
+    („Weckt die Toten“ / „Weckt die Toten !“).
+    """
+    overrides = overrides or {}
+    out: list[str] = []
+    for entry in queue[:count]:
+        query = overrides.get(entry.album_key)
+        out.append(query.album if query is not None else entry.album)
+    return out
+
+
+def _same_album(album: dict[str, Any], entry: WantedEntry,
+                query: AlbumQuery) -> bool:
+    """Betrifft eine gelesene Album-Zeile denselben Eintrag wie ``entry``?
+
+    Zwei Wege, beide für sich gültig:
+
+    * **Album-ID** — ``albums.id`` ist der Primärschlüssel; zwei Zeilen mit
+      derselben ID sind dasselbe Album (der Fall „Tags nach dem Neu-Import
+      geändert“: der Suchschlüssel des Eintrags ist veraltet, die Zeile nicht).
+    * **Suchschlüssel** (:meth:`AlbumQuery.key`) — derselbe normalisierte Titel +
+      Interpret + Jahr.  Das ist der Fall, der in einer gewachsenen Bibliothek
+      wirklich vorkommt: **zwei Album-Zeilen mit demselben Schlüssel** („Kill em
+      All“ und „Kill 'em all“), von denen eine das Cover trägt und die andere
+      leer ist.  Gespielt wird die leere; ihr Cover ist das gerade gesetzte.
+
+    Eine Meldung zu viel kostet den Client einen Status-Abruf, der dasselbe
+    Cover liefert — eine zu wenig liesse die Anzeige auf dem Platzhalter stehen.
+    Deshalb **oder**, nicht **und**.
+    """
+    key = query.key()
+    album_id = entry.album_id
+    if album_id is not None:
+        try:
+            if int(album["album_id"]) == int(album_id):
+                return True
+        except (TypeError, ValueError):
+            pass
+    return album["query"].key() == key
+
+
 def _scan_is_running() -> bool:
     """Läuft gerade ein Bibliotheks-Scan (fremder Scanner-Prozess)?"""
     try:
@@ -1092,6 +1485,21 @@ def configured_wanted_service() -> WantedService:
 def current_wanted_service() -> WantedService | None:
     """Der schon angelegte Dienst — oder ``None`` (legt keinen an)."""
     return _service
+
+
+def request_priority_for(mac: str, track_id: int | None = None) -> bool:
+    """Vorrang für einen gerade gestarteten lokalen Titel anfordern.
+
+    Aufrufer ist der Wiedergabepfad (``player/manager.py`` ``play_track``,
+    ``web/api.py`` ``_play_playlist_item``).  Ohne angelegten Dienst passiert
+    nichts: Tests und Werkzeuge ohne Artwork-Dienst bleiben unberührt.  Der
+    Aufruf ist synchron und ohne I/O — er setzt nur ein Flag und eine
+    Weckmarke, damit die Wiedergabe nie auf die Cover-Suche wartet.
+    """
+    service = _service
+    if service is None:
+        return False
+    return service.request_priority(mac, track_id)
 
 
 def reset_wanted_service() -> None:
@@ -1193,11 +1601,14 @@ def trigger_pass(*, reason: str = "gui") -> dict[str, Any]:
 
 __all__ = [
     "IDLE_SLEEP", "META_FINGERPRINT", "META_LAST_PASS", "META_LAST_RUN",
-    "PREF_WANTED_AUTO", "PREF_WANTED_PER_PASS", "STATUS_HIT", "STATUS_MISS",
+    "PREF_WANTED_AUTO", "PREF_WANTED_PER_PASS", "PRIORITY_SOURCE",
+    "QUEUE_HEAD", "STATUS_HIT", "STATUS_MISS",
     "STATUS_OPEN", "VA_SEARCH_ARTIST", "WANTED_PREF_DEFAULTS", "WantedEntry",
-    "WantedService", "WantedStore", "cache_entry_wait_seconds",
-    "configured_wanted_service", "current_wanted_service",
-    "library_albums_without_cover", "record_missing_albums", "reset_wanted_service",
+    "WantedService", "WantedStore", "albums_for_tracks",
+    "cache_entry_wait_seconds", "configured_wanted_service",
+    "current_wanted_service", "library_albums_without_cover",
+    "playing_track_ids", "record_missing_albums", "request_priority_for",
+    "reset_wanted_service",
     "load_settings_quietly", "note_settings_change", "retry_delay",
     "search_artist_for", "start_background", "stop_background", "trigger_pass",
     "wanted_status",
