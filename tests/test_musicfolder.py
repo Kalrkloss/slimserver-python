@@ -670,6 +670,94 @@ def test_every_perl_valid_type_extension_is_listable():
     assert not missing, f"Perl lists these, we dropped them: {sorted(missing)}"
 
 
+def test_listable_set_is_exactly_perls():
+    """**Equality**, not containment: no file Perl does not list may appear.
+
+    ``fileFilter`` (``Slim/Utils/Misc.pm:900-903``) drops every file that does
+    not match ``validTypeExtensions('list|audio')`` — a superset would show
+    files Perl hides.  The one we had was ``spx``/``tak``: both are in
+    ``media/scanner.SUPPORTED_EXTENSIONS`` (decodable) but ``types.conf`` has
+    no entry for either, so Perl's ``fileFilter`` never lists them.
+    """
+    assert folders.LISTABLE_EXTENSIONS == PERL_LIST_AUDIO_SUFFIXES
+    assert "spx" not in folders.LISTABLE_EXTENSIONS
+    assert "tak" not in folders.LISTABLE_EXTENSIONS
+
+
+def test_listable_set_is_derived_from_types_conf():
+    """The sets are computed from ``types.conf``, not hand-maintained.
+
+    ``validTypeExtensions`` (``Slim/Music/Info.pm:1345-1388``) walks
+    ``%slimTypes`` (column 4) and collects the suffixes of the matching types
+    (columns 1-3 live in ``formats/lms_types.TYPES_CONF``).  Recomputing that
+    here catches a typo in either table.
+    """
+    from lyrion.formats.lms_types import TYPES_CONF
+
+    def suffixes(slim_type: str) -> set[str]:
+        return {suffix
+                for type_id, (suffixes, _mimes) in TYPES_CONF.items()
+                if folders.PERL_SLIM_TYPES.get(type_id) == slim_type
+                for suffix in suffixes if ":" not in suffix}
+
+    assert folders.PERL_SONG_SUFFIXES == suffixes("audio")
+    assert folders.PLAYLIST_EXTENSIONS == suffixes("playlist")
+    # ``list|audio`` — the default ``$findTypes`` of ``validTypeExtensions``.
+    assert folders.LISTABLE_EXTENSIONS == (
+        suffixes("audio") | suffixes("playlist") | suffixes("list")
+    ) - {"lnk"}            # ``lnk`` only on Windows (``Info.pm:1371-1374``)
+    # ``dir`` (slim-type ``list``) has no suffix of its own; if that changes,
+    # the set above grows silently — pin the count.
+    assert len(folders.LISTABLE_EXTENSIONS) == 36
+
+
+def test_non_music_files_are_not_listable(tmp_path):
+    """``.nfo``/``.sfv``/``.par2``/``.jpg``/``.txt`` never reach the listing.
+
+    Live Perl 9.1.1 (read-only 2026-09-22), ``musicfolder 0 50
+    url:file:///mnt/media/Musik/Mittelalter/Sava-Metamorphosis-2008`` (holds
+    ``.m3u`` + ``.nfo`` + ``.sfv`` + 11 ``.mp3``) → ``count 12`` with the
+    ``.m3u`` as ``type 'playlist'``; ``.nfo``/``.sfv`` are absent.  The same
+    folder with a release-named ``.nfo`` DIRECTORY (the real library has those
+    at the top level, e.g. ``6MzM6F.…-2020-NoGroup.nfo``) still lists the
+    directory — Perl lists directories unconditionally (``Misc.pm:895-899``).
+    """
+    root = tmp_path / "lib"
+    root.mkdir()
+    for name in ("00-release.nfo", "00-release.sfv", "release.par2",
+                 "cover.jpg", "read me.txt", "cuesheet.cue", "list.m3u",
+                 "list.pls", "01-song.mp3", "06MzM6F.release.nfo"):
+        (root / name).write_bytes(b"\0")
+    (root / "06MzM6F.release.nfo").unlink()
+    (root / "06MzM6F.release.nfo").mkdir()          # a *folder* named *.nfo
+
+    entries = folders.list_directory_entries(root)
+    assert sorted(entries) == sorted(["06MzM6F.release.nfo", "01-song.mp3",
+                                      "cuesheet.cue", "list.m3u", "list.pls"])
+    assert {n: folders.item_type(str(root / n)) for n in entries} == {
+        "06MzM6F.release.nfo": "folder",
+        "01-song.mp3": "track",
+        "cuesheet.cue": "playlist",
+        "list.m3u": "playlist",
+        "list.pls": "playlist",
+    }
+
+
+def test_playlist_suffixes_are_perls_playlist_types():
+    """``wax`` is a playlist too — it is the second suffix of the ``asx`` type.
+
+    ``types.conf``: ``asx  asx,wax  …  playlist``; ``isPlaylist`` is
+    ``$slimTypes{$type} eq 'playlist'`` (``Slim/Music/Info.pm:1313-1320``), so
+    ``folder_loop`` answers ``type 'playlist'`` for a ``.wax``
+    (``Slim/Control/Queries.pm:2441-2443``) — ours said ``unknown``.
+    """
+    assert "wax" in folders.PLAYLIST_EXTENSIONS
+    assert folders.item_type("x.wax") == "playlist"
+    assert folders.item_type("x.m3u") == "playlist"
+    assert folders.item_type("x.pls") == "playlist"
+    assert folders.item_type("x.cue") == "playlist"
+
+
 def test_drill_lists_the_perl_type_set(monkeypatch, tmp_path, lib_db):
     """``.mp4``/``.dsf``/``.mp2`` children appear and are ``type 'track'``.
 

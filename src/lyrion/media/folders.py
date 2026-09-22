@@ -59,53 +59,108 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from lyrion.media import dir_rows
-from lyrion.media.scanner import SUPPORTED_EXTENSIONS
+from lyrion.platform.paths import is_windows
 
 logger = logging.getLogger(__name__)
 
-#: Playlist-ish suffixes Perl accepts through ``validTypeExtensions('list|audio')``
-#: (``Slim/Music/Info.pm:1345-1375``); ``readDirectory`` keeps them next to dirs.
-PLAYLIST_EXTENSIONS: frozenset[str] = frozenset({
-    "m3u", "m3u8", "pls", "wpl", "asx", "xspf", "cue",
-})
+#: ``types.conf`` column 4 — Perl's ``%slimTypes``.  ``loadTypesConfig``
+#: (``Slim/Music/Info.pm:92``) reads the file and stores
+#: ``$slimTypes{$type} = $fileType``; every filter below is a query against
+#: this column, so the table is *data* here (``formats/lms_types.TYPES_CONF``
+#: holds columns 1-3 verbatim, this is the missing 4th).
+PERL_SLIM_TYPES: dict[str, str] = {
+    "aif": "audio", "alc": "audio", "alcx": "audio", "ape": "audio",
+    "app": "-", "asx": "playlist", "css": "-", "cue": "playlist",
+    "cur": "-", "dff": "audio", "dir": "list", "dsf": "audio",
+    "dtd": "-", "flc": "audio", "fec": "playlist", "gif": "-",
+    "htm": "-", "htc": "-", "log": "-", "lpcm": "audio",
+    "ico": "-", "jpg": "-", "jnp": "-", "jar": "-",
+    "js": "-", "json": "-", "lnk": "list", "m3u": "playlist",
+    "aac": "audio", "mp4": "audio", "mp4x": "audio", "mp3": "audio",
+    "mpc": "audio", "ogg": "audio", "ogf": "audio", "ops": "audio",
+    "pcm": "audio", "pdf": "-", "pls": "playlist", "pod": "-",
+    "png": "-", "gd": "-", "sls": "audio", "svg": "-",
+    "swf": "-", "txt": "-", "wav": "audio", "wma": "audio",
+    "wmal": "audio", "wmap": "audio", "wpl": "playlist", "wvp": "audio",
+    "wvpx": "audio", "xml": "-", "xpf": "playlist", "xul": "-",
+    "zip": "-", "src": "audio", "spdr": "audio", "itu": "playlist",
+    "mmp": "playlist", "mood": "playlist", "ssp": "playlist",
+    "cpl": "playlist", "rnd": "playlist",
+}
 
-#: Perl ``validTypeExtensions`` — the audio + playlist set (Info.pm:1345-1375).
-#:
-#: Perl's ``readDirectory`` calls ``fileFilter`` with the **default**
-#: ``$validRE = Slim::Music::Info::validTypeExtensions()``
-#: (``Slim/Utils/Misc.pm:973-975``), i.e. every suffix whose ``types.conf``
-#: slim-type matches ``list|audio`` (``Slim/Music/Info.pm:1345-1375``:
-#: ``next unless $type =~ /$findTypes/`` with ``$findTypes || 'list|audio'``,
-#: ``types.conf`` column 4).  Deriving the set from ``SUPPORTED_EXTENSIONS``
-#: alone was short by 14 of Perl's suffixes, so the drill silently lost the
-#: children that carry them: live 192.168.1.90 ``musicfolder 0 400
-#: folder_id:<Video>`` → 6 children, ours 4 — the two ``.mp4`` files were
-#: missing (``types.conf:40`` ``mp4  m4a,mp4,m4b  …  audio``).  Same for the
-#: ``.dsf``/``.dff``/``.wv``/``.mp2``/``.wave``/``.pcm`` rows (types.conf:20,
-#: :22, :62, :42, :57, :47).  ``lnk`` stays out: Perl adds it only on Windows
-#: (``Info.pm:1371-1374`` ``if (main::ISWINDOWS …)``).
-PERL_LISTABLE_SUFFIXES: frozenset[str] = frozenset({
-    "dff", "dsf", "fla", "flc", "l16", "l24", "lpcm", "mp2", "mp4",
-    "ogf", "pcm", "wave", "wax", "wv",
-})
 
-LISTABLE_EXTENSIONS: frozenset[str] = (
-    SUPPORTED_EXTENSIONS | PLAYLIST_EXTENSIONS | PERL_LISTABLE_SUFFIXES
+def _perl_suffixes(slim_type_re: str) -> frozenset[str]:
+    """Suffixes whose ``types.conf`` slim-type matches ``slim_type_re``.
+
+    Port of ``Slim::Music::Info::validTypeExtensions``
+    (``Slim/Music/Info.pm:1345-1388``)::
+
+        my $findTypes = shift || 'list|audio';
+        while (my ($ext, $type) = each %slimTypes) {
+            next unless $type =~ /$findTypes/;
+            while (my ($suffix, $value) = each %suffixes) {
+                if ($ext eq $value && $suffix !~ /:/) {
+                    push @extensions, $suffix;
+                }
+            }
+        }
+
+    ``$ext eq $value`` is implicit here: ``TYPES_CONF`` already maps every
+    suffix to its own type id.  ``$suffix !~ /:/`` drops the URL *schemes*
+    (``itunesplaylist:``, ``playlist:`` — the bottom block of ``types.conf``),
+    which can never match a file name.
+    """
+    from lyrion.formats.lms_types import TYPES_CONF
+
+    pattern = re.compile(slim_type_re)
+    return frozenset(
+        suffix
+        for type_id, (suffixes, _mimes) in TYPES_CONF.items()
+        if pattern.search(PERL_SLIM_TYPES.get(type_id, ""))
+        for suffix in suffixes
+        if ":" not in suffix
+    )
+
+
+#: ``validTypeExtensions('list|audio')`` — the regex ``readDirectory``'s
+#: ``fileFilter`` applies to *files* (``Slim/Utils/Misc.pm:973-975`` →
+#: :900-903 ``return 0 if $item !~ $validRE``).  ``lnk`` is removed because
+#: Perl adds it only on Windows (``Info.pm:1371-1374``); ``cue`` needs no
+#: special case, ``types.conf`` already lists it as a ``playlist`` (Perl
+#: appends it a second time at ``Info.pm:1377-1379``).
+PERL_LIST_AUDIO_SUFFIXES: frozenset[str] = _perl_suffixes(r"list|audio") - (
+    frozenset({"lnk"}) if not is_windows() else frozenset()
 )
 
-#: ``types.conf`` suffixes whose slim-type is ``audio`` — Perl's ``isSong``
-#: (``Slim/Music/Info.pm:1262-1276``) is exactly
-#: ``$slimTypes{$type} eq 'audio'``, and that is what makes a ``folder_loop``
-#: item ``type 'track'`` (``Slim/Control/Queries.pm:2483-2484``).  A ``.mp4``
-#: is one of them (``types.conf:40`` ``mp4   m4a,mp4,m4b   …   audio``): live
-#: 192.168.1.90 ``musicfolder 0 4 folder_id:<Video>`` answers ``type: 'track'``
-#: for its ``.mp4`` files, deriving the set from ``SUPPORTED_EXTENSIONS`` alone
-#: answered ``unknown``.
-PERL_SONG_SUFFIXES: frozenset[str] = frozenset({
-    "aac", "aif", "aiff", "ape", "dff", "dsf", "fla", "flac", "flc",
-    "l16", "l24", "lpcm", "m4a", "m4b", "mp+", "mp2", "mp3", "mp4",
-    "mpc", "oga", "ogf", "ogg", "opus", "pcm", "wav", "wave", "wma", "wv",
-})
+#: Suffixes Perl calls a playlist — ``isPlaylist`` is exactly
+#: ``$slimTypes{$type} eq 'playlist'`` (``Slim/Music/Info.pm:1313-1320``);
+#: ``folder_loop`` then answers ``type 'playlist'``
+#: (``Slim/Control/Queries.pm:2441-2443``).  Note ``wax``: it is the second
+#: suffix of the ``asx`` type (``types.conf`` ``asx  asx,wax … playlist``).
+PLAYLIST_EXTENSIONS: frozenset[str] = _perl_suffixes(r"^playlist$")
+
+#: Suffixes Perl calls a song — ``isSong`` is ``$slimTypes{$type} eq 'audio'``
+#: (``Slim/Music/Info.pm:1262-1276``); ``folder_loop`` says ``type 'track'``
+#: (``Slim/Control/Queries.pm:2446-2448``).
+PERL_SONG_SUFFIXES: frozenset[str] = _perl_suffixes(r"^audio$")
+
+#: What the music folder may list — **exactly** Perl's ``fileFilter`` set.
+#:
+#: Everything else has no ``types.conf`` entry or the slim-type ``-``, so
+#: Perl's ``fileFilter`` drops it before it reaches ``folder_loop``: ``.nfo``,
+#: ``.sfv``, ``.par2``, ``.jpg``, ``.txt`` … never appear in the music folder.
+#: Live 192.168.1.90 (read-only 2026-09-22), ``musicfolder 0 50
+#: url:file:///mnt/media/Musik/Mittelalter/Sava-Metamorphosis-2008`` (the
+#: folder holds ``.m3u`` + ``.nfo`` + ``.sfv`` + 11 ``.mp3``) → ``count 12``:
+#: the ``.m3u`` as ``type 'playlist'`` and the 11 mp3; ``.nfo``/``.sfv`` are
+#: not listed.  Ours answers the same 12 (raw comparison in
+#: ``tests/test_musicfolder.py``).
+#:
+#: Deliberate difference to ``media/scanner.SUPPORTED_EXTENSIONS``: the scanner
+#: keeps ``spx``/``tak`` (decodable), but ``types.conf`` has no entry for
+#: either — Perl's ``fileFilter`` therefore never lists them, and a browse that
+#: does would show files Perl does not.
+LISTABLE_EXTENSIONS: frozenset[str] = PERL_LIST_AUDIO_SUFFIXES
 
 #: Perl ``fileFilter`` always drops these (``Slim/Utils/OS.pm:268-274`` + Misc.pm:835-845).
 IGNORED_ITEMS: frozenset[str] = frozenset({"lost+found"})
@@ -743,16 +798,21 @@ def item_type(path: str) -> str:
     """The ``type`` Perl puts on a ``folder_loop`` item.
 
     ``Slim/Control/Queries.pm:2472-2485``: ``folder`` for a directory,
-    ``playlist`` for a playlist file (``isPlaylist``, ``Info.pm:1313-1318``),
-    ``track`` for a song (``isSong`` ⇒ slim-type ``audio``,
-    ``Info.pm:1262-1276``), ``unknown`` for everything else.
+    ``playlist`` for a playlist file (``isPlaylist`` ⇒ slim-type ``playlist``,
+    ``Info.pm:1313-1320``), ``track`` for a song (``isSong`` ⇒ slim-type
+    ``audio``, ``Info.pm:1262-1276``), ``unknown`` for everything else.
+    Both sets come from ``types.conf`` (:func:`_perl_suffixes`), never from the
+    scanner's ``SUPPORTED_EXTENSIONS``: Perl's decision is the slim-type alone,
+    so a suffix ``types.conf`` does not know (``spx``, ``tak``) is ``unknown``
+    — and ``fileFilter`` keeps such a file out of the listing in the first
+    place.
     """
     if os.path.isdir(path):
         return "folder"
     suffix = path.rsplit(".", 1)[-1].lower() if "." in path else ""
     if suffix in PLAYLIST_EXTENSIONS:
         return "playlist"
-    if suffix in PERL_SONG_SUFFIXES or suffix in SUPPORTED_EXTENSIONS:
+    if suffix in PERL_SONG_SUFFIXES:
         return "track"
     return "unknown"
 

@@ -1195,7 +1195,94 @@ def _bmf_tap_tracks(tagged: dict) -> list[int]:
             directory = str(row.get("path") or directory)
     if not directory:
         return []
-    return _expand_track_ids({"folder_id": directory})
+    if os.path.isfile(directory):
+        # A *file* URL as the drill token — a row-less file keeps its URL as
+        # its ``id``.  There is nothing to expand below it; a playlist file is
+        # resolved by ``_bmf_playlist_row_ids`` instead.  (The old code ran the
+        # ``LIKE '<file>/%'`` query here, which needs ``tracks.content_type``
+        # and therefore blew up on a lean schema.)
+        return []
+    try:
+        return _expand_track_ids({"folder_id": directory})
+    except Exception as exc:  # noqa: BLE001 - lean DB / unmounted share
+        logger.debug("bmf tap: expanding %s failed: %s", directory, exc)
+        return []
+
+
+def _playlist_file_ids(url: str) -> list[int]:
+    """Track ids of a LOCAL playlist file — Perl expands it, never streams it.
+
+    A ``.m3u`` in the music folder is ``type 'playlist'``
+    (``Slim/Control/Queries.pm:2441-2443``) and playing it runs the file's own
+    entries through the queue: ``Slim/Control/Commands.pm:1309``
+    ``playlistXitemCommand`` → :3686-3693 (a local playlist URL resolves to a
+    ``Playlist`` object, only *remote* ones stay URLs) →
+    ``Slim/Formats/Playlists/M3U.pm:31-186`` → ``Slim/Player/Playlist.pm:188``
+    ``addTracks``.
+
+    ``[]`` means "not a local playlist file, or nothing resolvable" — the
+    caller then keeps its previous behaviour (a remote ``.m3u``/``.pls`` is an
+    internet-radio stream and must stay one).  Read-only: see
+    ``music/playlists.py`` for why entries missing from the library are
+    skipped instead of imported.
+    """
+    from lyrion.music import playlists
+
+    if not playlists.is_local_playlist(url):
+        return []
+    try:
+        from lyrion.media.folders import effective_media_dirs
+
+        media_dirs = effective_media_dirs("audio")
+    except Exception:  # noqa: BLE001 - prefs may be unavailable in tests
+        media_dirs = []
+    try:
+        db_path = _library_db_path()
+    except Exception:  # noqa: BLE001 - defensive, like every other caller
+        db_path = None
+    try:
+        return playlists.track_ids(url, media_dirs=media_dirs, db_path=db_path)
+    except Exception as exc:  # noqa: BLE001 - playback must not break
+        logger.warning("playlist %s could not be expanded: %s", url, exc)
+        return []
+
+
+def _bmf_playlist_row_ids(tagged: dict) -> list[int]:
+    """Track ids of a tapped „Musikordner“ row that is a playlist FILE.
+
+    Perl's row carries the ``tracks`` row it created while browsing
+    (``Slim/Control/Queries.pm:2255-2268`` ``objectForUrl({create => 1,
+    playlist => isPlaylist($url)})``) — live 192.168.1.90 (read-only
+    2026-09-22) the ``.m3u`` of ``…/Sava-Metamorphosis-2008`` is
+    ``track_id 205378``.  This port may not write, so the row keeps the file
+    URL as its ``id`` and the tap arrives with either that URL or the window's
+    ``folder_id`` plus the row index; both are resolved here.
+    """
+    url = str(tagged.get("url") or "").strip()
+    if url:
+        ids = _playlist_file_ids(url)
+        if ids:
+            return ids
+    fid = str(tagged.get("folder_id") or "").strip()
+    idx = next((str(tagged[k]).strip() for k in ("item_id", "touchToPlay")
+                if str(tagged.get(k) or "").strip().isdigit()), "")
+    if not fid or not idx:
+        return []
+    directory = _bmf_resolve_dir(fid, _bmf_music_root())
+    if not directory:
+        return []
+    rows, _total = _bmf_children(directory, int(idx), 1)
+    if not rows:
+        return []
+    row = rows[0]
+    if str(row.get("type")) != "audio":
+        return []
+    candidate = str(row.get("id") or row.get("path") or "")
+    if candidate and "://" not in candidate:
+        from lyrion.media.folders import file_url_from_path
+
+        candidate = file_url_from_path(candidate)
+    return _playlist_file_ids(candidate) if candidate else []
 
 
 def _bmf_window_folder_id(directory: str) -> str:
@@ -7756,6 +7843,14 @@ class JSONRPCAPI:
                             # case-sensitive). Perl keeps the item verbatim
                             # (playlistXitemCommand, Commands.pm:1354-1359).
                             pending = str(item).split(":", 1)[1]
+                            _pl_ids = _playlist_file_ids(pending)
+                            if _pl_ids:
+                                # A local playlist FILE contributes the tracks
+                                # it names, not a stream URL — Perl expands it
+                                # (Commands.pm:1309 → :3686-3693 → M3U.pm:31).
+                                player.playlist.extend(_pl_ids)
+                                player.last_activity = time.time()
+                                pending = ""
                         elif low.startswith("title:"):
                             title = str(item).split(":", 1)[1]
                             # Append the pending bare URL (it was held waiting
@@ -7812,6 +7907,12 @@ class JSONRPCAPI:
                                     new_ids.append(int(_tid))
                             elif str(item).isdigit():
                                 new_ids.append(int(item))
+                            elif low.startswith("url:"):
+                                # A local playlist FILE inserts the tracks it
+                                # names (Perl expands it on the tap,
+                                # Commands.pm:1309 → :3686-3693).
+                                new_ids.extend(
+                                    _playlist_file_ids(str(item).split(":", 1)[1]))
                     if new_ids:
                         playlist = list(player.playlist or [])
                         pos = int(player.playlist_position or 0) + 1
@@ -7912,6 +8013,19 @@ class JSONRPCAPI:
                         _url = str(rest[0])
                         if _url[:4].lower() == "url:":
                             _url = _url[4:]
+                        # A LOCAL playlist file is not a stream: Perl expands it
+                        # into the tracks it names (Commands.pm:1309
+                        # playlistXitemCommand → :3686-3693 → M3U.pm:31-186).
+                        # A remote .m3u/.pls stays what it was — an internet
+                        # radio stream — and keeps going through play_url.
+                        _pl_ids = _playlist_file_ids(_url)
+                        if _pl_ids:
+                            player.playlist = list(_pl_ids)
+                            player.playlist_total = len(_pl_ids)
+                            player.playlist_position = 0
+                            player.last_activity = time.time()
+                            await self._play_playlist_item(pm, player, 0)
+                            return
                         await pm.play_url(pid, _url, "")
                         return
                     elif rest and str(rest[0]).isdigit():
@@ -9903,6 +10017,11 @@ class JSONRPCAPI:
             return
         ids = _bmf_tap_tracks(tagged)
         if not ids:
+            # A playlist FILE row has no ``tracks`` row here (Perl created one
+            # while browsing, ``Queries.pm:2255-2268``) — its content is the
+            # queue Perl builds on the tap (``Slim/Formats/Playlists/M3U.pm:31``).
+            ids = _bmf_playlist_row_ids(tagged)
+        if not ids:
             # Perl plays a row-less file through its ``tmp://`` volatile URL
             # (BrowseLibrary.pm:2125-2138); this port refuses DB writes, so
             # such a row cannot be resolved to a stream.  Nothing is sent —
@@ -10006,6 +10125,16 @@ class JSONRPCAPI:
             if str(row.get("type")) == "audio":
                 if isinstance(rid, int):
                     target["track_id"] = rid
+                else:
+                    # A playlist FILE row has no ``tracks`` row here (Perl
+                    # created one while browsing, ``Queries.pm:2255-2268``) —
+                    # its ``id`` is the file URL.  Hand it out as the row's
+                    # resolvable token (``_bmf_tap_tracks`` step 2 →
+                    # ``_bmf_playlist_row_ids`` expands the file); without it
+                    # the tap names no item and nothing plays.
+                    candidate = str(rid or row.get("path") or "")
+                    if candidate:
+                        target["url"] = candidate
             elif folder_id:
                 # A *folder* row's ``id`` is the ``tracks`` row of its
                 # directory (``_bmf_dir_row_ids``) — a directory is never a
