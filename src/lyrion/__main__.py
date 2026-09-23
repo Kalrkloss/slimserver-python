@@ -232,6 +232,22 @@ async def _run_server(
     # and starves player/app requests for hours on large libraries. The scan
     # runs on demand via the "rescan" JSON-RPC method / CLI command.
 
+    # Plugins: discover manifests, resolve pending enable/disable states, load
+    # and initialize (Perl ``Slim::Utils::PluginManager->init``/``load``,
+    # PluginManager.pm:46-410).  Runs before the web server so a plugin's
+    # ``/settings/...`` page and hooks exist when the first request arrives.
+    try:
+        from lyrion.plugins.manager import PluginManager
+
+        plugin_manager = PluginManager()
+        # Third-party plugins below the server data dir (Perl's
+        # ``dirsFor('Plugins')`` / ``InstalledPlugins/Plugins``,
+        # PluginManagerDownloader.pm:74-151).
+        plugin_manager.add_plugin_dir(cfg.serverdata_dir / "Plugins")
+        await plugin_manager.startup()
+    except Exception as exc:  # noqa: BLE001 — a broken plugin must not block boot
+        log.warning("PluginManager not started: %s", exc, exc_info=True)
+
     # Start web server
     if not noweb:
         try:
@@ -328,6 +344,15 @@ async def _run_server(
         await asyncio.sleep(0.5)
 
     log.info("Shutting down...")
+
+    # Plugins first (Perl ``shutdownPlugins``, PluginManager.pm:412-428) so a
+    # plugin still sees a live config/DB while it tears down.
+    try:
+        from lyrion.plugins.manager import PluginManager
+
+        await PluginManager().shutdown()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("PluginManager shutdown failed: %s", exc)
 
     # Cancel all remaining background tasks (CLI server, slimproto server,
     # background scans) so no DB connections stay open. Without this,

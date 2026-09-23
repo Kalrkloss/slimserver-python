@@ -525,6 +525,21 @@ _ART_ONLINE = SettingsPage(
     fields=(*_ART_ONLINE_FIELDS, *_ART_WANTED_FIELDS),
 )
 
+#: Eigen-Kennzeichen: Seiten mit eigenem Handler statt Pref-Formular.
+#: Perl ``Plugins.pm:48-145`` (handler) + ``:46-49`` (page) — die Seite hat
+#: KEIN ``prefs()``; sie schreibt ``manual:<plugin>``-Parameter über
+#: ``enablePlugin``/``disablePlugin`` (``:91-94``).
+_PLUGINS = SettingsPage(
+    route="/settings/server/plugins.html",
+    perl_class="Slim::Web::Settings::Server::Plugins",
+    page_name="SETUP_PLUGINS",               # Plugins.pm:40-42
+    title_key="SETUP_PLUGINS",
+    title_default="Manage Plugins",
+    needs_client=False,
+    perl_source=("Slim/Web/Settings/Server/Plugins.pm:44-46 (page), :40-42 (name);"
+                 " Zustand/Regeln aus Slim/Utils/PluginManager.pm:535-585"),
+)
+
 #: Perl-Route → Seite. Schlüssel ist der HTTP-Pfad (ohne Slash am Ende).
 PAGES: dict[str, SettingsPage] = {
     _BASIC_SERVER.route: _BASIC_SERVER,
@@ -533,6 +548,7 @@ PAGES: dict[str, SettingsPage] = {
     _PLAYER_ALARM.route: _PLAYER_ALARM,
     _INFORMATION.route: _INFORMATION,
     _ART_ONLINE.route: _ART_ONLINE,
+    _PLUGINS.route: _PLUGINS,
     # Aufgaben-Alias (kein Perl-Fund, siehe Modul-Docstring „UNKLAR").
     "/settings/information.html": _INFORMATION,
 }
@@ -1123,6 +1139,132 @@ _ART_WANTED_JS = """
 """
 
 
+async def _render_plugins_page(params: dict[str, str], warning: Optional[str]) -> bytes:
+    """``settings/server/plugins.html`` — the plugin list.
+
+    Perl builds this page in ``Plugins.pm:201-357`` (``_addInfo``) on top of the
+    ``active``/``inactive`` lists of ``ExtensionsManager::getCurrentPlugins``;
+    the port has no repo layer yet, so the list is the manifest register and the
+    state pref (``PluginManager.pm:88-114,535-585``).  Per plugin the page shows
+    the manifest fields of ``install.xml`` (name, version, creator, description)
+    and the current state; a checkbox ``manual:<plugin>`` enables/disables
+    (``Plugins.pm:91-94``).
+    """
+    from lyrion.plugins.manager import PluginManager
+
+    manager = PluginManager()
+    if not manager.registry.manifests:
+        try:
+            manager.discover_plugins(use_cache=False)
+        except Exception as exc:  # noqa: BLE001 — the page must still render
+            logger.warning("settings: plugin register unreadable (%s)", exc)
+
+    # Perl seeds the state pref while parsing the manifest
+    # (``PluginManager.pm:711-728``); a page call before the first ``load`` must
+    # therefore still show ``enabled``/``disabled`` instead of an empty state.
+    states: dict[str, str] = {}
+    for name in manager.manifest_names():
+        manifest = manager.registry.get(name)
+        if manifest is None:
+            continue
+        if not manager.plugin_state(name):
+            await manager.ensure_plugin_state(name, manifest.default_state)
+        states[name] = manager.plugin_state(name)
+
+    action = _PLUGINS.route
+    parts = [
+        "<!DOCTYPE html>",
+        '<html lang="en"><head><meta charset="utf-8">',
+        f"<title>{_esc(_string(_PLUGINS.title_key, _PLUGINS.title_default))}</title>",
+        "</head><body>",
+        f'<div id="statusarea" class="statusarea">{warning or ""}</div>',
+        f'<form name="settingsForm" id="settingsForm" method="post" action="{_esc(action)}">',
+        '<input type="hidden" name="useAJAX" value="0">',
+        f'<input type="hidden" name="page" value="{_esc(_PLUGINS.page_name)}">',
+        '<div id="settingsRegion">',
+        f"<h2>{_esc(_string('SETUP_PLUGINS', 'Manage Plugins'))}</h2>",
+        '<table id="pluginsList">',
+        '<thead><tr>'
+        f"<th>{_esc(_string('PLUGIN_NAME', 'Plugin'))}</th>"
+        f"<th>{_esc(_string('ENABLED', 'Enabled'))}</th>"
+        "</tr></thead><tbody>",
+    ]
+
+    for name in manager.manifest_names():
+        manifest = manager.registry.get(name)
+        if manifest is None:
+            continue
+        state = states.get(name) or manager.plugin_state(name)
+        enabled = state in ("enabled", "needs-enable")
+        # Perl shows the localized name (``$plugins->{$_}->{name}`` is a string
+        # token, ``PluginManager.pm:578``); unknown tokens stay as they are.
+        label = _string(manifest.name, manifest.name)
+        desc = _string(manifest.description, manifest.description) \
+            if manifest.description else ""
+        checked = ' checked="checked"' if enabled else ""
+        disabled_attr = ""
+        if manifest.enforce:                      # PluginManager.pm:551-556
+            disabled_attr = ' disabled="disabled"'
+        parts.append(
+            f'<tr class="plugin" data-plugin="{_esc(name)}" data-state="{_esc(state)}">'
+            f'<td><strong>{_esc(label)}</strong>'
+            f' <span class="version">{_esc(manifest.version)}</span>'
+            f' <span class="creator">{_esc(manifest.creator)}</span>'
+            f'<div class="description">{_esc(desc)}</div></td>'
+            f'<td><input type="checkbox" name="manual:{_esc(name)}" value="1"'
+            f'{checked}{disabled_attr}>'
+            f'<span class="state">{_esc(state)}</span></td>'
+            "</tr>")
+    parts.append("</tbody></table>")
+    parts.append("</div>")
+
+    # Restart hint — Perl ``Plugins.pm:339-350``: needsRestart → the restart
+    # message with a link, else empty.
+    if manager.needs_restart():
+        restart_url = _PLUGINS.route + "?restart=1"
+        restart_msg = _string(
+            "PLUGINS_CHANGED_NEED_RESTART",
+            'Changes will take place at the next application restart. '
+            '<a href="%s">Please click here to restart the server now.</a>')
+        parts.append(f'<div id="restartWarning">{restart_msg % _esc(restart_url)}</div>')
+
+    parts.append(
+        '<div id="prefsSubmit">'
+        f'<input name="saveSettings" id="saveSettings" type="submit" class="stdclick" '
+        f'value="{_esc(_string("SAVE_SETTINGS", "Save Settings"))}">' 
+        '<input type="hidden" name="saveSettings" value="1"></div>')
+    parts.append("</form></body></html>")
+    return "\n".join(parts).encode("utf-8")
+
+
+async def _save_plugins_page(params: dict[str, str]) -> list[str]:
+    """Write the ``manual:<plugin>`` toggles — ``Plugins.pm:91-94``.
+
+    Checked → :meth:`PluginManager.enable_plugin` (→ ``needs-enable``), unchecked
+    → :meth:`disable_plugin` (→ ``needs-disable``, refused for ``enforce``).
+    """
+    from lyrion.plugins.manager import PluginManager
+
+    manager = PluginManager()
+    if not manager.registry.manifests:
+        manager.discover_plugins(use_cache=False)
+
+    changed: list[str] = []
+    for param, value in params.items():
+        if not param.startswith("manual:"):
+            continue
+        name = param[len("manual:"):]
+        if name not in manager.registry.manifests:
+            continue                      # Perl only knows installed plugins
+        if value and value != "0":
+            if await manager.enable_plugin(name):
+                changed.append(name)
+        else:
+            if await manager.disable_plugin(name):
+                changed.append(name)
+    return changed
+
+
 def _render_page(page: SettingsPage, params: dict[str, str], player,
                  warning: Optional[str],
                  extra_options: Optional[dict[str, tuple[tuple[str, str, str], ...]]] = None
@@ -1302,6 +1444,21 @@ async def handle_settings_request(scope: dict, receive, send) -> None:
         fingerprint_before = load_art_online_settings().fingerprint()
 
     if method == "POST" and "saveSettings" in params:
+        if page is _PLUGINS:
+            # ``Plugins.pm:60-100`` — the page writes no ``pref_*`` values; it
+            # toggles plugin state (``manual:<plugin>``) and shows that a restart
+            # is required (``:341``).
+            written = await _save_plugins_page(params)
+            warning = _string(
+                "SETUP_EXTENSIONS_RESTART_MSG",
+                "Please restart Lyrion Music Server for the changes to take effect.")
+            logger.info("settings: %s toggled %s", page.route, written)
+            if str(params.get("useAJAX", "0")) == "1":
+                await _send(send, 200, "text/plain", _render_ajax(warning, written))
+                return
+            await _send(send, 200, "text/html",
+                        await _render_plugins_page(params, warning))
+            return
         if page.needs_client and player is None:
             # Perl: Player/Display.pm:101-105 — ohne Client keine Einstellungen.
             warning = get_string("SETUP_NO_PREFS",
@@ -1341,6 +1498,13 @@ async def handle_settings_request(scope: dict, receive, send) -> None:
 
     if str(params.get("useAJAX", "0")) == "1":
         await _send(send, 200, "text/plain", _render_ajax(warning, written, invalid))
+        return
+
+    if page is _PLUGINS:
+        # GET, or a POST that did not save (``Plugins.pm:48-145`` renders the
+        # list in both cases; the restart hint comes from ``needsRestart``).
+        await _send(send, 200, "text/html",
+                    await _render_plugins_page(params, warning))
         return
 
     await _send(send, 200, "text/html",

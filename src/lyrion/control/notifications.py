@@ -489,7 +489,71 @@ def notify(notification: Notification) -> None:
         return
     logger.debug("Notify: %s", notification.request_string)
     _call_listeners(notification)
+    _notify_plugins(notification)
     _autoexecute(notification)
+
+
+def _notify_plugins(notification: Notification) -> None:
+    """Forward a playlist event to the plugins (``PluginManager`` subscribers).
+
+    Perl's plugin layer subscribes with
+    ``Slim::Control::Request::subscribe(\\&onPlaylistChange,
+    [['playlist'], ['cant_open', 'newsong', 'delete', 'resume']])``
+    (``Slim/Plugin/DontStopTheMusic/Plugin.pm:91``) and is called from
+    ``notify`` for every matching request.  The port has no generic request
+    subscription for plugins yet, so the playlist subset is bridged here —
+    the event dict carries what the DSTM handler reads (``source``, ``command``,
+    ``client``, ``repeat``, ``song_index``, ``url``, ``error``).
+    """
+    try:
+        from lyrion.plugins.manager import PluginManager
+
+        manager = PluginManager()
+        if not manager.started:
+            logger.debug("plugin notify skipped: PluginManager not started")
+            return
+        if not manager._playlist_change_hooks:
+            logger.debug("plugin notify skipped: no playlist hooks registered")
+            return
+    except Exception:  # noqa: BLE001 — plugins must never break notifications
+        return
+
+    verbs = [str(v).lower() for v in notification.verbs]
+    if not verbs or verbs[0] != "playlist":
+        return
+    command = verbs[1] if len(verbs) > 1 else ""
+    if command not in ("newsong", "delete", "cant_open", "resume"):
+        return
+
+    client_id = notification.client_id
+    player = _get_player(client_id) if client_id else None
+    # ``['playlist','newsong', title, index]`` trägt den Index als ``_p3``
+    # (``streaming.py:423-446``); Perl liest ihn live über
+    # ``Slim::Player::Source::streamingSongIndex($client)`` (``Plugin.pm:199``).
+    event_index = None
+    try:
+        raw = notification.get_param("_p3")
+        if raw is not None and str(raw).strip().lstrip("-").isdigit():
+            event_index = int(raw)
+    except Exception:  # noqa: BLE001
+        event_index = None
+    song_index = event_index
+    if song_index is None:
+        song_index = int(getattr(player, "playlist_position", 0) or 0)
+    event = {
+        "source": notification.source,
+        "command": command,
+        "client": player,
+        "repeat": int(getattr(player, "repeat", 0) or 0),
+        "song_index": song_index,
+        "url": notification.get_param("_url"),
+        "error": notification.get_param("_error"),
+    }
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return                       # Perl's subscriptions need the idle loop
+    loop.create_task(manager.notify_playlist_change(event))
 
 
 def check_notifications() -> int:

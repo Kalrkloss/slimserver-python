@@ -25,15 +25,18 @@ class PluginMetadata:
 class Plugin(ABC):
     """Abstract base class for Lyrion plugins.
 
-    All plugins must inherit from this class and implement the required
-    abstract methods. The metadata attribute must be set as a class attribute.
+    All plugins must inherit from this class and set the ``metadata`` class
+    attribute.  The lifecycle methods map to Perl's three init passes
+    (``Slim::Utils::PluginManager::load``, ``PluginManager.pm:383-404``):
+    ``on_preinit`` = ``preinitPlugin``, ``on_startup`` = ``initPlugin``,
+    ``on_postinit`` = ``postinitPlugin``.
     """
 
     metadata: PluginMetadata
-    enabled: bool = False
-    hooks: dict[str, list[Callable]] = field(default_factory=dict)
 
     def __init__(self) -> None:
+        self.enabled = False
+        self.hooks: dict[str, list[Callable]] = {}
         self._logger = logging.getLogger(f"{__name__}.{self.metadata.id}")
 
     def get_metadata(self) -> PluginMetadata:
@@ -75,9 +78,21 @@ class Plugin(ABC):
                 "Unregistered hook '%s' from plugin %s", name, self.metadata.id
             )
 
+    async def on_preinit(self) -> None:
+        """``preinitPlugin`` — first init pass (``PluginManager.pm:387-404``).
+
+        For plugins that offer a service to other plugins.
+        """
+
     async def on_startup(self) -> None:
-        """Called once when the server starts and the plugin is enabled."""
+        """``initPlugin`` — second pass; register on services offered earlier.
+
+        Called once when the server starts and the plugin is enabled.
+        """
         self._logger.debug("Plugin %s startup", self.metadata.id)
+
+    async def on_postinit(self) -> None:
+        """``postinitPlugin`` — third pass; start the service offered earlier."""
 
     async def on_shutdown(self) -> None:
         """Called once when the server is shutting down."""
