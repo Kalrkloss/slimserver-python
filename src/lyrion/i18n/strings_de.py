@@ -109,4 +109,25 @@ STRINGS_DE: dict[str, str] = {
     'ALL': 'Alle',  # strings.txt:11281 (DE :11284)
     # Settings.pm:168 — Warnung für einen abgelehnten Pref-Wert.
     'SETTINGS_INVALIDVALUE': '"%s" ist kein gültiger Wert für %s',  # strings.txt:10145 (DE :10148)
+    # ── Player-Firmware (Slim/Player/Squeezebox.pm) ─────────────────────────
+    # Der `showBriefly`-Block, wenn das Image der Zielrevision fehlt.
+    'FIRMWARE_MISSING': 'Fehler: Firmware fehlt',  # strings.txt:2765 (DE :2768)
+    'FIRMWARE_MISSING_DESC': 'Der Server kann zum Laden eines Firmware-Update keine Internetverbindung herstellen.',  # strings.txt:2784 (DE :2787)
+    'UPDATING_FIRMWARE_SQUEEZEBOX': 'Squeezebox-Firmware wird aktualisiert ...',  # strings.txt:2669 (DE :2672)
+    'UPDATING_FIRMWARE_SQUEEZEBOX2': 'Squeezebox-Firmware wird aktualisiert ...',  # strings.txt:2689 (DE :2692)
+    'UPDATING_FIRMWARE_TRANSPORTER': 'Transporter-Firmware wird aktualisiert...',  # strings.txt:2709 (DE :2712)
+    'UPDATING_FIRMWARE_RECEIVER': 'Squeezebox-Firmware wird aktualisiert...',  # strings.txt:2729 (DE :2732)
+    'UPDATING_FIRMWARE_BOOM': 'Firmware wird aktualisiert.',  # strings.txt:2747 (DE :2750)
+    # Boom-Zweistufen-Zähler (`Squeezebox.pm:425-434`).
+    'OUT_OF': 'von',  # strings.txt:777 (DE :780)
+    # ── Plugin-Verwaltung (Slim/Web/Settings/Server/Plugins.pm) ─────────────
+    'SETUP_PLUGINS': 'Plugins verwalten',  # strings.txt:7183 (DE :7186)
+    'PLUGINS_RESTART_MSG': 'Plugins wurden aktualisiert - Neustart erforderlich',  # strings.txt:23730 (DE :23733)
+    'SETUP_EXTENSIONS_RESTART_MSG': 'Lyrion Music Server muss neu gestartet werden, damit die Änderungen in Kraft treten.',  # strings.txt:7409 (DE :7412)
+    'ENABLED': 'Aktiviert',  # strings.txt:11400 (DE :11403)
+    'DISABLED': 'Deaktiviert',  # strings.txt:11420 (DE :11423)
+    'PLUGINS_CHANGED_NEED_RESTART': 'Beim nächsten Neustart der Anwendung werden die Änderungen wirksam. <a href="%s">Klicken Sie hier, um den Server jetzt neu zu starten.</a>',  # strings.txt:22253 (DE :22256)
+    'PLUGIN_DSTM': 'Musikwiedergabe nie anhalten',  # DontStopTheMusic/strings.txt:1 (DE :4)
+    'PLUGIN_DSTM_DESC': "Don't Stop The Music bewahrt Sie davor, von der Stille überrascht zu werden. Wenn sich die Wiedergabeliste dem Ende neigt, wird automatisch passende Musik angehängt.",  # DontStopTheMusic/strings.txt:12 (DE :15)
+    'PLUGIN_NAME': 'Plugin',  # strings.txt:11293 (DE :11296)
 }

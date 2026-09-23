@@ -217,71 +217,18 @@ class FirmwareVersion:
 
 
 # ---------------------------------------------------------------------------
-# Compatibility
+# Player upgrade decision (Perl Firmware.pm:319-348, ``need_upgrade``)
 # ---------------------------------------------------------------------------
-
-# LMS / Lyrion version mapping to minimum firmware requirements
-MIN_FIRMWARE_REQUIREMENTS: dict[str, str] = {
-    # (lms_version_major, lms_version_minor): minimum_player_firmware
-    (7, 0): "127",
-    (7, 5): "137",
-    (7, 6): "150",
-    (7, 7): "155",
-    (7, 8): "160",
-    (7, 9): "161",
-    (8, 0): "161",
-    (9, 0): "161",
-    (9, 2): "161",
-}
-
-
-def get_min_firmware_for_lms_version(lms_major: int, lms_minor: int) -> FirmwareVersion:
-    """Return minimum player firmware version for a given LMS version."""
-    key = (lms_major, lms_minor)
-    min_version_str = MIN_FIRMWARE_REQUIREMENTS.get(key, "127")
-    return FirmwareVersion.parse(min_version_str)
-
-
-def is_player_compatible(
-    player_firmware: str | FirmwareVersion,
-    lms_version: str | FirmwareVersion,
-) -> bool:
-    """
-    Return True if a player firmware is compatible with the LMS version.
-    """
-    if isinstance(player_firmware, str):
-        player_firmware = FirmwareVersion.parse(player_firmware)
-    if isinstance(lms_version, str):
-        lms_version = FirmwareVersion.parse(lms_version)
-
-    min_fw = get_min_firmware_for_lms_version(lms_version.major, lms_version.minor)
-    return player_firmware >= min_fw
-
-
-def needs_upgrade(
-    player_firmware: str | FirmwareVersion,
-    lms_version: str | FirmwareVersion,
-) -> tuple[bool, str]:
-    """
-    Check if a player needs a firmware upgrade.
-
-    Returns (needs_upgrade: bool, message: str)
-    """
-    if isinstance(player_firmware, str):
-        player_firmware = FirmwareVersion.parse(player_firmware)
-    if isinstance(lms_version, str):
-        lms_version = FirmwareVersion.parse(lms_version)
-
-    min_fw = get_min_firmware_for_lms_version(lms_version.major, lms_version.minor)
-
-    if player_firmware >= min_fw:
-        return False, "Compatible"
-
-    return True, (
-        f"Player firmware {player_firmware} is older than recommended "
-        f"minimum {min_fw} for LMS {lms_version}. "
-        "Upgrade recommended."
-    )
+# There is NO "minimum firmware for a server version" table in Perl.  The
+# decision is made per model from what is actually on disk (``%$firmwares``)
+# and the player's own version string — :func:`model_needs_upgrade` is the
+# Perl-true port and the only entry point.  The former invented helpers
+# (``MIN_FIRMWARE_REQUIREMENTS``, ``get_min_firmware_for_lms_version``,
+# ``is_player_compatible``, a tuple-returning ``needs_upgrade``) had no Perl
+# counterpart and no caller and were removed.  The player-side equivalent
+# (Perl ``Squeezebox.pm:241-341`` ``needsUpgrade``, which reads the
+# ``<model>.version`` range table) lives in :mod:`lyrion.player.firmware`,
+# next to the upgrade flow that uses it.
 
 
 def model_needs_upgrade(current: str, available: "FirmwareInfo") -> bool:

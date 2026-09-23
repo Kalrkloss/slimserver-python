@@ -220,6 +220,9 @@ class DisplayWiring:
         self._last_visu: dict[str, tuple[int, ...]] = {}
         # Display.pm:378-398 ``currBrightness`` pro Display.
         self._brightness: dict[str, int] = {}
+        # Display.pm:301 ``updateMode(2)`` — ein blockierender ``showBriefly``
+        # sperrt weitere Meldungen bis er abgelaufen ist (:245).
+        self._blocking: dict[str, bool] = {}
 
     # ------------------------------------------------------------------
     # Klasse / Fähigkeiten
@@ -516,6 +519,8 @@ class DisplayWiring:
         previous_text: Union[str, Sequence[str], None] = None,
         duration: Optional[int] = None,
         sleep: Optional[Callable[[float], Any]] = None,
+        callback: Optional[Callable[[], Any]] = None,
+        blocking: bool = False,
     ) -> list[str]:
         """Perl ``Display::showBriefly`` — ``Display.pm:221-327``.
 
@@ -525,12 +530,32 @@ class DisplayWiring:
         ``displaytexttimeout`` = 1 (``Slim/Utils/Prefs.pm:169``).
         Ein Client ohne Display bekommt auch hier nichts (NoDisplay.pm:24-38
         notifiziert nur CLI/Jive).
+
+        ``callback`` ist Perls ``$args->{'callback'}`` (:263, gespeichert als
+        ``sbCallbackData`` :306-310): er läuft, wenn die Anzeige FERTIG ist.
+        ``Squeezebox2.pm:348-356`` hängt daran den ``updn``-Frame — der Player
+        trennt die Verbindung bei ``updn`` und verbindet sich neu, deshalb darf
+        er erst nach der Meldung raus.
+
+        ``blocking`` ist Perls ``$args->{'block'}`` (:260): ``updateMode(2)``
+        (:301) lässt jeden weiteren ``showBriefly``-Aufruf an der
+        ``return if ($display->updateMode() == 2)``-Schranke (:245) verpuffen,
+        damit die Upgrade-Meldung nicht von einem Titelwechsel überschrieben
+        wird.
         """
         from lyrion.networking.protocol import DISPLAY_DURATION_DEFAULT
 
         if self.display_class(player) == NODISPLAY:
             return []
+        # Display.pm:245 — ein blockierender showBriefly ist noch aktiv.
+        if blocking and self._blocking.get(str(getattr(player, "mac", ""))):
+            logger.debug("showBriefly blocked for %s (Display.pm:245)",
+                         getattr(player, "mac", ""))
+            return []
         delay = DISPLAY_DURATION_DEFAULT if not duration else duration
+        mac = str(getattr(player, "mac", ""))
+        if blocking:
+            self._blocking[mac] = True
         sent = await self.update(player, bits=bits, text=text)
         # Perl's restore runs from a timer (Display.pm:325) — only await it when
         # the caller hands in a sleeper (tests); a request path must not block.
@@ -539,6 +564,15 @@ class DisplayWiring:
             if previous_bits is not None or previous_text is not None:
                 sent += await self.update(player, bits=previous_bits,
                                           text=previous_text)
+            if callback is not None:
+                # :313-325 ``endAnimation`` -> ``$callback->(@callbackargs)``.
+                try:
+                    result = callback()
+                    if inspect.isawaitable(result):
+                        await result
+                except Exception as exc:  # noqa: BLE001 — callback darf nie stören
+                    logger.warning("showBriefly callback failed: %s", exc)
+        self._blocking.pop(mac, None)
         return sent
 
     def brightness_for_power(self, player: Any, on: bool) -> int:

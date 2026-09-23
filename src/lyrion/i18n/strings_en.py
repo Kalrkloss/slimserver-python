@@ -117,4 +117,35 @@ STRINGS_EN: dict[str, str] = {
     # Settings.pm:168 `sprintf(SETTINGS_INVALIDVALUE, $value, $pref)` — the
     # warning for a pref value the validator rejected.
     'SETTINGS_INVALIDVALUE': 'Invalid value "%s" for %s',  # strings.txt:10145 (EN :10149)
+    # ── Player firmware (Slim/Player/Squeezebox.pm) ─────────────────────────
+    # The `showBriefly` block when the image for the target revision is not on
+    # disk (`Squeezebox2.pm:344-347`, `Squeezebox.pm:330-334`).
+    'FIRMWARE_MISSING': 'Error: Missing Firmware',  # strings.txt:2765 (EN :2774)
+    'FIRMWARE_MISSING_DESC': "Server can't connect to Internet to obtain firmware update.",  # strings.txt:2784 (EN :2793)
+    # `UPDATING_FIRMWARE_<UC(model)>` (`Squeezebox.pm:420`) — one key per player
+    # class, exactly as the Perl table carries them.
+    'UPDATING_FIRMWARE_SQUEEZEBOX': 'Updating Squeezebox firmware.',  # strings.txt:2669 (EN :2678)
+    'UPDATING_FIRMWARE_SQUEEZEBOX2': 'Updating Squeezebox firmware.',  # strings.txt:2689 (EN :2698)
+    'UPDATING_FIRMWARE_TRANSPORTER': 'Updating Transporter firmware.',  # strings.txt:2709 (EN :2718)
+    'UPDATING_FIRMWARE_RECEIVER': 'Updating Squeezebox Firmware.',  # strings.txt:2729 (EN :2738)
+    'UPDATING_FIRMWARE_BOOM': 'Updating Firmware.',  # strings.txt:2747 (EN :2756)
+    # `(` . $line . ' (1 ' . string('OUT_OF') . ' 2)'` — the Boom two-stage
+    # upgrade counter (`Squeezebox.pm:425-434`).
+    'OUT_OF': 'of',  # strings.txt:777 (EN :786)
+    # ── Plugin management (Slim/Web/Settings/Server/Plugins.pm) ─────────────
+    # Page name (`Plugins.pm:40-42` protectName('SETUP_PLUGINS')) and the
+    # restart message of the plugin manager (`PluginManager.pm:569-585`).
+    'SETUP_PLUGINS': 'Manage Plugins',  # strings.txt:7183 (EN :7187)
+    'PLUGINS_RESTART_MSG': 'Plugins have been updated - Restart Required',  # strings.txt:23730 (EN :23734)
+    # Restart hint of the settings page (`Plugins.pm:341`, used with :157).
+    'SETUP_EXTENSIONS_RESTART_MSG': 'Please restart Lyrion Music Server for the changes to take effect.',  # strings.txt:7409 (EN :7413)
+    # The plugin list states (`Plugins.pm:310` highlights enabled/disabled).
+    'ENABLED': 'Enabled',  # strings.txt:11400 (EN :11404)
+    'DISABLED': 'Disabled',  # strings.txt:11420 (EN :11424)
+    'PLUGINS_CHANGED_NEED_RESTART': 'Changes will take place at the next application restart. <a href="%s">Please click here to restart the server now.</a>',  # strings.txt:22253 (EN :22257)
+    # Plugin name and description of the shipped DSTM plugin
+    # (Slim/Plugin/DontStopTheMusic/strings.txt:1/:5, :12/:16).
+    'PLUGIN_DSTM': "Don't Stop The Music",  # DontStopTheMusic/strings.txt:1 (EN :5)
+    'PLUGIN_DSTM_DESC': "Don't Stop The Music will make sure you don't let the silence kill your flow. Once you reach the end of your playlist it will automatically add music similar to what you've been listening to.",  # DontStopTheMusic/strings.txt:12 (EN :16)
+    'PLUGIN_NAME': 'Plugin',  # strings.txt:11293 (EN :11297)
 }

@@ -235,6 +235,22 @@ class PlayerState:
     # Empty means "fall back to the per-class modelName() table".
     model_name: str = ""
 
+    # ── Firmware upgrade state (Perl ``Slim/Player/Client.pm``) ────────────
+    # ``isUpgrading`` (Client.pm:181 default 0, set by ``isUpgrading(1)`` at
+    # Squeezebox2.pm:369/Squeezebox1.pm:385). While it is 1 the player is
+    # pushing a new firmware image and must not be streamed to; Perl also
+    # skips the "now playing" display refresh for it.
+    is_upgrading: bool = False
+    # ``_needsUpgrade`` (Client.pm:180 default undef; Squeezebox.pm:245-246
+    # caches a prior ``needsUpgrade`` result and :307/:315 cache the 0 case) —
+    # ``None`` = not computed yet, an int = cached target revision (0 = none).
+    _needs_upgrade: Optional[int] = None
+    # ``revision`` (Client.pm:107, set by ``connected``/HELO). ``firmware``
+    # above carries the HELO's firmware string; the bare revision number that
+    # ``needsUpgrade`` compares against is kept separately because the string
+    # may be e.g. ``"9.0.0-r1583"`` while the table works on integers.
+    revision: int = 0
+
     # SlimProto STAT bookkeeping (set by the protocol handler):
     _last_stmd: Optional[float] = None        # last DECODE_COMPLETE time
     _track_started_at: Optional[float] = None  # last STMs time

@@ -714,11 +714,35 @@ PERL_HANDLER_NAMES = {
 PERL_BUTTON_OPCODES = frozenset({"IR  ", "BUTN", "KNOB"})
 
 
+def revision_of(firmware: str, helo_revision: object = 0) -> int:
+    """The player's bare firmware REVISION number — Perl ``Client.pm:107``.
+
+    Perl stores the revision as an integer and ``needsUpgrade`` compares
+    against it (``Squeezebox.pm:250`` ``$client->revision || return 0``).  Two
+    sources exist in our HELO:
+
+    * the caps ``Firmware=`` token, e.g. ``9.0.0-r1583`` — Perl's own version
+      regex ``m/^([^ ]+)\\sr(\\d+)/`` (``Firmware.pm:329``) takes the digits
+      after ``r``;
+    * the HELO revision byte/field (a plain number for older clients).
+
+    Returns 0 when neither yields digits — the player then never gets an
+    upgrade, which is exactly Perl's ``|| return 0`` (``Squeezebox.pm:250``).
+    """
+    text = str(firmware or "")
+    match = re.search(r"\br(\d+)", text)
+    if match:
+        return int(match.group(1))
+    for candidate in (text, str(helo_revision or "")):
+        stripped = candidate.strip()
+        if stripped.isdigit():
+            return int(stripped)
+    return 0
+
+
 def classify_opcode(op_raw: str) -> str:
     """Classify a player frame opcode exactly like Perl's handler lookup.
 
-    ``op_raw`` is the raw 4-byte ASCII opcode (no lower-casing — that is what
-    broke ``BYE!``). Returns one of:
 
     * ``"close"``   — Perl closes the socket here (``SHUT``)
     * ``"bye"``     — ``BYE!``: never closes, may request a firmware upgrade
@@ -1389,6 +1413,20 @@ class SlimProtoClient:
                 # PlayerManager). A (re)connect also drops a stale strm guard.
                 self._register_player_writer(mac_key, writer)
 
+                # Firmware-Check: das Modell in den Nachlade-Zyklus aufnehmen.
+                # Perl lernt die Modelle beim HELO (``Slim/Player/Squeezebox.pm``
+                # nach dem HELO-Handler) und prüft sie danach periodisch
+                # (``Slim/Utils/Firmware.pm:193-200``).  Der Aufruf ist
+                # fehlertolerant — ein Firmware-Problem darf den HELO nie
+                # scheitern lassen, und der Wiedergabepfad ruft hier KEIN Netz.
+                try:
+                    from lyrion.utils.firmware_service import ensure_model
+
+                    ensure_model(model)
+                except Exception as exc:  # noqa: BLE001 - HELO darf nicht brechen
+                    logger.debug("Firmware-Modell %s nicht registriert: %s",
+                                 model, exc)
+
                 # Start keepalive: Squeezelite declares the connection dead after
                 # ~35s without any server message ("No messages from server -
                 # connection dead"). Real LMS sends periodic frames. A 'setd'
@@ -1454,6 +1492,11 @@ class SlimProtoClient:
                         # All-zero means "no uuid" (Client.pm:167-168).
                         uuid=uuid_str,
                         model_name=display_name,
+                        # Perl's ``revision`` (Client.pm:107): the HELO's
+                        # revision byte, or the ``r<digits>`` tail of the caps
+                        # Firmware token — the same pair Perl's version regex
+                        # parses (`m/^([^ ]+)\sr(\d+)/`, Firmware.pm:329).
+                        revision=revision_of(firmware, revision),
                         # The player DECLARES its codecs in the HELO caps
                         # string (Perl SqueezePlay.pm:170-200); fall back to
                         # the model's static list only when it declares none.
@@ -1721,6 +1764,10 @@ class SlimProtoClient:
                     port=player_port,
                     model=model_name,
                     firmware=hello.revision.strip(),
+                    # Perl's ``revision`` (Client.pm:107) — this HELO carries it
+                    # as a single byte (HelloMessage.revision int), which is
+                    # what needsUpgrade compares against (Squeezebox.pm:250).
+                    revision=int(hello.revision) if str(hello.revision).isdigit() else 0,
                     # Legacy binary HELO (SB1-era hardware): no codec caps
                     # string in the frame, so the model's Perl list applies.
                     supported_formats=_formats_for_model(model_name),
@@ -3747,6 +3794,67 @@ class SlimProtoClient:
             logger.warning("send_vfdc to %s failed: %s", mac, exc)
             return False
 
+    async def send_updn(self, mac: str, payload: bytes = b" ") -> bool:
+        """Send an ``updn`` ("upgrade done") frame to a player.
+
+        Perl ``Slim/Player/Squeezebox.pm:488`` (``upgradeFirmware_SDK5``) and
+        ``Squeezebox2.pm:354`` (the ``FIRMWARE_MISSING`` callback) both send::
+
+            $client->sendFrame('updn', \\(' '));   # upgrade done
+
+        The payload is the single space character in both call sites — the
+        frame carries no data, the opcode IS the message. ``updn`` makes the
+        player disconnect and reconnect (that is why
+        ``Squeezebox2.pm:351-353`` waits for the display message to finish
+        before sending it), so this must only be called at the end of an
+        upgrade attempt.
+        """
+        mac_key = mac.upper().replace(":", "")
+        writer = self._player_writers.get(mac_key)
+        if writer is None or writer.is_closing():
+            logger.debug("send_updn: no writer for player %s", mac_key)
+            return False
+        frame = struct.pack(">H", len(b"updn") + len(payload)) + b"updn" + payload
+        try:
+            writer.write(frame)
+            await writer.drain()
+            logger.info("Sent updn (upgrade done) to %s", mac_key)
+            return True
+        except (ConnectionError, OSError, RuntimeError) as exc:
+            logger.warning("send_updn to %s failed: %s", mac_key, exc)
+            return False
+
+    async def send_upda(self, mac: str, chunk: bytes) -> bool:
+        """Send one ``upda`` firmware-image chunk to a player.
+
+        Perl ``Slim/Player/Squeezebox.pm:451-464`` (``upgradeFirmware_SDK5``)::
+
+            while ($bytesread = read(FS, my $buf, 1024)) {
+                assert(length($buf) == $bytesread);
+                $client->sendFrame('upda', \\$buf);
+                $totalbytesread += $bytesread;
+                …
+            }
+
+        Perl reads the image in 1024-byte blocks (``:453``) and sends one
+        ``upda`` frame per block, with nothing between the frames but the
+        progress display. The port keeps the payload opaque and lets the
+        caller chunk — ``send_upda`` writes exactly the bytes it is handed.
+        """
+        mac_key = mac.upper().replace(":", "")
+        writer = self._player_writers.get(mac_key)
+        if writer is None or writer.is_closing():
+            logger.debug("send_upda: no writer for player %s", mac_key)
+            return False
+        frame = struct.pack(">H", len(b"upda") + len(chunk)) + b"upda" + chunk
+        try:
+            writer.write(frame)
+            await writer.drain()
+            return True
+        except (ConnectionError, OSError, RuntimeError) as exc:
+            logger.warning("send_upda to %s failed: %s", mac_key, exc)
+            return False
+
     async def send_grfb(self, mac: str, brightness_code: int) -> bool:
         """Send a 'grfb' (display brightness) frame to a player.
 
@@ -3905,14 +4013,83 @@ class SlimProtoClient:
         upgradeFirmware()``). Perl never closes the control connection here —
         closing on ``BYE!`` was our own invention (audit B1, live: the frame
         went to the debug branch because we compared a lower-cased opcode
-        against ``"bye"``). We have no firmware image, so the request is
-        logged and the player keeps streaming.
+        against ``"bye"``).
         """
         logger.info("Player %s sent BYE! ('Saying goodbye')", mac_str)
         if payload == b"\x01":
-            logger.info(
-                "Player %s requests a firmware upgrade (BYE! chr(1)) — no "
-                "firmware image available, connection stays open", mac_str)
+            # Slimproto.pm:921-937 — the SDK4 request for the firmware push.
+            # Perl runs ``sleep(2); $client->unblock();
+            # $client->upgradeFirmware()``; the deliberate 2 s are not ported
+            # (our upgrade path is async and the connection stays open, so
+            # there is nothing to unblock) — the call itself is.
+            logger.info("Player %s requests a firmware upgrade (BYE! chr(1))",
+                        mac_str)
+            self._request_firmware_upgrade(mac_str, source="BYE!")
+
+    def _handle_update_request_frame(self, mac_str: str, payload: bytes) -> None:
+        """Perl ``_update_request_handler`` — ``Slimproto.pm:887-897``.
+
+        ::
+
+            sub _update_request_handler {
+                my $client = shift;
+                my $data_ref = shift;
+
+                # THIS IS ONLY FOR SDK5.X-BASED FIRMWARE OR LATER
+                main::INFOLOG && $log->info("Client requests firmware update.");
+
+                $client->unblock();
+
+                # Bug 3881, stop watching this client
+                delete $heartbeat{ $client->id };
+
+                $client->upgradeFirmware();
+            }
+
+        The payload is unused (:889) — the handler carries no request data. The
+        heartbeat delete is Bug 3881: while the upgrade is running the player
+        must not be closed by ``check_all_clients`` for a missed ``strm 't'``
+        poll, which the port mirrors by dropping the tracked heartbeat
+        timestamp for this player (:703-709 is where ``_stat_handler`` would
+        refresh it).
+
+        Perls ``$client->upgradeFirmware`` is the SDK5 method on
+        ``Squeezebox2`` (``Squeezebox2.pm:323-388``); the port routes it
+        through the player manager, which knows the model and the state flags.
+        """
+        main_log = logger
+        main_log.info("Client requests firmware update.")
+        # Bug 3881 (:893) — ``delete $heartbeat{ $client->id }``.
+        mac_key = mac_str.upper().replace(":", "")
+        self._heartbeats().pop(mac_key, None)
+        self._request_firmware_upgrade(mac_str, source="UREQ")
+
+    def _request_firmware_upgrade(self, mac_str: str, *, source: str) -> None:
+        """Hand a firmware-upgrade request to the player manager (async).
+
+        Both Perl entry points (``UREQ`` :887-897, ``BYE!`` chr(1) :921-937)
+        end in ``$client->upgradeFirmware()``. That method writes frames and
+        updates state, so it runs as a task on the running loop — the read loop
+        that got us here must not await it (a firmware error path displays a
+        message and the socket framing stays untouched).
+        """
+        async def _run() -> None:
+            try:
+                from lyrion.player.manager import PlayerManager
+                pm = PlayerManager()
+                await pm.upgrade_firmware(mac_str)
+            except Exception as exc:  # noqa: BLE001 — a bad request must not kill the loop
+                logger.warning("Firmware upgrade request (%s) for %s failed: %s",
+                               source, mac_str, exc)
+
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            # No event loop (bare unit-style call): do the work synchronously
+            # so the state change still happens, like Perl's direct call.
+            asyncio.run(_run())
+            return
+        loop.create_task(_run())
 
     def _handle_dsco_frame(self, mac_str: str, payload: bytes) -> None:
         """Perl ``_disco_handler`` — ``Slim/Networking/Slimproto.pm:599-679``.
@@ -3956,6 +4133,11 @@ class SlimProtoClient:
         handler = PERL_HANDLER_NAMES.get(op_raw, "?")
         logger.debug("Player %s frame %r -> Perl %s (%d bytes)",
                      mac_str, op_raw, handler, len(payload))
+        if op_raw == "UREQ":
+            # Perl ``_update_request_handler`` (Slimproto.pm:887-897): an
+            # SDK5 player asks the server to push a new firmware image.
+            self._handle_update_request_frame(mac_str, payload)
+            return
         if op_raw not in PERL_BUTTON_OPCODES:
             return
         try:

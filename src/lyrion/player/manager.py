@@ -74,6 +74,15 @@ STOPPED_TEXT = "Stopped"           # strings.txt:11107
 NOTHING_TEXT = "Nothing"           # strings.txt:469
 OUT_OF_TEXT = "of"                 # strings.txt:781
 
+#: ``Slim/Player/Squeezebox.pm:453`` — ``read(FS, my $buf, 1024)``: the image
+#: is pushed to the player in 1024-byte ``upda`` frames.
+FIRMWARE_CHUNK_SIZE = 1024
+
+#: ``showBriefly`` default duration for the FIRMWARE_MISSING block.
+#: ``Display.pm:258`` ``$args->{'duration'} || 1`` — Perl shows the message for
+#: one second before the ``updn`` callback fires (``Squeezebox2.pm:348-356``).
+DISPLAY_TEXT_DURATION_FALLBACK = 1
+
 
 def _library_db_path() -> str:
     """Pfad der Bibliotheks-DB (Test-/Dev-Läufe nutzen LYRION_SERVERDATA)."""
@@ -1019,6 +1028,7 @@ class PlayerManager:
         supported_formats: set[str] | None = None,
         uuid: str = "",
         model_name: str = "",
+        revision: int | None = None,
     ) -> PlayerState:
         """Register a new player or update an existing one.
 
@@ -1045,6 +1055,11 @@ class PlayerManager:
             model_name: The client's self-declared model name from the HELO
                 caps (ModelName=, SqueezePlay.pm:82) — e.g. "SB Player",
                 "SqueezeLite". Reported as 'modelname' in the players loop.
+            revision: The player's bare firmware REVISION number (Perl
+                ``Client.pm:107 revision``) — the integer ``needsUpgrade``
+                compares against (``Squeezebox.pm:250``). ``None`` means "not
+                supplied"; an existing player keeps its previous value, a new
+                one starts at 0 (Perl's ``|| return 0`` then never upgrades).
 
         Returns:
             The PlayerState for this player.
@@ -1073,6 +1088,9 @@ class PlayerManager:
                 player.name_source = name_source
             player.model = model or player.model
             player.firmware = firmware
+            if revision is not None:
+                # Client.pm's ``revision`` (the number needsUpgrade compares).
+                player.revision = int(revision)
             player.can_https = can_https
             if uuid:
                 player.uuid = uuid
@@ -1100,6 +1118,7 @@ class PlayerManager:
                 supported_formats=supported_formats or _formats_for_model(model),
                 uuid=uuid,
                 model_name=model_name,
+                revision=int(revision) if revision is not None else 0,
             )
             self.players[mac] = player
             logger.info("Player registered: %s (%s) [%s:%d] src=%s", name, mac, ip, port, name_source)
@@ -2022,6 +2041,206 @@ class PlayerManager:
             # playcontrolCommand's stop branch shows the status (Commands.pm:758-765).
             await self.notify_now_playing_display(player, "showbriefly")
         return ok
+
+    # ------------------------------------------------------------------
+    # Player-driven firmware upgrade (Perl UREQ / BYE! → upgradeFirmware)
+    # ------------------------------------------------------------------
+
+    def _firmware_search_dirs(self) -> list:
+        """Perl's ``(dirsFor('Firmware'), dirsFor('updates'))`` pair.
+
+        ``Squeezebox2.pm:334-335`` builds ``$file`` from
+        ``dirsFor('Firmware')`` and ``$file2`` from ``dirsFor('updates')`` and
+        ``:332-336``/``:362`` prefers the shipped image. Order matters, so the
+        two directories are returned in exactly that order.
+        """
+        from lyrion.platform.paths import dirs_for
+        from lyrion.utils.firmware import firmware_dirs, updates_dir
+
+        firm = list(firmware_dirs())
+        updates: list = []
+        try:
+            # The port's cache directory is ``dirsFor('updates')``'s parent —
+            # the same value the firmware service is started with
+            # (``web/app.py:1978`` ``config.cache_dir``, ``Firmware.pm:98``).
+            from lyrion.config import get_config
+            cache = get_config().cache_dir
+            if cache:
+                updates = [updates_dir(cache)]
+        except Exception as exc:  # noqa: BLE001 — a missing cache must not break the path
+            logger.debug("cache dir for firmware lookup unavailable: %s", exc)
+        if not firm:
+            # A source run has no shipped Firmware tree (OS.pm:143-176), so the
+            # directory list Perl would scan is the updates dir alone.  The
+            # ``dirs_for('Firmware')`` call is kept for a packaged install.
+            firm = [p for p in dirs_for("Firmware") if p is not None]
+        return firm + updates
+
+    async def upgrade_firmware(self, player_id: str) -> bool:
+        """Perl ``$client->upgradeFirmware()`` — ``Squeezebox2.pm:323-388``.
+
+        The SDK5 path (Squeezebox2/Transporter/Boom; ``Squeezebox1.pm:354-410``
+        is the SDK4 twin and shares the shape)::
+
+            my $to_version = $client->needsUpgrade();
+            if (!$to_version) { $to_version = $client->revision;
+                                $log->warn("upgrading to same rev: $to_version"); }
+            my $file  = catdir(dirsFor('Firmware'), $client->model . "_$to_version.bin");
+            my $file2 = catdir(dirsFor('updates'),  $client->model . "_$to_version.bin");
+            if (!-f $file && !-f $file2) { … FIRMWARE_MISSING … return 0 }
+            $client->stop();
+            $client->isUpgrading(1);
+            Slim::Control::Request::notifyFromArray($client, ['firmware_upgrade']);
+            my $err = $client->upgradeFirmware_SDK5($file);
+
+        The download of a missing image is NOT started here: Perl's
+        ``needsUpgrade`` (:327) schedules it in the background via
+        ``Slim::Utils::Firmware::downloadAsync`` and the request then falls into
+        the ``FIRMWARE_MISSING`` branch (:340-360), which is exactly what the
+        port does — the background download is the download task's job
+        (``utils.firmware``), not this one.
+
+        Returns True when an image was found and the push started.
+        """
+        player = self.get_player(player_id)
+        if player is None:
+            return False
+        handler = self._protocol_handler
+        if handler is None:
+            return False
+
+        model = getattr(player, "model", "") or ""
+        # Perl's needsUpgrade caches its answer on the client
+        # (``_needsUpgrade``, Squeezebox.pm:245-246/:307/:315).
+        target = getattr(player, "_needs_upgrade", None)
+        if target is None:
+            from lyrion.player.firmware import needs_upgrade as _needs_upgrade
+
+            decision = _needs_upgrade(
+                getattr(player, "revision", 0) or 0, model,
+                self._firmware_search_dirs())
+            player._needs_upgrade = decision.target
+            target = decision.target
+            if not target:
+                # Squeezebox2.pm:328-332 — ``!$to_version`` → use the player's
+                # own revision and warn.
+                logger.warning("upgrading to same rev: %s", getattr(player, "revision", 0))
+                target = int(getattr(player, "revision", 0) or 0)
+
+        from lyrion.player import firmware as player_firmware
+
+        image = player_firmware.choose_image(model, int(target),
+                                            self._firmware_search_dirs())
+        if image is None:
+            await self._firmware_missing(player, model, target)
+            return False
+
+        # Squeezebox2.pm:364 — ``$client->stop()`` before the transfer.
+        await self.stop_player(player.mac)
+        # Squeezebox2.pm:369 — ``$client->isUpgrading(1)``.
+        player.is_upgrading = True
+        # Squeezebox2.pm:372 — notify('firmware_upgrade').  Perl's verb string
+        # is literally ``firmware_upgrade`` even though the dispatch entry is
+        # ``client upgrade_firmware`` (Request.pm:643) — the notify path only
+        # matches the registered subscription, so the literal is kept.
+        from lyrion.control.notifications import notify_from_array
+
+        notify_from_array(player.mac, ["firmware_upgrade"])
+        await self._push_firmware(player, model, int(target), image)
+        return True
+
+    async def _firmware_missing(self, player: PlayerState, model: str,
+                                target) -> None:
+        """Perl ``Squeezebox2.pm:340-360`` — no image on disk.
+
+        Perls block::
+
+            $client->showBriefly({
+                'line' => [ $client->string('FIRMWARE_MISSING'),
+                            $client->string('FIRMWARE_MISSING_DESC') ]
+            }, {
+                'block' => 1, 'scroll' => 1, 'firstline' => 1,
+                'callback' => sub { $client->sendFrame('updn', \\(' ')); },
+            });
+            return(0);
+
+        The callback is the point: ``updn`` makes the player disconnect and
+        reconnect, so sending it while the message is still displayed would
+        lose the message (``:351-353``).  The port hands the frame send into
+        :meth:`DisplayWiring.show_briefly` as its completion callback.
+        """
+        from lyrion.i18n import get_string
+
+        line1 = get_string("FIRMWARE_MISSING", default="Error: Missing Firmware")
+        line2 = get_string("FIRMWARE_MISSING_DESC",
+                           default="Server can't connect to Internet to obtain firmware update.")
+        handler = self._protocol_handler
+        wiring = self.display_wiring()
+        updn_sent = False
+
+        async def _send_updn() -> None:
+            nonlocal updn_sent
+            if handler is not None and not updn_sent:
+                updn_sent = True
+                await handler.send_updn(player.mac)
+
+        if wiring is not None:
+            try:
+                # block=1 / scroll=1 / firstline=1 (Squeezebox2.pm:348-350) map
+                # to ``blocking`` (Display.pm:301 updateMode(2)); the callback
+                # runs from endAnimation (Display.pm:313-325) — a short sleep
+                # makes it follow the message, exactly like Perl's timer.
+                import asyncio as _asyncio
+
+                await wiring.show_briefly(
+                    player,
+                    text=[line1, line2],
+                    duration=DISPLAY_TEXT_DURATION_FALLBACK,
+                    blocking=True,
+                    sleep=_asyncio.sleep,
+                    callback=_send_updn,
+                )
+            except Exception as exc:  # noqa: BLE001 — Display darf nie stören
+                logger.warning("FIRMWARE_MISSING display for %s failed: %s",
+                               player.mac, exc)
+
+        # Perl's ``updn`` rides on the showBriefly CALLBACK (Squeezebox2.pm:354).
+        # A NoDisplay client (``squeezeplay``/``weirdbox``/…) never runs that
+        # callback — ``NoDisplay::showBriefly`` (NoDisplay.pm:24-35) only
+        # notifies and has no callback support — yet the player is still
+        # waiting for the upgrade-done frame to reconnect. The manager therefore
+        # guarantees the frame: the callback is idempotent (``updn`` is a
+        # terminal frame, Perl sends it once) and this direct send covers the
+        # display-less class. Without it a NoDisplay player would hang.
+        if wiring is None or not updn_sent:
+            await _send_updn()
+
+    async def _push_firmware(self, player: PlayerState, model: str, target,
+                             image) -> None:
+        """Perl ``upgradeFirmware_SDK5`` — ``Squeezebox.pm:395-500`` (the push).
+
+        Only the FRAME DELIVERY is ported here — the display progress screen
+        (``:420-475``) and the brightness handling ride on the display layer.
+        Perl reads the image in 1024-byte blocks (:453) and sends one ``upda``
+        per block, then ``updn`` (:488).  A read/open failure returns the error
+        string (:412) which the caller logs (``Squeezebox2.pm:378-381``).
+        """
+        handler = self._protocol_handler
+        if handler is None:
+            return
+        try:
+            with open(image, "rb") as handle:
+                while True:
+                    chunk = handle.read(FIRMWARE_CHUNK_SIZE)
+                    if not chunk:
+                        break
+                    await handler.send_upda(player.mac, chunk)
+        except OSError as exc:
+            logger.warning("Upgrade failed: Open failed for: %s: %s", image, exc)
+            return
+        # Squeezebox.pm:488 — ``$client->sendFrame('updn', \(' '));``
+        await handler.send_updn(player.mac)
+        logger.info("Firmware updated successfully: %s -> %s", model, image)
 
     async def pause_player(self, player_id: str, pause: bool) -> bool:
         """Pause (True) / resume (False) playback — NOT a stop+restart.

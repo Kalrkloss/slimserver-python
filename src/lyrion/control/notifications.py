@@ -124,6 +124,15 @@ class Notification:
                 verbs = list(candidate)
                 declared = NOTIFICATION_DISPATCH[candidate]
                 break
+        if not verbs:
+            # No dispatch leaf matched.  Perl still keeps the request: the
+            # object is built with ``_request => \@request`` (:987) and the
+            # tree walk only *parses* what it finds (:1008-1014) — an
+            # unregistered verb (``notifyFromArray(['firmware_upgrade'])``,
+            # Squeezebox2.pm:372) therefore survives with an empty parameter
+            # list and is delivered to subscribers as-is.  Dropping it here
+            # would silently swallow every notification Perl sends.
+            verbs = list(terms)
 
         params: list[tuple[str, Any]] = []
         index = len(verbs)
