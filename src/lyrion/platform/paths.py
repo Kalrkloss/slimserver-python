@@ -212,6 +212,24 @@ def dirs_for(
     environ = env if env is not None else os.environ
     h = _home(home)
 
+    if kind == "updates":
+        # Perl ``dirsFor('updates')`` — ``Slim/Utils/OS.pm:157-174``: the
+        # ``cachedir`` pref plus ``updates``, created on demand.  Firmware
+        # downloads land here (``Slim/Utils/Firmware.pm:98,171``); see
+        # ``utils/firmware.py`` ``updates_dir``.  It is OS-independent — the
+        # cache directory is the only input.
+        return []
+
+    if kind == "Firmware":
+        # Perl ``dirsFor('Firmware')`` has **no** branch in the base class
+        # (``Slim/Utils/OS.pm:143-176`` knows only ``Plugins`` and ``updates``),
+        # so a source run yields nothing.  Only the packaged Linux flavours add
+        # a shipped tree: ``OS/Debian.pm:50-52`` (and ``OS/RedHat.pm:42``)
+        # ``/usr/share/squeezeboxserver/Firmware``.
+        if is_linux(osname) and packaged:
+            return [Path("/usr/share/squeezeboxserver/Firmware")]
+        return []
+
     if is_windows(osname):
         # Win32.pm:485-560 writablePath(): registry DataPath, else
         # CSIDL_COMMON_APPDATA (%ProgramData%) + 'Lyrion' (Win32.pm:559).

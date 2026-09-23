@@ -382,6 +382,17 @@ class PreferenceStore:
             result[row["name"]] = self.get(row["name"])
         return result
 
+    def keys(self) -> list[str]:
+        """All known preference names (Perl ``keys %{$prefs->all}``).
+
+        Perl's ``PluginManager`` walks ``$prefs->all`` to find pending plugin
+        states (``PluginManager.pm:88,566,581``); this is the counterpart that
+        does not need the database.
+        """
+        names = set(self._cache) | set(self._cli_overrides) | set(self._conf_overrides)
+        names |= set(getattr(self, "_meta_cache", {}))
+        return sorted(names)
+
     async def close(self) -> None:
         """Close the database connection."""
         if self._db is not None:
@@ -709,6 +720,16 @@ class LyrionConfig:
             "scannerPriority", default=0, type_name="int", category="server")
         await prefs.init_preference("uuid", default="", category="server")
         await prefs.init_preference("password", default="", category="server")
+        # Server Settings → Software Updates.  Perl registers ``checkVersion``
+        # with default 1 and renders the checkbox in
+        # ``Slim/Web/Settings/Server/Software.pm:23-27``;
+        # ``Slim/Utils/Firmware.pm:118`` gates the firmware download on it.
+        # ``checkVersionInterval`` sits next to it (``Software.pm:23-27``), the
+        # interval a manual check waits for.
+        await prefs.init_preference(
+            "checkVersion", default=1, type_name="bool", category="server")
+        await prefs.init_preference(
+            "checkVersionInterval", default=86400, type_name="int", category="server")
         await prefs.init_preference("username", default="", category="server")
         await prefs.init_preference("authorize", default=0, type_name="bool", category="server")
         await prefs.init_preference("language", default="en", category="i18n")

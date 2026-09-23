@@ -1907,6 +1907,32 @@ async def _wanted_background_shutdown() -> None:
     logger.info("Artwork-Downloader: Hintergrund-Dienst angehalten")
 
 
+async def _firmware_startup(cache_dir, prefs) -> None:
+    """Firmware-Check-Dienst starten — Perl ``Firmware::init`` + Timer.
+
+    Perl richtet die beiden Verzeichnisse in ``init()`` ein
+    (``Slim/Utils/Firmware.pm:72-80``) und plant den Nachlade-Zyklus per
+    ``Timers::setTimer`` (``:193-200``).  Der Dienst läuft im Serverprozess,
+    rührt den Wiedergabepfad aber nicht an: die ``/firmware/``-Route liest nur
+    die Registrierung.
+    """
+    from lyrion.utils.firmware import CHECK_INTERVAL
+    from lyrion.utils.firmware_service import init_service, start_service
+
+    init_service(cache_dir, prefs=prefs)
+    started = await start_service()
+    logger.info("Firmware-Check: gestartet=%s (Intervall %s s)", started,
+                CHECK_INTERVAL)
+
+
+async def _firmware_shutdown() -> None:
+    """Firmware-Check-Dienst anhalten (Server-Shutdown)."""
+    from lyrion.utils.firmware_service import stop_service
+
+    await stop_service()
+    logger.info("Firmware-Check: Hintergrund-Dienst angehalten")
+
+
 def create_app(
     host: str = "0.0.0.0",
     port: int = 9000,
@@ -1943,6 +1969,15 @@ def create_app(
                     await _wanted_background_startup()
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("Artwork-Downloader nicht gestartet: %s", exc)
+                # Firmware-Check-Dienst (Perl Firmware.pm:72-80, :193-200).
+                # Auch hier gilt: ein Fehler darf den Start nicht brechen.
+                try:
+                    from lyrion.config import get_config, get_prefs
+
+                    config = get_config()
+                    await _firmware_startup(config.cache_dir, get_prefs())
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("Firmware-Check nicht gestartet: %s", exc)
                 await send({"type": "lifespan.startup.complete"})
             elif message.get("type") == "lifespan.shutdown":
                 try:
@@ -1950,6 +1985,10 @@ def create_app(
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("Artwork-Downloader nicht sauber angehalten: %s",
                                    exc)
+                try:
+                    await _firmware_shutdown()
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("Firmware-Check nicht sauber angehalten: %s", exc)
                 await send({"type": "lifespan.shutdown.complete"})
                 return
 
@@ -2009,6 +2048,50 @@ def create_app(
                     await _serve_album_cover(
                         cover_id, send, cover_size, cover_mode, cover_fmt)
                 return
+
+        # Firmware distribution: /firmware/<model>_<ver>_r<rev>.bin.
+        # Perl registers the route with Slim::Web::Pages->addRawDownload:
+        #   Firmware.pm:188,227,270  "^firmware/${model}.*\.bin"  MIME 'binary'
+        #   Firmware.pm:112          "^firmware/custom.$model.bin"
+        # Slim/Web/Pages.pm serves the file bytes with Content-Type 'binary'.
+        # The lookup is a registry read (already-downloaded files only) — it
+        # never downloads, so a player request cannot block on the network.
+        if path.startswith("/firmware/") and method in ("GET", "HEAD"):
+            from lyrion.utils.firmware_service import serve_path
+
+            hit = serve_path(path)
+            if hit is None:
+                await send({
+                    "type": "http.response.start",
+                    "status": 404,
+                    "headers": [(b"Content-Type", b"text/plain")],
+                })
+                await send({"type": "http.response.body", "body": b"not found"})
+                return
+            fw_file, fw_mime = hit
+            try:
+                fw_body = fw_file.read_bytes()
+            except OSError:
+                await send({
+                    "type": "http.response.start",
+                    "status": 404,
+                    "headers": [(b"Content-Type", b"text/plain")],
+                })
+                await send({"type": "http.response.body", "body": b"not found"})
+                return
+            await send({
+                "type": "http.response.start",
+                "status": 200,
+                "headers": [
+                    (b"Content-Type", fw_mime.encode()),
+                    # Perl answers finite bodies with Content-Length; a chunked
+                    # firmware reply would stall the player's HTTP fetch.
+                    (b"Content-Length", str(len(fw_body)).encode()),
+                ],
+            })
+            await send({"type": "http.response.body",
+                        "body": b"" if method == "HEAD" else fw_body})
+            return
 
         # Perl's ImageProxy (deviation D5): /imageproxy/<uri-escaped url>/<spec>.
         # Perl routes it in Slim/Web/HTTP.pm:1208-1212 to
