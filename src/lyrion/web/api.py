@@ -12,6 +12,13 @@ import time
 import urllib.parse
 from typing import Any, Callable, Optional
 
+#: ``Slim/Utils/Firmware.pm:327`` — ``($cur_version, $cur_rev) = $current =~ m/^([^ ]+)\sr(\d+)/``
+#: against what a client reports as ``firmwareVersion``.  The same pattern
+#: lives in :data:`lyrion.utils.firmware.VERSION_FILE_RE`; it stays local
+#: because that module is only imported inside the handler (lazy), while this
+#: constant is free of dependencies.
+_FW_PROTOCOL_REV_RE = re.compile(r"\sr(\d+)")
+
 #: Perl's directory rows (``content_type = 'dir'``) — the folder-id model the
 #: browse and the songs/titles filters use.  Imported at module level: it is
 #: dependency-free (stdlib + ``lyrion.platform.paths``, which is loaded
@@ -3282,6 +3289,35 @@ class JSONRPCAPI:
     # Built-in methods
     # ------------------------------------------------------------------
 
+    def _firmware_server_url(self) -> str:
+        """``Slim::Utils::Network::serverURL()`` for the firmware URL.
+
+        Perl builds ``serverURL() . '/firmware/' . basename($file)``
+        (``Firmware.pm:309``); its ``serverURL`` is
+        ``http://<ip>:<httpport>`` with **http**, never https, and the address
+        the player can reach.  The two ingredients are the ones this class
+        already uses for ``serverstatus`` (:4217-4233) and for the discovery
+        beacon: the LAN IP as seen from the default route
+        (:func:`lyrion.utils.network.get_local_ip`) and the ONE advertised
+        public HTTP port (:func:`lyrion.config.public_http_port`).
+
+        Falls back to loopback (``http://127.0.0.1:<port>``) exactly like
+        ``serverstatus`` does when the probe fails — a wrong host is still
+        better than advertising a URL the client cannot parse.
+        """
+        local_ip = "127.0.0.1"
+        try:
+            from lyrion.utils.network import get_local_ip
+            local_ip = get_local_ip() or local_ip
+        except Exception:  # noqa: BLE001 — kein Netz-Interface verfügbar
+            pass
+        try:
+            from lyrion.config import public_http_port
+            http_port = public_http_port()
+        except Exception:  # noqa: BLE001
+            http_port = 9000
+        return f"http://{local_ip}:{http_port}"
+
     async def _server_version(self) -> str:
         from lyrion.version import __version__
         return __version__
@@ -5361,13 +5397,50 @@ class JSONRPCAPI:
             return {"count": 0}                # Live: jivewallpapers/jivesounds
 
         # ── firmwareupgrade (Jive.pm:2196-2229, needClient = 0) ───────
-        # Perl liefert firmwareUrl/relativeFirmwareUrl nur, wenn für das
-        # Modell ein Firmware-File vorliegt (Firmware.pm:288-310); ohne
-        # Download-Quelle ist ``need_upgrade`` undef → 0. Unser Server
-        # verteilt keine Jive-Firmware (kein /firmware/-Route) → keinen URL
-        # anbieten, sonst schickt der Client ein Upgrade ins Leere.
+        # Echter Zustand statt hart 0: Modell + firmwareVersion kommen aus
+        # den Parametern (Jive.pm:2204-2205), die URL nur bei vorhandenem
+        # Image (Firmware.pm:307-309) und das Flag aus ``need_upgrade``
+        # (Firmware.pm:319-348). Alle drei sind als CLI-Token an die
+        # Jive-Dispatch-Parameter ``machine``/``firmwareVersion`` gebunden
+        # (Jive.pm:135-136) und laufen deshalb über denselben
+        # ``_jive_params``-Parser wie die übrigen Menü-Queries.
         if cmd == "firmwareupgrade":
-            return {"firmwareUpgrade": 0}
+            _, tagged = _jive_params(args, [])
+            model = tagged.get("machine") or "jive"   # Jive.pm:2205
+            version = tagged.get("firmwareVersion")   # Jive.pm:2204
+
+            from lyrion.utils import firmware as _fw
+            from lyrion.utils import firmware_service as _fws
+
+            # Jive.pm:2208 → Firmware.pm:288-297: ein unbekanntes Modell
+            # stößt den Download an (Perl ``init_firmware_download``), hat
+            # aber in DIESEM Aufruf noch kein ``file`` → keine URL.
+            _fws.ensure_model(model)
+            service = _fws.get_service()
+            registry = service.registry if service is not None else None
+
+            result: dict = {}
+            url = (registry.url_for(model, server_url=self._firmware_server_url())
+                   if registry is not None else None)
+            if url:                                   # Firmware.pm:307-309
+                # Bug 6828 (Jive.pm:2210-2219): ein Client ab r1659 bekommt
+                # den relativen Pfad, sonst die volle URL. ``directFirmware-
+                # Download`` ist auf unserem Port immer falsch (kein
+                # BASE/BASE_FOLDER-Direktpfad ohne ``file``) und die URL nie
+                # https — Perl nimmt damit ebenfalls den relativen Zweig.
+                match = _FW_PROTOCOL_REV_RE.search(str(version or ""))
+                if match and int(match.group(1)) >= 1659:
+                    result["relativeFirmwareUrl"] = urllib.parse.urlsplit(url).path
+                else:
+                    result["firmwareUrl"] = url
+
+            available = registry.get(model) if registry is not None else None
+            # Jive.pm:2222-2228: 1 nur bei wahrer Prüfung, sonst 0 — Perl
+            # schreibt das Feld immer (Live: ``firmwareUpgrade 0``).
+            result["firmwareUpgrade"] = int(bool(
+                available and _fw.model_needs_upgrade(str(version or ""), available)
+            ))
+            return result
 
         # ── jiverecentsearches (Jive.pm:2768-2797, needClient = 0) ────
         if cmd == "jiverecentsearches":

@@ -71,7 +71,9 @@ jsonrpc.js):
   ``cmd`` ``["playlists","delete"]``.
 * ``jiverecentsearches`` → ``{"count":"1","offset":0,"item_loop":[{"text":
   "Leer","style":"itemNoAction","action":"none"}]}`` (``count`` STRING).
-* ``firmwareupgrade`` → ``{"firmwareUpgrade":0}`` (ohne Firmware-File),
+* ``firmwareupgrade`` → echter Zustand (``Firmware.pm:288-310``/``:319-348``):
+  ohne Image ``{"firmwareUpgrade":0}``, mit Image ``firmwareUrl`` (bzw. ab
+  r1659 ``relativeFirmwareUrl``, Bug 6828) plus Need-upgrade-Flag,
   ``jivewallpapers``/``jivesounds`` → ``{"count":0}``.
 """
 
@@ -85,6 +87,8 @@ import pytest
 from lyrion.alarms import Alarm, AlarmManager
 from lyrion.player.manager import PlayerManager
 from lyrion.player.state import PlayerState
+from lyrion.utils import firmware as fw
+from lyrion.utils import firmware_service as fws
 from lyrion.web.api import JSONRPCAPI
 
 MAC = "1C:87:2C:47:FC:36"           # unser Client (SqueezePlay, NoDisplay)
@@ -718,11 +722,82 @@ def test_jive_recent_searches_is_empty_like_perl_live():
 
 
 def test_firmware_upgrade_without_a_firmware_file():
-    # Firmware.pm:288-310 liefert ohne Firmware-File keinen URL; need_upgrade
-    # ist dann undef → 0 (Live ohne Download-Quelle: {"firmwareUpgrade":0}).
-    assert _req(["firmwareupgrade"]) == {"firmwareUpgrade": 0}
-    assert _req(["firmwareupgrade", "machine:jive",
-                 "firmwareVersion:7.7.3 r16676"]) == {"firmwareUpgrade": 0}
+    # Firmware.pm:307-309 liefert ohne Firmware-File keinen URL; ``need_upgrade``
+    # ist dann undef → 0 (Jive.pm:2222-2228). Live gegen Perl 9.1.1
+    # (192.168.1.90:9000) für ein unbekanntes Modell:
+    #   ["firmwareupgrade","machine:nosuchmodelxyz"] → {"firmwareUpgrade":0}
+    # Genau so, wenn gar kein Firmware-Dienst läuft (Server-Boot).
+    fws.reset_service()
+    try:
+        assert _req(["firmwareupgrade"]) == {"firmwareUpgrade": 0}
+        assert _req(["firmwareupgrade", "machine:jive",
+                     "firmwareVersion:7.7.3 r16676"]) == {"firmwareUpgrade": 0}
+        assert _req(["firmwareupgrade",
+                     "machine:nosuchmodelxyz"]) == {"firmwareUpgrade": 0}
+    finally:
+        fws.reset_service()
+
+
+def _with_fake_jive_image(tmp_path, *, version="7.8.0", revision=16739):
+    """Registriert ein Jive-Image wie Perl's ``%$firmwares`` (Firmware.pm:264-268).
+
+    Perl-Referenz-Live-Antworten (192.168.1.90, jive_7.8.0_r16739.bin):
+      ["firmwareupgrade"]                              → firmwareUrl + Upgrade 0
+      ["firmwareupgrade","firmwareVersion:7.0 r1658"]  → firmwareUrl + Upgrade 1
+      ["firmwareupgrade","firmwareVersion:7.0 r1659"]  → relativeFirmwareUrl + 1
+    """
+    image = tmp_path / f"jive_{version}_r{revision}.bin"
+    image.write_bytes(b"\x00fake")
+    service = fws.init_service(tmp_path)
+    service.registry.register(fw.FirmwareInfo(
+        model="jive", version=version, revision=revision, file=image))
+    return service
+
+
+def test_firmware_upgrade_with_an_image_matches_perl_live(tmp_path, monkeypatch):
+    """Mit Image: echter URL + Upgrade-Flag statt hart 0 (Jive.pm:2208-2228)."""
+    monkeypatch.setattr(JSONRPCAPI, "_firmware_server_url",
+                        lambda self: "http://192.168.1.90:9000")
+    _with_fake_jive_image(tmp_path)
+    try:
+        # Kein firmwareVersion → Perl nimmt den vollen URL-Zweig
+        # (:2213, $cur_rev ist undef) und meldet kein Update.
+        assert _req(["firmwareupgrade"]) == {
+            "firmwareUrl": "http://192.168.1.90:9000/firmware/jive_7.8.0_r16739.bin",
+            "firmwareUpgrade": 0,
+        }
+        # r1658 < 1659 → firmwareUrl; Version verschieden → Upgrade 1 (:336-340).
+        assert _req(["firmwareupgrade", "firmwareVersion:7.0 r1658"]) == {
+            "firmwareUrl": "http://192.168.1.90:9000/firmware/jive_7.8.0_r16739.bin",
+            "firmwareUpgrade": 1,
+        }
+        # Bug 6828: ab r1659 der RELATIVE Pfad (URI->new($url)->path).
+        assert _req(["firmwareupgrade", "firmwareVersion:7.1 r1659",
+                     "machine:jive"]) == {
+            "relativeFirmwareUrl": "/firmware/jive_7.8.0_r16739.bin",
+            "firmwareUpgrade": 1,
+        }
+        # Gleiche Version/Revision → kein Update (Live: firmwareUpgrade 0).
+        assert _req(["firmwareupgrade", "firmwareVersion:7.8.0 r16739"]) == {
+            "relativeFirmwareUrl": "/firmware/jive_7.8.0_r16739.bin",
+            "firmwareUpgrade": 0,
+        }
+        # Unparsbare Version → need_upgrade undef/False, URL wie bei r<1659
+        # (Live: firmwareVersion:nonsense → firmwareUrl + 0).
+        assert _req(["firmwareupgrade", "firmwareVersion:nonsense"]) == {
+            "firmwareUrl": "http://192.168.1.90:9000/firmware/jive_7.8.0_r16739.bin",
+            "firmwareUpgrade": 0,
+        }
+    finally:
+        fws.reset_service()
+
+
+def test_firmware_server_url_uses_advertised_host_and_port(monkeypatch):
+    """``_firmware_server_url`` = serverURL(): LAN-IP + öffentlicher HTTP-Port."""
+    monkeypatch.setattr("lyrion.utils.network.get_local_ip",
+                        lambda *a, **kw: "10.0.0.7")
+    monkeypatch.setattr("lyrion.config.public_http_port", lambda *a, **kw: 9000)
+    assert JSONRPCAPI()._firmware_server_url() == "http://10.0.0.7:9000"
 
 
 @pytest.mark.parametrize("cmd", ["jiveapplets", "jivewallpapers",
