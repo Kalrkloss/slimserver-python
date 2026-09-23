@@ -381,24 +381,45 @@ def _album_shuffle(player: PlayerState, preserve: int | None) -> list[int]:
             index = int(index) if index is not None else None
         except (TypeError, ValueError):
             index = None
+        # :923 ``$realsong = $listRef->[$index]`` — ``$listRef`` ist die
+        # ALTE shufflelist, ``$index`` der gespeicherte Pref (Queue-Position).
+        # Fehlt die Liste (frischer Player), ist Perls Liste die Identitaet
+        # (``playlist``), der Index zeigt dann direkt auf den Playlist-Eintrag.
         old = list(getattr(player, "shufflelist", None) or [])
-        if index is not None and 0 <= index < len(old):
-            preserve = old[index]
+        if index is not None and 0 <= index < max(len(old), len(playlist)):
+            preserve = old[index] if index < len(old) else index
+    # :919-931 ``my $currentTrack = ${playList($client)}[$realsong]`` — der
+    # ``$realsong`` IST der Playlist-Index (kein Shuffle-Griff mehr).
     current_album = 0
     if preserve is not None and 0 <= preserve < len(playlist):
         entry = playlist[preserve]
         if isinstance(entry, int):
-            current_album = album_of.get(int(entry), 0) or 0   # :919-931
-    albums = list(album_tracks)                          # :934
-    fischer_yates_shuffle(albums)                        # :936
-    for idx, album in enumerate(albums):                 # :939-949
-        if preserve is not None and album == current_album:
-            albums.insert(0, albums.pop(idx))
+            current_album = album_of.get(int(entry), 0) or 0   # :938-940
+    albums = list(album_tracks)                          # :942-943
+    fischer_yates_shuffle(albums)                        # :945
+    for idx, album in enumerate(albums):                 # :948-955
+        if album == current_album:
+            albums.pop(idx)
+            albums.insert(0, album)
             break
-    new: list[int] = []                                  # :952-961
+    new: list[int] = []                                  # :958-961
     for album in albums:
         for raw in album_tracks[album]:
             new.append(track_to_position[raw])
+    # Nach dem Umbau wird das Vorliek fortgeschrieben bzw. verworfen (Perl: der
+    # aufrufende ``playlist``-Befehl, ``Playlist.pm:1127-1141``).  Der Pref-Wert
+    # ist die NEUE Queue-Position des laufenden Titels — hier, nach :963-980.
+    # ``_album_shuffle`` hat den Eintrag in einen bestehenden Store geschrieben
+    # (der alte Wert ist verbraucht, :921-928); dieser Store ist die Wahrheit:
+    # ein Index ausserhalb der neuen Liste wird geloescht, damit :925-928 nicht
+    # mit einem ungültigen Wert weiterrechnet.
+    prefs = getattr(player, "playerprefs", None)
+    if prefs is not None and "currentSong" in prefs:
+        pos = int(getattr(player, "playlist_position", 0) or 0)
+        if 0 <= pos < len(playlist):
+            prefs["currentSong"] = pos
+        else:
+            del prefs["currentSong"]
     return new
 
 
@@ -492,6 +513,12 @@ def shufflelist(player: PlayerState) -> list[int]:
     current = list(getattr(player, "shufflelist", None) or [])
     built_for = int(getattr(player, "shufflelist_mode", -1))
     if built_for != mode or len(current) != count or sorted(current) != list(range(count)):
+        # Der laufende Titel steht in der ALTEN Liste — ins Vorliek, BEVOR
+        # ``reshuffle`` den Queue-Eintrag auf die neue Position umnummeriert
+        # (:963-980) und damit zuruecksetzt.  Perl schreibt es im Befehls-Weg
+        # (``Client.pm:630``, ``Playlist.pm:1136-1141``), also genau vor dem
+        # Reshuffle; ``reshuffle`` liest es in :921-928 wieder aus.
+        save_current_song(player)
         reshuffle(player)
         current = list(getattr(player, "shufflelist", None) or [])
     return current
@@ -545,6 +572,64 @@ def playlist_queue_position(player: PlayerState, item) -> int | None:
     return lst.index(raw) if raw in lst else None
 
 
+def playing_queue_position(player: PlayerState) -> int:
+    """Perl ``Slim::Player::Source::playingSongIndex($client)``.
+
+    ``Source.pm:229-233``:: ``my $song = $client->currentsongqueue()->[1];
+    my $index; $index = $song->index() if $song; return defined $index ?
+    $index : 0;`` — the QUEUE position of the playing song, and the value
+    Perl writes into the ``currentSong`` player pref
+    (``Client.pm:630``, ``Playlist.pm:1141``).  ``playlist_position`` tracks
+    that same index in this port; when it points past the playlist the
+    position of the current track is used, else 0.
+    """
+    items = list(getattr(player, "playlist", None) or [])
+    index = int(getattr(player, "playlist_position", 0) or 0)
+    if not items:
+        return 0
+    if 0 <= index < len(items):
+        return index
+    track_id = getattr(player, "current_track_id", None)
+    if track_id is not None and track_id in items:
+        position = playlist_queue_position(player, track_id)
+        if position is not None:
+            return position
+    return 0
+
+
+def save_current_song(player: PlayerState) -> int:
+    """Perl's ``prefs->client($client)->set('currentSong', $currsong)``.
+
+    ``Slim/Player/Client.pm:630`` (``initial_add_done``) and
+    ``Slim/Player/Playlist.pm:1141`` (``savePlaylist``'s ``$saveCurrentSong``
+    branch, ``:1136-1141``) write the **queue position** of the playing song.
+    ``$currsong = (shuffleList($client))->[playingSongIndex($client)]`` is the
+    PLAYLIST index — but only for the m3u pointer written right before
+    (``:1138``); the preference itself receives the queue position its caller
+    computed (``initial_add_done``'s ``$currsong`` comes from the saved m3u and
+    is consumed as a shuffle-list value, ``Client.pm:596`` + ``:590``, so :630
+    stores a queue position again).
+
+    Perl calls this whenever the playlist or the current song changes
+    (``$request->isCommand([['playlist'], ['open', 'newsong', 'jump', 'index',
+    'shuffle']])``, ``Playlist.pm:1128-1129``, or a plain ``playlist`` command,
+    ``:1127``).  The value is read back in ``reshuffle`` (:923) to keep the
+    running song's album in front of an album shuffle, and on startup
+    (``Client.pm:596-630``) to jump to the song the player was on.
+
+    Ours cannot hook Perl's request dispatcher, so the pref is maintained
+    lazily like ``shufflelist``: this function is called from the places that
+    resolve the playing song for a status/queue answer
+    (:func:`queue_order`, the web status path) and the stored value is what
+    ``reshuffle`` falls back to when it is passed no explicit index
+    (:908-917).  Returns the stored value.
+    """
+    if getattr(player, "playerprefs", None) is None:
+        player.playerprefs = {}
+    return player.playerprefs.setdefault("currentSong",
+                                         playing_queue_position(player))
+
+
 def queue_order(player: PlayerState) -> list:
     """The playlist in QUEUE order — Perl ``Playlist::songs($client, 0, n)``.
 
@@ -558,6 +643,11 @@ def queue_order(player: PlayerState) -> list:
     lst = shufflelist(player)
     if len(lst) != len(items):
         return items
+    # A client that is looking at the queue sees *this* moment's playing song
+    # at the front — Perl writes the pref on the same change that reshuffles
+    # (Playlist.pm:1136-1141 within savePlaylist, Client.pm:630 in
+    # initial_add_done), and ``reshuffle`` reads it back in :923.
+    save_current_song(player)
     return [items[raw] for raw in lst]
 
 
@@ -657,6 +747,10 @@ def nextsong(player: PlayerState, currsong: int | None = None) -> int | None:
         nxt = 0
     if not repeat and nxt == 0:
         return None                                     # :897
+    # ``playlist newsong``/``jump``/``index`` schreiben das Vorliek
+    # (``Client.pm:630``, ``Playlist.pm:1128-1141``) — der Auto-Advance ist
+    # genau dieser Weg.
+    save_current_song(player)
     return nxt
 
 
@@ -2313,6 +2407,7 @@ class PlayerManager:
         shuffle on the new entries get their positions in the shuffle list
         (``Commands.pm:1766`` ``reshuffle($client, undef)`` — the current song
         is preserved and ends up at the top of the list, ``Playlist.pm:857-877``).
+        ``playlist``-Befehle schreiben das Vorliek (``Playlist.pm:1127-1141``).
         """
         player = self.get_player(player_id)
         if player is None:
@@ -2325,6 +2420,7 @@ class PlayerManager:
         else:
             player.shufflelist = list(range(len(player.playlist)))
             player.shufflelist_mode = 0
+        save_current_song(player)
         player.last_activity = time.time()
         return True
 
@@ -2472,6 +2568,10 @@ class PlayerManager:
         item = playlist_item(player, index)              # :78-84
         if item is None:
             return False
+        # Perl's ``playlist jump``/``playlist index`` schreibt den laufenden
+        # Titel ins Vorliek (``Playlist.pm:1127-1141`` ``$saveCurrentSong``:
+        # ``$request->isCommand([['playlist'], ['jump', 'index']])``).
+        save_current_song(player)
         if not isinstance(item, int):
             # Stream URL entry — send the strm frame for the remote source.
             handler = self._protocol_handler

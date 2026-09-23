@@ -273,6 +273,70 @@ def test_perl_types_for_shuffle_repeat_and_cur_index(tmp_path, monkeypatch):
     assert r["playlist shuffle"] == 1
     assert r["playlist repeat"] == 2
     assert isinstance(r["playlist_cur_index"], str)
+    # `playlist_position` is a QUEUE position and the status reports it
+    # unchanged (Queries.pm:4208) — the shuffle only decides WHICH entry that
+    # position plays (Playlist::track, Playlist.pm:78-84), not the index.
+    assert r["playlist_cur_index"] == str(player.playlist_position)
+    # The queue position in the answer is the position in the QUEUE order
+    # (Playlist::songs, :104-118), so the item at ``playlist_cur_index`` must
+    # resolve to ``playlist[shufflelist[position]]`` (:78-84) — and the answer
+    # carries only that one window item (``status - 1``).
+    lst = getattr(player, "shufflelist", None) or [0, 1, 2]
+    assert r["playlist_loop"][player.playlist_position]["params"]["track_id"] == \
+        player.playlist[lst[player.playlist_position]]
+    assert r["playlist_loop"][player.playlist_position]["playlist index"] == \
+        player.playlist_position
+
+
+def test_playlist_loop_shows_the_queue_order_not_the_raw_playlist(tmp_path, monkeypatch):
+    """Punkt 1: ``playlist_loop`` folgt ``Playlist::songs`` (``:104-118``).
+
+    ``(@{ playList($client) }[ @{ shuffleList($client) } ])[$start .. $end]`` —
+    die Queue-Reihenfolge, nicht die rohe Playlist. Die ``playlist index``-
+    Felder sind Positionen in DIESER Reihenfolge (:4425 ``normalize``), und der
+    laufende Titel sitzt an ``playingSongIndex``.
+    """
+    monkeypatch.setattr(api_mod, "_library_db_path", lambda: _db(tmp_path))
+    # ``status - 1`` (Menge 1) liefert nur das Item an ``playlist_cur_index`` —
+    # die Fensterung ist Perl-identisch (Queries.pm:4425-4431).  Ohne
+    # Mengenangabe kommt das ganze Fenster, dann ist die Reihenfolge sichtbar.
+    player = _player([11, 12, 13], 1, mode="play", elapsed=3.0, shuffle=1)
+    player.shufflelist = [2, 0, 1]                # Queue: 13, 11, 12
+    player.shufflelist_mode = 1
+
+    r = _status(player, ["status", "-", "0", "100"])
+
+    ids = [it["id"] for it in r["playlist_loop"]]
+    assert ids == [13, 11, 12], "Queue-Reihenfolge, nicht [11, 12, 13]"
+    assert [it["playlist index"] for it in r["playlist_loop"]] == [0, 1, 2]
+    # Position 1 spielt playlist[shufflelist[1]] == 11
+    assert r["playlist_loop"][1]["params"]["track_id"] == 11
+    assert r["playlist_cur_index"] == "1"
+
+
+def test_playing_entry_resolves_through_the_shufflelist(tmp_path, monkeypatch):
+    """Der laufende Eintrag ist ``playlist[shufflelist[position]]`` (:78-84)."""
+    monkeypatch.setattr(api_mod, "_library_db_path", lambda: _db(tmp_path))
+    player = _player([11, 12, 13], 2, mode="play", elapsed=3.0, shuffle=1)
+    player.shufflelist = [2, 0, 1]
+    player.shufflelist_mode = 1
+
+    r = _status(player)
+
+    # Queue-Position 2 spielt playlist[shufflelist[2]] == playlist[1] == 12
+    assert r["playlist_loop"][0]["params"]["track_id"] == 12
+
+
+def test_status_off_keeps_the_raw_order(tmp_path, monkeypatch):
+    """Mit ``shuffle 0`` ist die Queue-Reihenfolge die rohe Playlist (:826)."""
+    monkeypatch.setattr(api_mod, "_library_db_path", lambda: _db(tmp_path))
+    player = _player([11, 12, 13], 1, mode="play", elapsed=3.0, shuffle=0)
+
+    r = _status(player, ["status", "-", "0", "100"])
+
+    assert [it["id"] for it in r["playlist_loop"]] == [11, 12, 13]
+    # Position 1 spielt playlist[1] == 12 (Identitaetsliste)
+    assert r["playlist_loop"][1]["params"]["track_id"] == 12
     assert r["playlist_cur_index"] == "1"
 
 

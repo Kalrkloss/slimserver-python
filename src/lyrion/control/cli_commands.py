@@ -2601,6 +2601,15 @@ async def cmd_playlist(
                                      results=[(f"_{sub}", value)])
             if player4 is not None:
                 setattr(player4, sub, max(0, min(2, int(str(rest[0])))))
+                # Perl ``playlistShuffleCommand`` mischt sofort neu:
+                # ``Slim::Player::Playlist::shuffle($client, $newvalue);
+                # Slim::Player::Playlist::reshuffle($client);``
+                # (``Slim/Control/Commands.pm:1194-1195``). Ohne das blieb die
+                # alte Queue-Reihenfolge stehen und ``status``/``playlist
+                # tracks`` zeigten weiter die rohe Playlist.
+                if sub == "shuffle":
+                    from lyrion.player.manager import reshuffle
+                    reshuffle(player4)
             return _command_echo(["playlist", sub], rest, ["_newvalue"],
                                  clientid=ctx.player_id)
         if sub == "loop":

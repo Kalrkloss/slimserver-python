@@ -6101,7 +6101,22 @@ class JSONRPCAPI:
             return int(text) if text.isdigit() else None
 
         loop = []
-        playlist_ids = getattr(player, "playlist", []) or []
+        # Perl builds `playlist_loop`/`item_loop` from `Playlist::songs`
+        # (`(@{ playList($client) }[ @{ shuffleList($client) } ])[$start .. $end]`,
+        # Playlist.pm:104-118), i.e. from the QUEUE order — with shuffle on the
+        # client sees the mixed order, not the order the tracks were added in.
+        # Our `player.playlist` is Perl's raw `playlist` (add order) and it is
+        # `playlist[shufflelist[i]]` that plays at queue position `i`
+        # (`Playlist::track`, :78-84).  The status window and every
+        # "playlist index"/params.playlist_index below are QUEUE positions, so
+        # the loop MUST be built in queue order — the raw list made `status -
+        # 1` answer a track that is not the playing one while shuffle is on.
+        from lyrion.player.manager import queue_order, save_current_song
+        playlist_ids = queue_order(player)
+        # Das Vorliek `playerprefs.currentSong` pflegt Perl bei jeder
+        # Playlist-/Titel-Aenderung (Client.pm:630, Playlist.pm:1136-1141);
+        # hier wird es beim Aufloesen der Statusantwort mitgeschrieben.
+        save_current_song(player)
         int_ids = [x for x in (_local_id(e) for e in playlist_ids) if x is not None]
         track_rows = await self._load_tracks(int_ids) if int_ids else {}
 
@@ -6128,6 +6143,8 @@ class JSONRPCAPI:
         # Now-Playing renders from it). Computed here (before the loop) because
         # cur_info/elapsed are derived later in this function.
         _cur = player.playlist_position or 0
+        # `playlist_position` is a QUEUE position — `playlist_ids` already holds
+        # the queue order, so the current entry is the one AT that position.
         _cur_tid = playlist_ids[_cur] if 0 <= _cur < len(playlist_ids) else None
         _cur_remote = _cur_tid is not None and _local_id(_cur_tid) is None
         _cur_url = (str(getattr(player, "current_url", "") or _cur_tid)
@@ -8098,7 +8115,15 @@ class JSONRPCAPI:
                 player = pm.get_player(pid)
                 if player is not None and rest:
                     try:
+                        from lyrion.player.manager import reshuffle
                         player.shuffle = max(0, min(2, int(str(rest[0]))))
+                        # Perl ``playlistShuffleCommand`` mischt sofort neu:
+                        # ``Slim::Player::Playlist::shuffle($client, $newvalue);
+                        # Slim::Player::Playlist::reshuffle($client);``
+                        # (``Slim/Control/Commands.pm:1194-1195``) — ohne das
+                        # bliebe die alte Queue-Reihenfolge stehen und der
+                        # ``status``/``playlist tracks`` zeigte weiter die alte.
+                        reshuffle(player)
                     except ValueError:
                         pass
             elif sub == "repeat":

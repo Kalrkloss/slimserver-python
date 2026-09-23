@@ -41,9 +41,11 @@ from lyrion.player.manager import (
     nextsong,
     playlist_item,
     playlist_queue_position,
+    playing_queue_position,
     queue_order,
     queue_playlist_index,
     reshuffle,
+    save_current_song,
     shufflelist,
 )
 from lyrion.player.state import PlayerState
@@ -322,9 +324,14 @@ def test_nextsong_wrap_reshuffles_with_the_pref(monkeypatch):
     p = _player(playlist=(10, 11, 12, 13), position=3, shuffle=1, repeat=2)
     p.shufflelist = [2, 0, 3, 1]
     p.shufflelist_mode = 1
+    # Determinismus: ``fischer_yates`` mit Partner 0 erzeugt die bekannte
+    # "move to front"-Folge (siehe die fischer_yates-Tests oben).
+    monkeypatch.setattr(manager_mod.random, "randrange", lambda stop: 0)
     assert nextsong(p) == 0
     assert sorted(p.shufflelist) == [0, 1, 2, 3]
     assert p.shufflelist != [2, 0, 3, 1], "es wurde neu gemischt"
+    # ``playlist newsong`` schreibt das Vorliek (Client.pm:630/Playlist.pm:1141)
+    assert p.playerprefs["currentSong"] == 0
 
 
 def test_nextsong_repeat_off_still_ends_the_playlist():
@@ -442,3 +449,160 @@ def test_playlist_play_stream_entry_uses_the_shuffle_order():
     p.shufflelist_mode = 1
     assert asyncio.run(pm.playlist_play(p.mac, 0)) is True
     assert handler.remote[-1] == (p.mac, streams[1])
+
+
+# ---------------------------------------------------------------------------
+# playerprefs.currentSong — Client.pm:630 + Playlist.pm:1127-1141
+# ---------------------------------------------------------------------------
+
+def test_save_current_song_stores_the_queue_position():
+    """``$prefs->client($client)->set('currentSong', $currsong)``
+    (``Client.pm:630``, ``Playlist.pm:1141``) ist eine QUEUE-Position —
+    ``$currsong = (shuffleList)->[playingSongIndex]`` liefert nur fuer den
+    m3u-Zeiger den PLAYLIST-Index (:1138)."""
+    p = _player(playlist=(10, 11, 12, 13), position=3, shuffle=1)
+    p.shufflelist = [2, 0, 3, 1]
+    p.shufflelist_mode = 1
+    assert save_current_song(p) == 3
+    assert p.playerprefs["currentSong"] == 3
+    assert playing_queue_position(p) == 3
+
+
+def test_save_current_song_handles_a_position_past_the_end():
+    """``playingSongIndex`` faellt auf 0 zurueck (``Source.pm:229-233``: kein
+    Song in der Queue -> ``0``); hier zeigt ``playlist_position`` ins Leere."""
+    p = _player(playlist=(10, 11), position=9, shuffle=1)
+    assert save_current_song(p) == 0
+    assert p.playerprefs["currentSong"] == 0
+
+
+def test_queue_order_maintains_the_current_song_pref():
+    """Pflege beim Aufloesen der Queue-Reihenfolge (dieselbe Stelle, an der
+    Perl ``savePlaylist`` das Pref schreibt, ``Playlist.pm:1136-1141``)."""
+    p = _player(playlist=(10, 11, 12), position=2, shuffle=1)
+    p.shufflelist = [1, 2, 0]
+    p.shufflelist_mode = 1
+    assert queue_order(p) == [11, 12, 10]
+    assert p.playerprefs["currentSong"] == 2
+
+
+def test_album_shuffle_uses_the_current_song_pref(monkeypatch):
+    """``Playlist.pm:921-928``: im Album-Zweig holt Perl ``$realsong`` aus dem
+    ``currentSong``-Pref (``$realsong = $listRef->[$index]``), wenn keiner
+    uebergeben wurde — das Album des SO gespeicherten Titels kommt nach vorne,
+    und der Pref wird auf die neue Queue-Position umgeschrieben (:963-980)."""
+    monkeypatch.setattr(
+        manager_mod, "_entry_album_ids",
+        lambda entries: {50: 100, 51: 100, 52: 200, 53: 200, 54: 300, 55: 300})
+    monkeypatch.setattr(manager_mod.random, "randrange", lambda stop: 0)
+    # Queue-Position 4 spielt playlist[shufflelist[4]] == playlist[5] == 55,
+    # der Pref zeigt auf QUEUE-Position 5 -> playlist[4] == 54 — beide
+    # Album 300, d.h. die Reihenfolge selbst sagt nichts.  Unterschieden wird
+    # ueber die GESPEICHERTE Position: nach Perl ist ``$realsong`` der
+    # PLAYLIST-Index 4, und nach :963-980 gehoert der Titel an die Queue-
+    # Position 0.
+    p = PlayerState(mac=MAC, name="Test", ip="127.0.0.1", port=0)
+    p.playlist = [50, 51, 52, 53, 54, 55]
+    p.playlist_position = 4
+    p.shuffle = 2
+    p.shufflelist = [3, 0, 1, 2, 5, 4]
+    p.shufflelist_mode = 2
+    p.playerprefs = {"currentSong": 5}
+    reshuffle(p)
+    assert {p.shufflelist[0], p.shufflelist[1]} == {4, 5}, (
+        "Album 300 (Titel 54/55) muss vorne stehen, das ist das Album hinter "
+        f"dem currentSong-Pref — bekommen: {p.shufflelist}")
+    # Der Pref-Wert ist ein PLAYLIST-Index (``$listRef->[$index]``, :923) — die
+    # Queue-Position, die der Port speichert, wird beim Reshuffle auf die neue
+    # Position des laufenden Titels gezogen (:963-980).
+    assert p.playerprefs["currentSong"] == 4
+
+
+def test_album_shuffle_preserves_the_album_of_the_explicit_position(monkeypatch):
+    """Der uebergebene ``preserve``-Index gewinnt (``:905-914``); der Pref wird
+    trotzdem fortgeschrieben."""
+    monkeypatch.setattr(
+        manager_mod, "_entry_album_ids",
+        lambda entries: {50: 100, 51: 100, 52: 200, 53: 200, 54: 300, 55: 300})
+    p = _player(playlist=(50, 51, 52, 53, 54, 55), position=4, shuffle=2)
+    p.shufflelist = [0, 1, 2, 3, 4, 5]
+    p.shufflelist_mode = 2
+    reshuffle(p)
+    assert {p.shufflelist[0], p.shufflelist[1]} == {4, 5}   # Album 300 vorne
+    # Ohne Pref im Store bleibt er leer — der laufende Titel ist ueber
+    # ``playingSongIndex`` schon geschont, ein zweiter Schreibpfad waere falsch.
+    assert "currentSong" not in p.playerprefs
+
+
+def test_album_shuffle_follows_the_stored_current_song_not_the_position(monkeypatch):
+    """Negativkontrolle fuer Punkt 2: ohne das Vorliek richtet sich das
+    Schonen nach dem laufenden Titel, MIT Vorliek nach ``currentSong``
+    (``Playlist.pm:921-928`` — Perl liest dort den Pref, NICHT die
+    Queue-Position).  Der Unterschied ist hier am vordersten Album sichtbar."""
+    monkeypatch.setattr(
+        manager_mod, "_entry_album_ids",
+        lambda entries: {50: 100, 51: 100, 52: 200, 53: 200, 54: 300, 55: 300})
+    monkeypatch.setattr(manager_mod.random, "randrange", lambda stop: 0)
+
+    def run(prefs):
+        # Bewusst OHNE ``_player``: die Hilfsfunktion schickt ``shufflelist=[]``
+        # mit, was erst durch den Lazy-Rebuild in ``shufflelist()`` befuellt
+        # wuerde — hier soll die Liste von Hand stehen (wie nach einem
+        # ``playlist shuffle``-Befehl).
+        c = PlayerState(mac=MAC, name="Test", ip="127.0.0.1", port=0)
+        c.playlist = [50, 51, 52, 53, 54, 55]
+        c.playlist_total = 6
+        c.playlist_position = 4          # laufender Titel: playlist[3], Album 200
+        c.shuffle = 2
+        c.shufflelist = [3, 0, 1, 2, 5, 4]
+        c.shufflelist_mode = 2
+        if prefs is not None:
+            c.playerprefs = dict(prefs)
+        # ``reshuffle`` direkt: ein ``shufflelist()``-Aufruf wuerde erst den
+        # Lazy-Rebuild ueber das Vorliek laufen lassen und den Testaufbau
+        # ueberschreiben.
+        out = reshuffle(c)
+        # ``_album_shuffle`` allein betrachtet: ``reshuffle`` hat ``preserve``
+        # schon aus der Queue-Position berechnet (``playingSongIndex``, :806)
+        # und damit den Pref-Pfad uebersprungen.
+        return out[:2]
+
+    def run_pref_only(prefs):
+        """Nur der Pref-Pfad: ``reshuffle`` mit ``preserve=None`` (:908-917)."""
+        c = PlayerState(mac=MAC, name="Test", ip="127.0.0.1", port=0)
+        c.playlist = [50, 51, 52, 53, 54, 55]
+        c.playlist_total = 6
+        c.playlist_position = 4
+        c.shuffle = 2
+        c.shufflelist = [3, 0, 1, 2, 5, 4]
+        c.shufflelist_mode = 2
+        c.playerprefs = dict(prefs)
+        return manager_mod._album_shuffle(c, None)[:2]
+
+    # Der laufende Titel (Queue-Position 4) schont Album 300 — Perl zieht den
+    # Vergleich ueber ``$listRef->[$realsong]``, hier playlist[shufflelist[4]]
+    # == playlist[5] == 55, ebenfalls Album 300.
+    assert set(run(None)) == {4, 5}
+    # Der Pref-Pfad (:908-917) wird nur betreten, wenn Perl KEINEN
+    # ``$realsong`` uebergeben hat; dann gilt ``$realsong = $listRef->[$index]``
+    # mit dem gespeicherten ``currentSong`` als QUEUE-Position (:923) — und
+    # genau der steuert das vordere Album, NICHT die laufende Position.
+    # Pref-QUEUE-Position 0 -> playlist[shufflelist[0]] == playlist[3] (Album 200)
+    assert set(run_pref_only({"currentSong": 0})) == {2, 3}
+    # Pref-QUEUE-Position 1 -> playlist[shufflelist[1]] == playlist[0] (Album 100)
+    assert set(run_pref_only({"currentSong": 1})) == {0, 1}
+    # Pref-QUEUE-Position 5 -> playlist[shufflelist[5]] == playlist[4] (Album 300)
+    assert set(run_pref_only({"currentSong": 5})) == {4, 5}
+    # Der Blick der laufenden Position (``playingSongIndex``, :806) kommt ohne
+    # Pref zum selben Ergebnis wie der Pref auf die laufende Queue-Position —
+    # die beiden Pfade widersprechen sich also nicht.
+    assert set(run_pref_only({"currentSong": 4})) == set(run(None))
+    # Ohne Shuffle/Album-Gruppen bleibt es bei der Identitaet — der Pref ist
+    # dann nur ein gespeicherter Wert (Client.pm:630).
+    c = PlayerState(mac=MAC, name="Test", ip="127.0.0.1", port=0)
+    c.playlist = [50, 51, 52]
+    c.playlist_position = 1
+    c.shuffle = 0
+    c.playerprefs = {"currentSong": 1}
+    assert reshuffle(c) == [0, 1, 2]
+    assert c.playerprefs["currentSong"] == 1
