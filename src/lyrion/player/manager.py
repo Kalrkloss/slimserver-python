@@ -1220,6 +1220,13 @@ class PlayerManager:
         # Persist (INSERT OR IGNORE — keep any user-assigned name)
         self._save_player(player)
 
+        # Perl `initPrefs` (Client.pm:334-349) beim (Re-)Connect: die in
+        # `_client:<MAC>` gespeicherten Werte nachtragen, fehlende bleiben
+        # Default (Prefs/Base.pm:196-230 `init` schreibt nur Undefiniertes).
+        from lyrion.player.playerprefs import load_player_prefs
+
+        load_player_prefs(player)
+
         # Perl's client lifecycle notification, fired where Perl fires it:
         #   * a new client:       Client.pm:313-315  ['client', 'new']
         #   * a known client's HELO: Slimproto.pm:1211-1213 ['client','reconnect']
@@ -1379,6 +1386,12 @@ class PlayerManager:
 
     def unregister_player(self, mac: str) -> None:
         """Remove a player from the registry.
+
+        Perl's ``forgetClient`` (``Slim/Player/Client.pm:539-568``) does the
+        same and deliberately does **not** touch the client's prefs — they
+        stay in the store and come back on the next ``initPrefs``
+        (``Client.pm:334-349``).  Only ``resetPrefs`` (``Client.pm:375-383``)
+        wipes them; see ``player.playerprefs.remove_player_prefs``.
 
         Args:
             mac: The MAC address of the player to remove.

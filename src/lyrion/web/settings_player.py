@@ -184,6 +184,7 @@ from typing import Any, Optional
 from urllib.parse import quote
 
 from lyrion.player.manager import PlayerManager
+from lyrion.player.playerprefs import set_player_pref
 from lyrion.web.settings import (  # noqa: F401 — Bausteine werden weiterbenutzt
     Field,
     SettingsPage,
@@ -613,7 +614,7 @@ def _sync_selected(player) -> str:
 
 # ── Handler: MenÃ¼ ────────────────────────────────────────────────────────────
 
-def _apply_menu_actions(player, params: dict[str, str]) -> list[str]:
+async def _apply_menu_actions(player, params: dict[str, str]) -> list[str]:
     """Perl ``Menu.pm:43-99``: ``Action<i>``/``menuItemRemove<i>``/``nonMenuItemAdd<i>``."""
     items = _menu_items(player)
     if not items:
@@ -648,7 +649,7 @@ def _apply_menu_actions(player, params: dict[str, str]) -> list[str]:
     if not items:
         items = list(DEFAULT_MENU_ITEMS)   # Menu.pm:88-91
 
-    _client_prefs(player)[MENU_ITEM_PREF] = items   # Menu.pm:93
+    await set_player_pref(player, MENU_ITEM_PREF, items)   # Menu.pm:93
     return items
 
 
@@ -663,7 +664,7 @@ def _max_index(params: dict[str, str], prefix: str) -> int:
 
 # ── Handler: Fernbedienung ───────────────────────────────────────────────────
 
-def _apply_remote_save(player, params: dict[str, str]) -> list[str]:
+async def _apply_remote_save(player, params: dict[str, str]) -> list[str]:
     """Perl ``Remote.pm:53-71``: ``disabledirsets`` aus den ``pref_irsetlist<i>``.
 
     Unser Port hat keinen IR-Dateibaum (``Slim/Hardware/IR.pm:165-243``), also
@@ -679,7 +680,7 @@ def _apply_remote_save(player, params: dict[str, str]) -> list[str]:
             break
         disabled.append(params[key])
         index += 1
-    _client_prefs(player)[DISABLED_IRSETS_PREF] = disabled
+    await set_player_pref(player, DISABLED_IRSETS_PREF, disabled)
     return [DISABLED_IRSETS_PREF] if index else []
 
 
@@ -734,10 +735,10 @@ async def save_player_page(page: SettingsPage, params: dict[str, str], player,
     written = await _save_simple_prefs(page, params, player, invalid)
 
     if handler == HANDLER_MENU and player is not None and "saveSettings" in params:
-        _apply_menu_actions(player, params)
+        await _apply_menu_actions(player, params)
         written.append(MENU_ITEM_PREF)
     elif handler == HANDLER_REMOTE and player is not None and "saveSettings" in params:
-        written.extend(_apply_remote_save(player, params))
+        written.extend(await _apply_remote_save(player, params))
     elif handler == HANDLER_SYNC and player is not None:
         written.extend(_apply_sync(player, params))
     return written

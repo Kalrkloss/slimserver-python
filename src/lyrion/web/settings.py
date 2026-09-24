@@ -196,7 +196,7 @@ from lyrion.media.art_online_wanted import (
     WANTED_PREF_DEFAULTS as _ART_WANTED_PREF_DEFAULTS,
 )
 from lyrion.player.manager import PlayerManager
-from lyrion.player.playerprefs import apply_player_pref
+from lyrion.player.playerprefs import set_player_pref
 from lyrion.utils.strings import get_string
 
 logger = logging.getLogger(__name__)
@@ -1494,7 +1494,7 @@ async def _save_simple_prefs(page: SettingsPage, params: dict[str, str],
                     logger.warning("settings: %s=%r ist keine Zahl — übersprungen",
                                    f.pref, raw)
                     continue
-            apply_player_pref(player, real, value)
+            await set_player_pref(player, real, value)
             written.append(real)
         else:
             if f.validator is not None and not f.validator(raw):

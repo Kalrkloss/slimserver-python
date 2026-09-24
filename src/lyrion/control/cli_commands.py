@@ -1596,14 +1596,15 @@ async def cmd_playerpref(
             )
         # Set form: value may be multi-word (join the rest)
         value = " ".join(str(a) for a in args[1:])
-        prefs[key] = value
-        # Wie Perls setChange-Callbacks (Player.pm:79): die Werte, die unsere
-        # Frames lesen (digitalVolumeControl/preampVolumeControl, Mixer-Werte),
-        # sofort auf den PlayerState anwenden.
-        from lyrion.player.playerprefs import apply_player_pref
+        # Wie Perls `$prefs->client($client)->set(...)` (Commands.pm:2670): Wert
+        # ablegen, speichern (Prefs/Base.pm:121-124) UND die setChange-Callbacks
+        # (Player.pm:79) auslösen — alles in set_player_pref.
+        from lyrion.player.playerprefs import set_player_pref
 
         if player is not None:
-            apply_player_pref(player, key, value)
+            await set_player_pref(player, key, value)
+        else:
+            prefs[key] = value
         return _command_line(["playerpref"], args, ["_prefname", "_newvalue"],
                              clientid=ctx.player_id, has_tags=True)
     except Exception:  # noqa: BLE001
