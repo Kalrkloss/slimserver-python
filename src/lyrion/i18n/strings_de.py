@@ -130,4 +130,42 @@ STRINGS_DE: dict[str, str] = {
     'PLUGIN_DSTM': 'Musikwiedergabe nie anhalten',  # DontStopTheMusic/strings.txt:1 (DE :4)
     'PLUGIN_DSTM_DESC': "Don't Stop The Music bewahrt Sie davor, von der Stille überrascht zu werden. Wenn sich die Wiedergabeliste dem Ende neigt, wird automatisch passende Musik angehängt.",  # DontStopTheMusic/strings.txt:12 (DE :15)
     'PLUGIN_NAME': 'Plugin',  # strings.txt:11293 (DE :11296)
+    # ── Player-Seiten (web/settings_player.py; Perl Player/{Menu,Remote, ────
+    # ── Synchronization}.pm) ────────────────────────────────────────────────
+    'MENU_SETTINGS': 'Menüs',  # strings.txt:14914
+    'REMOTE_SETTINGS': 'Fernbedienung',  # strings.txt:14988
+    'SETUP_GROUP_MENUITEMS': 'Hauptmenü',  # strings.txt:3614
+    'SETUP_GROUP_MENUITEMS_DESC': "Sie können die im Hauptmenü des Players verfügbaren Einträge bestimmen. Klicken Sie auf die entsprechenden Schaltflächen, um Einträge nach oben bzw. unten zu verschieben oder sie zu entfernen. Klicken Sie auf 'Hinzufügen', um einen entfernten Eintrag wieder aufzunehmen.",  # strings.txt:3633
+    'SETUP_GROUP_NONMENUITEMS_INTRO': 'Inaktive Menüeinträge:',  # strings.txt:3654
+    'MOVEUP': 'Nach oben',  # strings.txt:11226
+    'MOVEDOWN': 'Nach unten',  # strings.txt:11246
+    'ADD': 'Hinzufügen',  # strings.txt:11266
+    'DELETE': 'Löschen',  # strings.txt:16048
+    'SETUP_GROUP_IRSETS': 'Fernbedienungen',  # strings.txt:3911
+    'SETUP_GROUP_IRSETS_DESC': 'Sie können bestimmen, ob der Player bestimmte Infrarotsignale ignorieren soll oder nicht. Aktivieren bzw. deaktivieren Sie das Kontrollkästchen neben dem Namen, um eine Fernbedienung zu aktivieren bzw. zu deaktivieren.',  # strings.txt:3931
+    'SETUP_IRMAP': 'Funktionen der Fernbedienungstasten',  # strings.txt:6486
+    'SETUP_IRMAP_DESC': "Sie können zwischen Tastenfunktionsgruppen wählen, die Tasten der Fernbedienung mit bestimmten Funktionen belegen. Die Gruppe 'Standard' wird in der Dokumentation beschrieben.",  # strings.txt:6506
+    'SETUP_SYNCHRONIZE': 'Synchronisieren',  # strings.txt:4690
+    'SETUP_SYNCHRONIZE_DESC': "Der Player kann mit anderen Playern synchronisiert werden, um simultan dieselbe Musik wiederzugeben. Wählen Sie die gewünschten Player aus der Liste der verfügbaren Synchronisierungsgruppen. Wählen Sie 'Keine Synchronisierung', um die Funktion zu deaktivieren.",  # strings.txt:4711
+    'SETUP_NO_SYNCHRONIZATION': 'Keine Synchronisation',  # strings.txt:4732
+    'SETUP_SYNCVOLUME': 'Lautstärke synchronisieren',  # strings.txt:4793
+    'SETUP_SYNCVOLUME_DESC': "Sie können die Lautstärke synchronisierter Player aufeinander abstimmen oder unabhängig belassen. Wählen Sie die gewünschte Option und klicken Sie auf 'Ändern'.",  # strings.txt:4814
+    'SETUP_SYNCVOLUME_ON': 'Player-Lautstärke synchronisieren',  # strings.txt:4753
+    'SETUP_SYNCVOLUME_OFF': 'Player-Lautstärke nicht synchronisieren',  # strings.txt:4773
+    'SETUP_SYNCPOWER': 'Ein-/Ausschalten synchronisieren',  # strings.txt:4874
+    'SETUP_SYNCPOWER_DESC': "Sie können diesen Player einzeln oder zusammen mit den anderen synchronisierten Playern ein- bzw. ausschalten. Wählen Sie die gewünschte Option und klicken Sie auf 'Ändern'.",  # strings.txt:4895
+    'SETUP_SYNCPOWER_ON': 'In Gruppe ein-/ausschalten',  # strings.txt:4834
+    'SETUP_SYNCPOWER_OFF': 'Getrennt ein-/ausschalten',  # strings.txt:4854
+    'SETUP_MAINTAINSYNC': 'Synchronisation beibehalten',  # strings.txt:5175
+    'SETUP_MAINTAINSYNC_DESC': 'Auch wenn mehrere Player die Wiedergabe eines Titels gleichzeitig starten, können sie nach einer gewissen Zeit (i.d.R. nach ein paar Minuten) voneinander abweichen. Eine Differenz von mehr als 30\u00a0ms ist wahrnehmbar, wenn die Ausgabe mehrerer Player gleichzeitig gehört werden kann. Lyrion Music Server prüft ständig, wie viel ein Player wiedergegeben hat und nimmt bei Bedarf Änderungen vor. Sie können dieses Verhalten aktivieren bzw. deaktivieren.',  # strings.txt:5194
+    'SETUP_MAINTAINSYNC_ON': 'Synchronisation bei der Wiedergabe beibehalten',  # strings.txt:5213
+    'SETUP_MAINTAINSYNC_OFF': 'Synchronisation nicht beibehalten',  # strings.txt:5232
+    'SETUP_STARTDELAY': 'Startverzögerung des Players (ms)',  # strings.txt:5139
+    'SETUP_STARTDELAY_DESC': "Es kann eine gewisse Zeit dauern, bis ein Player die Wiedergabe beginnt (bis Sie die Musik hören), nachdem der von Lyrion Music Server empfangene Startbefehl verarbeitet wurde. Dies kann bei der Nutzung digitaler Ausgänge (abhängig vom angeschlossenen Gerät) oder bei bestimmten Software-Playern unter bestimmten Plattformen vorkommen. Sie können dann diese Verzögerung hier festlegen, damit Lyrion Music Server weiß, wie bald dieser Player gestartet werden soll, damit die Wiedergabe aus allen synchronisierten Playern gleichzeitig gestartet wird. Hinweis: Diese Verzögerung gilt zusätzlich zu 'Audioverzögerung des Players' (siehe unten).",  # strings.txt:5157
+    'SETUP_PLAYDELAY': 'Audioverzögerung des Players (ms)',  # strings.txt:5251
+    'SETUP_PLAYDELAY_DESC': 'Es kann ein wahrnehmbarer Unterschied zwischen der abgelaufenen Zeit, die der Player an Lyrion Music Server meldet, und der tatsächlichen Wiedergabezeit auftreten. Dies kann bei der Nutzung digitaler Ausgänge (abhängig vom angeschlossenen Gerät) oder bei bestimmten Software-Playern unter bestimmten Plattformen vorkommen. In diesen Fällen können Sie hier die Verzögerung einstellen, damit diese von Lyrion Music Server beim Anpassen der Synchronisation einbezogen wird.',  # strings.txt:5269
+    'SETUP_MINSYNCADJUST': 'Minimale Synchronisationsanpassung (ms)',  # strings.txt:5287
+    'SETUP_MINSYNCADJUST_DESC': 'Wenn Lyrion Music Server erkennt, dass die Synchronisation zweier Player leicht verschoben ist, wird i.d.R. am langsameren Player eine geringfügige Anpassung vorgenommen. Sie können die minimale Anpassung für diesen Player konfigurieren. Je größer dieses Intervall ist, desto seltener werden Anpassungen vorgenommen aber desto häufiger können Abweichungen vorkommen.',  # strings.txt:5306
+    'SETUP_PACKETLATENCY': 'Netzwerkpaket-Wartezeit (ms)',  # strings.txt:5324
+    'SETUP_PACKETLATENCY_DESC': 'Lyrion Music Server misst automatisch die Netzwerk-Wartezeit zwischen der Anwendung und dem Player. Dies ist zum Beibehalten der Synchronisation wichtig. Wenn diese Messungen zu inkonsistent sind, empfehlen wir, hier einen typischen Wert einzugeben.',  # strings.txt:5342
 }
