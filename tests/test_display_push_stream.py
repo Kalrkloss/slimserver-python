@@ -167,11 +167,25 @@ def test_perl_added_time_uses_the_language_default_formats(monkeypatch):
     assert _perl_added_time(ts) == "Samstag, 5. September 2026, 09:07"
 
 
-def test_perl_pretty_bitrate_matches_the_icy_value():
-    """``Track.pm:353-363`` — live Perl: ``"256kb/s CBR"`` / ohne Wert ``0``."""
-    assert _perl_pretty_bitrate(256000) == "256kb/s CBR"
+def test_perl_pretty_bitrate_matches_the_icy_value(monkeypatch):
+    """``Track.pm:359-371`` — ``sprintf("%d", $b/1000) . string('KBPS') . $mode``.
+
+    ``string('KBPS')`` ist sprachabhaengig (``strings.txt:13483`` EN ``kbps``,
+    DE ``kb/s``); der Live-Server 192.168.1.90 hat ``pref language = DE`` und
+    liefert deshalb ``remoteMeta.bitrate = "256kb/s CBR"`` (read-only
+    JSON-RPC-Probe).  Der Port spiegelt genau das, also muss der Test die
+    Sprache setzen statt die DE-Darstellung zu unterstellen: die frueheren
+    Asserts liefen mit dem Failsafe ``EN`` (``Strings.pm:62``).  Ohne Wert
+    gibt Perl die Zahl ``0`` zurueck (:370), ``VBR`` nur bei ``vbr_scale``.
+    """
+    # Failsafe EN (Strings.pm:62): "kbps" (strings.txt:13487).
+    monkeypatch.setattr("lyrion.i18n.resolve_language", lambda *a, **k: "EN")
+    assert _perl_pretty_bitrate(256000) == "256kbps CBR"
     assert _perl_pretty_bitrate(0) == 0
     assert _perl_pretty_bitrate(192000, vbr_scale=1).endswith("VBR")
+    # Live-Language DE: "kb/s" (strings.txt:13486), wie am 192.168.1.90.
+    monkeypatch.setattr("lyrion.i18n.resolve_language", lambda *a, **k: "DE")
+    assert _perl_pretty_bitrate(256000) == "256kb/s CBR"
 
 
 # ---------------------------------------------------------------------------
@@ -187,7 +201,7 @@ def _status(args: list[str]) -> dict:
     return _run(JSONRPCAPI()._slim_request(MAC, ["status", "-", "1"] + args))
 
 
-def test_remote_meta_carries_bitrate_and_added_time_for_the_full_tag_set():
+def test_remote_meta_carries_bitrate_and_added_time_for_the_full_tag_set(monkeypatch):
     """Live Perl ``status - 1 tags:ABCDEKJZlcuxyrtSgad`` (Stream, read-only)::
 
         remoteMeta = {"id":"-94115167939280","title":"Life Breath (oct12)",
@@ -199,7 +213,12 @@ def test_remote_meta_carries_bitrate_and_added_time_for_the_full_tag_set():
     Reihenfolge = Tag-Reihenfolge (``_songData`` nutzt Tie::IxHash,
     ``Queries.pm:5898``); ``bitrate`` kommt aus ``$remoteMeta->{r}`` (:5937)
     und ``addedTime`` aus ``$track->addedTime`` (:5681, :6100-6102).
+
+    Sprache auf ``DE`` gesetzt (wie ``test_perl_added_time_...``), weil der
+    Live-Server ``pref language = DE`` hat; ``string('KBPS')`` waere sonst
+    unter dem Failsafe ``EN`` ``kbps`` (``strings.txt:13486-13487``).
     """
+    monkeypatch.setattr("lyrion.i18n.resolve_language", lambda *a, **k: "DE")
     res = _status(["tags:ABCDEKJZlcuxyrtSgad"])
     meta = res["remoteMeta"]
     assert list(meta) == ["id", "title", "artist", "addedTime", "artwork_url",
