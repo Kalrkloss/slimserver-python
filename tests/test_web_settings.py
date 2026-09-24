@@ -442,3 +442,294 @@ def test_imageproxy_follow_switch_is_on_by_default_and_writable():
              data={"saveSettings": "1", f"pref_{PREF}": "1"})
     assert store.get(PREF) == "1"
     assert imageproxy_follow_redirects() is True
+
+
+# ── Server: Software-Updates (Server/Software.pm:23-31, Update.pm:30-141) ───
+#
+# Perl zeigt ``pref_checkVersion`` und ``pref_checkVersionInterval``
+# (``software.html:4-18``), dazu ``pref_autoDownloadUpdate`` nur bei
+# ``canAutoUpdate`` (``Software.pm:26-28``) und den Knopf ``checkForUpdateNow``
+# nur, wenn NICHT aus dem Quellbaum gestartet (``software.html:35-38``).  Die
+# Prüfung selbst liest ``servers.json`` (``Update.pm:17,84``) und vergleicht die
+# Version (``Update.pm:104-111``); **ein Selbst-Update führen wir nicht aus**.
+
+
+def test_software_get_has_the_perl_pref_fields():
+    body = _request("GET", "/settings/server/software.html").text
+
+    assert 'name="pref_checkVersion"' in body
+    assert 'name="pref_checkVersionInterval"' in body
+    # Software.pm:24 — die vier Intervalle aus software.html:15-18
+    for value in ("3600", "86400", "604800", "2592000"):
+        assert f'value="{value}"' in body
+    # Vorbelegung Prefs.pm:170-171
+    assert '<option value="1" selected>' in body
+    assert '<option value="86400" selected>' in body
+    # Versionsanzeige (Software.pm:40-42 via $::newVersion/main::VERSION)
+    assert "9.2.0" in body
+    # Knopf nur ohne Quellbaum-Start (software.html:35-38); unser Default ist
+    # „nicht aus dem Quellbaum" (OSDetect hat kein running_from_source).
+    assert 'name="checkForUpdateNow"' in body
+
+
+def test_software_post_writes_checkversion_prefs():
+    res = _request("POST", "/settings/server/software.html",
+                   data={"saveSettings": "1", "pref_checkVersion": "0",
+                         "pref_checkVersionInterval": "604800"})
+
+    assert res.status_code == 200
+    prefs = get_prefs()
+    assert prefs.get("checkVersion") == "0"                 # Prefs.pm:170
+    assert prefs.get("checkVersionInterval") == "604800"    # Prefs.pm:171
+
+
+def test_software_can_auto_update_is_false_like_perl_on_linux():
+    """``Slim/Utils/OS.pm:451`` ``sub canAutoUpdate { 0 }`` — Linux: kein Feld."""
+    from lyrion.web.settings import _can_auto_update
+
+    assert _can_auto_update() is False
+    # ``software.html:24-32`` rendert das Feld dann nicht.
+    body = _request("GET", "/settings/server/software.html").text
+    assert 'name="pref_autoDownloadUpdate"' not in body
+
+
+def test_software_version_compare_matches_update_pm():
+    """``Update.pm:111`` — Repo-Version muss höher sein als die laufende."""
+    from lyrion.web.settings import _evaluate_update_payload, _version_greater
+
+    assert _version_greater("9.3.0", "9.2.0") is True
+    assert _version_greater("9.2.0", "9.2.0") is False
+    assert _version_greater("9.1.9", "9.2.0") is False
+    assert _version_greater("10.0.0", "9.9.9") is True
+
+    # Ein höheres Repo-Ergebnis ergibt SERVER_UPDATE_AVAILABLE (Update.pm:117)
+    payload = {"latest": {"default": {"version": "9.9.9", "url": "http://x/y.tgz"}}}
+    msg = _evaluate_update_payload(payload, "9.2.0")
+    assert "9.9.9" in msg and "y.tgz" in msg
+    # Kein Update → leere Meldung (Aufrufer setzt CONTROLPANEL_NO_UPDATE_AVAILABLE)
+    assert _evaluate_update_payload(
+        {"latest": {"default": {"version": "9.2.0"}}}, "9.2.0") == ""
+
+
+# ── Server: Netzwerk (Server/Network.pm:27-41) ─────────────────────────────
+
+def test_network_get_has_the_unconditional_perl_prefs():
+    body = _request("GET", "/settings/server/networking.html").text
+
+    # Network.pm:28 — die sieben unbedingten Prefs in der Vorlagenreihenfolge
+    for name in ("webproxy", "httpport", "maxRedirects", "bufferSecs",
+                 "remotestreamtimeout", "maxWMArate", "useEnhancedHTTP"):
+        assert f'name="pref_{name}"' in body, name
+    # Vorbelegungen aus Prefs.pm:210-216
+    assert 'value="9000"' in body         # httpport
+    assert 'value="3"' in body            # bufferSecs
+    assert 'value="15"' in body           # remotestreamtimeout
+    assert 'value="7"' in body            # maxRedirects
+    # networking.html:25 — die WMA-Raten
+    for rate in ("9999", "128", "320"):
+        assert f'value="{rate}"' in body
+
+
+def test_network_post_writes_the_prefs_and_reports_port_change():
+    res = _request("POST", "/settings/server/networking.html",
+                   data={"saveSettings": "1", "pref_httpport": "9123",
+                         "pref_bufferSecs": "10", "pref_useEnhancedHTTP": "2"})
+
+    assert res.status_code == 200
+    prefs = get_prefs()
+    assert prefs.get("httpport") == "9123"
+    assert prefs.get("bufferSecs") == "10"
+    assert prefs.get("useEnhancedHTTP") == "2"
+    # Network.pm:53-60 — SETUP_HTTPPORT_OK mit der Server-URL
+    assert "Now using port:" in res.text
+
+
+def test_network_rejects_out_of_range_buffer_secs():
+    """``Prefs.pm:319`` ``intlimit 3..30`` → SETTINGS_INVALIDVALUE, nicht schreiben."""
+    _set_pref("bufferSecs", "5")
+    res = _request("POST", "/settings/server/networking.html",
+                   data={"saveSettings": "1", "pref_bufferSecs": "99"})
+
+    assert 'Invalid value "99" for bufferSecs' in res.text
+    assert get_prefs().get("bufferSecs") == "5"           # unverändert
+
+
+def test_network_hides_syncstartdelay_without_multiple_players():
+    """``Network.pm:36-38`` — ``syncStartDelay`` nur bei ``clients() > 1``."""
+    body = _request("GET", "/settings/server/networking.html").text
+    assert 'name="pref_syncStartDelay"' not in body
+
+
+# ── Server: Sicherheit (Server/Security.pm:26-64) ──────────────────────────
+
+def test_security_get_lists_the_perl_prefs_and_password_fields():
+    body = _request("GET", "/settings/server/security.html").text
+
+    # Security.pm:27 ``prefs()`` + die zwei Passwortfelder der Vorlage
+    for name in ("authorize", "username", "password", "password_repeat",
+                 "filterHosts", "allowedHosts", "csrfProtectionLevel",
+                 "corsAllowedHosts", "insecureHTTPS"):
+        assert f'name="pref_{name}"' in body, name
+    assert '<input type="password"' in body               # security.html:18,22
+
+
+def test_security_hashes_the_password_like_perl():
+    """``Security.pm:57-58`` — ``sha1_base64``, Klartext wird nie gespeichert."""
+    from lyrion.web.settings import perl_sha1_base64
+
+    expected = perl_sha1_base64("geheim")
+    res = _request("POST", "/settings/server/security.html",
+                   data={"saveSettings": "1", "pref_username": "admin",
+                         "pref_password": "geheim",
+                         "pref_password_repeat": "geheim"})
+
+    assert res.status_code == 200
+    stored = get_prefs().get("password")
+    assert stored == expected
+    assert stored != "geheim"
+    # Der Hash darf nicht im Formular stehen (wir geben ihn nicht heraus).
+    body = _request("GET", "/settings/server/security.html").text
+    assert expected not in body
+    # ``password_repeat`` ist reines Vergleichsfeld (Security.pm:46)
+    assert get_prefs().get("password_repeat") is None
+
+
+def test_security_password_mismatch_warns_and_disables_authorize():
+    """``Security.pm:46-51`` — ``SETUP_PASSWORD_MISMATCH``, ``authorize = 0``."""
+    res = _request("POST", "/settings/server/security.html",
+                   data={"saveSettings": "1", "pref_authorize": "1",
+                         "pref_username": "admin",
+                         "pref_password": "a", "pref_password_repeat": "b"})
+
+    assert "The passwords you entered do not match." in res.text
+    assert get_prefs().get("authorize") == "0"
+
+
+def test_security_authorize_without_username_warns():
+    """``Security.pm:34-39`` — ``SETUP_MISSING_USERNAME``, ``authorize = 0``."""
+    res = _request("POST", "/settings/server/security.html",
+                   data={"saveSettings": "1", "pref_authorize": "1",
+                         "pref_username": ""})
+
+    assert "You can't enable authorization without a password." in res.text
+    assert get_prefs().get("authorize") == "0"
+
+
+# ── Server: Dateitypen (Server/FileTypes.pm:27-133) ────────────────────────
+
+def test_filetypes_get_has_the_perl_fields_and_profile_table():
+    body = _request("GET", "/settings/server/filetypes.html").text
+
+    # FileTypes.pm:28,37-38 — die Vorlage gibt die Endungen OHNE ``pref_`` aus
+    assert 'name="disabledextensionsaudio"' in body
+    assert 'name="disabledextensionsplaylist"' in body
+    assert 'name="pref_prioritizeNative"' in body         # :28
+    # filetypes.html:21 — die Tabellenköpfe
+    for token in ("File Format", "Stream Format", "From", "Decoder"):
+        assert token in body
+    # filetypes.html:37,39-40 — je Profil ein ``select`` mit ``DISABLED``
+    assert 'value="DISABLED"' in body
+
+
+def test_filetypes_post_writes_extensions_and_disabledformats():
+    res = _request("POST", "/settings/server/filetypes.html",
+                   data={"saveSettings": "1",
+                         "disabledextensionsaudio": "cue, mp4",
+                         "disabledextensionsplaylist": "m3u",
+                         "pref_prioritizeNative": "0",
+                         "flc-mp3-*-*": "DISABLED"})
+
+    assert res.status_code == 200
+    prefs = get_prefs()
+    assert prefs.get("disabledextensionsaudio") == "cue, mp4"      # :37
+    assert prefs.get("disabledextensionsplaylist") == "m3u"        # :38
+    assert prefs.get("prioritizeNative") == "0"                    # :68
+    assert prefs.get("disabledformats") == "flc-mp3-*-*"           # :40,67
+
+
+# ── Server: Logging (Server/Debugging.pm:24-78) ───────────────────────────
+
+def test_debugging_get_has_the_levels_groups_and_logfiles():
+    body = _request("GET", "/settings/server/debugging.html").text
+
+    # Log.pm:64 — die sechs Stufen
+    for level in ("OFF", "FATAL", "ERROR", "WARN", "INFO", "DEBUG"):
+        assert f'value="{level}"' in body, level
+    # Log.pm:66-102 — die vier Protokollsätze
+    for group in ("SERVER", "RADIO", "TRANSCODING", "SCANNER", "DEFAULT"):
+        assert f'value="{group}"' in body, group
+    # Log.pm:645-651 — die Logdatei-Links der Vorlage (debugging.html:21-27)
+    assert "/lyrion.log?lines=100" in body
+    assert "/lyrion.log?full=1" in body
+    assert "/lyrion.log?zip=1" in body
+    # debugging.html:47-55 — Kategoriename als Feldname, plus Beschriftung
+    assert 'name="network.http"' in body
+    assert '(network.http)' in body
+
+
+def test_debugging_post_writes_single_category_level():
+    """``Debugging.pm:40-46`` — je Kategorie der Formularwert."""
+    res = _request("POST", "/settings/server/debugging.html",
+                   data={"saveSettings": "1", "logging_group": "",
+                         "persist": "1", "network.http": "DEBUG",
+                         "server": "INFO"})
+
+    assert res.status_code == 200
+    prefs = get_prefs()
+    assert prefs.get("log.level.network.http") == "DEBUG"
+    assert prefs.get("log.level.server") == "INFO"
+    assert prefs.get("log.persist") == "1"                 # :48
+
+
+def test_debugging_post_applies_a_logging_group():
+    """``Debugging.pm:32-36`` — ``setLogGroup`` setzt ALLE Kategorien."""
+    _request("POST", "/settings/server/debugging.html",
+             data={"saveSettings": "1", "logging_group": "RADIO"})
+
+    prefs = get_prefs()
+    assert prefs.get("log.group") == "RADIO"
+    # Log.pm:74-80 — der RADIO-Satz hebt ``formats.audio``/``network.asyncdns``
+    assert prefs.get("log.level.formats.audio") == "DEBUG"
+    assert prefs.get("log.level.network.asyncdns") == "DEBUG"
+    # Kategorien außerhalb des Satzes behalten ihre Vorbelegung
+    assert prefs.get("log.level.server") == "ERROR"
+
+
+# ── Server: Leistung (Server/Performance.pm:26-30) ────────────────────────
+
+def test_performance_get_has_the_perl_prefs():
+    body = _request("GET", "/settings/server/performance.html").text
+
+    for name in ("dbhighmem", "dontTriggerScanOnPrefChange", "useBalancedShuffle",
+                 "disableStatistics", "precacheArtwork", "useLocalImageproxy",
+                 "serverPriority", "scannerPriority", "maxPlaylistLength"):
+        assert f'name="pref_{name}"' in body, name
+    # Prefs.pm:221 — ``precacheArtwork`` vorbelegt AN
+    assert 'value="1" selected' in body
+    # Performance.pm:82-91 — die fünf Prioritätslabels
+    for token in ("Above Normal", "Below Normal"):
+        assert token in body
+
+
+def test_performance_hides_autorescan_without_os_support():
+    """``Performance.pm:28`` — nur bei ``canAutoRescan`` (``OS.pm:455`` = 0)."""
+    from lyrion.web.settings import _can_auto_rescan
+
+    assert _can_auto_rescan() is False
+    body = _request("GET", "/settings/server/performance.html").text
+    assert 'name="pref_autorescan"' not in body
+
+
+def test_performance_post_writes_the_prefs():
+    res = _request("POST", "/settings/server/performance.html",
+                   data={"saveSettings": "1", "pref_dbhighmem": "1",
+                         "pref_maxPlaylistLength": "2500",
+                         "pref_scannerPriority": "5",
+                         "pref_dontTriggerScanOnPrefChange": "0"})
+
+    assert res.status_code == 200
+    prefs = get_prefs()
+    assert prefs.get("dbhighmem") == "1"                    # Prefs.pm:139
+    assert prefs.get("maxPlaylistLength") == "2500"         # Prefs.pm:223
+    assert prefs.get("scannerPriority") == "5"              # Prefs.pm:220
+    assert prefs.get("dontTriggerScanOnPrefChange") == "0"  # Prefs.pm:167
