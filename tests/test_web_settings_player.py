@@ -21,10 +21,9 @@ Perl-Belege (``/tmp/lms-ref``, read-only)
   :50-58; ``-1`` = keine Synchronisation :66,:92).  Vorlage
   ``HTML/EN/settings/player/synchronization.html:5-60``.
 
-Die Tests fahren die Seiten **in-process** Ã¼ber die ASGI-App; die Dispatch-Zeile
-in ``settings.py`` ist noch nicht verdrahtet (parallel arbeitender Agent), also
-baut der Test denselben Weg Ã¼ber ``settings_player.handle_player_page_request``
-auf â€” dieselbe Funktion, die der Registry-Patch (Modul-Docstring) aufruft.
+Die Tests fahren die Seiten **in-process** Ã¼ber die ASGI-App und damit durch den
+echten ``/settings/``-Dispatch in ``settings.py`` (Registry-Eintrag + Handler-Zeile
+vor ``PAGES.get(path)``).
 """
 
 from __future__ import annotations
@@ -85,32 +84,17 @@ def players():
 
 
 async def _asgi_request(method: str, path: str, *, params=None, data=None) -> httpx.Response:
-    """Anfrage gegen die ASGI-App, deren ``/settings/``-Dispatch der Patch-Zeile entspricht."""
+    """Anfrage gegen die ASGI-App — der echte ``/settings/``-Dispatch.
+
+    Seit dem Registry-Patch in ``settings.py`` laufen die Player-Seiten dort
+    verdrahtet durch (``if path in PLAYER_PAGES: handle_player_page_request``),
+    der Test braucht also keinen eigenen Wrapper mehr.
+    """
     app = create_app()
-
-    # Denselben Weg wie der empfohlene settings.py-Dispatch aufbauen: vor dem
-    # Standard-Handler prÃ¼fen, ob der Pfad eine Player-Seite dieses Moduls ist.
     transport = httpx.ASGITransport(app=app)
-
-    # Ein kleiner ASGI-Wrapper, der die Player-Seiten an unser Modul gibt.
-    from lyrion.web import settings as S
-
-    orig = S.handle_settings_request
-
-    async def dispatch(scope, receive, send):
-        if scope.get("path") in sp.PLAYER_PAGES:
-            await sp.handle_player_page_request(
-                scope, receive, send, sp.PLAYER_PAGES[scope["path"]])
-            return
-        await orig(scope, receive, send)
-
-    S.handle_settings_request = dispatch
-    try:
-        async with httpx.AsyncClient(transport=transport,
-                                     base_url="http://testserver") as client:
-            return await client.request(method, path, params=params, data=data)
-    finally:
-        S.handle_settings_request = orig
+    async with httpx.AsyncClient(transport=transport,
+                                 base_url="http://testserver") as client:
+        return await client.request(method, path, params=params, data=data)
 
 
 def _request(method: str, path: str, *, params=None, data=None) -> httpx.Response:
@@ -377,9 +361,28 @@ def test_unknown_settings_path_is_still_404():
     assert res.status_code == 404
 
 
-def test_player_pages_are_not_in_the_reference_registry_yet():
-    """Solange der Patch nicht eingetragen ist, bleiben die Pfade frei (Gegenprobe)."""
+def test_player_pages_are_registered_in_the_reference_registry():
+    """Registry-Patch: die drei Seiten stehen in ``settings.PAGES`` + Extra-Felder hängen.
+
+    Dieses Testmodul importiert ``settings_player`` VOR ``settings`` — genau der
+    Fall, in dem die Verdrahtung nicht beim Laden, sondern beim ersten Zugriff
+    nachgeholt wird (Import-Zyklus, s. ``settings._wire_player_pages``).
+    """
     from lyrion.web import settings as S
 
-    for route in sp.PLAYER_PAGES:
-        assert route not in S.PAGES
+    S._wire_player_pages()
+
+    for route, page in sp.PLAYER_PAGES.items():
+        assert S.PAGES.get(route) is page, route
+
+    # Nachzügler-Felder sind an die bestehenden Player-Seiten gehängt (additiv,
+    # Reihenfolge: Perls ``push`` — die Zusatzfelder stehen am Ende).
+    audio = S.PAGES["/settings/player/audio.html"].fields
+    assert [f.pref for f in audio[-len(sp.AUDIO_EXTRA_FIELDS):]] == \
+        [f.pref for f in sp.AUDIO_EXTRA_FIELDS]
+    display = S.PAGES["/settings/player/display.html"].fields
+    assert [f.pref for f in display[-len(sp.DISPLAY_EXTRA_FIELDS):]] == \
+        [f.pref for f in sp.DISPLAY_EXTRA_FIELDS]
+    # ``alarmDefaultVolume`` führt die Seite schon unbedingt — kein Duplikat.
+    alarm = [f.pref for f in S.PAGES["/settings/player/alarm.html"].fields]
+    assert alarm.count("alarmDefaultVolume") == 1

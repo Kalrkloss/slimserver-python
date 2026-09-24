@@ -91,6 +91,12 @@ Seiten + Feldlisten (je ``page()``/``prefs()``/``handler()``)
   ``Slim/Utils/Log.pm:64``, Kategorien :876-948.
 * ``GET|POST /settings/server/performance.html`` — ``.../Server/Performance.pm``:
   ``page`` :21-23, ``prefs`` :25-30, Prioritäten :82-91.
+* ``GET|POST /settings/player/{menu,remote,synchronization}.html`` — Seiten mit
+  eigenem ``handler()`` (kein reiner ``pref_*``-Weg): ``.../Player/Menu.pm``
+  (``menuItem``-Liste :35-109), ``.../Player/Remote.pm`` (``disabledirsets``
+  :47-85), ``.../Player/Synchronization.pm`` (``synchronize`` + Sync-Prefs
+  :44-73).  Sie liegen in :mod:`lyrion.web.settings_player` und werden hier nur
+  verdrahtet (Registry + Dispatch, s. ``_wire_player_pages``).
 
 **Die Aufgabe nennt ``/settings/information.html`` — diese Route gibt es in Perl NICHT**
 (``Slim/Web/Settings/Server/Status.pm:20`` liefert ``settings/server/status.html``). Wir
@@ -164,7 +170,7 @@ import json
 import logging
 import re
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Callable, Optional
 from urllib.parse import quote, parse_qs
 
@@ -2884,6 +2890,20 @@ async def handle_settings_request(scope: dict, receive, send) -> None:
     """
     method = scope.get("method", "GET")
     path = scope.get("path", "")
+
+    # Seiten mit eigenem Handler (Perl ``handler()``, nicht nur ``prefs()``):
+    # ``Menu``/``Remote``/``Synchronization`` aus ``web/settings_player.py``
+    # (Import erst hier — Zyklus, siehe ``_wire_player_pages``).  Bewusst VOR
+    # ``_read_body``: ``handle_player_page_request`` liest den Body selbst; ein
+    # zweites ``receive()`` nach dem verbrauchten Body blockiert (gemessen mit
+    # ``httpx.ASGITransport``: der Aufruf wartet auf ``http.disconnect``).
+    player_pages = _wire_player_pages()
+    if path in player_pages:
+        from lyrion.web.settings_player import handle_player_page_request
+
+        await handle_player_page_request(scope, receive, send, player_pages[path])
+        return
+
     body = await _read_body(receive)
     params = _parse_params(scope, body)
 
@@ -3053,3 +3073,81 @@ async def handle_settings_request(scope: dict, receive, send) -> None:
 
     await _send(send, 200, "text/html",
                 _render_page(page, params, player, warning, extra_options))
+
+
+# ── Player-Seiten aus ``web/settings_player.py`` ─────────────────────────────
+# Perl ``Slim/Web/Settings/Player/{Menu,Remote,Synchronization}.pm``: Seiten mit
+# eigenem ``handler()``, die der reine ``pref_*``-Weg dieses Moduls nicht
+# abbildet.  Die Seiten selbst liegen in ``settings_player.py``; hier wird nur
+# verdrahtet (Registry + Dispatch).
+#
+# ``settings_player`` baut seine Seiten aus den Bausteinen DIESES Moduls
+# (``Field``, ``SettingsPage``, ``_as_list``, ``_esc``, ``_render_input``,
+# ``_save_simple_prefs``, ``_string``) — ein Import auf Modulebene wäre in beide
+# Richtungen ein Zyklus (``settings.py`` → ``settings_player`` → halb
+# initialisiertes ``settings.py`` und umgekehrt ``settings_player`` →
+# ``settings.py`` → halb initialisiertes ``settings_player.py``; beide
+# ``ImportError`` gemessen).  Der Import steht deshalb am Dateiende und wird nur
+# ausgeführt, wenn er durchläuft (Normalfall: dieses Modul ist dann vollständig,
+# ``settings_player`` wird hier nachgeladen).  Hat ``settings_player`` uns
+# umgekehrt selbst importiert, ist es hier halb geladen — dann verdrahtet der
+# erste Settings-Request (:func:`_wire_player_pages` ist idempotent).
+_PLAYER_PAGES: dict[str, SettingsPage] = {}
+
+
+def _extend_fields(page: SettingsPage, extra: tuple[Field, ...]) -> SettingsPage:
+    """Nachzügler-Felder additiv anhängen (Perls ``push``-Reihenfolge bleibt).
+
+    ``SettingsPage`` ist frozen — deshalb eine neue Seite statt eines ``append``.
+    Prefs, die die Seite schon führt, werden übersprungen: ``Alarm.pm:46-50``
+    meldet ``alarmDefaultVolume`` nur ohne Digital-Lautstärke, ``_PLAYER_ALARM``
+    führt sie bereits unbedingt — ein zweites ``pref_alarmDefaultVolume`` wäre
+    eine doppelte Zeile im selben Formular.
+    """
+    known = {f.pref for f in page.fields}
+    return replace(page, fields=page.fields + tuple(
+        f for f in extra if f.pref not in known))
+
+
+def _wire_player_pages(module=None) -> dict[str, SettingsPage]:
+    """Verdrahtet die Player-Seiten (idempotent): Feld-Ergänzungen + ``PAGES``.
+
+    ``module`` ist ``lyrion.web.settings_player`` (Parameter nur, damit der
+    Aufruf beim Laden den bereits geladenen Modulstand weiterreichen kann).
+    """
+    global _PLAYER_AUDIO, _PLAYER_DISPLAY, _PLAYER_ALARM, _PLAYER_PAGES
+
+    if _PLAYER_PAGES:
+        return _PLAYER_PAGES
+    if module is None:
+        from lyrion.web import settings_player as module
+
+    # Nachzügler-Felder an die bestehenden Seiten (Audio.pm:35-117,
+    # Display.pm:49-61, Alarm.pm:46-50) — additiv, s. :func:`_extend_fields`.
+    _PLAYER_AUDIO = _extend_fields(_PLAYER_AUDIO, module.AUDIO_EXTRA_FIELDS)
+    _PLAYER_DISPLAY = _extend_fields(_PLAYER_DISPLAY, module.DISPLAY_EXTRA_FIELDS)
+    _PLAYER_ALARM = _extend_fields(_PLAYER_ALARM, module.ALARM_EXTRA_FIELDS)
+
+    _PLAYER_PAGES = dict(module.PLAYER_PAGES)
+    PAGES.update({
+        _PLAYER_AUDIO.route: _PLAYER_AUDIO,
+        _PLAYER_DISPLAY.route: _PLAYER_DISPLAY,
+        _PLAYER_ALARM.route: _PLAYER_ALARM,
+        # Player-Seiten aus web/settings_player.py (Perl
+        # Slim/Web/Settings/Player/{Menu,Remote,Synchronization}.pm).
+        **_PLAYER_PAGES,
+    })
+    return _PLAYER_PAGES
+
+
+_settings_player_module = None
+try:
+    from lyrion.web import settings_player as _settings_player_module
+except ImportError:  # pragma: no cover — settings_player hat uns gerade selbst importiert
+    _settings_player_module = None
+
+# ``hasattr`` prüft die Vollständigkeit: beim direkten Import von
+# ``settings_player`` liegt hier nur der halb geladene Modulstand vor (der
+# Import ist dann ein Zyklus) — die Verdrahtung übernimmt der erste Request.
+if _settings_player_module is not None and hasattr(_settings_player_module, "PLAYER_PAGES"):
+    _wire_player_pages(_settings_player_module)
